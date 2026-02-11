@@ -153,11 +153,28 @@ class EnergyProfileExtractor:
     # ------------------------------------------------------------------
 
     def _extract_curves(self, df: pd.DataFrame) -> Tuple[List[dict], int]:
-        """Extract individual value curves from the DataFrame."""
+        """Extract individual value curves from the DataFrame.
+        
+        Groups by BOTH case_id AND activity to properly extract curves
+        for each activity instance within a case.
+        """
         curves: List[dict] = []
         lengths: List[int] = []
+        skipped_nan = 0
+        skipped_short = 0
 
-        for case_id, group in df.groupby(self.case_id_column):
+        # Group by BOTH case_id and activity (critical fix!)
+        grouping_cols = [self.case_id_column, self.activity_column]
+        
+        for group_keys, group in df.groupby(grouping_cols, dropna=False):
+            # Handle tuple unpacking for group keys
+            if isinstance(group_keys, tuple):
+                case_id, activity = group_keys
+            else:
+                case_id = group_keys
+                activity = group[self.activity_column].iloc[0]
+            
+            # Sort by timestamp to ensure temporal order
             group = group.sort_values(self.timestamp_column).reset_index(drop=True)
 
             start_idxs = group[group[self.start_end_column] == "start"].index
@@ -172,13 +189,30 @@ class EnergyProfileExtractor:
                 curve_df = group.iloc[s : e + 1]
 
                 if len(curve_df) < 3:
+                    skipped_short += 1
                     continue
 
+                # Extract values and handle NaN
                 values = curve_df[self.value_column].values.astype(float)
+                
+                # Skip curves with too many NaN values (>50%)
+                nan_ratio = np.isnan(values).sum() / len(values)
+                if nan_ratio > 0.5:
+                    skipped_nan += 1
+                    continue
+                
+                # Interpolate remaining NaN values
+                if np.isnan(values).any():
+                    mask = np.isnan(values)
+                    values[mask] = np.interp(
+                        np.flatnonzero(mask),
+                        np.flatnonzero(~mask),
+                        values[~mask]
+                    )
 
                 curve_dict: dict = {
                     "case_id": case_id,
-                    self.activity_column: curve_df.iloc[0][self.activity_column],
+                    self.activity_column: activity,
                     "values": values,
                 }
                 for col in self._all_attribute_columns:
@@ -188,7 +222,14 @@ class EnergyProfileExtractor:
                 lengths.append(len(values))
 
         if not curves:
-            raise ValueError("No valid curves found in the data.")
+            raise ValueError(
+                f"No valid curves found in the data. "
+                f"Skipped: {skipped_short} too short, {skipped_nan} too many NaNs."
+            )
+
+        if self.verbose:
+            print(f"Skipped curves: {skipped_short} (too short), {skipped_nan} (too many NaNs)")
+            print(f"Curve lengths - min: {min(lengths)}, max: {max(lengths)}, median: {int(np.median(lengths))}")
 
         target_length = int(np.median(lengths))
         return curves, target_length
@@ -201,13 +242,24 @@ class EnergyProfileExtractor:
     def resample_curve(values: np.ndarray, target_len: int) -> np.ndarray:
         """Resample a curve to *target_len* with outlier clipping + median filter."""
         values = np.asarray(values, dtype=float)
-        mean, std = values.mean(), values.std()
+        
+        # Handle edge cases
+        if len(values) == 0:
+            return np.zeros(target_len)
+        
+        # Remove outliers (3-sigma rule)
+        mean, std = np.nanmean(values), np.nanstd(values)
         if std > 0:
             values = np.clip(values, mean - 3 * std, mean + 3 * std)
-        kernel = min(5, len(values))
-        if kernel % 2 == 0:
-            kernel = max(kernel - 1, 1)
-        values = medfilt(values, kernel_size=kernel)
+        
+        # Apply median filter for smoothing (only if enough data points)
+        if len(values) >= 3:
+            kernel = min(5, len(values))
+            if kernel % 2 == 0:
+                kernel = max(kernel - 1, 1)
+            values = medfilt(values, kernel_size=kernel)
+        
+        # Interpolate to target length
         x_old = np.linspace(0, 1, len(values))
         x_new = np.linspace(0, 1, target_len)
         return np.interp(x_new, x_old, values)
