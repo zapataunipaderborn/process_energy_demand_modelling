@@ -1097,6 +1097,14 @@ process_datasets_to_model = process_datasets
 import pandas as pd
 from sim_extractor import extract_process
 from simulation import ProcessSimulation
+from sim_modeller import SimModeller
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULATION MODE TOGGLE
+#   'statistical' – sample durations/transitions from best-fit distributions
+#   'ml'          – use XGBoost models (falls back to statistical when needed)
+# ─────────────────────────────────────────────────────────────────────────────
+SIMULATION_MODE = 'statistical'   # ← change to 'ml' to enable ML mode
 
 # Initialize a list to store results for each process
 evaluation_results_list = []
@@ -1109,15 +1117,28 @@ for process in process_datasets_to_model.keys():
     df_event_log = process_datasets_to_model[process]['event_log']
     production_plan = process_datasets_to_model[process]['production_plan']
 
-    activity_stats_df = extract_process(df_event_log)
+    activity_stats_df, raw_df = extract_process(df_event_log)
     print("\n" + "="*50)
     print("PROBABILISTIC END ACTIVITY STATS:")
     print("="*50)
     print(activity_stats_df)
 
+    # ── (optional) ML model training ────────────────────────────────────────
+    ml_models = None
+    if SIMULATION_MODE == 'ml':
+        print("\n" + "="*50)
+        print("TRAINING ML MODELS (XGBoost)")
+        print("="*50)
+        ml_models = SimModeller()
+        ml_models.train(raw_df, activity_stats_df)
+        print(ml_models.summary())
+
     # Drop rows where case_id is NaN (or missing)
     df_compare = df_event_log.dropna(subset=['case_id'])
-    simulated_log = ProcessSimulation(activity_stats_df, production_plan).run()
+    simulated_log = ProcessSimulation(
+        activity_stats_df, production_plan,
+        mode=SIMULATION_MODE, ml_models=ml_models
+    ).run()
 
     print("\n" + "="*50)
     print("Simulated log")
@@ -2491,7 +2512,6 @@ training_results = train_position_based_regression(df_expanded, 'temp_nach_WR2_(
 
 
 # %%
-stop
 
 # %%
 
