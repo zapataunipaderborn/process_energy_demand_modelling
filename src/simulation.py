@@ -3,16 +3,47 @@ import numpy as np
 import random
 from datetime import datetime, timedelta
 
+from sim_extractor import sample_from_dist
+
+
 class ProcessSimulation:
-    def __init__(self, activity_stats_df, production_plan, random_seed=42):
+    """
+    Simulate a process using either statistical or ML-based models.
+
+    Parameters
+    ----------
+    activity_stats_df : pd.DataFrame
+        Output of ``sim_extractor.extract_process`` (the stats DataFrame).
+    production_plan : pd.DataFrame
+        One row per case to simulate.
+    mode : {'statistical', 'ml'}
+        'statistical' – sample durations/transitions from fitted distributions
+        (or normal as fallback).
+        'ml'          – use XGBoost models from *ml_models* when available;
+        fall back to statistical automatically.
+    ml_models : SimModeller | None
+        A trained ``SimModeller`` instance (required when mode='ml').
+    random_seed : int
+        NumPy / random seed for reproducibility.
+    """
+
+    def __init__(self, activity_stats_df, production_plan,
+                 mode='statistical', ml_models=None, random_seed=42):
         self.activity_stats = activity_stats_df
         self.production_plan = production_plan
+        self.mode = mode
+        self.ml_models = ml_models
         random.seed(random_seed)
         np.random.seed(random_seed)
-        
+
+        if self.mode == 'ml' and self.ml_models is None:
+            print("[ProcessSimulation] WARNING: mode='ml' but no ml_models provided – "
+                  "falling back to statistical mode.")
+            self.mode = 'statistical'
+
         self.env = None
         self.events = []
-        
+
         # Process configuration - build from activity_stats only
         self._build_activity_config()
         
@@ -29,85 +60,128 @@ class ProcessSimulation:
             
             key = (activity_name, object_name, object_type, higher_level)
             self.activity_config[key] = {
-                'duration': row['duration'],
+                'duration':     row['duration'],
                 'duration_std': row['duration_std'],
-                'transitions': row['transition'],
-                'is_start': row['is_start'],
-                'is_end': row['is_end'],
-                'n_events': row['n_events']
+                # Best-fit distribution (added by enhanced sim_extractor)
+                'dist_name':    row.get('dist_name', 'norm'),
+                'dist_params':  row.get('dist_params', (row['duration'], row['duration_std'])),
+                'transitions':  row['transition'],
+                'is_start':     row['is_start'],
+                'is_end':       row['is_end'],
+                'n_events':     row['n_events'],
             }
             
             print(f"  Config: {key}")
             print(f"    Transitions: {row['transition']}")
             print(f"    Start: {row['is_start']}")
     
-    def _get_activity_duration(self, activity, object_name, object_type, higher_level_activity):
-        """Generate duration for an activity based on statistics"""
-        activity = str(activity).strip()
-        object_name = str(object_name).strip()
-        object_type = str(object_type).strip()
-        higher_level_activity = str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None
-        
+    def _get_activity_duration(self, activity, object_name, object_type,
+                               higher_level_activity, object_attributes=None):
+        """
+        Generate a sampled duration (minutes) for one activity instance.
+
+        In 'ml' mode the XGBoost duration model is tried first; it falls back
+        to the statistical path when no model exists for this key.
+        In 'statistical' mode the best-fit distribution stored in
+        activity_config is used directly.
+        """
+        activity              = str(activity).strip()
+        object_name           = str(object_name).strip()
+        object_type           = str(object_type).strip()
+        higher_level_activity = (str(higher_level_activity).strip()
+                                 if pd.notna(higher_level_activity) else None)
+        object_attributes     = object_attributes or {}
+
         key = (activity, object_name, object_type, higher_level_activity)
-        
+
+        # ── ML path ──────────────────────────────────────────────────────
+        if self.mode == 'ml' and self.ml_models is not None:
+            ml_dur = self.ml_models.predict_duration(
+                activity, object_name, object_type,
+                higher_level_activity, object_attributes
+            )
+            if ml_dur is not None:
+                return ml_dur
+            # else: fall through to statistical
+
+        # ── Statistical path ──────────────────────────────────────────────
         if key in self.activity_config:
-            config = self.activity_config[key]
-            duration = config['duration']
-            duration_std = config['duration_std']
-            
-            if duration_std > 0:
-                sampled_duration = max(0.1, np.random.normal(duration, duration_std))
+            config      = self.activity_config[key]
+            dist_name   = config.get('dist_name', 'norm')
+            dist_params = config.get('dist_params')
+
+            if dist_params and any(p != 0 for p in dist_params[1:]):
+                return sample_from_dist(dist_name, dist_params)
             else:
-                sampled_duration = duration
-                
-            return sampled_duration
+                # Degenerate case: zero variance – return the mean
+                return max(0.1, config['duration'])
         else:
             print(f"WARNING: No config found for {key}")
             return 10.0
     
-    def _get_next_activity(self, current_activity, object_name, object_type, higher_level_activity):
+    def _get_next_activity(self, current_activity, object_name, object_type,
+                           higher_level_activity, object_attributes=None):
         """
-        Determine next activity based on transition probabilities
-        NOW HANDLES PROBABILISTIC END instead of hard stop
+        Determine next activity based on transition probabilities.
+        Handles probabilistic END transitions.
+
+        In 'ml' mode the XGBoost transition classifier is tried first; it
+        falls back to the statistical (frequency-based) path automatically.
         """
-        current_activity = str(current_activity).strip()
-        object_name = str(object_name).strip()
-        object_type = str(object_type).strip()
-        higher_level_activity = str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None
-        
+        current_activity      = str(current_activity).strip()
+        object_name           = str(object_name).strip()
+        object_type           = str(object_type).strip()
+        higher_level_activity = (str(higher_level_activity).strip()
+                                 if pd.notna(higher_level_activity) else None)
+        object_attributes     = object_attributes or {}
+
         key = (current_activity, object_name, object_type, higher_level_activity)
-        
+
         print(f"    Looking for transitions from: {current_activity}")
-        
-        if key in self.activity_config:
-            transitions = self.activity_config[key]['transitions']
-            print(f"    Found transitions: {transitions}")
-            
-            if transitions and len(transitions) > 0:
-                activities = list(transitions.keys())
-                probabilities = list(transitions.values())
-                
-                # Normalize probabilities
-                prob_sum = sum(probabilities)
-                if prob_sum > 0:
-                    probabilities = [p/prob_sum for p in probabilities]
-                    
-                    # Choose next transition (including possible __END__)
-                    next_transition = np.random.choice(activities, p=probabilities)
-                    
-                    # Check if we selected the END transition
-                    if next_transition == '__END__':
-                        print(f"    Selected END transition - stopping process")
-                        return None
-                    else:
-                        print(f"    Selected next activity: {next_transition}")
-                        return str(next_transition).strip()
+
+        # ── resolve transition probability dict ───────────────────────────
+        transitions = None
+
+        # ML path
+        if self.mode == 'ml' and self.ml_models is not None:
+            ml_tr = self.ml_models.predict_transitions(
+                current_activity, object_name, object_type,
+                higher_level_activity, object_attributes
+            )
+            if ml_tr is not None:
+                transitions = ml_tr
+                print(f"    ML transitions: {transitions}")
+
+        # Statistical path (also serves as fallback for ml mode)
+        if transitions is None:
+            if key in self.activity_config:
+                transitions = self.activity_config[key]['transitions']
+                print(f"    Statistical transitions: {transitions}")
             else:
-                print(f"    No transitions available - ending process")
-        else:
-            print(f"    Key not found in config: {key}")
-        
-        return None  # End of process
+                print(f"    Key not found in config: {key}")
+                return None
+
+        # ── sample next activity ──────────────────────────────────────────
+        if not transitions:
+            print(f"    No transitions available - ending process")
+            return None
+
+        activities    = list(transitions.keys())
+        probabilities = list(transitions.values())
+        prob_sum      = sum(probabilities)
+
+        if prob_sum <= 0:
+            return None
+
+        probabilities   = [p / prob_sum for p in probabilities]
+        next_transition = np.random.choice(activities, p=probabilities)
+
+        if next_transition == '__END__':
+            print(f"    Selected END transition - stopping process")
+            return None
+
+        print(f"    Selected next activity: {next_transition}")
+        return str(next_transition).strip()
     
     def _get_start_activities(self, object_name, object_type, higher_level_activity):
         """Get all possible start activities for a given object configuration"""
@@ -184,7 +258,8 @@ class ProcessSimulation:
                 
                 # Get duration
                 activity_duration = self._get_activity_duration(
-                    current_activity, object_name, object_type, higher_level_activity
+                    current_activity, object_name, object_type,
+                    higher_level_activity, object_attributes
                 )
                 
                 # Calculate timestamps
@@ -208,7 +283,8 @@ class ProcessSimulation:
                 
                 # Get next activity (which may return None if __END__ is chosen)
                 next_activity = self._get_next_activity(
-                    current_activity, object_name, object_type, higher_level_activity
+                    current_activity, object_name, object_type,
+                    higher_level_activity, object_attributes
                 )
                 
                 if not next_activity:
@@ -226,6 +302,7 @@ class ProcessSimulation:
         
         print(f"Starting simulation with {len(self.production_plan)} cases...")
         print(f"Activity config has {len(self.activity_config)} activity configurations")
+        print(f"Simulation mode: {self.mode}")
         print("Using probabilistic end transitions!")
         
         # Simulate each case
