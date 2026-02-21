@@ -1101,10 +1101,12 @@ from sim_modeller import SimModeller
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIMULATION MODE TOGGLE
-#   'statistical' – sample durations/transitions from best-fit distributions
-#   'ml'          – use XGBoost models (falls back to statistical when needed)
+#   'statistical'      – sample durations/transitions from best-fit distributions
+#   'ml'               – use XGBoost models (falls back to statistical when needed)
+#   'ml_duration_only' – use XGBoost only for the duration median; std and
+#                        transition probabilities still come from data extraction
 # ─────────────────────────────────────────────────────────────────────────────
-SIMULATION_MODE = 'statistical'   # ← change to 'ml' to enable ML mode
+SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
 
 # Initialize a list to store results for each process
 evaluation_results_list = []
@@ -1125,7 +1127,7 @@ for process in process_datasets_to_model.keys():
 
     # ── (optional) ML model training ────────────────────────────────────────
     ml_models = None
-    if SIMULATION_MODE == 'ml':
+    if SIMULATION_MODE in ('ml', 'ml_duration_only'):
         print("\n" + "="*50)
         print("TRAINING ML MODELS (XGBoost)")
         print("="*50)
@@ -1146,7 +1148,6 @@ for process in process_datasets_to_model.keys():
 
     # Run the comprehensive evaluation
     print("🔍 RUNNING COMPREHENSIVE SIMULATION EVALUATION")
-    print("Based on process mining literature (Rozinat et al., van der Aalst et al., Burattin & Sperduti)")
     print("="*80)
 
     evaluation_results = comprehensive_simulation_evaluation(simulated_log, df_event_log)
@@ -1177,8 +1178,10 @@ evaluation_results_df = evaluation_results_df[columns_order]
 
 # print the DataFrame
 print("\nAggregated Evaluation Results:")
-print(evaluation_results_df)
+evaluation_results_df
 
+# %% 
+Stop
 # %% [markdown]
 # # Data fusion
 

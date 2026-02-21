@@ -6,10 +6,10 @@ Trains XGBoost models that power the 'ml' simulation mode.
 Three model families are trained, all keyed by
 ``(activity, object, object_type, higher_level_activity)``:
 
-1. **duration_models**     – XGBRegressor predicting *mean* duration from
-                              ``object_attributes``.
-2. **duration_std_models** – XGBRegressor predicting *standard deviation* of
-                              duration (fitted on absolute residuals of model 1).
+1. **duration_models**     – XGBRegressor predicting *median* duration from
+                              ``object_attributes`` (objective=``reg:absoluteerror``).
+2. **duration_std_models** – XGBRegressor predicting *median absolute deviation*
+                              of duration (fitted on absolute residuals of model 1).
 3. **transition_models**   – XGBClassifier predicting the *next activity*
                               (including ``'__END__'``) from
                               ``object_attributes``.
@@ -173,6 +173,7 @@ class SimModeller:
                         n_estimators=self.n_estimators,
                         max_depth=self.max_depth,
                         random_state=self.random_state,
+                        objective='reg:absoluteerror',   # median (MAE)
                         verbosity=0,
                     )
                     dur_model.fit(X, y_dur)
@@ -185,6 +186,7 @@ class SimModeller:
                         n_estimators=self.n_estimators,
                         max_depth=self.max_depth,
                         random_state=self.random_state,
+                        objective='reg:absoluteerror',   # median (MAE)
                         verbosity=0,
                     )
                     std_model.fit(X, residuals)
@@ -237,6 +239,7 @@ class SimModeller:
     ) -> float | None:
         """
         Predict a sampled duration (minutes) for one activity instance.
+        The prediction is centred on the **median** (reg:absoluteerror objective).
 
         Returns ``None`` when no ML model is available for the given key,
         signalling the caller to fall back to statistical mode.
@@ -248,9 +251,12 @@ class SimModeller:
 
         dur_model, feature_cols = self.duration_models[key]
         features = self._attrs_to_features(object_attributes, feature_cols)
-        X = pd.DataFrame([features])[feature_cols].fillna(0.0)
+        X = pd.DataFrame([features])[feature_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
 
-        mean_pred = float(dur_model.predict(X)[0])
+        median_pred = float(dur_model.predict(X)[0])
 
         std_pred = 0.0
         if key in self.duration_std_models:
@@ -258,11 +264,44 @@ class SimModeller:
             std_pred = max(0.0, float(std_model.predict(X)[0]))
 
         if std_pred > 0:
-            sampled = np.random.normal(mean_pred, std_pred)
+            sampled = np.random.normal(median_pred, std_pred)
         else:
-            sampled = mean_pred
+            sampled = median_pred
 
         return max(0.1, float(sampled))
+
+    def predict_duration_median(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+    ) -> float | None:
+        """
+        Return the raw ML median duration prediction **without** adding
+        ML-predicted noise (std).
+
+        Used by ``'ml_duration_only'`` mode, where the caller adds statistical
+        std from the extracted data instead.
+
+        Returns ``None`` when no ML model is available for the given key,
+        signalling the caller to fall back to statistical mode.
+        """
+        key = self._make_key(activity, object_name, object_type, higher_level_activity)
+
+        if key not in self.duration_models:
+            return None
+
+        dur_model, feature_cols = self.duration_models[key]
+        features = self._attrs_to_features(object_attributes, feature_cols)
+        X = pd.DataFrame([features])[feature_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
+
+        median_pred = float(dur_model.predict(X)[0])
+        return max(0.1, median_pred)
 
     def predict_transitions(
         self,
@@ -284,7 +323,10 @@ class SimModeller:
 
         tr_model, le, feature_cols = self.transition_models[key]
         features = self._attrs_to_features(object_attributes, feature_cols)
-        X = pd.DataFrame([features])[feature_cols].fillna(0.0)
+        X = pd.DataFrame([features])[feature_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
 
         probs = tr_model.predict_proba(X)[0]
         return {

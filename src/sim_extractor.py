@@ -126,8 +126,8 @@ def extract_process(df):
             durations = (
                 activity_data['timestamp_end'] - activity_data['timestamp_start']
             ).dt.total_seconds() / 60
-            duration_mean = float(durations.mean())
-            duration_std  = float(durations.std()) if len(durations) > 1 else 0.0
+            duration_median = float(durations.median())
+            duration_std    = float(durations.std()) if len(durations) > 1 else 0.0
             n_events = len(activity_data)
 
             # ── Best-fit distribution ─────────────────────────────────────
@@ -199,7 +199,7 @@ def extract_process(df):
                 'object':                object_name,
                 'object_type':           object_type,
                 'higher_level_activity': higher_level_activity,
-                'duration':              duration_mean,
+                'duration':              duration_median,
                 'duration_std':          duration_std,
                 'dist_name':             dist_name,
                 'dist_params':           dist_params,
