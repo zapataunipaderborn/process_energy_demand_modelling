@@ -66,11 +66,45 @@ _MIN_SAMPLES = 5
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Constant baseline "models" — mean & median
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _ConstantPredictor:
+    """Sklearn-compatible estimator that always predicts a constant.
+
+    ``strategy='mean'``  → predicts the training mean.
+    ``strategy='median'`` → predicts the training median.
+    """
+
+    def __init__(self, strategy: str = 'mean'):
+        if strategy not in ('mean', 'median'):
+            raise ValueError(f"Unknown strategy: {strategy}")
+        self.strategy = strategy
+        self._value: float = 0.0
+
+    def fit(self, X, y):
+        y_arr = np.asarray(y, dtype=float)
+        self._value = float(np.mean(y_arr) if self.strategy == 'mean'
+                            else np.median(y_arr))
+        return self
+
+    def predict(self, X):
+        return np.full(len(X), self._value)
+
+    def __repr__(self):
+        return f"_ConstantPredictor(strategy='{self.strategy}', value={self._value:.4f})"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Model factories (default parameters)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _default_regressor(model_type: str, random_state: int = 42):
     """Return a regressor instance with sensible defaults."""
+    if model_type == 'mean':
+        return _ConstantPredictor(strategy='mean')
+    if model_type == 'median':
+        return _ConstantPredictor(strategy='median')
     if model_type == 'xgboost':
         if not _XGBOOST_AVAILABLE:
             raise RuntimeError("xgboost not installed")
@@ -122,6 +156,9 @@ def _default_classifier(model_type: str, random_state: int = 42):
 
 def _optuna_regressor(trial, model_type: str, random_state: int = 42):
     """Return a regressor with Optuna-suggested hyper-parameters."""
+    # Baselines have no hyper-parameters to tune
+    if model_type in ('mean', 'median'):
+        return _ConstantPredictor(strategy=model_type)
     if model_type == 'xgboost':
         return XGBRegressor(
             n_estimators=trial.suggest_int('n_estimators', 50, 300),
@@ -193,21 +230,25 @@ class SimModeller:
     modes.
 
     All model types in *model_types* are trained for each activity key,
-    and the **best one on the temporal test set** is automatically selected.
+    and the **best one on the internal validation set** is automatically
+    selected.  The winning model is then re-trained on all incoming data.
 
     Parameters
     ----------
     model_types : list[str]
         List of model types to train and compare.
-        Supported: ``'xgboost'``, ``'linear'``, ``'lasso'``, ``'mlp'``.
+        Supported: ``'mean'``, ``'median'``, ``'xgboost'``, ``'linear'``,
+        ``'lasso'``, ``'mlp'``.
     optimize_hyperparams : bool
         If ``True``, use Optuna to find optimal hyper-parameters on the
         training split.  Requires ``optuna`` to be installed.
+        (Ignored for ``'mean'`` and ``'median'`` which have no parameters.)
     n_optuna_trials : int
         Number of Optuna trials per model (only used when
         *optimize_hyperparams* is True).
-    test_size : float
-        Fraction of data reserved for the temporal test set (default 0.30).
+    val_size : float
+        Fraction of data reserved for the internal validation set
+        (default 0.20).  Used for model selection only.
     random_state : int
         Random seed for reproducibility.
     """
@@ -217,7 +258,7 @@ class SimModeller:
         model_types: list[str] | None = None,
         optimize_hyperparams: bool = False,
         n_optuna_trials: int = 50,
-        test_size: float = 0.30,
+        val_size: float = 0.20,
         train_transitions: bool = True,
         random_state: int = 42,
     ):
@@ -225,7 +266,7 @@ class SimModeller:
         self.train_transitions = train_transitions
         self.optimize_hyperparams  = optimize_hyperparams
         self.n_optuna_trials       = n_optuna_trials
-        self.test_size             = test_size
+        self.val_size              = val_size
         self.random_state          = random_state
 
         # Filter out xgboost if not available
@@ -242,9 +283,9 @@ class SimModeller:
         self.duration_fallback:   dict = {}   # key -> (dist_name, dist_params)
         self.transition_fallback: dict = {}   # key -> transition dict
 
-        # ── evaluation metrics ────────────────────────────────────────────
-        self.duration_test_metrics:   dict = {}   # key -> {mae, rmse, r2, model_type}
-        self.transition_test_metrics: dict = {}   # key -> {accuracy, f1, model_type}
+        # ── evaluation metrics (internal validation for model selection) ──
+        self.duration_val_metrics:   dict = {}   # key -> {mae, rmse, r2, model_type}
+        self.transition_val_metrics: dict = {}   # key -> {accuracy, f1, model_type}
         # All model results (for comparison reporting)
         self.duration_all_results:   dict = {}   # key -> {model_type: {mae, rmse, r2}}
         self.transition_all_results: dict = {}   # key -> {model_type: {accuracy, f1}}
@@ -278,21 +319,20 @@ class SimModeller:
         return X.fillna(0.0)
 
     # ------------------------------------------------------------------
-    # Temporal split helper
+    # Internal validation split helper (for model selection only)
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _temporal_split(group: pd.DataFrame, test_size: float = 0.30):
+    def _validation_split(group: pd.DataFrame, val_size: float = 0.20):
         """
-        Sort *group* by ``timestamp_start`` and split into train / test.
-        The first ``1 - test_size`` fraction becomes training data.
+        Split *group* into fit / validation (for model selection).
+        Sorts by ``timestamp_start`` if available, else uses tail.
         """
-        if 'timestamp_start' not in group.columns:
-            n_test = max(1, int(len(group) * test_size))
-            return group.iloc[:-n_test], group.iloc[-n_test:]
-
-        sorted_g = group.sort_values('timestamp_start').reset_index(drop=True)
-        split_idx = int(len(sorted_g) * (1 - test_size))
+        if 'timestamp_start' in group.columns:
+            sorted_g = group.sort_values('timestamp_start').reset_index(drop=True)
+        else:
+            sorted_g = group.reset_index(drop=True)
+        split_idx = int(len(sorted_g) * (1 - val_size))
         split_idx = max(1, min(split_idx, len(sorted_g) - 1))
         return sorted_g.iloc[:split_idx], sorted_g.iloc[split_idx:]
 
@@ -376,9 +416,11 @@ class SimModeller:
         """
         Train all ML models.
 
-        For each activity key, every model type in ``self.model_types`` is
-        trained.  The best model (lowest MAE for duration, highest accuracy
-        for transitions) on the temporal test set is selected automatically.
+        The incoming ``raw_df`` is assumed to be the **train portion** only
+        (the pipeline handles the real train/test split).  Internally, a
+        small validation split (``val_size``) is used only for model
+        selection among ``model_types``.  The winning model is then
+        **re-trained on all incoming data** before being stored.
 
         Parameters
         ----------
@@ -430,7 +472,7 @@ class SimModeller:
 
         print(f"\n[SimModeller] Model types      : {self.model_types}")
         print(f"[SimModeller] Optuna tuning    : {self.optimize_hyperparams}")
-        print(f"[SimModeller] Temporal test %  : {self.test_size:.0%}")
+        print(f"[SimModeller] Internal val %   : {self.val_size:.0%}")
         print(f"[SimModeller] Feature columns  : {feature_cols}")
 
         for key_vals, group in grouped:
@@ -442,27 +484,29 @@ class SimModeller:
             if len(group) < _MIN_SAMPLES:
                 continue
 
-            # ── temporal train / test split ───────────────────────────────
-            train_g, test_g = self._temporal_split(group, self.test_size)
+            # ── internal validation split (for model selection only) ──────
+            fit_g, val_g = self._validation_split(group, self.val_size)
 
-            X_train = self._build_X(train_g, feature_cols)
-            X_test  = self._build_X(test_g,  feature_cols)
+            X_fit = self._build_X(fit_g, feature_cols)
+            X_val = self._build_X(val_g, feature_cols)
+            # Full data (for re-training the winning model)
+            X_all = self._build_X(group, feature_cols)
 
             # skip if all features are constant (no signal)
-            if (X_train.nunique() <= 1).all():
+            if (X_fit.nunique() <= 1).all():
                 continue
 
             print(f"\n  Key: {key}")
-            print(f"    Train size: {len(train_g)}, Test size: {len(test_g)}")
+            print(f"    Fit size: {len(fit_g)}, Val size: {len(val_g)}, Total: {len(group)}")
 
             # ==============================================================
-            # 1. Duration model — train ALL types, pick best by MAE
+            # 1. Duration model — train ALL types, pick best by val MAE
             # ==============================================================
-            y_train_dur = train_g['duration'].astype(float)
-            y_test_dur  = test_g['duration'].astype(float)
+            y_fit_dur = fit_g['duration'].astype(float)
+            y_val_dur = val_g['duration'].astype(float)
+            y_all_dur = group['duration'].astype(float)
 
             best_dur_mae   = float('inf')
-            best_dur_model = None
             best_dur_type  = None
             best_dur_metrics = None
             dur_results = {}
@@ -471,14 +515,14 @@ class SimModeller:
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        model = self._fit_regressor(mtype, X_train, y_train_dur)
+                        model = self._fit_regressor(mtype, X_fit, y_fit_dur)
 
-                    # evaluate on test
-                    if len(X_test) > 0:
-                        y_pred = model.predict(X_test)
-                        mae  = mean_absolute_error(y_test_dur, y_pred)
-                        rmse = np.sqrt(mean_squared_error(y_test_dur, y_pred))
-                        r2   = r2_score(y_test_dur, y_pred)
+                    # evaluate on validation
+                    if len(X_val) > 0:
+                        y_pred = model.predict(X_val)
+                        mae  = mean_absolute_error(y_val_dur, y_pred)
+                        rmse = np.sqrt(mean_squared_error(y_val_dur, y_pred))
+                        r2   = r2_score(y_val_dur, y_pred)
                         dur_results[mtype] = {
                             'mae': mae, 'rmse': rmse, 'r2': r2,
                         }
@@ -486,50 +530,50 @@ class SimModeller:
                               f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}")
 
                         if mae < best_dur_mae:
-                            best_dur_mae     = mae
-                            best_dur_model   = model
-                            best_dur_type    = mtype
+                            best_dur_mae  = mae
+                            best_dur_type = mtype
                             best_dur_metrics = dur_results[mtype]
                     else:
-                        # No test data — keep first successful model
-                        if best_dur_model is None:
-                            best_dur_model = model
-                            best_dur_type  = mtype
+                        if best_dur_type is None:
+                            best_dur_type = mtype
 
                 except Exception as exc:
                     print(f"    Duration [{mtype:>8s}]  FAILED: {exc}")
 
-            if best_dur_model is not None:
-                self.duration_models[key] = (best_dur_model, feature_cols,
-                                             best_dur_type)
-                dur_trained += 1
-                if best_dur_metrics:
-                    self.duration_test_metrics[key] = {
-                        **best_dur_metrics, 'model_type': best_dur_type,
-                    }
-                if dur_results:
-                    self.duration_all_results[key] = dur_results
-
-                print(f"    ✓ Best duration model: {best_dur_type}"
-                      + (f"  (MAE={best_dur_mae:.3f})"
-                         if best_dur_mae < float('inf') else ""))
-
-                # ── Duration std model (on abs residuals) — same type ─────
+            # Re-train the winning model on ALL incoming data
+            if best_dur_type is not None:
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        residuals = np.abs(
-                            y_train_dur.values
-                            - best_dur_model.predict(X_train)
+                        final_dur_model = self._fit_regressor(
+                            best_dur_type, X_all, y_all_dur
                         )
-                        std_model = self._fit_regressor(
-                            best_dur_type, X_train, pd.Series(residuals)
-                        )
-                        self.duration_std_models[key] = (std_model,
-                                                         feature_cols,
-                                                         best_dur_type)
+                    self.duration_models[key] = (final_dur_model, feature_cols,
+                                                 best_dur_type)
+                    dur_trained += 1
+                    if best_dur_metrics:
+                        self.duration_val_metrics[key] = {
+                            **best_dur_metrics, 'model_type': best_dur_type,
+                        }
+                    if dur_results:
+                        self.duration_all_results[key] = dur_results
+
+                    print(f"    ✓ Best duration model: {best_dur_type}"
+                          + (f"  (val MAE={best_dur_mae:.3f})"
+                             if best_dur_mae < float('inf') else ""))
+
+                    # ── Duration std model (on abs residuals) — same type ─
+                    residuals = np.abs(
+                        y_all_dur.values - final_dur_model.predict(X_all)
+                    )
+                    std_model = self._fit_regressor(
+                        best_dur_type, X_all, pd.Series(residuals)
+                    )
+                    self.duration_std_models[key] = (std_model,
+                                                     feature_cols,
+                                                     best_dur_type)
                 except Exception as exc:
-                    print(f"    [!] Duration std model failed: {exc}")
+                    print(f"    [!] Final duration re-train failed: {exc}")
 
             # ==============================================================
             # 2. Transition model — train ALL types, pick best by accuracy
@@ -538,18 +582,19 @@ class SimModeller:
             if not self.train_transitions:
                 continue
 
-            y_train_tr = train_g['next_activity'].astype(str)
-            y_test_tr  = test_g['next_activity'].astype(str)
+            y_fit_tr = fit_g['next_activity'].astype(str)
+            y_val_tr = val_g['next_activity'].astype(str)
+            y_all_tr = group['next_activity'].astype(str)
 
-            if y_train_tr.nunique() < 2:
+            if y_all_tr.nunique() < 2:
                 continue
 
             le = LabelEncoder()
-            y_enc_train = le.fit_transform(y_train_tr)
+            le.fit(y_all_tr)  # fit on ALL classes so nothing is unknown later
+            y_enc_fit = le.transform(y_fit_tr)
 
-            best_tr_acc   = -1.0
-            best_tr_model = None
-            best_tr_type  = None
+            best_tr_acc  = -1.0
+            best_tr_type = None
             best_tr_metrics = None
             tr_results = {}
 
@@ -558,17 +603,17 @@ class SimModeller:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         model = self._fit_classifier(
-                            mtype, X_train, y_enc_train
+                            mtype, X_fit, y_enc_fit
                         )
 
-                    # evaluate on test
-                    if len(X_test) > 0:
-                        known_mask = y_test_tr.isin(le.classes_)
+                    # evaluate on validation
+                    if len(X_val) > 0:
+                        known_mask = y_val_tr.isin(le.classes_)
                         if known_mask.sum() > 0:
-                            y_enc_test = le.transform(y_test_tr[known_mask])
-                            y_pred_tr  = model.predict(X_test[known_mask])
-                            acc = accuracy_score(y_enc_test, y_pred_tr)
-                            f1  = f1_score(y_enc_test, y_pred_tr,
+                            y_enc_val = le.transform(y_val_tr[known_mask])
+                            y_pred_tr = model.predict(X_val[known_mask])
+                            acc = accuracy_score(y_enc_val, y_pred_tr)
+                            f1  = f1_score(y_enc_val, y_pred_tr,
                                            average='weighted',
                                            zero_division=0)
                             tr_results[mtype] = {
@@ -578,36 +623,43 @@ class SimModeller:
                                   f"Acc={acc:.3f}  F1={f1:.3f}")
 
                             if acc > best_tr_acc:
-                                best_tr_acc     = acc
-                                best_tr_model   = model
-                                best_tr_type    = mtype
+                                best_tr_acc  = acc
+                                best_tr_type = mtype
                                 best_tr_metrics = tr_results[mtype]
                         else:
-                            if best_tr_model is None:
-                                best_tr_model = model
-                                best_tr_type  = mtype
+                            if best_tr_type is None:
+                                best_tr_type = mtype
                     else:
-                        if best_tr_model is None:
-                            best_tr_model = model
-                            best_tr_type  = mtype
+                        if best_tr_type is None:
+                            best_tr_type = mtype
 
                 except Exception as exc:
                     print(f"    Transition [{mtype:>8s}]  FAILED: {exc}")
 
-            if best_tr_model is not None:
-                self.transition_models[key] = (best_tr_model, le,
-                                               feature_cols, best_tr_type)
-                tr_trained += 1
-                if best_tr_metrics:
-                    self.transition_test_metrics[key] = {
-                        **best_tr_metrics, 'model_type': best_tr_type,
-                    }
-                if tr_results:
-                    self.transition_all_results[key] = tr_results
+            # Re-train the winning classifier on ALL incoming data
+            if best_tr_type is not None:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        y_enc_all = le.transform(y_all_tr)
+                        final_tr_model = self._fit_classifier(
+                            best_tr_type, X_all, y_enc_all
+                        )
+                    self.transition_models[key] = (final_tr_model, le,
+                                                   feature_cols, best_tr_type)
+                    tr_trained += 1
+                    if best_tr_metrics:
+                        self.transition_val_metrics[key] = {
+                            **best_tr_metrics, 'model_type': best_tr_type,
+                        }
+                    if tr_results:
+                        self.transition_all_results[key] = tr_results
 
-                print(f"    ✓ Best transition model: {best_tr_type}"
-                      + (f"  (Acc={best_tr_acc:.3f})"
-                         if best_tr_acc >= 0 else ""))
+                    print(f"    ✓ Best transition model: {best_tr_type}"
+                          + (f"  (val Acc={best_tr_acc:.3f})"
+                             if best_tr_acc >= 0 else ""))
+                except Exception as exc:
+                    print(f"    [!] Final transition re-train failed: {exc}")
 
         print(
             f"\n[SimModeller] Training complete – "
@@ -751,9 +803,9 @@ class SimModeller:
             f" {len(self.transition_fallback)} (transition)",
         ]
 
-        if self.duration_test_metrics:
-            lines.append("\n  ── Best duration model per key (on test set) ──")
-            for key, m in self.duration_test_metrics.items():
+        if self.duration_val_metrics:
+            lines.append("\n  ── Best duration model per key (on val set) ──")
+            for key, m in self.duration_val_metrics.items():
                 lines.append(
                     f"    {key}  →  [{m['model_type']}]  "
                     f"MAE={m['mae']:.3f}  RMSE={m['rmse']:.3f}  "
@@ -766,17 +818,17 @@ class SimModeller:
                 lines.append(f"    {key}:")
                 for mtype, m in results.items():
                     best_marker = " ★" if (
-                        key in self.duration_test_metrics
-                        and self.duration_test_metrics[key]['model_type'] == mtype
+                        key in self.duration_val_metrics
+                        and self.duration_val_metrics[key]['model_type'] == mtype
                     ) else ""
                     lines.append(
                         f"      {mtype:>8s}:  MAE={m['mae']:.3f}  "
                         f"RMSE={m['rmse']:.3f}  R²={m['r2']:.3f}{best_marker}"
                     )
 
-        if self.transition_test_metrics:
-            lines.append("\n  ── Best transition model per key (on test set) ──")
-            for key, m in self.transition_test_metrics.items():
+        if self.transition_val_metrics:
+            lines.append("\n  ── Best transition model per key (on val set) ──")
+            for key, m in self.transition_val_metrics.items():
                 lines.append(
                     f"    {key}  →  [{m['model_type']}]  "
                     f"Acc={m['accuracy']:.3f}  F1={m['f1']:.3f}"
@@ -788,8 +840,8 @@ class SimModeller:
                 lines.append(f"    {key}:")
                 for mtype, m in results.items():
                     best_marker = " ★" if (
-                        key in self.transition_test_metrics
-                        and self.transition_test_metrics[key]['model_type'] == mtype
+                        key in self.transition_val_metrics
+                        and self.transition_val_metrics[key]['model_type'] == mtype
                     ) else ""
                     lines.append(
                         f"      {mtype:>8s}:  Acc={m['accuracy']:.3f}  "
