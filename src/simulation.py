@@ -16,11 +16,14 @@ class ProcessSimulation:
         Output of ``sim_extractor.extract_process`` (the stats DataFrame).
     production_plan : pd.DataFrame
         One row per case to simulate.
-    mode : {'statistical', 'ml'}
-        'statistical' – sample durations/transitions from fitted distributions
-        (or normal as fallback).
-        'ml'          – use XGBoost models from *ml_models* when available;
-        fall back to statistical automatically.
+    mode : {'statistical', 'ml', 'ml_duration_only'}
+        'statistical'      – sample durations/transitions from fitted
+        distributions (or normal as fallback).
+        'ml'               – use XGBoost models from *ml_models* when
+        available; fall back to statistical automatically.
+        'ml_duration_only' – use XGBoost only for the duration *median*;
+        the standard deviation and transition probabilities still come
+        from the statistical extraction (``activity_stats_df``).
     ml_models : SimModeller | None
         A trained ``SimModeller`` instance (required when mode='ml').
     random_seed : int
@@ -36,9 +39,9 @@ class ProcessSimulation:
         random.seed(random_seed)
         np.random.seed(random_seed)
 
-        if self.mode == 'ml' and self.ml_models is None:
-            print("[ProcessSimulation] WARNING: mode='ml' but no ml_models provided – "
-                  "falling back to statistical mode.")
+        if self.mode in ('ml', 'ml_duration_only') and self.ml_models is None:
+            print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no ml_models "
+                  "provided – falling back to statistical mode.")
             self.mode = 'statistical'
 
         self.env = None
@@ -82,6 +85,8 @@ class ProcessSimulation:
 
         In 'ml' mode the XGBoost duration model is tried first; it falls back
         to the statistical path when no model exists for this key.
+        In 'ml_duration_only' mode, the ML model provides only the median
+        prediction while the noise (std) comes from the statistical config.
         In 'statistical' mode the best-fit distribution stored in
         activity_config is used directly.
         """
@@ -94,7 +99,7 @@ class ProcessSimulation:
 
         key = (activity, object_name, object_type, higher_level_activity)
 
-        # ── ML path ──────────────────────────────────────────────────────
+        # ── Full ML path (duration + ML std) ──────────────────────────────
         if self.mode == 'ml' and self.ml_models is not None:
             ml_dur = self.ml_models.predict_duration(
                 activity, object_name, object_type,
@@ -102,6 +107,24 @@ class ProcessSimulation:
             )
             if ml_dur is not None:
                 return ml_dur
+            # else: fall through to statistical
+
+        # ── ML duration-only path (ML median + statistical std) ──────────
+        if self.mode == 'ml_duration_only' and self.ml_models is not None:
+            ml_median = self.ml_models.predict_duration_median(
+                activity, object_name, object_type,
+                higher_level_activity, object_attributes
+            )
+            if ml_median is not None:
+                # Use the statistical std from the extracted data
+                stat_std = 0.0
+                if key in self.activity_config:
+                    stat_std = self.activity_config[key].get('duration_std', 0.0)
+                if stat_std > 0:
+                    sampled = np.random.normal(ml_median, stat_std)
+                else:
+                    sampled = ml_median
+                return max(0.1, float(sampled))
             # else: fall through to statistical
 
         # ── Statistical path ──────────────────────────────────────────────
@@ -113,7 +136,7 @@ class ProcessSimulation:
             if dist_params and any(p != 0 for p in dist_params[1:]):
                 return sample_from_dist(dist_name, dist_params)
             else:
-                # Degenerate case: zero variance – return the mean
+                # Degenerate case: zero variance – return the median
                 return max(0.1, config['duration'])
         else:
             print(f"WARNING: No config found for {key}")
@@ -127,6 +150,8 @@ class ProcessSimulation:
 
         In 'ml' mode the XGBoost transition classifier is tried first; it
         falls back to the statistical (frequency-based) path automatically.
+        In 'ml_duration_only' mode, transitions always come from the
+        statistical (frequency-based) path.
         """
         current_activity      = str(current_activity).strip()
         object_name           = str(object_name).strip()
@@ -142,7 +167,7 @@ class ProcessSimulation:
         # ── resolve transition probability dict ───────────────────────────
         transitions = None
 
-        # ML path
+        # ML path (full ml mode only – ml_duration_only skips this)
         if self.mode == 'ml' and self.ml_models is not None:
             ml_tr = self.ml_models.predict_transitions(
                 current_activity, object_name, object_type,
@@ -152,7 +177,8 @@ class ProcessSimulation:
                 transitions = ml_tr
                 print(f"    ML transitions: {transitions}")
 
-        # Statistical path (also serves as fallback for ml mode)
+        # Statistical path (used by 'statistical', 'ml_duration_only',
+        # and as fallback for 'ml' mode)
         if transitions is None:
             if key in self.activity_config:
                 transitions = self.activity_config[key]['transitions']
