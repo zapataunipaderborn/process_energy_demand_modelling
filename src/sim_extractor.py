@@ -177,6 +177,7 @@ def extract_process(df):
                         'higher_level_activity': higher_level_activity,
                         'duration':              inst_duration,
                         'next_activity':         next_act,
+                        'timestamp_start':       row_here['timestamp_start'],
                         **attr_flat,
                     })
 

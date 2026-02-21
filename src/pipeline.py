@@ -1102,11 +1102,25 @@ from sim_modeller import SimModeller
 # ─────────────────────────────────────────────────────────────────────────────
 # SIMULATION MODE TOGGLE
 #   'statistical'      – sample durations/transitions from best-fit distributions
-#   'ml'               – use XGBoost models (falls back to statistical when needed)
-#   'ml_duration_only' – use XGBoost only for the duration median; std and
+#   'ml'               – use ML models (falls back to statistical when needed)
+#   'ml_duration_only' – use ML only for the duration median; std and
 #                        transition probabilities still come from data extraction
 # ─────────────────────────────────────────────────────────────────────────────
 SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
+#   model_types: list of models to train — best is selected per activity key
+#                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
+#   optimize_hyperparams: True  → Optuna hyper-parameter search
+#                         False → use default model parameters
+#   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
+#   test_size: fraction of data for temporal test set (default 0.30 = 30%)
+# ─────────────────────────────────────────────────────────────────────────────
+ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
+ML_OPTIMIZE_HYPERPARAMS = True     # ← set True to enable Optuna tuning
+ML_OPTUNA_TRIALS        = 20
+ML_TEST_SIZE            = 0.20
 
 # Initialize a list to store results for each process
 evaluation_results_list = []
@@ -1129,9 +1143,16 @@ for process in process_datasets_to_model.keys():
     ml_models = None
     if SIMULATION_MODE in ('ml', 'ml_duration_only'):
         print("\n" + "="*50)
-        print("TRAINING ML MODELS (XGBoost)")
+        print(f"TRAINING ML MODELS  (types={ML_MODEL_TYPES}, "
+              f"optuna={ML_OPTIMIZE_HYPERPARAMS})")
         print("="*50)
-        ml_models = SimModeller()
+        ml_models = SimModeller(
+            model_types=ML_MODEL_TYPES,
+            optimize_hyperparams=ML_OPTIMIZE_HYPERPARAMS,
+            n_optuna_trials=ML_OPTUNA_TRIALS,
+            test_size=ML_TEST_SIZE,
+            train_transitions=(SIMULATION_MODE != 'ml_duration_only'),
+        )
         ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
 
