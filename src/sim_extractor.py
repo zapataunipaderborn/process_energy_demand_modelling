@@ -169,6 +169,24 @@ def extract_process(df):
                     attr_raw = row_here.get('object_attributes', {}) or {}
                     attr_flat = {f'attr_{k}': v for k, v in attr_raw.items()}
 
+                    # ── lag features: last 2 activities & durations ────────
+                    prev_act_1, prev_dur_1 = '__NONE__', 0.0
+                    prev_act_2, prev_dur_2 = '__NONE__', 0.0
+                    if idx >= 1:
+                        prev_row = case_acts.iloc[idx - 1]
+                        prev_act_1 = prev_row['activity']
+                        prev_dur_1 = (
+                            (prev_row['timestamp_end'] - prev_row['timestamp_start'])
+                            .total_seconds() / 60
+                        )
+                    if idx >= 2:
+                        prev_row2 = case_acts.iloc[idx - 2]
+                        prev_act_2 = prev_row2['activity']
+                        prev_dur_2 = (
+                            (prev_row2['timestamp_end'] - prev_row2['timestamp_start'])
+                            .total_seconds() / 60
+                        )
+
                     raw_rows.append({
                         'case_id':               case_id,
                         'activity':              activity,
@@ -178,6 +196,10 @@ def extract_process(df):
                         'duration':              inst_duration,
                         'next_activity':         next_act,
                         'timestamp_start':       row_here['timestamp_start'],
+                        'prev_activity_1':       prev_act_1,
+                        'prev_duration_1':       prev_dur_1,
+                        'prev_activity_2':       prev_act_2,
+                        'prev_duration_2':       prev_dur_2,
                         **attr_flat,
                     })
 

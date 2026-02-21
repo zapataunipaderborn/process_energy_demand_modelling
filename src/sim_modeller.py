@@ -128,6 +128,9 @@ def _default_regressor(model_type: str, random_state: int = 42):
 
 def _default_classifier(model_type: str, random_state: int = 42):
     """Return a classifier instance with sensible defaults."""
+    if model_type in ('mean', 'median'):
+        # Baselines aren't meaningful for classification but shouldn't crash
+        return _ConstantPredictor(strategy=model_type)
     if model_type == 'xgboost':
         if not _XGBOOST_AVAILABLE:
             raise RuntimeError("xgboost not installed")
@@ -191,6 +194,8 @@ def _optuna_regressor(trial, model_type: str, random_state: int = 42):
 
 def _optuna_classifier(trial, model_type: str, random_state: int = 42):
     """Return a classifier with Optuna-suggested hyper-parameters."""
+    if model_type in ('mean', 'median'):
+        return _ConstantPredictor(strategy=model_type)
     if model_type == 'xgboost':
         return XGBClassifier(
             n_estimators=trial.suggest_int('n_estimators', 50, 300),
@@ -292,6 +297,9 @@ class SimModeller:
 
         self._trained = False
 
+        # ── label encoder for prev_activity columns ───────────────────────
+        self.activity_label_encoder = None   # fitted during train()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -308,12 +316,28 @@ class SimModeller:
 
     @staticmethod
     def _feature_cols(df: pd.DataFrame) -> list[str]:
-        return [c for c in df.columns if c.startswith('attr_')]
+        """Return attr_* plus prev_* feature columns."""
+        cols = [c for c in df.columns if c.startswith('attr_')]
+        for c in ('prev_activity_1', 'prev_duration_1',
+                  'prev_activity_2', 'prev_duration_2'):
+            if c in df.columns:
+                cols.append(c)
+        return cols
 
-    @staticmethod
-    def _build_X(group: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-        """Return numeric feature matrix (impute missing values with 0)."""
+    def _build_X(self, group: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
+        """Return numeric feature matrix (impute missing values with 0).
+        Activity-name columns are label-encoded using self.activity_label_encoder."""
         X = group[feature_cols].copy()
+        # label-encode prev_activity columns
+        for col in ('prev_activity_1', 'prev_activity_2'):
+            if col in X.columns and self.activity_label_encoder is not None:
+                le = self.activity_label_encoder
+                X[col] = X[col].map(
+                    lambda v, _le=le: (
+                        int(_le.transform([str(v)])[0])
+                        if str(v) in _le.classes_ else -1
+                    )
+                )
         for col in feature_cols:
             X[col] = pd.to_numeric(X[col], errors='coerce')
         return X.fillna(0.0)
@@ -456,10 +480,19 @@ class SimModeller:
             self._trained = True
             return
 
+        # ── fit label encoder for prev_activity columns ───────────────────
+        all_activities = set()
+        for col in ('prev_activity_1', 'prev_activity_2', 'activity'):
+            if col in raw_df.columns:
+                all_activities |= set(raw_df[col].dropna().astype(str).unique())
+        all_activities.add('__NONE__')
+        self.activity_label_encoder = LabelEncoder()
+        self.activity_label_encoder.fit(sorted(all_activities))
+
         feature_cols = self._feature_cols(raw_df)
         if not feature_cols:
-            print("[SimModeller] No attr_* columns found – ML models skipped, "
-                  "using statistical fallbacks.")
+            print("[SimModeller] No feature columns found in raw_df – "
+                  "using statistical fallbacks only.")
             self._trained = True
             return
 
@@ -721,13 +754,21 @@ class SimModeller:
         object_type: str,
         higher_level_activity,
         object_attributes: dict,
+        activity_history: list | None = None,
     ) -> float | None:
         """
         Return the raw ML duration prediction **without** adding
         ML-predicted noise (std).
 
-        Used by ``'ml_duration_only'`` mode, where the caller adds statistical
-        std from the extracted data instead.
+        Used by ``'ml_duration_only'`` and
+        ``'ml_duration_only_with_activity_past'`` modes.
+
+        Parameters
+        ----------
+        activity_history : list[tuple[str, float]] | None
+            The last N activities as ``[(activity_name, duration_min), ...]``
+            ordered most-recent-first.  When supplied the ``prev_activity_*``
+            and ``prev_duration_*`` features are populated from this list.
 
         Returns ``None`` when no ML model is available for the given key.
         """
@@ -739,6 +780,25 @@ class SimModeller:
 
         dur_model, feature_cols, _mtype = self.duration_models[key]
         features = self._attrs_to_features(object_attributes, feature_cols)
+
+        # ── fill lag features from activity_history ────────────────────────
+        if activity_history is not None:
+            le = self.activity_label_encoder
+            for i in range(2):
+                act_col = f'prev_activity_{i+1}'
+                dur_col = f'prev_duration_{i+1}'
+                if act_col in feature_cols:
+                    if i < len(activity_history):
+                        act_name, act_dur = activity_history[i]
+                        encoded = -1
+                        if le is not None and str(act_name) in le.classes_:
+                            encoded = int(le.transform([str(act_name)])[0])
+                        features[act_col] = encoded
+                        features[dur_col] = act_dur
+                    else:
+                        features[act_col] = -1
+                        features[dur_col] = 0.0
+
         X = pd.DataFrame([features])[feature_cols]
         for col in X.columns:
             X[col] = pd.to_numeric(X[col], errors='coerce')
@@ -786,11 +846,16 @@ class SimModeller:
     @staticmethod
     def _attrs_to_features(object_attributes: dict,
                            feature_cols: list[str]) -> dict:
-        """Map ``object_attributes`` dict to the ``attr_*`` feature space."""
-        return {
-            col: object_attributes.get(col[5:], 0)   # strip 'attr_' prefix
-            for col in feature_cols
-        }
+        """Map ``object_attributes`` dict to the ``attr_*`` / ``prev_*``
+        feature space.  ``prev_*`` columns default to 0 here and are
+        overridden by the caller when activity history is available."""
+        feats = {}
+        for col in feature_cols:
+            if col.startswith('attr_'):
+                feats[col] = object_attributes.get(col[5:], 0)
+            else:
+                feats[col] = 0   # prev_* defaults; overridden by caller
+        return feats
 
     def summary(self) -> str:
         lines = [

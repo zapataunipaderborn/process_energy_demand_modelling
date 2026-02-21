@@ -39,7 +39,8 @@ class ProcessSimulation:
         random.seed(random_seed)
         np.random.seed(random_seed)
 
-        if self.mode in ('ml', 'ml_duration_only') and self.ml_models is None:
+        if self.mode in ('ml', 'ml_duration_only',
+                        'ml_duration_only_with_activity_past') and self.ml_models is None:
             print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no ml_models "
                   "provided – falling back to statistical mode.")
             self.mode = 'statistical'
@@ -79,7 +80,8 @@ class ProcessSimulation:
             print(f"    Start: {row['is_start']}")
     
     def _get_activity_duration(self, activity, object_name, object_type,
-                               higher_level_activity, object_attributes=None):
+                               higher_level_activity, object_attributes=None,
+                               activity_history=None):
         """
         Generate a sampled duration (minutes) for one activity instance.
 
@@ -87,6 +89,8 @@ class ProcessSimulation:
         to the statistical path when no model exists for this key.
         In 'ml_duration_only' mode, the ML model provides only the median
         prediction while the noise (std) comes from the statistical config.
+        In 'ml_duration_only_with_activity_past' mode, same as ml_duration_only
+        but the last 2 activities & durations are passed as extra features.
         In 'statistical' mode the best-fit distribution stored in
         activity_config is used directly.
         """
@@ -109,11 +113,15 @@ class ProcessSimulation:
                 return ml_dur
             # else: fall through to statistical
 
-        # ── ML duration-only path (ML median + statistical std) ──────────
-        if self.mode == 'ml_duration_only' and self.ml_models is not None:
+        # ── ML duration-only paths (with or without activity history) ─────
+        if self.mode in ('ml_duration_only',
+                         'ml_duration_only_with_activity_past') \
+                and self.ml_models is not None:
+            hist = activity_history if self.mode == 'ml_duration_only_with_activity_past' else None
             ml_median = self.ml_models.predict_duration_median(
                 activity, object_name, object_type,
-                higher_level_activity, object_attributes
+                higher_level_activity, object_attributes,
+                activity_history=hist,
             )
             if ml_median is not None:
                 # Use the statistical std from the extracted data
@@ -276,16 +284,19 @@ class ProcessSimulation:
             current_activity = random.choice(start_activities)
             print(f"  Starting with activity: {current_activity}")
             
-            # Follow the process flow with probabilistic ending - NO ARTIFICIAL LIMITS
+            # Follow the process flow with probabilistic ending
             activity_count = 0
-            
+            # Track last 2 activities/durations for the _with_activity_past mode
+            activity_history = []   # [(activity_name, duration), ...] most recent first
+
             while current_activity:
                 print(f"    Processing activity {activity_count + 1}: {current_activity}")
                 
-                # Get duration
+                # Get duration (pass history for ml_duration_only_with_activity_past)
                 activity_duration = self._get_activity_duration(
                     current_activity, object_name, object_type,
-                    higher_level_activity, object_attributes
+                    higher_level_activity, object_attributes,
+                    activity_history=activity_history if self.mode == 'ml_duration_only_with_activity_past' else None,
                 )
                 
                 # Calculate timestamps
@@ -305,6 +316,10 @@ class ProcessSimulation:
                     object_attributes=object_attributes
                 )
                 
+                # Update activity history (most-recent-first, keep last 2)
+                activity_history.insert(0, (current_activity, activity_duration))
+                activity_history = activity_history[:2]
+
                 activity_count += 1
                 
                 # Get next activity (which may return None if __END__ is chosen)

@@ -1128,7 +1128,7 @@ ML_OPTUNA_TRIALS        = 20
 #   TRAIN_RATIO    : fraction of cases used for training (e.g. 0.80 = 80%)
 # ─────────────────────────────────────────────────────────────────────────────
 TEMPORAL_SPLIT = True
-TRAIN_RATIO    = 0.80
+TRAIN_RATIO    = 0.70
 
 
 def _split_process_datasets(datasets, train_ratio=0.80):
@@ -1220,7 +1220,7 @@ else:
 # MODES TO COMPARE
 #   We run BOTH modes on every process so results appear side by side.
 # ─────────────────────────────────────────────────────────────────────────────
-MODES_TO_COMPARE = ['statistical', 'ml_duration_only']
+MODES_TO_COMPARE = ['statistical', 'ml_duration_only', 'ml_duration_only_with_activity_past']
 
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
@@ -1263,7 +1263,8 @@ for process in process_datasets_to_model.keys():
         print(f"  ▶ SIMULATION MODE: {sim_mode.upper()}")
         print("─"*80)
 
-        mode_ml = ml_models if sim_mode in ('ml', 'ml_duration_only') else None
+        mode_ml = ml_models if sim_mode in ('ml', 'ml_duration_only',
+                                               'ml_duration_only_with_activity_past') else None
 
         simulated_log = ProcessSimulation(
             activity_stats_df, production_plan,
