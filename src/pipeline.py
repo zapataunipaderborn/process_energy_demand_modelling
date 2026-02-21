@@ -1220,7 +1220,13 @@ else:
 # MODES TO COMPARE
 #   We run BOTH modes on every process so results appear side by side.
 # ─────────────────────────────────────────────────────────────────────────────
-MODES_TO_COMPARE = ['statistical', 'ml_duration_only', 'ml_duration_only_with_activity_past']
+MODES_TO_COMPARE = [
+    'statistical',
+    'ml_duration_only',
+    'ml_duration_only_with_activity_past',
+    'ml_duration_only_with_activity_past_point_estimate',
+    'ml_global_model',
+]
 
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
@@ -1243,7 +1249,7 @@ for process in process_datasets_to_model.keys():
 
     # ── Train ML models once (shared by ml-based modes) ───────────────────
     ml_models = None
-    if any(m in ('ml', 'ml_duration_only') for m in MODES_TO_COMPARE):
+    if any(m != 'statistical' for m in MODES_TO_COMPARE):
         print("\n" + "="*50)
         print(f"TRAINING ML MODELS  (types={ML_MODEL_TYPES}, "
               f"optuna={ML_OPTIMIZE_HYPERPARAMS})")
@@ -1263,8 +1269,7 @@ for process in process_datasets_to_model.keys():
         print(f"  ▶ SIMULATION MODE: {sim_mode.upper()}")
         print("─"*80)
 
-        mode_ml = ml_models if sim_mode in ('ml', 'ml_duration_only',
-                                               'ml_duration_only_with_activity_past') else None
+        mode_ml = ml_models if sim_mode != 'statistical' else None
 
         simulated_log = ProcessSimulation(
             activity_stats_df, production_plan,

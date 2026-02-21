@@ -300,6 +300,10 @@ class SimModeller:
         # ── label encoder for prev_activity columns ───────────────────────
         self.activity_label_encoder = None   # fitted during train()
 
+        # ── global model (single model across all activities) ─────────────
+        self.global_duration_model = None    # (model, feat_cols, cat_encoders, model_type)
+        self.global_val_metrics:  dict = {}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -698,7 +702,128 @@ class SimModeller:
             f"\n[SimModeller] Training complete – "
             f"{dur_trained} duration models, {tr_trained} transition models."
         )
+
+        # ── Global model (single model across all activities) ─────────────
+        self._train_global_duration_model(raw_df)
+
         self._trained = True
+
+    # ------------------------------------------------------------------
+    # Global model training
+    # ------------------------------------------------------------------
+
+    def _train_global_duration_model(self, raw_df: pd.DataFrame):
+        """Train a single duration model on ALL rows (all activity keys).
+
+        Features include label-encoded activity/object/type/higher-level
+        plus attr_* and prev_* columns.  This enables cross-activity
+        learning that per-key models cannot do.
+        """
+        import warnings
+        print("\n  ── Training Global Duration Model ──")
+
+        df = raw_df.copy()
+        cat_cols = ['activity', 'object', 'object_type', 'higher_level_activity']
+        cat_encoders: dict = {}
+        global_feat_cols: list[str] = []
+
+        # ── encode categorical columns ────────────────────────────────────
+        for col in cat_cols:
+            feat = f'feat_{col}'
+            if col in df.columns:
+                le = LabelEncoder()
+                vals = df[col].fillna('__NONE__').astype(str)
+                df[feat] = le.fit_transform(vals)
+                cat_encoders[col] = le
+                global_feat_cols.append(feat)
+
+        # ── prev_activity columns (use activity_label_encoder) ────────────
+        for col in ('prev_activity_1', 'prev_activity_2'):
+            if col in df.columns and self.activity_label_encoder is not None:
+                le = self.activity_label_encoder
+                df[col] = df[col].map(
+                    lambda v, _le=le: (
+                        int(_le.transform([str(v)])[0])
+                        if str(v) in _le.classes_ else -1
+                    )
+                )
+                global_feat_cols.append(col)
+
+        # ── prev_duration columns ─────────────────────────────────────────
+        for col in ('prev_duration_1', 'prev_duration_2'):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                global_feat_cols.append(col)
+
+        # ── attr_* columns ────────────────────────────────────────────────
+        for col in df.columns:
+            if col.startswith('attr_'):
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                global_feat_cols.append(col)
+
+        if not global_feat_cols:
+            print("    No features for global model — skipping.")
+            return
+
+        X_all = df[global_feat_cols].astype(float).fillna(0)
+        y_all = df['duration'].astype(float)
+
+        print(f"    Features ({len(global_feat_cols)}): {global_feat_cols}")
+        print(f"    Training samples: {len(X_all)}")
+
+        # ── validation split ──────────────────────────────────────────────
+        fit_g, val_g = self._validation_split(df, self.val_size)
+        X_fit = fit_g[global_feat_cols].astype(float).fillna(0)
+        y_fit = fit_g['duration'].astype(float)
+        X_val = val_g[global_feat_cols].astype(float).fillna(0)
+        y_val = val_g['duration'].astype(float)
+
+        best_mae  = float('inf')
+        best_type = None
+        best_metrics = None
+
+        for mtype in self.model_types:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    model = self._fit_regressor(mtype, X_fit, y_fit)
+
+                if len(X_val) > 0:
+                    y_pred = model.predict(X_val)
+                    mae  = mean_absolute_error(y_val, y_pred)
+                    rmse = np.sqrt(mean_squared_error(y_val, y_pred))
+                    r2   = r2_score(y_val, y_pred)
+                    print(f"    Global [{mtype:>8s}]  "
+                          f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}")
+                    if mae < best_mae:
+                        best_mae    = mae
+                        best_type   = mtype
+                        best_metrics = {'mae': mae, 'rmse': rmse, 'r2': r2}
+                else:
+                    if best_type is None:
+                        best_type = mtype
+            except Exception as exc:
+                print(f"    Global [{mtype:>8s}]  FAILED: {exc}")
+
+        # ── re-train winner on all data ───────────────────────────────────
+        if best_type is not None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    final_model = self._fit_regressor(
+                        best_type, X_all.fillna(0), y_all,
+                    )
+                self.global_duration_model = (
+                    final_model, global_feat_cols, cat_encoders, best_type,
+                )
+                self.global_val_metrics = best_metrics or {}
+                print(f"    ✓ Best global model: {best_type}"
+                      + (f"  (val MAE={best_mae:.3f})"
+                         if best_mae < float('inf') else ""))
+            except Exception as exc:
+                print(f"    [!] Global model re-train failed: {exc}")
+        else:
+            print("    No global model could be trained.")
 
     # ------------------------------------------------------------------
     # Prediction
@@ -806,6 +931,79 @@ class SimModeller:
 
         median_pred = float(dur_model.predict(X)[0])
         return max(0.1, median_pred)
+
+    def predict_duration_global(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        activity_history: list | None = None,
+    ) -> float | None:
+        """
+        Predict duration using the single global model (one model for
+        all activities).  Returns ``None`` if no global model was trained.
+        """
+        if self.global_duration_model is None:
+            return None
+
+        model, global_feat_cols, cat_encoders, _mtype = self.global_duration_model
+        features: dict = {}
+
+        # ── encode categorical features ───────────────────────────────────
+        cat_values = {
+            'activity':              str(activity).strip(),
+            'object':                str(object_name).strip(),
+            'object_type':           str(object_type).strip(),
+            'higher_level_activity': (str(higher_level_activity).strip()
+                                      if pd.notna(higher_level_activity)
+                                      else '__NONE__'),
+        }
+        for col, val in cat_values.items():
+            feat = f'feat_{col}'
+            if feat in global_feat_cols and col in cat_encoders:
+                le = cat_encoders[col]
+                if val in le.classes_:
+                    features[feat] = int(le.transform([val])[0])
+                else:
+                    features[feat] = -1
+
+        # ── prev_activity / prev_duration features ────────────────────────
+        if activity_history is not None:
+            le = self.activity_label_encoder
+            for i in range(2):
+                act_col = f'prev_activity_{i+1}'
+                dur_col = f'prev_duration_{i+1}'
+                if act_col in global_feat_cols:
+                    if i < len(activity_history):
+                        act_name, act_dur = activity_history[i]
+                        encoded = -1
+                        if le is not None and str(act_name) in le.classes_:
+                            encoded = int(le.transform([str(act_name)])[0])
+                        features[act_col] = encoded
+                        features[dur_col] = act_dur
+                    else:
+                        features[act_col] = -1
+                        features[dur_col] = 0.0
+
+        # ── attr_* features ───────────────────────────────────────────────
+        for col in global_feat_cols:
+            if col.startswith('attr_'):
+                features[col] = object_attributes.get(col[5:], 0)
+
+        # ── fill any missing columns with 0 ───────────────────────────────
+        for col in global_feat_cols:
+            if col not in features:
+                features[col] = 0
+
+        X = pd.DataFrame([features])[global_feat_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
+
+        pred = float(model.predict(X)[0])
+        return max(0.1, pred)
 
     def predict_transitions(
         self,
