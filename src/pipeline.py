@@ -1115,14 +1115,114 @@ SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only
 #   optimize_hyperparams: True  → Optuna hyper-parameter search
 #                         False → use default model parameters
 #   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
-#   test_size: fraction of data for temporal test set (default 0.30 = 30%)
 # ─────────────────────────────────────────────────────────────────────────────
 ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
-ML_OPTIMIZE_HYPERPARAMS = True     # ← set True to enable Optuna tuning
+ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
+ML_OPTIMIZE_HYPERPARAMS = False    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
-ML_TEST_SIZE            = 0.20
 
-# Initialize a list to store results for each process
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPORAL TRAIN / TEST SPLIT (at the pipeline level, BEFORE extraction)
+#   TEMPORAL_SPLIT : True  → split all data by case start time (no leakage)
+#                    False → use all data (no split, single evaluation)
+#   TRAIN_RATIO    : fraction of cases used for training (e.g. 0.80 = 80%)
+# ─────────────────────────────────────────────────────────────────────────────
+TEMPORAL_SPLIT = True
+TRAIN_RATIO    = 0.80
+
+
+def _split_process_datasets(datasets, train_ratio=0.80):
+    """
+    Split *every* process inside ``datasets`` into two copies:
+    ``train_datasets`` and ``test_datasets``.
+
+    For each process the event_log is used to determine the temporal
+    cutoff by case start time.  The same case partition is then applied
+    to **production_plan** and **expanded** (using ``case_id_log``).
+
+    Returns (train_datasets, test_datasets).
+    """
+    train_datasets = {}
+    test_datasets  = {}
+
+    for proc_name, proc_data in datasets.items():
+        event_log        = proc_data['event_log']
+        production_plan  = proc_data['production_plan']
+        expanded         = proc_data.get('expanded')   # may or may not exist
+
+        # ── determine train / test case IDs from the event log ────────────
+        el = event_log.dropna(subset=['case_id']).copy()
+        case_start = el.groupby('case_id')['timestamp_start'].min().sort_values()
+        n_train = max(1, int(len(case_start) * train_ratio))
+
+        train_cases = set(case_start.index[:n_train])
+        test_cases  = set(case_start.index[n_train:])
+
+        # ── event log split ───────────────────────────────────────────────
+        el_train = el[el['case_id'].isin(train_cases)].copy()
+        el_test  = el[el['case_id'].isin(test_cases)].copy()
+
+        # ── production plan split ─────────────────────────────────────────
+        pp_train = production_plan[production_plan['case_id'].isin(train_cases)].copy()
+        pp_test  = production_plan[production_plan['case_id'].isin(test_cases)].copy()
+
+        # ── expanded df split (uses case_id_log) ─────────────────────────
+        exp_train, exp_test = None, None
+        if expanded is not None:
+            if 'case_id_log' in expanded.columns:
+                exp_train = expanded[expanded['case_id_log'].isin(train_cases)].copy()
+                exp_test  = expanded[expanded['case_id_log'].isin(test_cases)].copy()
+            else:
+                # fallback: use datetime_energy and the cutoff date
+                cutoff = case_start.iloc[n_train - 1]
+                if 'datetime_energy' in expanded.columns:
+                    exp_train = expanded[expanded['datetime_energy'] <= cutoff].copy()
+                    exp_test  = expanded[expanded['datetime_energy'] > cutoff].copy()
+                else:
+                    exp_train = expanded.copy()
+                    exp_test  = expanded.iloc[0:0].copy()   # empty
+
+        train_datasets[proc_name] = {
+            'event_log': el_train,
+            'production_plan': pp_train,
+            'expanded': exp_train,
+        }
+        test_datasets[proc_name] = {
+            'event_log': el_test,
+            'production_plan': pp_test,
+            'expanded': exp_test,
+        }
+
+        print(f"  {proc_name}: {len(train_cases)} train cases, "
+              f"{len(test_cases)} test cases  |  "
+              f"event_log {len(el_train)}/{len(el_test)}  |  "
+              f"production_plan {len(pp_train)}/{len(pp_test)}"
+              + (f"  |  expanded {len(exp_train)}/{len(exp_test)}"
+                 if exp_train is not None else ""))
+
+    return train_datasets, test_datasets
+
+
+# ── Build the two dictionaries ───────────────────────────────────────────────
+if TEMPORAL_SPLIT:
+    print(f"\n📌 TEMPORAL SPLIT ({TRAIN_RATIO:.0%} train / "
+          f"{1-TRAIN_RATIO:.0%} test) — splitting all processes:")
+    train_datasets, test_datasets = _split_process_datasets(
+        process_datasets_to_model, TRAIN_RATIO
+    )
+else:
+    print("\n📌 NO SPLIT – using all data for extraction & training")
+    train_datasets = process_datasets_to_model
+    test_datasets  = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODES TO COMPARE
+#   We run BOTH modes on every process so results appear side by side.
+# ─────────────────────────────────────────────────────────────────────────────
+MODES_TO_COMPARE = ['statistical', 'ml_duration_only']
+
+# Initialize a list to store results for each process × mode
 evaluation_results_list = []
 
 for process in process_datasets_to_model.keys():
@@ -1130,18 +1230,20 @@ for process in process_datasets_to_model.keys():
     print(f"ANALYZING {process.upper()}")
     print("="*80)
 
-    df_event_log = process_datasets_to_model[process]['event_log']
-    production_plan = process_datasets_to_model[process]['production_plan']
+    # Use the pre-split dictionaries
+    df_train        = train_datasets[process]['event_log']
+    production_plan = train_datasets[process]['production_plan']
 
-    activity_stats_df, raw_df = extract_process(df_event_log)
+    # ── Extract process statistics (from TRAIN only — shared by both modes)
+    activity_stats_df, raw_df = extract_process(df_train)
     print("\n" + "="*50)
-    print("PROBABILISTIC END ACTIVITY STATS:")
+    print("PROBABILISTIC END ACTIVITY STATS (from train set):")
     print("="*50)
     print(activity_stats_df)
 
-    # ── (optional) ML model training ────────────────────────────────────────
+    # ── Train ML models once (shared by ml-based modes) ───────────────────
     ml_models = None
-    if SIMULATION_MODE in ('ml', 'ml_duration_only'):
+    if any(m in ('ml', 'ml_duration_only') for m in MODES_TO_COMPARE):
         print("\n" + "="*50)
         print(f"TRAINING ML MODELS  (types={ML_MODEL_TYPES}, "
               f"optuna={ML_OPTIMIZE_HYPERPARAMS})")
@@ -1150,55 +1252,90 @@ for process in process_datasets_to_model.keys():
             model_types=ML_MODEL_TYPES,
             optimize_hyperparams=ML_OPTIMIZE_HYPERPARAMS,
             n_optuna_trials=ML_OPTUNA_TRIALS,
-            test_size=ML_TEST_SIZE,
-            train_transitions=(SIMULATION_MODE != 'ml_duration_only'),
+            train_transitions=False,   # only duration for ml_duration_only
         )
         ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
 
-    # Drop rows where case_id is NaN (or missing)
-    df_compare = df_event_log.dropna(subset=['case_id'])
-    simulated_log = ProcessSimulation(
-        activity_stats_df, production_plan,
-        mode=SIMULATION_MODE, ml_models=ml_models
-    ).run()
+    # ── Loop over modes ───────────────────────────────────────────────────
+    for sim_mode in MODES_TO_COMPARE:
+        print("\n" + "─"*80)
+        print(f"  ▶ SIMULATION MODE: {sim_mode.upper()}")
+        print("─"*80)
 
-    print("\n" + "="*50)
-    print("Simulated log")
-    print(simulated_log)
+        mode_ml = ml_models if sim_mode in ('ml', 'ml_duration_only') else None
 
-    # Run the comprehensive evaluation
-    print("🔍 RUNNING COMPREHENSIVE SIMULATION EVALUATION")
-    print("="*80)
+        simulated_log = ProcessSimulation(
+            activity_stats_df, production_plan,
+            mode=sim_mode, ml_models=mode_ml
+        ).run()
 
-    evaluation_results = comprehensive_simulation_evaluation(simulated_log, df_event_log)
+        print(f"\n  Simulated log ({sim_mode}): {len(simulated_log)} events")
 
-    # Flatten the evaluation results and add the process name
-    flattened_results = {'process': process}
-    for category, metrics in evaluation_results.items():
-        if isinstance(metrics, dict):
-            for metric_name, value in metrics.items():
-                flattened_results[f"{category}_{metric_name}"] = value
-        else:
-            flattened_results[category] = metrics
+        # ══════════════════════════════════════════════════════════════════
+        # EVALUATION — TRAIN SET
+        # ══════════════════════════════════════════════════════════════════
+        split_label = "TRAIN" if TEMPORAL_SPLIT else "ALL DATA"
+        print(f"\n  🔍 EVALUATION ON {split_label}  [{sim_mode}]")
+        print("  " + "="*76)
 
-    # Append the flattened results to the list
-    evaluation_results_list.append(flattened_results)
+        eval_train = comprehensive_simulation_evaluation(simulated_log, df_train)
 
-    print("\n📊 GENERATING COMPARISON PLOTS")
-    plot_simulation_comparison(simulated_log, df_event_log)
-    visualize_heuristic_nets(df_compare, simulated_log)
+        print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
+        plot_simulation_comparison(simulated_log, df_train)
+        df_compare_train = df_train.dropna(subset=['case_id'])
+        visualize_heuristic_nets(df_compare_train, simulated_log)
+
+        # Flatten train results
+        flattened = {'process': process, 'mode': sim_mode, 'split': split_label}
+        for category, metrics in eval_train.items():
+            if isinstance(metrics, dict):
+                for metric_name, value in metrics.items():
+                    flattened[f"train_{category}_{metric_name}"] = value
+            else:
+                flattened[f"train_{category}"] = metrics
+
+        # ══════════════════════════════════════════════════════════════════
+        # EVALUATION — TEST SET
+        # ══════════════════════════════════════════════════════════════════
+        df_test = test_datasets[process]['event_log'] if test_datasets else None
+        if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
+            print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
+            print("  " + "="*76)
+
+            eval_test = comprehensive_simulation_evaluation(simulated_log, df_test)
+
+            print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
+            plot_simulation_comparison(simulated_log, df_test)
+            df_compare_test = df_test.dropna(subset=['case_id'])
+            visualize_heuristic_nets(df_compare_test, simulated_log)
+
+            for category, metrics in eval_test.items():
+                if isinstance(metrics, dict):
+                    for metric_name, value in metrics.items():
+                        flattened[f"test_{category}_{metric_name}"] = value
+                else:
+                    flattened[f"test_{category}"] = metrics
+
+        evaluation_results_list.append(flattened)
 
 # Convert the results list into a DataFrame
 evaluation_results_df = pd.DataFrame(evaluation_results_list)
 
-# Reorder columns to place overall_score and quality_assessment first
-columns_order = ['process', 'overall_score', 'quality_assessment'] + \
-                [col for col in evaluation_results_df.columns if col not in ['process', 'overall_score', 'quality_assessment']]
-evaluation_results_df = evaluation_results_df[columns_order]
+# Reorder columns to place key columns first
+priority_cols = ['process', 'mode', 'split']
+for prefix in ['train', 'test']:
+    for col_name in ['overall_score', 'quality_assessment']:
+        full = f"{prefix}_{col_name}"
+        if full in evaluation_results_df.columns:
+            priority_cols.append(full)
+remaining_cols = [c for c in evaluation_results_df.columns if c not in priority_cols]
+evaluation_results_df = evaluation_results_df[priority_cols + remaining_cols]
 
 # print the DataFrame
-print("\nAggregated Evaluation Results:")
+print("\n" + "="*80)
+print("AGGREGATED EVALUATION RESULTS — MODE COMPARISON")
+print("="*80)
 evaluation_results_df
 
 # %% 
