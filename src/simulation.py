@@ -40,7 +40,10 @@ class ProcessSimulation:
         np.random.seed(random_seed)
 
         if self.mode in ('ml', 'ml_duration_only',
-                        'ml_duration_only_with_activity_past') and self.ml_models is None:
+                        'ml_duration_only_with_activity_past',
+                        'ml_duration_only_with_activity_past_point_estimate',
+                        'ml_global_model') \
+                and self.ml_models is None:
             print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no ml_models "
                   "provided – falling back to statistical mode.")
             self.mode = 'statistical'
@@ -114,17 +117,23 @@ class ProcessSimulation:
             # else: fall through to statistical
 
         # ── ML duration-only paths (with or without activity history) ─────
-        if self.mode in ('ml_duration_only',
-                         'ml_duration_only_with_activity_past') \
-                and self.ml_models is not None:
-            hist = activity_history if self.mode == 'ml_duration_only_with_activity_past' else None
+        _ML_DUR_MODES = ('ml_duration_only',
+                         'ml_duration_only_with_activity_past',
+                         'ml_duration_only_with_activity_past_point_estimate')
+        if self.mode in _ML_DUR_MODES and self.ml_models is not None:
+            use_hist = self.mode in ('ml_duration_only_with_activity_past',
+                                     'ml_duration_only_with_activity_past_point_estimate')
+            hist = activity_history if use_hist else None
             ml_median = self.ml_models.predict_duration_median(
                 activity, object_name, object_type,
                 higher_level_activity, object_attributes,
                 activity_history=hist,
             )
             if ml_median is not None:
-                # Use the statistical std from the extracted data
+                # Point estimate mode → return raw prediction, no noise
+                if self.mode == 'ml_duration_only_with_activity_past_point_estimate':
+                    return max(0.1, float(ml_median))
+                # Otherwise add statistical std as noise
                 stat_std = 0.0
                 if key in self.activity_config:
                     stat_std = self.activity_config[key].get('duration_std', 0.0)
@@ -133,6 +142,17 @@ class ProcessSimulation:
                 else:
                     sampled = ml_median
                 return max(0.1, float(sampled))
+            # else: fall through to statistical
+
+        # ── Global model path (single model across all activities) ───────
+        if self.mode == 'ml_global_model' and self.ml_models is not None:
+            global_pred = self.ml_models.predict_duration_global(
+                activity, object_name, object_type,
+                higher_level_activity, object_attributes or {},
+                activity_history=activity_history,
+            )
+            if global_pred is not None:
+                return global_pred
             # else: fall through to statistical
 
         # ── Statistical path ──────────────────────────────────────────────
@@ -292,11 +312,14 @@ class ProcessSimulation:
             while current_activity:
                 print(f"    Processing activity {activity_count + 1}: {current_activity}")
                 
-                # Get duration (pass history for ml_duration_only_with_activity_past)
+                # Get duration (pass history for modes that use it)
+                _HIST_MODES = ('ml_duration_only_with_activity_past',
+                               'ml_duration_only_with_activity_past_point_estimate',
+                               'ml_global_model')
                 activity_duration = self._get_activity_duration(
                     current_activity, object_name, object_type,
                     higher_level_activity, object_attributes,
-                    activity_history=activity_history if self.mode == 'ml_duration_only_with_activity_past' else None,
+                    activity_history=activity_history if self.mode in _HIST_MODES else None,
                 )
                 
                 # Calculate timestamps
