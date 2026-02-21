@@ -755,6 +755,12 @@ class SimModeller:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 global_feat_cols.append(col)
 
+        # ── numeric context columns ───────────────────────────────────────
+        for col in ('activity_index', 'hour_of_day', 'day_of_week'):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+                global_feat_cols.append(col)
+
         # ── attr_* columns ────────────────────────────────────────────────
         for col in df.columns:
             if col.startswith('attr_'):
@@ -940,6 +946,7 @@ class SimModeller:
         higher_level_activity,
         object_attributes: dict,
         activity_history: list | None = None,
+        activity_index: int = 0,
     ) -> float | None:
         """
         Predict duration using the single global model (one model for
@@ -991,6 +998,10 @@ class SimModeller:
         for col in global_feat_cols:
             if col.startswith('attr_'):
                 features[col] = object_attributes.get(col[5:], 0)
+
+        # ── numeric context features ──────────────────────────────────────
+        if 'activity_index' in global_feat_cols:
+            features['activity_index'] = activity_index
 
         # ── fill any missing columns with 0 ───────────────────────────────
         for col in global_feat_cols:

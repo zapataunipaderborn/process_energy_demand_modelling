@@ -48,6 +48,14 @@ class ProcessSimulation:
                   "provided – falling back to statistical mode.")
             self.mode = 'statistical'
 
+        # Verification: confirm global model is loaded for ml_global_model
+        if self.mode == 'ml_global_model' and self.ml_models is not None:
+            has_global = self.ml_models.global_duration_model is not None
+            print(f"[ProcessSimulation] ml_global_model: global_duration_model loaded = {has_global}")
+            if not has_global:
+                print("[ProcessSimulation] WARNING: global model is None! "
+                      "Will fall back to statistical for every activity.")
+
         self.env = None
         self.events = []
 
@@ -84,7 +92,7 @@ class ProcessSimulation:
     
     def _get_activity_duration(self, activity, object_name, object_type,
                                higher_level_activity, object_attributes=None,
-                               activity_history=None):
+                               activity_history=None, activity_index=0):
         """
         Generate a sampled duration (minutes) for one activity instance.
 
@@ -150,6 +158,7 @@ class ProcessSimulation:
                 activity, object_name, object_type,
                 higher_level_activity, object_attributes or {},
                 activity_history=activity_history,
+                activity_index=activity_index,
             )
             if global_pred is not None:
                 return global_pred
@@ -320,6 +329,7 @@ class ProcessSimulation:
                     current_activity, object_name, object_type,
                     higher_level_activity, object_attributes,
                     activity_history=activity_history if self.mode in _HIST_MODES else None,
+                    activity_index=activity_count,
                 )
                 
                 # Calculate timestamps

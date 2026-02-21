@@ -196,6 +196,9 @@ def extract_process(df):
                         'duration':              inst_duration,
                         'next_activity':         next_act,
                         'timestamp_start':       row_here['timestamp_start'],
+                        'activity_index':        idx,          # position in case
+                        'hour_of_day':           row_here['timestamp_start'].hour if hasattr(row_here['timestamp_start'], 'hour') else 0,
+                        'day_of_week':           row_here['timestamp_start'].weekday() if hasattr(row_here['timestamp_start'], 'weekday') else 0,
                         'prev_activity_1':       prev_act_1,
                         'prev_duration_1':       prev_dur_1,
                         'prev_activity_2':       prev_act_2,
