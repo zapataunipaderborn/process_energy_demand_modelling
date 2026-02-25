@@ -151,6 +151,121 @@ def _get_stochastic_map(net, im, fm, log):
     return stochastic_map, replay_results
 
 
+def _compute_decision_point_weights(net, im, fm, case_sorted):
+    """
+    Replay each case on the Petri net step-by-step and record,
+    for every *decision point* (defined by the frozenset of enabled
+    labelled transitions), which activity was actually chosen.
+
+    When a case ends (no more events), record an ``__END__`` choice
+    at the current decision point.
+
+    Returns
+    -------
+    decision_weights : dict
+        {frozenset(enabled_labels): {chosen_label_or___END__: count, ...}}
+    max_case_length : int
+        Longest case (number of labelled activities) seen in training.
+    """
+    import copy
+
+    def _enabled(net_, marking_):
+        enabled_ = set()
+        for t in net_.transitions:
+            if all(marking_.get(arc.source, 0) >= 1 for arc in t.in_arcs):
+                enabled_.add(t)
+        return enabled_
+
+    def _fire(marking_, transition_):
+        m = copy.copy(marking_)
+        for arc in transition_.in_arcs:
+            m[arc.source] -= 1
+            if m[arc.source] == 0:
+                del m[arc.source]
+        for arc in transition_.out_arcs:
+            if arc.target not in m:
+                m[arc.target] = 0
+            m[arc.target] += 1
+        return m
+
+    decision_weights = defaultdict(lambda: defaultdict(int))
+    max_case_length = 0
+
+    for case_id, case_df in case_sorted.items():
+        activities_in_case = case_df['activity'].tolist()
+        if not activities_in_case:
+            continue
+        max_case_length = max(max_case_length, len(activities_in_case))
+
+        marking = copy.copy(im)
+        act_idx = 0
+        max_replay_steps = 500
+
+        for _ in range(max_replay_steps):
+            enabled = _enabled(net, marking)
+            if not enabled:
+                break  # deadlock
+
+            # Separate labelled and silent transitions
+            label_map = defaultdict(list)   # label -> [transition, ...]
+            silent = []
+            for t in enabled:
+                if t.label is not None:
+                    label_map[str(t.label).strip()].append(t)
+                else:
+                    silent.append(t)
+
+            # If only silent transitions enabled, fire one and continue
+            if not label_map:
+                if silent:
+                    marking = _fire(marking, silent[0])
+                    continue
+                else:
+                    break
+
+            enabled_labels = frozenset(label_map.keys())
+
+            # Case has ended — record __END__
+            if act_idx >= len(activities_in_case):
+                decision_weights[enabled_labels]['__END__'] += 1
+                break
+
+            # Match the next activity to an enabled transition
+            next_act = str(activities_in_case[act_idx]).strip()
+
+            if next_act in label_map:
+                decision_weights[enabled_labels][next_act] += 1
+                # Fire the corresponding transition
+                chosen_t = label_map[next_act][0]
+                marking = _fire(marking, chosen_t)
+                act_idx += 1
+            else:
+                # Activity not enabled — skip silent transitions first
+                if silent:
+                    marking = _fire(marking, silent[0])
+                    continue
+                else:
+                    # Can't match — skip this activity (misalignment)
+                    act_idx += 1
+                    continue
+
+        # If we consumed all activities but didn't record __END__ yet
+        if act_idx >= len(activities_in_case):
+            enabled = _enabled(net, marking)
+            label_map = defaultdict(list)
+            for t in enabled:
+                if t.label is not None:
+                    label_map[str(t.label).strip()].append(t)
+            if label_map:
+                enabled_labels = frozenset(label_map.keys())
+                decision_weights[enabled_labels]['__END__'] += 1
+
+    # Convert to plain dicts
+    decision_weights = {k: dict(v) for k, v in decision_weights.items()}
+
+    return decision_weights, max_case_length
+
+
 def _derive_transitions_from_net(net, im, fm, sub_log, sub_df):
     """
     Derive transition probabilities from the Petri net by analysing
@@ -482,6 +597,16 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
     stochastic_map, _ = _get_stochastic_map(net, im, fm, sub_log)
     print(f"    Stochastic map: {len(stochastic_map)} transition weights")
 
+    # ── Decision-point-aware weights (Changes 2+3) ────────────────────
+    decision_weights, max_case_length = _compute_decision_point_weights(
+        net, im, fm, case_sorted
+    )
+    n_dp = len(decision_weights)
+    n_end = sum(1 for dp in decision_weights.values() if '__END__' in dp)
+    print(f"    Decision-point weights: {n_dp} decision points, "
+          f"{n_end} with __END__ probability")
+    print(f"    Max case length in training: {max_case_length}")
+
     # ── Derive transitions from the mined model ──────────────────────
     transitions_dict, start_acts, end_acts = _derive_transitions_from_net(
         net, im, fm, sub_log, sub_df
@@ -542,6 +667,8 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         'duration_map': duration_map,
         'bigram_transitions': bigram_transitions,
         'activity_count_transitions': activity_count_transitions,
+        'decision_weights': decision_weights,
+        'max_case_length': max_case_length,
     }
 
     return stats, process_model
@@ -551,7 +678,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def extract_process(df, mining_algorithm='inductive'):
+def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2):
     """
     Extract process statistics from an event log.
 
@@ -567,6 +694,9 @@ def extract_process(df, mining_algorithm='inductive'):
         - 'heuristic' — pm4py Heuristics Miner → noise-tolerant
         - 'alpha' — pm4py Alpha Miner → classic algorithm
         - 'manual' — original manual extraction (no process mining)
+    noise_threshold : float
+        Noise filtering for the Inductive Miner (0.0 = keep all,
+        1.0 = max filtering). Default 0.2.
 
     Returns
     -------
@@ -587,10 +717,6 @@ def extract_process(df, mining_algorithm='inductive'):
         None when mining_algorithm == 'manual'.
     """
     use_pm4py = mining_algorithm != 'manual'
-    # Noise threshold is only used by the Inductive Miner.
-    # 0.0 = keep all (identical to statistical), 0.2 = moderate filtering,
-    # higher = stricter model with fewer paths.
-    noise_threshold = 0
 
     all_stats = []
     all_raw_rows = []
