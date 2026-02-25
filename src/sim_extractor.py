@@ -590,7 +590,7 @@ def extract_process(df, mining_algorithm='inductive'):
     # Noise threshold is only used by the Inductive Miner.
     # 0.0 = keep all (identical to statistical), 0.2 = moderate filtering,
     # higher = stricter model with fewer paths.
-    noise_threshold = 0.2
+    noise_threshold = 0
 
     all_stats = []
     all_raw_rows = []

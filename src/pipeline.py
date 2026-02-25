@@ -1137,7 +1137,7 @@ ML_OPTUNA_TRIALS        = 20
 #   TRAIN_RATIO    : fraction of cases used for training (e.g. 0.80 = 80%)
 # ─────────────────────────────────────────────────────────────────────────────
 TEMPORAL_SPLIT = True
-TRAIN_RATIO    = 0.70
+TRAIN_RATIO    = 0.50
 
 
 def _split_process_datasets(datasets, train_ratio=0.80):
@@ -1430,10 +1430,11 @@ else:
 
 # %% 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLOTLY VISUALIZATION — MODE COMPARISON DASHBOARD
+# VISUALIZATION — MODE COMPARISON DASHBOARD  (seaborn / matplotlib)
 # ══════════════════════════════════════════════════════════════════════════════
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 
 # Select test columns (numeric only)
 test_cols = [c for c in evaluation_results_df.columns
@@ -1469,90 +1470,62 @@ higher_is_better = {
     'test_control_flow_metrics_end_activities_jaccard',
 }
 
-# Filter to existing columns
 test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
 
-# Color palette for modes
-mode_colors = {
-    'statistical': '#636EFA',
-    'petri_net': '#EF553B',
-    'petri_net_statistical': '#00CC96',
-    'petri_net_statistical_memory': '#B6E880',
-    'ml_duration_only': '#AB63FA',
-    'ml_duration_only_with_activity_past': '#FFA15A',
-    'ml_duration_only_with_activity_past_point_estimate': '#19D3F3',
-    'ml_global_model': '#FF6692',
-}
+# Short labels
+short_labels = {c: c.replace('test_', '').replace('_metrics_', ': ')
+                   .replace('_', ' ').title()
+                for c in test_cols}
 
+def _normalise_metrics(df, cols, lower_set):
+    """Min-max normalise. For lower-is-better, invert so 1 = best."""
+    norm_df = df.copy()
+    for c in cols:
+        vals = df[c].dropna()
+        if len(vals) == 0:
+            continue
+        vmin, vmax = vals.min(), vals.max()
+        rng = vmax - vmin if vmax != vmin else 1.0
+        if c in lower_set:
+            norm_df[c] = (vmax - df[c]) / rng
+        else:
+            norm_df[c] = (df[c] - vmin) / rng
+    return norm_df
+
+# %% 
+# ── CHART 1: HEATMAP — normalised modes × metrics ────────────────────────────
 if test_cols and 'mode' in evaluation_results_df.columns:
-
-    # ──────────────────────────────────────────────────────────────────
-    # Helper: normalise all metrics to 0-1 scale where 1 = BEST
-    # ──────────────────────────────────────────────────────────────────
-    def _normalise_metrics(df, cols, lower_set):
-        """Min-max normalise. For lower-is-better, invert so 1 = best."""
-        norm_df = df.copy()
-        for c in cols:
-            vals = df[c].dropna()
-            if len(vals) == 0:
-                continue
-            vmin, vmax = vals.min(), vals.max()
-            rng = vmax - vmin if vmax != vmin else 1.0
-            if c in lower_set:
-                # Invert: lowest raw → 1.0, highest raw → 0.0
-                norm_df[c] = (vmax - df[c]) / rng
-            else:
-                norm_df[c] = (df[c] - vmin) / rng
-        return norm_df
-
-    # Create short display labels for metrics
-    short_labels = {c: c.replace('test_', '').replace('_metrics_', ': ')
-                       .replace('_', ' ').title()
-                    for c in test_cols}
-
-    # ══════════════════════════════════════════════════════════════════
-    # CHART 1: HEATMAP — all modes × all metrics (normalised 0-1)
-    # ══════════════════════════════════════════════════════════════════
-    print("\n📊 Chart 1: Heatmap — mode × metric comparison")
-
-    # Average across processes for global view, per mode
     mode_avg = evaluation_results_df.groupby('mode')[test_cols].mean()
     mode_avg_norm = _normalise_metrics(mode_avg, test_cols, lower_is_better)
-
-    # Sort modes by overall score if available
-    if 'test_overall_score' in mode_avg.columns:
+    if 'test_overall_score' in mode_avg_norm.columns:
         mode_avg_norm = mode_avg_norm.sort_values('test_overall_score', ascending=False)
 
-    fig_heatmap = go.Figure(data=go.Heatmap(
-        z=mode_avg_norm[test_cols].values,
-        x=[short_labels[c] for c in test_cols],
-        y=mode_avg_norm.index.tolist(),
-        colorscale='RdYlGn',
-        zmin=0, zmax=1,
-        text=mode_avg[test_cols].reindex(mode_avg_norm.index).values.round(3),
-        texttemplate='%{text}',
-        textfont=dict(size=9),
-        hovertemplate='Mode: %{y}<br>Metric: %{x}<br>Normalised: %{z:.2f}<br>Raw: %{text}<extra></extra>',
-        colorbar=dict(title='Score<br>(1=best)', tickvals=[0, 0.5, 1],
-                      ticktext=['Worst', 'Mid', 'Best']),
-    ))
-    fig_heatmap.update_layout(
-        title='<b>Mode Comparison Heatmap</b><br>'
-              '<sup>Normalised 0-1 (green = best). Raw values shown in cells.</sup>',
-        height=max(350, 60 * len(mode_avg_norm)),
-        width=max(900, 70 * len(test_cols)),
-        xaxis=dict(tickangle=45, tickfont=dict(size=9), side='bottom'),
-        yaxis=dict(tickfont=dict(size=11), autorange='reversed'),
-        margin=dict(l=200, b=180, t=80),
-    )
-    fig_heatmap.show()
+    # Build annotation matrix with raw values
+    annot_df = mode_avg[test_cols].reindex(mode_avg_norm.index).round(3)
 
-    # ══════════════════════════════════════════════════════════════════
-    # CHART 2: RADAR CHART — one per process, all modes overlaid
-    # ══════════════════════════════════════════════════════════════════
-    print("📊 Chart 2: Radar charts — mode profiles per process")
+    display_cols = [short_labels[c] for c in test_cols]
+    plot_df = mode_avg_norm[test_cols].copy()
+    plot_df.columns = display_cols
 
-    # Select a subset of key metrics for the radar (too many = unreadable)
+    annot_vals = annot_df.copy()
+    annot_vals.columns = display_cols
+
+    fig, ax = plt.subplots(figsize=(max(14, len(test_cols) * 0.9),
+                                    max(3, len(mode_avg_norm) * 0.8)))
+    sns.heatmap(plot_df, annot=annot_vals, fmt='', cmap='RdYlGn',
+                vmin=0, vmax=1, linewidths=0.5, ax=ax,
+                cbar_kws={'label': 'Score (1 = best)'})
+    ax.set_title('Mode Comparison Heatmap\n(normalised 0–1, green = best; raw values in cells)',
+                 fontsize=13, fontweight='bold')
+    ax.set_ylabel('')
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
+    ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+# %%
+# ── CHART 2: RADAR / SPIDER — mode profiles per process ──────────────────────
+if test_cols and 'mode' in evaluation_results_df.columns:
     radar_metrics = [c for c in [
         'test_overall_score',
         'test_control_flow_metrics_edge_f1_score',
@@ -1567,16 +1540,23 @@ if test_cols and 'mode' in evaluation_results_df.columns:
 
     radar_labels = [short_labels[c] for c in radar_metrics]
     processes = evaluation_results_df['process'].unique()
+    modes = evaluation_results_df['mode'].unique()
+
+    mode_colors_list = plt.cm.tab10(np.linspace(0, 1, len(modes)))
+    mode_cmap = {m: mode_colors_list[i] for i, m in enumerate(modes)}
 
     n_proc = len(processes)
-    fig_radar = make_subplots(
-        rows=1, cols=n_proc,
-        specs=[[{'type': 'polar'}] * n_proc],
-        subplot_titles=[str(p) for p in processes],
-    )
+    fig, axes = plt.subplots(1, n_proc, figsize=(6 * n_proc, 5),
+                             subplot_kw=dict(polar=True))
+    if n_proc == 1:
+        axes = [axes]
 
-    modes = evaluation_results_df['mode'].unique()
+    angles = np.linspace(0, 2 * np.pi, len(radar_metrics), endpoint=False).tolist()
+    angles += angles[:1]  # close
+    labels_closed = radar_labels + [radar_labels[0]]
+
     for proc_idx, proc in enumerate(processes):
+        ax = axes[proc_idx]
         proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
         proc_norm = _normalise_metrics(proc_df, radar_metrics, lower_is_better)
 
@@ -1585,43 +1565,28 @@ if test_cols and 'mode' in evaluation_results_df.columns:
             if mode_row.empty:
                 continue
             vals = mode_row[radar_metrics].iloc[0].tolist()
-            # Close the polygon
-            vals_closed = vals + [vals[0]]
-            labels_closed = radar_labels + [radar_labels[0]]
+            vals += vals[:1]
+            ax.plot(angles, vals, 'o-', linewidth=1.5, label=mode,
+                    color=mode_cmap[mode], markersize=3)
+            ax.fill(angles, vals, alpha=0.08, color=mode_cmap[mode])
 
-            fig_radar.add_trace(
-                go.Scatterpolar(
-                    r=vals_closed,
-                    theta=labels_closed,
-                    name=mode,
-                    line=dict(color=mode_colors.get(mode, '#888'), width=2),
-                    fill='toself',
-                    opacity=0.3,
-                    showlegend=(proc_idx == 0),
-                    legendgroup=mode,
-                ),
-                row=1, col=proc_idx + 1,
-            )
+        ax.set_thetagrids(np.degrees(angles[:-1]), radar_labels, fontsize=7)
+        ax.set_ylim(0, 1)
+        ax.set_title(str(proc), fontsize=11, fontweight='bold', pad=20)
 
-    fig_radar.update_polars(
-        radialaxis=dict(range=[0, 1], tickvals=[0.25, 0.5, 0.75, 1.0],
-                        tickfont=dict(size=8)),
-        angularaxis=dict(tickfont=dict(size=8)),
-    )
-    fig_radar.update_layout(
-        title='<b>Mode Profiles — Radar Chart per Process</b><br>'
-              '<sup>Normalised 0-1 (outer = best). Overlapping areas show where modes agree.</sup>',
-        height=500,
-        width=max(500 * n_proc, 800),
-        legend=dict(orientation='h', yanchor='bottom', y=-0.15,
-                    xanchor='center', x=0.5, font=dict(size=10)),
-    )
-    fig_radar.show()
+    axes[0].legend(loc='upper left', bbox_to_anchor=(-0.3, 1.15),
+                   fontsize=8, ncol=min(len(modes), 4))
+    fig.suptitle('Mode Profiles — Radar Chart per Process\n'
+                 '(outer = best, normalised 0–1)',
+                 fontsize=13, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.show()
 
-    # ══════════════════════════════════════════════════════════════════
-    # CHART 3: GROUPED BARS — key metrics, modes side by side per process
-    # ══════════════════════════════════════════════════════════════════
-    print("📊 Chart 3: Grouped bar comparison — key metrics per process")
+# %%
+# ── CHART 3: GROUPED BARS — key metrics side-by-side per process ──────────────
+if test_cols and 'mode' in evaluation_results_df.columns:
+    processes = evaluation_results_df['process'].unique()
+    modes = evaluation_results_df['mode'].unique()
 
     key_metrics = [c for c in [
         'test_overall_score',
@@ -1632,52 +1597,48 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     ] if c in test_cols]
 
     n_key = len(key_metrics)
-    fig_bars = make_subplots(
-        rows=n_key, cols=1,
-        subplot_titles=[short_labels[c] + (' ↓' if c in lower_is_better else ' ↑')
-                        for c in key_metrics],
-        vertical_spacing=0.12,
-        shared_xaxes=True,
-    )
+    fig, axes = plt.subplots(n_key, 1, figsize=(max(8, 2.5 * len(processes) * len(modes) / 3),
+                                                 3.5 * n_key),
+                             sharex=True)
+    if n_key == 1:
+        axes = [axes]
 
-    # X-axis = process names, one group of bars per mode
-    x_labels = [str(p) for p in processes]
+    x = np.arange(len(processes))
+    width = 0.8 / len(modes)
+
+    mode_colors_bar = plt.cm.Set2(np.linspace(0, 1, len(modes)))
 
     for m_idx, metric in enumerate(key_metrics):
-        for mode in modes:
+        ax = axes[m_idx]
+        for i, mode in enumerate(modes):
             mode_df = evaluation_results_df[evaluation_results_df['mode'] == mode]
             y_vals = []
             for proc in processes:
                 row_val = mode_df[mode_df['process'] == proc][metric]
-                y_vals.append(float(row_val.iloc[0]) if len(row_val) > 0 else None)
+                y_vals.append(float(row_val.iloc[0]) if len(row_val) > 0 else 0)
+            ax.bar(x + i * width, y_vals, width, label=mode if m_idx == 0 else '',
+                   color=mode_colors_bar[i], edgecolor='white', linewidth=0.5)
 
-            fig_bars.add_trace(
-                go.Bar(
-                    x=x_labels, y=y_vals,
-                    name=mode,
-                    marker_color=mode_colors.get(mode, '#888'),
-                    showlegend=(m_idx == 0),
-                    legendgroup=mode,
-                ),
-                row=m_idx + 1, col=1,
-            )
+        direction = '↓ lower' if metric in lower_is_better else '↑ higher'
+        ax.set_ylabel(short_labels[metric], fontsize=9)
+        ax.set_title(f'{short_labels[metric]}  ({direction} is better)',
+                     fontsize=10, fontweight='bold')
+        ax.tick_params(axis='y', labelsize=8)
 
-    fig_bars.update_layout(
-        title='<b>Key Metrics — Side-by-Side per Process</b><br>'
-              '<sup>↑ = higher is better, ↓ = lower is better</sup>',
-        height=280 * n_key,
-        width=max(800, 150 * len(x_labels) * len(modes)),
-        barmode='group',
-        legend=dict(orientation='h', yanchor='bottom', y=-0.05,
-                    xanchor='center', x=0.5, font=dict(size=10)),
-    )
-    fig_bars.update_xaxes(tickfont=dict(size=10))
-    fig_bars.show()
+    axes[-1].set_xticks(x + width * (len(modes) - 1) / 2)
+    axes[-1].set_xticklabels([str(p) for p in processes], fontsize=10)
+    axes[0].legend(loc='upper center', bbox_to_anchor=(0.5, 1.35),
+                   ncol=min(len(modes), 4), fontsize=8)
+    fig.suptitle('Key Metrics — Side-by-Side per Process',
+                 fontsize=13, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    plt.show()
 
-    # ══════════════════════════════════════════════════════════════════
-    # CHART 4: RANKING TABLE — which mode wins on each metric × process
-    # ══════════════════════════════════════════════════════════════════
-    print("\n📊 Chart 4: Win count table — how many metrics each mode wins per process")
+# %%
+# ── CHART 4: WIN COUNT HEATMAP — which mode wins most metrics ─────────────────
+if test_cols and 'mode' in evaluation_results_df.columns:
+    processes = evaluation_results_df['process'].unique()
+    modes = evaluation_results_df['mode'].unique()
 
     win_rows = []
     for proc in processes:
@@ -1699,7 +1660,7 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     wins_df = pd.DataFrame(win_rows)
     wins_pivot = wins_df.pivot(index='mode', columns='process', values='wins').fillna(0)
     wins_pivot['TOTAL'] = wins_pivot.sum(axis=1)
-    wins_pivot = wins_pivot.sort_values('TOTAL', ascending=False)
+    wins_pivot = wins_pivot.sort_values('TOTAL', ascending=False).astype(int)
 
     print("\n" + "="*60)
     print("  METRIC WINS PER MODE (across all test metrics)")
@@ -1707,30 +1668,21 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     with pd.option_context('display.max_columns', None, 'display.width', 120):
         print(wins_pivot.to_string())
 
-    # Also show as heatmap
-    fig_wins = go.Figure(data=go.Heatmap(
-        z=wins_pivot.values,
-        x=wins_pivot.columns.tolist(),
-        y=wins_pivot.index.tolist(),
-        colorscale='Blues',
-        text=wins_pivot.values.astype(int),
-        texttemplate='%{text}',
-        textfont=dict(size=14),
-        hovertemplate='Mode: %{y}<br>Process: %{x}<br>Wins: %{text}<extra></extra>',
-    ))
-    fig_wins.update_layout(
-        title='<b>Metric Wins per Mode × Process</b><br>'
-              '<sup>How many metrics each mode is #1 on (darker = more wins)</sup>',
-        height=max(300, 50 * len(wins_pivot)),
-        width=max(500, 100 * len(wins_pivot.columns)),
-        yaxis=dict(autorange='reversed'),
-        margin=dict(l=200, t=80),
-    )
-    fig_wins.show()
+    fig, ax = plt.subplots(figsize=(max(6, len(wins_pivot.columns) * 1.2),
+                                    max(3, len(wins_pivot) * 0.7)))
+    sns.heatmap(wins_pivot, annot=True, fmt='d', cmap='Blues',
+                linewidths=0.5, ax=ax,
+                cbar_kws={'label': 'Number of metrics won'})
+    ax.set_title('Metric Wins per Mode × Process\n'
+                 '(how many metrics each mode is #1 on)',
+                 fontsize=12, fontweight='bold')
+    ax.set_ylabel('')
+    ax.set_xticklabels(ax.get_xticklabels(), fontsize=10)
+    ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
+    plt.tight_layout()
+    plt.show()
 
     print("✅ All comparison charts displayed.")
-else:
-    print("⚠️ No test metrics found in evaluation_results_df (TEMPORAL_SPLIT may be off).")
 
 # %% 
 
