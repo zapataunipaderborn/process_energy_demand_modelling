@@ -1,7 +1,12 @@
+import copy
 import pandas as pd
 import numpy as np
 import random
+from collections import defaultdict
 from datetime import datetime, timedelta
+
+from pm4py.objects.petri_net.obj import PetriNet, Marking
+from pm4py.objects.petri_net import semantics as pn_semantics
 
 from sim_extractor import sample_from_dist
 
@@ -16,7 +21,7 @@ class ProcessSimulation:
         Output of ``sim_extractor.extract_process`` (the stats DataFrame).
     production_plan : pd.DataFrame
         One row per case to simulate.
-    mode : {'statistical', 'ml', 'ml_duration_only'}
+    mode : {'statistical', 'ml', 'ml_duration_only', 'petri_net'}
         'statistical'      – sample durations/transitions from fitted
         distributions (or normal as fallback).
         'ml'               – use XGBoost models from *ml_models* when
@@ -24,18 +29,29 @@ class ProcessSimulation:
         'ml_duration_only' – use XGBoost only for the duration *median*;
         the standard deviation and transition probabilities still come
         from the statistical extraction (``activity_stats_df``).
+        'petri_net'        – simulate using the Petri net token game;
+        transitions are chosen based on stochastic weights from log
+        replay; durations from fitted distributions.
     ml_models : SimModeller | None
         A trained ``SimModeller`` instance (required when mode='ml').
+    process_models : dict | None
+        Mined Petri nets from ``sim_extractor.extract_process()``.
+        Required when mode='petri_net'.
     random_seed : int
         NumPy / random seed for reproducibility.
     """
 
     def __init__(self, activity_stats_df, production_plan,
-                 mode='statistical', ml_models=None, random_seed=42):
+                 mode='statistical', ml_models=None, process_models=None,
+                 random_seed=42):
         self.activity_stats = activity_stats_df
         self.production_plan = production_plan
         self.mode = mode
         self.ml_models = ml_models
+        self.process_models = process_models  # Petri nets from sim_extractor
+        print(f"[DEBUG __init__] mode={self.mode}, "
+              f"process_models is None: {process_models is None}, "
+              f"process_models len: {len(process_models) if process_models else 'N/A'}")
         random.seed(random_seed)
         np.random.seed(random_seed)
 
@@ -46,6 +62,13 @@ class ProcessSimulation:
                 and self.ml_models is None:
             print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no ml_models "
                   "provided – falling back to statistical mode.")
+            self.mode = 'statistical'
+
+        # Petri net mode validation
+        if self.mode in ('petri_net', 'petri_net_statistical') \
+                and (self.process_models is None or len(self.process_models) == 0):
+            print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no "
+                  "process_models provided – falling back to statistical mode.")
             self.mode = 'statistical'
 
         # Verification: confirm global model is loaded for ml_global_model
@@ -285,8 +308,532 @@ class ProcessSimulation:
             'object_attributes': object_attributes
         })
     
+    # ------------------------------------------------------------------
+    # Petri net token-game simulation
+    # ------------------------------------------------------------------
+
+    def _get_enabled_transitions(self, net, marking):
+        """
+        Return the set of transitions enabled in the current marking.
+        A transition is enabled when every input place has at least
+        one token.
+        """
+        enabled = set()
+        for t in net.transitions:
+            if all(marking.get(arc.source, 0) >= 1 for arc in t.in_arcs):
+                enabled.add(t)
+        return enabled
+
+    def _fire_transition(self, marking, transition):
+        """
+        Fire *transition* in *marking*: consume tokens from input places,
+        produce tokens in output places.  Returns new marking.
+        """
+        new_marking = copy.copy(marking)
+        for arc in transition.in_arcs:
+            new_marking[arc.source] -= 1
+            if new_marking[arc.source] == 0:
+                del new_marking[arc.source]
+        for arc in transition.out_arcs:
+            if arc.target not in new_marking:
+                new_marking[arc.target] = 0
+            new_marking[arc.target] += 1
+        return new_marking
+
+    def _choose_transition(self, enabled, stochastic_map):
+        """
+        Given a set of enabled transitions, pick one using stochastic
+        weights.  Falls back to uniform random if no weights available.
+        """
+        enabled_list = list(enabled)
+        weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
+        total = sum(weights)
+        if total <= 0:
+            return random.choice(enabled_list)
+        probs = [w / total for w in weights]
+        return np.random.choice(enabled_list, p=probs)
+
+    def _simulate_petri_net_for_case(self, case_id, object_attributes,
+                                     start_time):
+        """
+        Simulate one case using the Petri net token game.
+
+        For each (object, object_type, higher_level_activity) group that
+        has a mined Petri net, we:
+          1. Place a token in the initial marking.
+          2. Find enabled transitions.
+          3. Choose one (stochastic weights).
+          4. Fire it → update marking.
+          5. If the transition has a label (= activity), sample a duration
+             and log the event.
+          6. Repeat until the final marking is reached or no transitions
+             are enabled.
+        """
+        current_sim_time = start_time.timestamp()
+        unique_objects = (
+            self.activity_stats[['object', 'object_type',
+                                 'higher_level_activity']]
+            .drop_duplicates()
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key = (object_name, object_type, higher_level_activity)
+            model = self.process_models.get(key) if self.process_models else None
+
+            if model is None:
+                # No Petri net for this group → fall back to statistical
+                print(f"  No Petri net for {key} — falling back to "
+                      f"statistical simulation.")
+                self._simulate_statistical_for_object(
+                    case_id, object_attributes, current_sim_time,
+                    object_name, object_type, higher_level_activity
+                )
+                continue
+
+            net = model['net']
+            im  = model['im']
+            fm  = model['fm']
+            stochastic_map = model.get('stochastic_map', {})
+            duration_map   = model.get('duration_map', {})
+
+            # Start the token game
+            marking = copy.copy(im)
+            activity_count = 0
+            max_steps = 500  # safety limit
+            step = 0
+
+            print(f"\nCase {case_id}: Petri net simulation for {object_name} "
+                  f"({object_type})")
+
+            while step < max_steps:
+                step += 1
+
+                # Check if we reached the final marking
+                if marking == fm:
+                    print(f"    Final marking reached after {activity_count} "
+                          f"activities.")
+                    break
+
+                # Check also if fm is a subset of marking (common pattern)
+                fm_reached = all(
+                    marking.get(p, 0) >= fm[p] for p in fm
+                )
+                if fm_reached and activity_count > 0:
+                    print(f"    Final marking subset reached after "
+                          f"{activity_count} activities.")
+                    break
+
+                # Find enabled transitions
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after "
+                          f"{activity_count} activities.")
+                    break
+
+                # Choose which transition to fire
+                chosen = self._choose_transition(enabled, stochastic_map)
+
+                # Fire the transition (update marking)
+                marking = self._fire_transition(marking, chosen)
+
+                # If this is a visible transition (has a label), log event
+                if chosen.label is not None:
+                    activity_label = str(chosen.label).strip()
+
+                    # Get duration from the duration map or activity config
+                    act_key = (activity_label, object_name, object_type,
+                               higher_level_activity)
+
+                    if act_key in self.activity_config:
+                        config = self.activity_config[act_key]
+                        dist_name = config.get('dist_name', 'norm')
+                        dist_params = config.get('dist_params')
+                        if dist_params and any(p != 0 for p in dist_params[1:]):
+                            activity_duration = sample_from_dist(
+                                dist_name, dist_params
+                            )
+                        else:
+                            activity_duration = max(0.1, config['duration'])
+                    elif activity_label in duration_map:
+                        dn, dp = duration_map[activity_label]
+                        activity_duration = sample_from_dist(dn, dp)
+                    else:
+                        print(f"    WARNING: No duration info for "
+                              f"'{activity_label}' — using 10 min default.")
+                        activity_duration = 10.0
+
+                    # Calculate timestamps
+                    start_time_obj = datetime.fromtimestamp(current_sim_time)
+                    current_sim_time += activity_duration * 60
+                    end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                    # Log the event
+                    self._log_event(
+                        case_id=case_id,
+                        activity=activity_label,
+                        timestamp_start=start_time_obj,
+                        timestamp_end=end_time_obj,
+                        object_name=object_name,
+                        object_type=object_type,
+                        higher_level_activity=higher_level_activity,
+                        object_attributes=object_attributes,
+                    )
+
+                    activity_count += 1
+                    current_sim_time += 1  # 1 second gap
+
+                    print(f"    [{activity_count}] Fired '{activity_label}' "
+                          f"(dur={activity_duration:.1f} min)")
+                else:
+                    # Silent (tau) transition — no event logged
+                    pass
+
+            if step >= max_steps:
+                print(f"    WARNING: Max steps ({max_steps}) reached for "
+                      f"{object_name} — stopping.")
+
+            print(f"  Completed {object_name} Petri net simulation with "
+                  f"{activity_count} activities")
+
+    # ------------------------------------------------------------------
+    # Combined: Petri net structure + statistical/ML probabilities
+    # ------------------------------------------------------------------
+
+    def _simulate_petri_net_statistical_for_case(self, case_id,
+                                                  object_attributes,
+                                                  start_time):
+        """
+        Simulate one case using the Petri net structure as a constraint
+        on which activities can follow, while **blending** the Petri
+        net's stochastic weights (from token replay) with the
+        statistical transition probabilities from the log.
+
+        At each step:
+        1.  Find enabled Petri net transitions → extract their labels
+            as the set of *structurally valid* next activities.
+        2.  Look up the statistical transition probabilities AND the
+            Petri net stochastic weights for the current decision.
+        3.  Blend them using  alpha * stat_prob + (1-alpha) * pn_weight
+            (both independently normalised first).
+        4.  Fire the corresponding Petri net transition to advance the
+            marking.
+        5.  Use the full `_get_activity_duration` pipeline for the
+            sampled duration.
+
+        alpha = 1.0  →  pure statistical (Petri net only constrains structure)
+        alpha = 0.0  →  pure Petri net stochastic weights
+        alpha = 0.5  →  equal blend (default)
+        """
+        # ── blending weight: tune between 0.0 and 1.0 ────────────────
+        alpha = 0
+
+        current_sim_time = start_time.timestamp()
+        unique_objects = (
+            self.activity_stats[['object', 'object_type',
+                                 'higher_level_activity']]
+            .drop_duplicates()
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key = (object_name, object_type, higher_level_activity)
+            pm_keys = list(self.process_models.keys()) if self.process_models else []
+            print(f"  [DEBUG] Looking up key: {key}")
+            print(f"  [DEBUG] Available process_models keys: {pm_keys}")
+            model = self.process_models.get(key) if self.process_models else None
+
+            if model is None:
+                print(f"  ⚠️ No Petri net for {key} — FALLING BACK to "
+                      f"statistical simulation (this means results = statistical!)")
+                self._simulate_statistical_for_object(
+                    case_id, object_attributes, current_sim_time,
+                    object_name, object_type, higher_level_activity
+                )
+                continue
+            
+            print(f"  ✅ Petri net FOUND for {key}")
+            print(f"  [DEBUG] label_stochastic: {model.get('label_stochastic', {})}")
+
+            net = model['net']
+            im  = model['im']
+            fm  = model['fm']
+            label_stochastic = model.get('label_stochastic', {})
+
+            # Start the token game
+            marking = copy.copy(im)
+            activity_count = 0
+            activity_history = []
+            max_steps = 500
+            step = 0
+
+            print(f"\nCase {case_id}: Petri-net-statistical simulation "
+                  f"for {object_name} ({object_type})  [alpha={alpha}]")
+
+            while step < max_steps:
+                step += 1
+
+                # Check final marking
+                if marking == fm:
+                    print(f"    Final marking reached after "
+                          f"{activity_count} activities.")
+                    break
+                fm_reached = all(
+                    marking.get(p, 0) >= fm[p] for p in fm
+                )
+                if fm_reached and activity_count > 0:
+                    print(f"    Final marking subset reached after "
+                          f"{activity_count} activities.")
+                    break
+
+                # Find enabled transitions
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after "
+                          f"{activity_count} activities.")
+                    break
+
+                # ── Build label → [transitions] map for enabled set ───
+                label_to_transitions = defaultdict(list)
+                silent_transitions = []
+                for t in enabled:
+                    if t.label is not None:
+                        label_to_transitions[str(t.label).strip()].append(t)
+                    else:
+                        silent_transitions.append(t)
+
+                # If only silent transitions are enabled, fire one and loop
+                if not label_to_transitions:
+                    chosen = random.choice(silent_transitions)
+                    marking = self._fire_transition(marking, chosen)
+                    continue
+
+                valid_labels = set(label_to_transitions.keys())
+
+                # ── First step: pick a start activity ─────────────────
+                if activity_count == 0:
+                    start_acts = self._get_start_activities(
+                        object_name, object_type, higher_level_activity
+                    )
+                    constrained_starts = [
+                        a for a in start_acts if a in valid_labels
+                    ]
+                    if not constrained_starts:
+                        constrained_starts = list(valid_labels)
+                    if not constrained_starts:
+                        print(f"    No valid start activities — ending.")
+                        break
+
+                    chosen_label = random.choice(constrained_starts)
+                    print(f"  Starting with constrained activity: "
+                          f"{chosen_label}")
+                else:
+                    # ── Blend statistical + Petri net weights ──────────
+                    prev_activity = self.events[-1]['activity']
+                    prev_key = (prev_activity, object_name, object_type,
+                                higher_level_activity)
+
+                    # Source 1: statistical transition probabilities
+                    stat_probs = {}
+                    if prev_key in self.activity_config:
+                        raw_tr = self.activity_config[prev_key].get(
+                            'transitions', {}
+                        )
+                        stat_probs = {
+                            k: v for k, v in raw_tr.items()
+                            if k in valid_labels or k == '__END__'
+                        }
+
+                    # Source 2: Petri net stochastic weights (label-level)
+                    pn_weights = {
+                        lbl: label_stochastic.get(lbl, 0.0)
+                        for lbl in valid_labels
+                    }
+
+                    # Normalise each source independently (over valid + END)
+                    all_labels = list(valid_labels)
+                    has_end = '__END__' in stat_probs
+                    if has_end:
+                        all_labels.append('__END__')
+
+                    stat_total = sum(stat_probs.get(l, 0.0)
+                                     for l in all_labels) or 1.0
+                    pn_total = sum(pn_weights.values()) or 1.0
+
+                    # Blend into a single probability per label (+ __END__)
+                    blended = {}
+                    for lbl in all_labels:
+                        s = stat_probs.get(lbl, 0.0) / stat_total
+                        if lbl == '__END__':
+                            # __END__ only comes from statistical side
+                            p = 0.0
+                        else:
+                            p = pn_weights.get(lbl, 0.0) / pn_total
+                        blended[lbl] = alpha * s + (1.0 - alpha) * p
+
+                    # Sample from blended probabilities (including __END__)
+                    acts = list(blended.keys())
+                    probs = [blended[a] for a in acts]
+                    psum = sum(probs)
+                    if psum <= 0:
+                        # Fallback: uniform over valid labels
+                        acts = list(valid_labels)
+                        probs = [1.0 / len(acts)] * len(acts)
+                    else:
+                        probs = [p / psum for p in probs]
+
+                    chosen_label = str(
+                        np.random.choice(acts, p=probs)
+                    ).strip()
+
+                    # If __END__ was chosen, stop the process
+                    if chosen_label == '__END__':
+                        print(f"    Selected END transition — stopping.")
+                        break
+
+                    print(f"    Constrained next: {chosen_label}")
+
+                # ── Fire the Petri net transition for chosen_label ─────
+                candidates = label_to_transitions.get(chosen_label, [])
+                if not candidates:
+                    print(f"    WARNING: label '{chosen_label}' not in "
+                          f"enabled transitions — ending.")
+                    break
+                chosen_transition = random.choice(candidates)
+                marking = self._fire_transition(marking, chosen_transition)
+
+                # ── Sample duration using full pipeline ────────────────
+                _HIST_MODES = (
+                    'ml_duration_only_with_activity_past',
+                    'ml_duration_only_with_activity_past_point_estimate',
+                    'ml_global_model',
+                )
+                activity_duration = self._get_activity_duration(
+                    chosen_label, object_name, object_type,
+                    higher_level_activity, object_attributes,
+                    activity_history=(
+                        activity_history if self.mode in _HIST_MODES
+                        else None
+                    ),
+                    activity_index=activity_count,
+                )
+
+                # Timestamps
+                start_time_obj = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += activity_duration * 60
+                end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id, activity=chosen_label,
+                    timestamp_start=start_time_obj,
+                    timestamp_end=end_time_obj,
+                    object_name=object_name,
+                    object_type=object_type,
+                    higher_level_activity=higher_level_activity,
+                    object_attributes=object_attributes,
+                )
+
+                activity_history.insert(
+                    0, (chosen_label, activity_duration)
+                )
+                activity_history = activity_history[:2]
+                activity_count += 1
+                current_sim_time += 1  # 1 second gap
+
+                print(f"    [{activity_count}] '{chosen_label}' "
+                      f"(dur={activity_duration:.1f} min)")
+
+            if step >= max_steps:
+                print(f"    WARNING: Max steps ({max_steps}) reached.")
+
+            print(f"  Completed {object_name} petri_net_statistical "
+                  f"with {activity_count} activities")
+
+    def _simulate_statistical_for_object(self, case_id, object_attributes,
+                                          current_sim_time, object_name,
+                                          object_type,
+                                          higher_level_activity):
+        """
+        Statistical simulation for a single object group.
+        Extracted so petri_net mode can fall back to it per-group.
+        """
+        start_activities = self._get_start_activities(
+            object_name, object_type, higher_level_activity
+        )
+        if not start_activities:
+            print(f"  WARNING: No start activities for {object_name} — SKIP")
+            return
+
+        current_activity = random.choice(start_activities)
+        activity_count = 0
+        activity_history = []
+
+        while current_activity:
+            _HIST_MODES = ('ml_duration_only_with_activity_past',
+                           'ml_duration_only_with_activity_past_point_estimate',
+                           'ml_global_model')
+            activity_duration = self._get_activity_duration(
+                current_activity, object_name, object_type,
+                higher_level_activity, object_attributes,
+                activity_history=activity_history if self.mode in _HIST_MODES else None,
+                activity_index=activity_count,
+            )
+
+            start_time_obj = datetime.fromtimestamp(current_sim_time)
+            current_sim_time += activity_duration * 60
+            end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+            self._log_event(
+                case_id=case_id, activity=current_activity,
+                timestamp_start=start_time_obj, timestamp_end=end_time_obj,
+                object_name=object_name, object_type=object_type,
+                higher_level_activity=higher_level_activity,
+                object_attributes=object_attributes,
+            )
+
+            activity_history.insert(0, (current_activity, activity_duration))
+            activity_history = activity_history[:2]
+            activity_count += 1
+
+            next_activity = self._get_next_activity(
+                current_activity, object_name, object_type,
+                higher_level_activity, object_attributes,
+            )
+            if not next_activity:
+                break
+            current_activity = next_activity
+            current_sim_time += 1
+
     def _simulate_process_for_case(self, case_id, object_attributes, start_time):
         """Simulate process for one case using probabilistic end transitions"""
+        print(f"[DEBUG _simulate_process_for_case] self.mode = '{self.mode}'")
+        # ── Petri net mode delegates to its own method ────────────────
+        if self.mode == 'petri_net':
+            self._simulate_petri_net_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── Petri net + statistical combined mode ─────────────────────
+        if self.mode == 'petri_net_statistical':
+            self._simulate_petri_net_statistical_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── All other modes: statistical / ML ─────────────────────────
         unique_objects = self.activity_stats[['object', 'object_type', 'higher_level_activity']].drop_duplicates()
         
         current_sim_time = start_time.timestamp()

@@ -5,6 +5,13 @@ from scipy import stats as scipy_stats
 import warnings
 
 # ---------------------------------------------------------------------------
+# pm4py imports (used when mining_algorithm != 'manual')
+# ---------------------------------------------------------------------------
+import pm4py
+from pm4py.objects.petri_net.obj import PetriNet, Marking
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+
+# ---------------------------------------------------------------------------
 # Distribution helpers
 # ---------------------------------------------------------------------------
 
@@ -76,36 +83,459 @@ def sample_from_dist(dist_name, dist_params):
 
 
 # ---------------------------------------------------------------------------
-# Process extractor
+# pm4py mining helpers
 # ---------------------------------------------------------------------------
 
-def extract_process(df):
+def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
     """
-    Extract process statistics with PROBABILISTIC END transitions.
-    End is treated as a transition probability, not a hard stop.
+    Mine a Petri net from a pm4py-formatted event log sub-group.
+
+    Parameters
+    ----------
+    sub_log : pd.DataFrame
+        pm4py-formatted event log (case:concept:name, concept:name, time:timestamp).
+    algorithm : str
+        'inductive', 'heuristic', or 'alpha'.
+    noise_threshold : float
+        Noise filtering for the Inductive Miner (0.0 = keep all, 1.0 = max filtering).
+        Higher values produce stricter models that filter out infrequent paths.
+
+    Returns
+    -------
+    net, im, fm : PetriNet, Marking, Marking
+    """
+    if algorithm == 'inductive':
+        net, im, fm = pm4py.discover_petri_net_inductive(
+            sub_log, noise_threshold=noise_threshold
+        )
+    elif algorithm == 'heuristic':
+        net, im, fm = pm4py.discover_petri_net_heuristics(sub_log)
+    elif algorithm == 'alpha':
+        net, im, fm = pm4py.discover_petri_net_alpha(sub_log)
+    else:
+        raise ValueError(f"Unknown mining algorithm: {algorithm}")
+
+    return net, im, fm
+
+
+def _get_stochastic_map(net, im, fm, log):
+    """
+    Replay the log on the Petri net via token replay and compute
+    transition firing frequencies → stochastic weights.
+
+    Returns
+    -------
+    stochastic_map : dict
+        {Transition: weight} where weight is the count of times that
+        transition fired during replay, normalised per decision point.
+    replay_results : list
+        Raw token-replay results for further analysis.
+    """
+    # Run token-based replay
+    replay_results = token_replay.apply(
+        log, net, im, fm,
+        parameters={
+            'consider_remaining_in_fitness': True
+        }
+    )
+
+    # Count how many times each transition fired across all traces
+    firing_counts = defaultdict(int)
+    for result in replay_results:
+        for transition in result.get('activated_transitions', []):
+            firing_counts[transition] += 1
+
+    # Build stochastic map (raw counts — simulation will normalise per choice)
+    stochastic_map = dict(firing_counts)
+
+    return stochastic_map, replay_results
+
+
+def _derive_transitions_from_net(net, im, fm, sub_log, sub_df):
+    """
+    Derive transition probabilities from the Petri net by analysing
+    the directly-follows relationships in the log filtered through the model.
+
+    Uses pm4py's DFG + the net structure to produce per-activity transition
+    probabilities that respect the mined model.
+
+    Returns
+    -------
+    transitions_dict : dict
+        {activity_label: {next_activity: probability}}
+    start_activities : set
+        Activities that appear as start activities.
+    end_activities : set
+        Activities that appear as end activities.
+    """
+    # Get DFG from the log
+    dfg, start_acts, end_acts = pm4py.discover_dfg(sub_log)
+
+    # Convert DFG to transition probabilities
+    # dfg is {(act_a, act_b): count, ...}
+    outgoing_counts = defaultdict(lambda: defaultdict(int))
+    outgoing_total = defaultdict(int)
+
+    for (src, tgt), count in dfg.items():
+        outgoing_counts[src][tgt] += count
+        outgoing_total[src] += count
+
+    # Add __END__ transitions from end_acts
+    # end_acts is {activity: count}
+    for act, count in end_acts.items():
+        outgoing_counts[act]['__END__'] += count
+        outgoing_total[act] += count
+
+    # Normalise to probabilities
+    transitions_dict = {}
+    for act in outgoing_counts:
+        transitions_dict[act] = {}
+        total = outgoing_total[act]
+        if total > 0:
+            for next_act, count in outgoing_counts[act].items():
+                transitions_dict[act][next_act] = count / total
+
+    return transitions_dict, set(start_acts.keys()), set(end_acts.keys())
+
+
+# ---------------------------------------------------------------------------
+# Shared: duration + raw-row extraction per activity (used by ALL modes)
+# ---------------------------------------------------------------------------
+
+def _extract_duration_and_raw(group, object_name, object_type,
+                              higher_level_activity, case_sorted):
+    """
+    For every activity in *group*, compute duration stats and collect
+    per-instance raw rows for ML training.
+
+    This is shared between 'manual' and pm4py modes — the duration
+    fitting and raw-row collection are independent of the process model.
+
+    Returns
+    -------
+    duration_info : dict  {activity: {duration, duration_std, dist_name, dist_params, n_events}}
+    raw_rows : list[dict]
+    """
+    activities = group['activity'].unique()
+    duration_info = {}
+    raw_rows = []
+
+    for activity in activities:
+        activity_data = group[group['activity'] == activity]
+
+        # ── Basic statistics ──────────────────────────────────────────
+        durations = (
+            activity_data['timestamp_end'] - activity_data['timestamp_start']
+        ).dt.total_seconds() / 60
+        duration_median = float(durations.median())
+        duration_std    = float(durations.std()) if len(durations) > 1 else 0.0
+        n_events = len(activity_data)
+
+        # ── Best-fit distribution ─────────────────────────────────────
+        dist_name, dist_params = fit_best_distribution(durations.values)
+        print(f"    {activity}: best fit = {dist_name} {dist_params}")
+
+        duration_info[activity] = {
+            'duration':     duration_median,
+            'duration_std': duration_std,
+            'dist_name':    dist_name,
+            'dist_params':  dist_params,
+            'n_events':     n_events,
+        }
+
+        # ── Raw rows for ML training ──────────────────────────────────
+        for case_id, case_acts in case_sorted.items():
+            current_indices = case_acts[case_acts['activity'] == activity].index
+
+            for idx in current_indices:
+                row_here = case_acts.iloc[idx]
+
+                # resolved next activity for this instance
+                if idx + 1 < len(case_acts):
+                    next_act = case_acts.iloc[idx + 1]['activity']
+                else:
+                    next_act = '__END__'
+
+                inst_duration = (
+                    (row_here['timestamp_end'] - row_here['timestamp_start'])
+                    .total_seconds() / 60
+                )
+                attr_raw = row_here.get('object_attributes', {}) or {}
+                attr_flat = {f'attr_{k}': v for k, v in attr_raw.items()}
+
+                # ── lag features: last 2 activities & durations ────────
+                prev_act_1, prev_dur_1 = '__NONE__', 0.0
+                prev_act_2, prev_dur_2 = '__NONE__', 0.0
+                if idx >= 1:
+                    prev_row = case_acts.iloc[idx - 1]
+                    prev_act_1 = prev_row['activity']
+                    prev_dur_1 = (
+                        (prev_row['timestamp_end'] - prev_row['timestamp_start'])
+                        .total_seconds() / 60
+                    )
+                if idx >= 2:
+                    prev_row2 = case_acts.iloc[idx - 2]
+                    prev_act_2 = prev_row2['activity']
+                    prev_dur_2 = (
+                        (prev_row2['timestamp_end'] - prev_row2['timestamp_start'])
+                        .total_seconds() / 60
+                    )
+
+                raw_rows.append({
+                    'case_id':               case_id,
+                    'activity':              activity,
+                    'object':                object_name,
+                    'object_type':           object_type,
+                    'higher_level_activity': higher_level_activity,
+                    'duration':              inst_duration,
+                    'next_activity':         next_act,
+                    'timestamp_start':       row_here['timestamp_start'],
+                    'activity_index':        idx,
+                    'hour_of_day':           row_here['timestamp_start'].hour if hasattr(row_here['timestamp_start'], 'hour') else 0,
+                    'day_of_week':           row_here['timestamp_start'].weekday() if hasattr(row_here['timestamp_start'], 'weekday') else 0,
+                    'prev_activity_1':       prev_act_1,
+                    'prev_duration_1':       prev_dur_1,
+                    'prev_activity_2':       prev_act_2,
+                    'prev_duration_2':       prev_dur_2,
+                    **attr_flat,
+                })
+
+    return duration_info, raw_rows
+
+
+# ---------------------------------------------------------------------------
+# Manual process extraction (original approach)
+# ---------------------------------------------------------------------------
+
+def _extract_manual(group, object_name, object_type, higher_level_activity,
+                    case_sorted, duration_info):
+    """
+    Original manual extraction: walk cases to determine start/end flags
+    and transition probabilities by counting.
+    """
+    activities = group['activity'].unique()
+    stats = []
+
+    for activity in activities:
+        # ── Start detection ───────────────────────────────────────────
+        is_start = False
+        for case_id, case_acts in case_sorted.items():
+            if len(case_acts) > 0 and case_acts.iloc[0]['activity'] == activity:
+                is_start = True
+                break
+
+        # ── Probabilistic transition detection ───────────────────────
+        transition_counts = defaultdict(int)
+        end_counts       = 0
+        total_occurrences = 0
+
+        for case_id, case_acts in case_sorted.items():
+            current_indices = case_acts[case_acts['activity'] == activity].index
+
+            for idx in current_indices:
+                total_occurrences += 1
+                if idx + 1 < len(case_acts):
+                    next_act = case_acts.iloc[idx + 1]['activity']
+                    transition_counts[next_act] += 1
+                else:
+                    end_counts += 1
+
+        # ── Transition probabilities ──────────────────────────────────
+        transitions = {}
+        if total_occurrences > 0:
+            for next_act, count in transition_counts.items():
+                transitions[next_act] = count / total_occurrences
+            if end_counts > 0:
+                transitions['__END__'] = end_counts / total_occurrences
+
+        is_end = end_counts > 0
+        d = duration_info[activity]
+
+        print(f"      Events: {d['n_events']}, Start: {is_start}, Can End: {is_end}")
+        print(f"      Total occurrences: {total_occurrences}")
+        print(f"      Transitions: {transitions}")
+
+        stats.append({
+            'activity':              activity,
+            'object':                object_name,
+            'object_type':           object_type,
+            'higher_level_activity': higher_level_activity,
+            'duration':              d['duration'],
+            'duration_std':          d['duration_std'],
+            'dist_name':             d['dist_name'],
+            'dist_params':           d['dist_params'],
+            'n_events':              d['n_events'],
+            'transition':            transitions,
+            'is_start':              is_start,
+            'is_end':                is_end,
+        })
+
+    return stats, None  # No process_model for manual
+
+
+# ---------------------------------------------------------------------------
+# pm4py-based process extraction
+# ---------------------------------------------------------------------------
+
+def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
+                        case_sorted, duration_info, algorithm='inductive',
+                        noise_threshold=0.2):
+    """
+    Mine a Petri net from the sub-log and derive transitions, start/end
+    from the mined model.
+
+    Returns
+    -------
+    stats : list[dict]
+    process_model : dict
+        {'net': PetriNet, 'im': Marking, 'fm': Marking,
+         'stochastic_map': dict, 'duration_map': dict}
+    """
+    # ── Format the sub-log for pm4py ──────────────────────────────────
+    sub_df = group[['case_id', 'activity', 'timestamp_start', 'timestamp_end']].copy()
+    sub_df = sub_df.dropna(subset=['case_id'])
+
+    if len(sub_df) < 2:
+        print(f"    WARNING: Too few events ({len(sub_df)}) for pm4py mining — "
+              f"falling back to manual extraction.")
+        return _extract_manual(group, object_name, object_type,
+                               higher_level_activity, case_sorted, duration_info)
+
+    sub_log = pm4py.format_dataframe(
+        sub_df,
+        case_id='case_id',
+        activity_key='activity',
+        timestamp_key='timestamp_start'
+    )
+
+    # ── Mine the Petri net ────────────────────────────────────────────
+    print(f"    Mining Petri net with '{algorithm}' algorithm "
+          f"(noise_threshold={noise_threshold})...")
+    net, im, fm = _mine_petri_net(sub_log, algorithm,
+                                  noise_threshold=noise_threshold)
+
+    print(f"    Petri net: {len(net.places)} places, "
+          f"{len(net.transitions)} transitions, "
+          f"{len(net.arcs)} arcs")
+
+    # ── Get stochastic map via token replay ───────────────────────────
+    stochastic_map, _ = _get_stochastic_map(net, im, fm, sub_log)
+    print(f"    Stochastic map: {len(stochastic_map)} transition weights")
+
+    # ── Derive transitions from the mined model ──────────────────────
+    transitions_dict, start_acts, end_acts = _derive_transitions_from_net(
+        net, im, fm, sub_log, sub_df
+    )
+
+    # ── Build duration map for the Petri net simulation ───────────────
+    # Maps transition labels → (dist_name, dist_params)
+    duration_map = {}
+    for act, d in duration_info.items():
+        duration_map[act] = (d['dist_name'], d['dist_params'])
+
+    # ── Build stats rows ──────────────────────────────────────────────
+    activities = group['activity'].unique()
+    stats = []
+
+    for activity in activities:
+        is_start = activity in start_acts
+        is_end = activity in end_acts
+        transitions = transitions_dict.get(activity, {})
+        d = duration_info[activity]
+
+        print(f"      {activity}: Start={is_start}, End={is_end}, "
+              f"Transitions={transitions}")
+
+        stats.append({
+            'activity':              activity,
+            'object':                object_name,
+            'object_type':           object_type,
+            'higher_level_activity': higher_level_activity,
+            'duration':              d['duration'],
+            'duration_std':          d['duration_std'],
+            'dist_name':             d['dist_name'],
+            'dist_params':           d['dist_params'],
+            'n_events':              d['n_events'],
+            'transition':            transitions,
+            'is_start':              is_start,
+            'is_end':                is_end,
+        })
+
+    # ── Build label-level stochastic weights for blending ───────────
+    # stochastic_map keys are Transition objects; convert to labels
+    label_stochastic = defaultdict(float)
+    for t, weight in stochastic_map.items():
+        if t.label is not None:
+            label_stochastic[str(t.label).strip()] += weight
+
+    process_model = {
+        'net': net,
+        'im': im,
+        'fm': fm,
+        'stochastic_map': stochastic_map,
+        'label_stochastic': dict(label_stochastic),
+        'duration_map': duration_map,
+    }
+
+    return stats, process_model
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def extract_process(df, mining_algorithm='inductive'):
+    """
+    Extract process statistics from an event log.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Event log with columns: case_id, activity, timestamp_start,
+        timestamp_end, object, object_type, higher_level_activity,
+        object_attributes.
+    mining_algorithm : str
+        Process mining algorithm to use:
+        - 'inductive' (default) — pm4py Inductive Miner → sound Petri net
+        - 'heuristic' — pm4py Heuristics Miner → noise-tolerant
+        - 'alpha' — pm4py Alpha Miner → classic algorithm
+        - 'manual' — original manual extraction (no process mining)
 
     Returns
     -------
     stats_df : pd.DataFrame
         One row per (activity, object, object_type, higher_level_activity).
-        Columns include *dist_name* and *dist_params* in addition to the
-        original duration / transition columns.
+        Columns: activity, object, object_type, higher_level_activity,
+        duration, duration_std, dist_name, dist_params, n_events,
+        transition (dict), is_start, is_end.
     raw_df : pd.DataFrame
-        One row per activity *instance* with the raw duration, the resolved
-        next activity (``'__END__'`` when none), and any flattened
-        ``object_attributes`` keys (prefixed with ``attr_``).
+        One row per activity instance with raw duration, next_activity,
+        lag features, and flattened object_attributes.
+    process_models : dict or None
+        When mining_algorithm != 'manual', contains the mined Petri nets:
+        {(object, object_type, higher_level_activity): {
+            'net': PetriNet, 'im': Marking, 'fm': Marking,
+            'stochastic_map': dict, 'duration_map': dict
+        }}
+        None when mining_algorithm == 'manual'.
     """
+    use_pm4py = mining_algorithm != 'manual'
+    # Noise threshold is only used by the Inductive Miner.
+    # 0.0 = keep all (identical to statistical), 0.2 = moderate filtering,
+    # higher = stricter model with fewer paths.
+    noise_threshold = 0.6
 
-    stats = []
-    raw_rows = []   # ← new: per-instance data for ML training
+    all_stats = []
+    all_raw_rows = []
+    process_models = {} if use_pm4py else None
 
     # Group by the combination that defines a unique process configuration
     grouped = df.groupby(['object', 'object_type', 'higher_level_activity'])
-    
+
     for (object_name, object_type, higher_level_activity), group in grouped:
         print(f"\nProcessing: {object_name} ({object_type}) - {higher_level_activity}")
+        print(f"  Mining algorithm: {mining_algorithm}")
 
-        # Get all activities for this object configuration
         activities = group['activity'].unique()
         print(f"  Found {len(activities)} unique activities: {activities}")
 
@@ -118,124 +548,31 @@ def extract_process(df):
                 .reset_index(drop=True)
             )
 
-        # For each activity, calculate statistics
-        for activity in activities:
-            activity_data = group[group['activity'] == activity]
+        # ── Duration + raw row extraction (shared by all modes) ───────
+        duration_info, raw_rows = _extract_duration_and_raw(
+            group, object_name, object_type, higher_level_activity, case_sorted
+        )
+        all_raw_rows.extend(raw_rows)
 
-            # ── Basic statistics ──────────────────────────────────────────
-            durations = (
-                activity_data['timestamp_end'] - activity_data['timestamp_start']
-            ).dt.total_seconds() / 60
-            duration_median = float(durations.median())
-            duration_std    = float(durations.std()) if len(durations) > 1 else 0.0
-            n_events = len(activity_data)
+        # ── Process model extraction ──────────────────────────────────
+        if use_pm4py:
+            stats, process_model = _extract_with_pm4py(
+                group, object_name, object_type, higher_level_activity,
+                case_sorted, duration_info, algorithm=mining_algorithm,
+                noise_threshold=noise_threshold
+            )
+            if process_model is not None:
+                key = (object_name, object_type, higher_level_activity)
+                process_models[key] = process_model
+        else:
+            stats, _ = _extract_manual(
+                group, object_name, object_type, higher_level_activity,
+                case_sorted, duration_info
+            )
 
-            # ── Best-fit distribution ─────────────────────────────────────
-            dist_name, dist_params = fit_best_distribution(durations.values)
-            print(f"    {activity}: best fit = {dist_name} {dist_params}")
+        all_stats.extend(stats)
 
-            # ── Start detection ───────────────────────────────────────────
-            is_start = False
-            for case_id, case_acts in case_sorted.items():
-                if len(case_acts) > 0 and case_acts.iloc[0]['activity'] == activity:
-                    is_start = True
-                    break
+    stats_df = pd.DataFrame(all_stats)
+    raw_df   = pd.DataFrame(all_raw_rows)
 
-            # ── Probabilistic transition detection ───────────────────────
-            transition_counts = defaultdict(int)
-            end_counts       = 0
-            total_occurrences = 0
-
-            for case_id, case_acts in case_sorted.items():
-                current_indices = case_acts[case_acts['activity'] == activity].index
-
-                for idx in current_indices:
-                    total_occurrences += 1
-                    row_here = case_acts.iloc[idx]
-
-                    # resolved next activity for this instance
-                    if idx + 1 < len(case_acts):
-                        next_act = case_acts.iloc[idx + 1]['activity']
-                        transition_counts[next_act] += 1
-                    else:
-                        next_act = '__END__'
-                        end_counts += 1
-
-                    # ── raw row for ML training ───────────────────────────
-                    inst_duration = (
-                        (row_here['timestamp_end'] - row_here['timestamp_start'])
-                        .total_seconds() / 60
-                    )
-                    attr_raw = row_here.get('object_attributes', {}) or {}
-                    attr_flat = {f'attr_{k}': v for k, v in attr_raw.items()}
-
-                    # ── lag features: last 2 activities & durations ────────
-                    prev_act_1, prev_dur_1 = '__NONE__', 0.0
-                    prev_act_2, prev_dur_2 = '__NONE__', 0.0
-                    if idx >= 1:
-                        prev_row = case_acts.iloc[idx - 1]
-                        prev_act_1 = prev_row['activity']
-                        prev_dur_1 = (
-                            (prev_row['timestamp_end'] - prev_row['timestamp_start'])
-                            .total_seconds() / 60
-                        )
-                    if idx >= 2:
-                        prev_row2 = case_acts.iloc[idx - 2]
-                        prev_act_2 = prev_row2['activity']
-                        prev_dur_2 = (
-                            (prev_row2['timestamp_end'] - prev_row2['timestamp_start'])
-                            .total_seconds() / 60
-                        )
-
-                    raw_rows.append({
-                        'case_id':               case_id,
-                        'activity':              activity,
-                        'object':                object_name,
-                        'object_type':           object_type,
-                        'higher_level_activity': higher_level_activity,
-                        'duration':              inst_duration,
-                        'next_activity':         next_act,
-                        'timestamp_start':       row_here['timestamp_start'],
-                        'activity_index':        idx,          # position in case
-                        'hour_of_day':           row_here['timestamp_start'].hour if hasattr(row_here['timestamp_start'], 'hour') else 0,
-                        'day_of_week':           row_here['timestamp_start'].weekday() if hasattr(row_here['timestamp_start'], 'weekday') else 0,
-                        'prev_activity_1':       prev_act_1,
-                        'prev_duration_1':       prev_dur_1,
-                        'prev_activity_2':       prev_act_2,
-                        'prev_duration_2':       prev_dur_2,
-                        **attr_flat,
-                    })
-
-            # ── Transition probabilities ──────────────────────────────────
-            transitions = {}
-            if total_occurrences > 0:
-                for next_act, count in transition_counts.items():
-                    transitions[next_act] = count / total_occurrences
-                if end_counts > 0:
-                    transitions['__END__'] = end_counts / total_occurrences
-
-            is_end = end_counts > 0
-
-            print(f"      Events: {n_events}, Start: {is_start}, Can End: {is_end}")
-            print(f"      Total occurrences: {total_occurrences}")
-            print(f"      Transitions: {transitions}")
-
-            stats.append({
-                'activity':              activity,
-                'object':                object_name,
-                'object_type':           object_type,
-                'higher_level_activity': higher_level_activity,
-                'duration':              duration_median,
-                'duration_std':          duration_std,
-                'dist_name':             dist_name,
-                'dist_params':           dist_params,
-                'n_events':              n_events,
-                'transition':            transitions,
-                'is_start':              is_start,
-                'is_end':                is_end,
-            })
-
-    stats_df = pd.DataFrame(stats)
-    raw_df   = pd.DataFrame(raw_rows)
-
-    return stats_df, raw_df
+    return stats_df, raw_df, process_models
