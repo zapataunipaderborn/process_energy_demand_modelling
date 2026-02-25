@@ -403,11 +403,12 @@ class ProcessSimulation:
             fm  = model['fm']
             stochastic_map = model.get('stochastic_map', {})
             duration_map   = model.get('duration_map', {})
+            max_case_length = model.get('max_case_length', 200)
 
             # Start the token game
             marking = copy.copy(im)
             activity_count = 0
-            max_steps = 500  # safety limit
+            max_steps = max(max_case_length * 2, 50)  # guard from training data
             step = 0
 
             print(f"\nCase {case_id}: Petri net simulation for {object_name} "
@@ -572,12 +573,14 @@ class ProcessSimulation:
             im  = model['im']
             fm  = model['fm']
             label_stochastic = model.get('label_stochastic', {})
+            decision_weights = model.get('decision_weights', {})
+            max_case_length = model.get('max_case_length', 200)
 
             # Start the token game
             marking = copy.copy(im)
             activity_count = 0
             activity_history = []
-            max_steps = 500
+            max_steps = max(max_case_length * 2, 50)  # Change 4: guard from data
             step = 0
 
             print(f"\nCase {case_id}: Petri-net-statistical simulation "
@@ -657,31 +660,42 @@ class ProcessSimulation:
                             if k in valid_labels or k == '__END__'
                         }
 
-                    # Source 2: Petri net stochastic weights (label-level)
+                    # Source 2: Decision-point weights (context-aware)
+                    dp_key = frozenset(valid_labels)
+                    dp_weights = decision_weights.get(dp_key, {})
+
+                    # Fallback to label_stochastic if no decision-point data
+                    if not dp_weights:
+                        dp_weights = {
+                            lbl: label_stochastic.get(lbl, 0.0)
+                            for lbl in valid_labels
+                        }
+
+                    # Include __END__ from decision-point weights
                     pn_weights = {
-                        lbl: label_stochastic.get(lbl, 0.0)
+                        lbl: dp_weights.get(lbl, 0.0)
                         for lbl in valid_labels
                     }
+                    # Add __END__ if the decision-point data has it
+                    if '__END__' in dp_weights:
+                        pn_weights['__END__'] = dp_weights['__END__']
 
-                    # Normalise each source independently (over valid + END)
+                    # Normalise each source independently
                     all_labels = list(valid_labels)
-                    has_end = '__END__' in stat_probs
-                    if has_end:
+                    has_end = '__END__' in stat_probs or '__END__' in pn_weights
+                    if has_end and '__END__' not in all_labels:
                         all_labels.append('__END__')
 
                     stat_total = sum(stat_probs.get(l, 0.0)
                                      for l in all_labels) or 1.0
-                    pn_total = sum(pn_weights.values()) or 1.0
+                    pn_total = sum(pn_weights.get(l, 0.0)
+                                   for l in all_labels) or 1.0
 
                     # Blend into a single probability per label (+ __END__)
                     blended = {}
                     for lbl in all_labels:
                         s = stat_probs.get(lbl, 0.0) / stat_total
-                        if lbl == '__END__':
-                            # __END__ only comes from statistical side
-                            p = 0.0
-                        else:
-                            p = pn_weights.get(lbl, 0.0) / pn_total
+                        p = pn_weights.get(lbl, 0.0) / pn_total
                         blended[lbl] = alpha * s + (1.0 - alpha) * p
 
                     # Sample from blended probabilities (including __END__)
@@ -825,6 +839,8 @@ class ProcessSimulation:
             label_stochastic       = model.get('label_stochastic', {})
             bigram_transitions     = model.get('bigram_transitions', {})
             activity_count_trans   = model.get('activity_count_transitions', {})
+            decision_weights       = model.get('decision_weights', {})
+            max_case_length        = model.get('max_case_length', 200)
 
             # ── Per-case memory state ─────────────────────────────────
             marking = copy.copy(im)
@@ -832,7 +848,7 @@ class ProcessSimulation:
             activity_history = []        # ordered list of fired labels
             activity_counts_map = defaultdict(int)  # {label: times_fired}
             prev_activity = '__START__'  # sentinel for first step
-            max_steps = 500
+            max_steps = max(max_case_length * 2, 50)  # Change 4
             step = 0
 
             print(f"\nCase {case_id}: Petri-net-memory simulation "
@@ -900,9 +916,6 @@ class ProcessSimulation:
                     weight_source = None
 
                     # --- Try bigram (2nd-order Markov) -----------------
-                    # Bigram table: (prev_of_current, current) -> {next: count}
-                    # prev_activity = last fired = "current" in bigram
-                    # bigram_prev   = the one before that
                     bigram_prev = (activity_history[-2]
                                    if len(activity_history) >= 2
                                    else '__START__')
@@ -938,16 +951,26 @@ class ProcessSimulation:
                                 memory_weights = filtered
                                 weight_source = 'activity_count'
 
-                    # --- Build base weights (1st-order, always used) ---
-                    base_weights = {
-                        lbl: label_stochastic.get(lbl, 1.0)
-                        for lbl in valid_labels
-                    }
+                    # --- Build base weights (decision-point-aware) -----
+                    dp_key = frozenset(valid_labels)
+                    dp_weights = decision_weights.get(dp_key, {})
+                    if dp_weights:
+                        base_weights = {
+                            lbl: dp_weights.get(lbl, 0.0)
+                            for lbl in valid_labels
+                        }
+                        # Include __END__ from decision-point weights
+                        if '__END__' in dp_weights:
+                            base_weights['__END__'] = dp_weights['__END__']
+                    else:
+                        # Fallback to global label_stochastic
+                        base_weights = {
+                            lbl: label_stochastic.get(lbl, 1.0)
+                            for lbl in valid_labels
+                        }
 
                     # --- Blend memory with base weights ───────────────
                     if memory_weights is not None:
-                        # Normalise both to probability distributions
-                        # over the same label set (valid_labels ∪ __END__)
                         all_keys = set(base_weights.keys())
                         all_keys.update(memory_weights.keys())
 
@@ -965,7 +988,7 @@ class ProcessSimulation:
                         weight_source = f'{weight_source}+blend'
                     else:
                         weights = base_weights
-                        weight_source = 'label_stochastic'
+                        weight_source = 'decision_point' if dp_weights else 'label_stochastic'
 
                     # ── Normalise and sample ──────────────────────────
                     all_labels = list(weights.keys())
