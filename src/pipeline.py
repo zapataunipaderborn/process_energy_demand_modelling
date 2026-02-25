@@ -1109,6 +1109,15 @@ from sim_modeller import SimModeller
 SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PROCESS MINING ALGORITHM
+#   'inductive'  – pm4py Inductive Miner → guarantees a sound Petri net
+#   'heuristic'  – pm4py Heuristics Miner → better noise filtering
+#   'alpha'      – pm4py Alpha Miner → classic algorithm
+#   'manual'     – original manual extraction (no process mining)
+# ─────────────────────────────────────────────────────────────────────────────
+MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
 #   model_types: list of models to train — best is selected per activity key
 #                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
@@ -1222,6 +1231,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
     'statistical',
+    'petri_net',
+    'petri_net_statistical',
     'ml_duration_only',
     'ml_duration_only_with_activity_past',
     'ml_duration_only_with_activity_past_point_estimate',
@@ -1241,7 +1252,32 @@ for process in process_datasets_to_model.keys():
     production_plan = train_datasets[process]['production_plan']
 
     # ── Extract process statistics (from TRAIN only — shared by both modes)
-    activity_stats_df, raw_df = extract_process(df_train)
+    activity_stats_df, raw_df, process_models = extract_process(df_train, mining_algorithm=MINING_ALGORITHM)
+
+    # ── Visualize mined Petri nets ────────────────────────────────────────
+    if process_models:
+        print("\n" + "="*50)
+        print("MINED PETRI NETS")
+        print("="*50)
+        for key, model in process_models.items():
+            obj_name, obj_type, hla = key
+            print(f"\n  Petri net: {obj_name} ({obj_type}) — {hla}")
+            print(f"    Places: {len(model['net'].places)}, "
+                  f"Transitions: {len(model['net'].transitions)}, "
+                  f"Arcs: {len(model['net'].arcs)}")
+            # Show visible transitions
+            visible = [t.label for t in model['net'].transitions if t.label]
+            silent = [t for t in model['net'].transitions if t.label is None]
+            print(f"    Visible transitions: {visible}")
+            print(f"    Silent (tau) transitions: {len(silent)}")
+            if model.get('label_stochastic'):
+                print(f"    Stochastic weights: {model['label_stochastic']}")
+            try:
+                pm4py.view_petri_net(model['net'], model['im'], model['fm'],
+                                     format='png')
+            except Exception as e:
+                print(f"    (Could not render Petri net: {e})")
+
     print("\n" + "="*50)
     print("PROBABILISTIC END ACTIVITY STATS (from train set):")
     print("="*50)
@@ -1269,11 +1305,13 @@ for process in process_datasets_to_model.keys():
         print(f"  ▶ SIMULATION MODE: {sim_mode.upper()}")
         print("─"*80)
 
-        mode_ml = ml_models if sim_mode != 'statistical' else None
+        mode_ml = ml_models if sim_mode not in ('statistical', 'petri_net') else None
+        mode_pm = process_models if sim_mode in ('petri_net', 'petri_net_statistical') else None
 
         simulated_log = ProcessSimulation(
             activity_stats_df, production_plan,
-            mode=sim_mode, ml_models=mode_ml
+            mode=sim_mode, ml_models=mode_ml,
+            process_models=mode_pm,
         ).run()
 
         print(f"\n  Simulated log ({sim_mode}): {len(simulated_log)} events")
@@ -1288,7 +1326,7 @@ for process in process_datasets_to_model.keys():
         eval_train = comprehensive_simulation_evaluation(simulated_log, df_train)
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
-        plot_simulation_comparison(simulated_log, df_train)
+        #plot_simulation_comparison(simulated_log, df_train)
         df_compare_train = df_train.dropna(subset=['case_id'])
         visualize_heuristic_nets(df_compare_train, simulated_log)
 
@@ -1312,7 +1350,7 @@ for process in process_datasets_to_model.keys():
             eval_test = comprehensive_simulation_evaluation(simulated_log, df_test)
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
-            plot_simulation_comparison(simulated_log, df_test)
+            #plot_simulation_comparison(simulated_log, df_test)
             df_compare_test = df_test.dropna(subset=['case_id'])
             visualize_heuristic_nets(df_compare_test, simulated_log)
 
@@ -1342,7 +1380,127 @@ evaluation_results_df = evaluation_results_df[priority_cols + remaining_cols]
 print("\n" + "="*80)
 print("AGGREGATED EVALUATION RESULTS — MODE COMPARISON")
 print("="*80)
+
+evaluation_results_df.to_parquet(
+    "evaluation_results.parquet",
+    engine="pyarrow",
+    index=False
+)
 evaluation_results_df
+
+# %% 
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTLY VISUALIZATION — TEST RESULTS COMPARISON BY METRIC
+# ══════════════════════════════════════════════════════════════════════════════
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Select test columns (numeric only) and define display-friendly names
+test_cols = [c for c in evaluation_results_df.columns
+             if c.startswith('test_') and evaluation_results_df[c].dtype in ('float64', 'float32', 'int64')]
+
+# Metrics where LOWER is better (errors, divergences, KS statistics)
+lower_is_better = {
+    'test_basic_metrics_event_count_error',
+    'test_basic_metrics_case_count_error',
+    'test_activity_metrics_js_divergence',
+    'test_activity_metrics_frequency_mae',
+    'test_duration_metrics_ks_statistic',
+    'test_duration_metrics_mean_duration_error',
+    'test_duration_metrics_median_duration_error',
+    'test_duration_metrics_std_duration_error',
+    'test_case_metrics_events_per_case_ks',
+    'test_case_metrics_mean_events_per_case_error',
+    'test_case_metrics_median_events_per_case_error',
+}
+
+# Metrics where HIGHER is better (scores, ratios, F1, coverage)
+higher_is_better = {
+    'test_overall_score',
+    'test_basic_metrics_event_count_ratio',
+    'test_basic_metrics_case_count_ratio',
+    'test_activity_metrics_activity_coverage_ratio',
+    'test_duration_metrics_ks_pvalue',
+    'test_case_metrics_events_per_case_pvalue',
+    'test_control_flow_metrics_edge_precision',
+    'test_control_flow_metrics_edge_recall',
+    'test_control_flow_metrics_edge_f1_score',
+    'test_control_flow_metrics_start_activities_jaccard',
+    'test_control_flow_metrics_end_activities_jaccard',
+}
+
+# Filter to only columns that actually exist
+test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
+
+if test_cols and 'mode' in evaluation_results_df.columns:
+    n_metrics = len(test_cols)
+    n_cols_grid = 3
+    n_rows_grid = (n_metrics + n_cols_grid - 1) // n_cols_grid
+
+    fig = make_subplots(
+        rows=n_rows_grid, cols=n_cols_grid,
+        subplot_titles=[c.replace('test_', '').replace('_', ' ').title()
+                        for c in test_cols],
+        vertical_spacing=0.08,
+        horizontal_spacing=0.08,
+    )
+
+    # Color palette for modes
+    mode_colors = {
+        'statistical': '#636EFA',
+        'petri_net': '#EF553B',
+        'petri_net_statistical': '#00CC96',
+        'ml_duration_only': '#AB63FA',
+        'ml_duration_only_with_activity_past': '#FFA15A',
+        'ml_duration_only_with_activity_past_point_estimate': '#19D3F3',
+        'ml_global_model': '#FF6692',
+    }
+
+    for idx, col in enumerate(test_cols):
+        row = idx // n_cols_grid + 1
+        col_pos = idx % n_cols_grid + 1
+
+        # Sort modes: best first
+        ascending = col in lower_is_better
+        df_sorted = evaluation_results_df[['mode', col]].dropna().sort_values(
+            col, ascending=ascending
+        )
+
+        for _, r in df_sorted.iterrows():
+            mode_name = r['mode']
+            fig.add_trace(
+                go.Bar(
+                    x=[mode_name],
+                    y=[r[col]],
+                    name=mode_name,
+                    marker_color=mode_colors.get(mode_name, '#888'),
+                    showlegend=(idx == 0),  # legend only on first subplot
+                    legendgroup=mode_name,
+                ),
+                row=row, col=col_pos,
+            )
+
+        # Add "direction" annotation
+        direction = "↓ lower is better" if col in lower_is_better else "↑ higher is better"
+        fig.add_annotation(
+            text=direction, xref=f"x{idx+1}", yref=f"y{idx+1}",
+            x=0.5, y=1.05, xanchor='center', yanchor='bottom',
+            showarrow=False, font=dict(size=9, color='gray'),
+        )
+
+    fig.update_layout(
+        title_text="<b>Test Set Evaluation — All Metrics by Simulation Mode</b><br>"
+                   "<sup>Bars sorted by best-performing mode (leftmost = best)</sup>",
+        height=350 * n_rows_grid,
+        width=1200,
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=-0.02, xanchor='center', x=0.5),
+    )
+    fig.update_xaxes(tickangle=45, tickfont=dict(size=8))
+    fig.show()
+    print("✅ Plotly visualization displayed.")
+else:
+    print("⚠️ No test metrics found in evaluation_results_df (TEMPORAL_SPLIT may be off).")
 
 # %% 
 Stop
