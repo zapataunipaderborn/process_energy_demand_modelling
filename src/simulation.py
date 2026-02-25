@@ -65,7 +65,8 @@ class ProcessSimulation:
             self.mode = 'statistical'
 
         # Petri net mode validation
-        if self.mode in ('petri_net', 'petri_net_statistical') \
+        if self.mode in ('petri_net', 'petri_net_statistical',
+                         'petri_net_statistical_memory') \
                 and (self.process_models is None or len(self.process_models) == 0):
             print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no "
                   "process_models provided – falling back to statistical mode.")
@@ -761,6 +762,292 @@ class ProcessSimulation:
             print(f"  Completed {object_name} petri_net_statistical "
                   f"with {activity_count} activities")
 
+    # ------------------------------------------------------------------
+    # Memory-augmented: GSPN with history-dependent stochastic weights
+    # ------------------------------------------------------------------
+
+    def _simulate_petri_net_statistical_memory_for_case(self, case_id,
+                                                        object_attributes,
+                                                        start_time):
+        """
+        Simulate one case using the Petri net structure with
+        **history-dependent** transition selection (GSPN-M).
+
+        At each decision point the transition weights are resolved using
+        a priority cascade:
+          1. **Bigram** — P(next | prev_activity, current_activity)
+             Uses 2nd-order Markov statistics mined from the event log.
+          2. **Activity-count** — P(next | current_activity, times_seen)
+             Uses repetition-aware statistics (how many times the
+             current activity has already been executed in this case).
+          3. **Label stochastic (1st-order)** — standard Petri net
+             stochastic weights from token replay.
+
+        The highest-priority source with sufficient data is **blended**
+        with the 1st-order label stochastic weights (MEMORY_BLEND_ALPHA
+        controls the mix) to avoid overfitting to rare contexts.
+
+        Durations are sampled identically to the non-memory mode.
+        """
+        MIN_CONTEXT_OBSERVATIONS = 5   # need ≥5 total obs to trust a context
+        MEMORY_BLEND_ALPHA = 0.5     # 70% memory, 30% label_stochastic
+
+        current_sim_time = start_time.timestamp()
+        unique_objects = (
+            self.activity_stats[['object', 'object_type',
+                                 'higher_level_activity']]
+            .drop_duplicates()
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key = (object_name, object_type, higher_level_activity)
+            model = self.process_models.get(key) if self.process_models else None
+
+            if model is None:
+                print(f"  ⚠️ No Petri net for {key} — falling back to "
+                      f"statistical simulation.")
+                self._simulate_statistical_for_object(
+                    case_id, object_attributes, current_sim_time,
+                    object_name, object_type, higher_level_activity
+                )
+                continue
+
+            net = model['net']
+            im  = model['im']
+            fm  = model['fm']
+            label_stochastic       = model.get('label_stochastic', {})
+            bigram_transitions     = model.get('bigram_transitions', {})
+            activity_count_trans   = model.get('activity_count_transitions', {})
+
+            # ── Per-case memory state ─────────────────────────────────
+            marking = copy.copy(im)
+            activity_count = 0
+            activity_history = []        # ordered list of fired labels
+            activity_counts_map = defaultdict(int)  # {label: times_fired}
+            prev_activity = '__START__'  # sentinel for first step
+            max_steps = 500
+            step = 0
+
+            print(f"\nCase {case_id}: Petri-net-memory simulation "
+                  f"for {object_name} ({object_type})")
+
+            while step < max_steps:
+                step += 1
+
+                # ── Check final marking ───────────────────────────────
+                if marking == fm:
+                    print(f"    Final marking reached after "
+                          f"{activity_count} activities.")
+                    break
+                fm_reached = all(
+                    marking.get(p, 0) >= fm[p] for p in fm
+                )
+                if fm_reached and activity_count > 0:
+                    print(f"    Final marking subset reached after "
+                          f"{activity_count} activities.")
+                    break
+
+                # ── Enabled transitions ───────────────────────────────
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after "
+                          f"{activity_count} activities.")
+                    break
+
+                # ── Separate labelled vs silent ───────────────────────
+                label_to_transitions = defaultdict(list)
+                silent_transitions = []
+                for t in enabled:
+                    if t.label is not None:
+                        label_to_transitions[str(t.label).strip()].append(t)
+                    else:
+                        silent_transitions.append(t)
+
+                # Only silent transitions enabled → fire one and loop
+                if not label_to_transitions:
+                    chosen = random.choice(silent_transitions)
+                    marking = self._fire_transition(marking, chosen)
+                    continue
+
+                valid_labels = set(label_to_transitions.keys())
+
+                # ── First step: pick a start activity ─────────────────
+                if activity_count == 0:
+                    start_acts = self._get_start_activities(
+                        object_name, object_type, higher_level_activity
+                    )
+                    constrained_starts = [
+                        a for a in start_acts if a in valid_labels
+                    ]
+                    if not constrained_starts:
+                        constrained_starts = list(valid_labels)
+                    if not constrained_starts:
+                        print(f"    No valid start activities — ending.")
+                        break
+                    chosen_label = random.choice(constrained_starts)
+                    weight_source = 'start'
+
+                else:
+                    # ── Memory-based weight resolution with blending ──
+                    memory_weights = None
+                    weight_source = None
+
+                    # --- Try bigram (2nd-order Markov) -----------------
+                    # Bigram table: (prev_of_current, current) -> {next: count}
+                    # prev_activity = last fired = "current" in bigram
+                    # bigram_prev   = the one before that
+                    bigram_prev = (activity_history[-2]
+                                   if len(activity_history) >= 2
+                                   else '__START__')
+
+                    bigram_context = bigram_transitions.get(
+                        (bigram_prev, prev_activity), {}
+                    )
+                    if bigram_context:
+                        filtered = {
+                            k: v for k, v in bigram_context.items()
+                            if k in valid_labels or k == '__END__'
+                        }
+                        total = sum(filtered.values())
+                        if total >= MIN_CONTEXT_OBSERVATIONS and filtered:
+                            memory_weights = filtered
+                            weight_source = 'bigram'
+
+                    # --- Try activity-count if bigram insufficient -----
+                    if memory_weights is None:
+                        times_seen = max(
+                            activity_counts_map.get(prev_activity, 1) - 1, 0
+                        )
+                        count_context = activity_count_trans.get(
+                            (prev_activity, times_seen), {}
+                        )
+                        if count_context:
+                            filtered = {
+                                k: v for k, v in count_context.items()
+                                if k in valid_labels or k == '__END__'
+                            }
+                            total = sum(filtered.values())
+                            if total >= MIN_CONTEXT_OBSERVATIONS and filtered:
+                                memory_weights = filtered
+                                weight_source = 'activity_count'
+
+                    # --- Build base weights (1st-order, always used) ---
+                    base_weights = {
+                        lbl: label_stochastic.get(lbl, 1.0)
+                        for lbl in valid_labels
+                    }
+
+                    # --- Blend memory with base weights ───────────────
+                    if memory_weights is not None:
+                        # Normalise both to probability distributions
+                        # over the same label set (valid_labels ∪ __END__)
+                        all_keys = set(base_weights.keys())
+                        all_keys.update(memory_weights.keys())
+
+                        mem_total = sum(memory_weights.values())
+                        base_total = sum(base_weights.values())
+
+                        weights = {}
+                        for k in all_keys:
+                            mem_p = (memory_weights.get(k, 0) / mem_total
+                                     if mem_total > 0 else 0)
+                            base_p = (base_weights.get(k, 0) / base_total
+                                      if base_total > 0 else 0)
+                            weights[k] = (MEMORY_BLEND_ALPHA * mem_p
+                                          + (1 - MEMORY_BLEND_ALPHA) * base_p)
+                        weight_source = f'{weight_source}+blend'
+                    else:
+                        weights = base_weights
+                        weight_source = 'label_stochastic'
+
+                    # ── Normalise and sample ──────────────────────────
+                    all_labels = list(weights.keys())
+                    vals = [weights[l] for l in all_labels]
+                    psum = sum(vals)
+                    if psum <= 0:
+                        all_labels = list(valid_labels)
+                        vals = [1.0] * len(all_labels)
+                        psum = sum(vals)
+                    probs = [v / psum for v in vals]
+
+                    chosen_label = str(
+                        np.random.choice(all_labels, p=probs)
+                    ).strip()
+
+                    if chosen_label == '__END__':
+                        print(f"    Selected END transition "
+                              f"(source={weight_source}) — stopping.")
+                        break
+
+                    print(f"    Constrained next: {chosen_label} "
+                          f"(source={weight_source})")
+
+                # ── Fire the Petri net transition ─────────────────────
+                candidates = label_to_transitions.get(chosen_label, [])
+                if not candidates:
+                    print(f"    WARNING: label '{chosen_label}' not in "
+                          f"enabled transitions — ending.")
+                    break
+                chosen_transition = random.choice(candidates)
+                marking = self._fire_transition(marking, chosen_transition)
+
+                # ── Update memory state ───────────────────────────────
+                activity_history.append(chosen_label)
+                activity_counts_map[chosen_label] += 1
+                prev_activity = chosen_label
+
+                # ── Sample duration ───────────────────────────────────
+                _HIST_MODES = (
+                    'ml_duration_only_with_activity_past',
+                    'ml_duration_only_with_activity_past_point_estimate',
+                    'ml_global_model',
+                )
+                hist_for_dur = (
+                    [(a, 0.0) for a in activity_history[-2:]]
+                    if self.mode in _HIST_MODES else None
+                )
+                activity_duration = self._get_activity_duration(
+                    chosen_label, object_name, object_type,
+                    higher_level_activity, object_attributes,
+                    activity_history=hist_for_dur,
+                    activity_index=activity_count,
+                )
+
+                # Timestamps
+                start_time_obj = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += activity_duration * 60
+                end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id, activity=chosen_label,
+                    timestamp_start=start_time_obj,
+                    timestamp_end=end_time_obj,
+                    object_name=object_name,
+                    object_type=object_type,
+                    higher_level_activity=higher_level_activity,
+                    object_attributes=object_attributes,
+                )
+
+                activity_count += 1
+                current_sim_time += 1  # 1 second gap
+
+                print(f"    [{activity_count}] '{chosen_label}' "
+                      f"(dur={activity_duration:.1f} min, "
+                      f"src={weight_source})")
+
+            if step >= max_steps:
+                print(f"    WARNING: Max steps ({max_steps}) reached.")
+
+            print(f"  Completed {object_name} petri_net_statistical_memory "
+                  f"with {activity_count} activities")
+
     def _simulate_statistical_for_object(self, case_id, object_attributes,
                                           current_sim_time, object_name,
                                           object_type,
@@ -829,6 +1116,13 @@ class ProcessSimulation:
         # ── Petri net + statistical combined mode ─────────────────────
         if self.mode == 'petri_net_statistical':
             self._simulate_petri_net_statistical_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── Petri net + memory (history-dependent) mode ───────────────
+        if self.mode == 'petri_net_statistical_memory':
+            self._simulate_petri_net_statistical_memory_for_case(
                 case_id, object_attributes, start_time
             )
             return

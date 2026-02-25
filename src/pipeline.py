@@ -1233,10 +1233,11 @@ MODES_TO_COMPARE = [
     'statistical',
     'petri_net',
     'petri_net_statistical',
-    'ml_duration_only',
-    'ml_duration_only_with_activity_past',
-    'ml_duration_only_with_activity_past_point_estimate',
-    'ml_global_model',
+    'petri_net_statistical_memory',
+    #'ml_duration_only',
+    #'ml_duration_only_with_activity_past',
+    #'ml_duration_only_with_activity_past_point_estimate',
+    #'ml_global_model',
 ]
 
 # Initialize a list to store results for each process × mode
@@ -1306,7 +1307,7 @@ for process in process_datasets_to_model.keys():
         print("─"*80)
 
         mode_ml = ml_models if sim_mode not in ('statistical', 'petri_net') else None
-        mode_pm = process_models if sim_mode in ('petri_net', 'petri_net_statistical') else None
+        mode_pm = process_models if sim_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
         simulated_log = ProcessSimulation(
             activity_stats_df, production_plan,
@@ -1388,18 +1389,57 @@ evaluation_results_df.to_parquet(
 )
 evaluation_results_df
 
+# ── Per-process breakdown: show modes sorted by test_overall_score ────────
+print("\n" + "="*80)
+print("PER-PROCESS RESULTS — MODES SORTED BY test_overall_score")
+print("="*80)
+
+sort_col = 'test_overall_score'
+if sort_col in evaluation_results_df.columns:
+    # Columns to display (key columns only for readability)
+    display_cols = ['process', 'mode', 'split']
+    for prefix in ['test', 'train']:
+        for col_name in ['overall_score', 'quality_assessment']:
+            full = f"{prefix}_{col_name}"
+            if full in evaluation_results_df.columns:
+                display_cols.append(full)
+    # Add all test_ metric columns for full visibility
+    test_metric_cols = [c for c in evaluation_results_df.columns
+                        if c.startswith('test_') and c not in display_cols]
+    display_cols.extend(test_metric_cols)
+    display_cols = [c for c in display_cols if c in evaluation_results_df.columns]
+
+    for process_name, grp in evaluation_results_df.groupby('process'):
+        print(f"\n{'─'*80}")
+        print(f"  PROCESS: {process_name}")
+        print(f"{'─'*80}")
+        sorted_grp = grp.sort_values(sort_col, ascending=False)
+        # Pretty-print with pandas
+        with pd.option_context('display.max_columns', None,
+                               'display.width', 200,
+                               'display.max_colwidth', 30):
+            print(sorted_grp[display_cols].to_string(index=False))
+else:
+    print(f"  Column '{sort_col}' not found — skipping per-process ranking.")
+    print(f"  Available columns: {list(evaluation_results_df.columns)}")
+
+# %% 
+
+# %% [markdown]
+# # Data fusion
+
 # %% 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLOTLY VISUALIZATION — TEST RESULTS COMPARISON BY METRIC
+# PLOTLY VISUALIZATION — MODE COMPARISON DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════════
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# Select test columns (numeric only) and define display-friendly names
+# Select test columns (numeric only)
 test_cols = [c for c in evaluation_results_df.columns
              if c.startswith('test_') and evaluation_results_df[c].dtype in ('float64', 'float32', 'int64')]
 
-# Metrics where LOWER is better (errors, divergences, KS statistics)
+# Metrics where LOWER is better
 lower_is_better = {
     'test_basic_metrics_event_count_error',
     'test_basic_metrics_case_count_error',
@@ -1414,7 +1454,7 @@ lower_is_better = {
     'test_case_metrics_median_events_per_case_error',
 }
 
-# Metrics where HIGHER is better (scores, ratios, F1, coverage)
+# Metrics where HIGHER is better
 higher_is_better = {
     'test_overall_score',
     'test_basic_metrics_event_count_ratio',
@@ -1429,84 +1469,274 @@ higher_is_better = {
     'test_control_flow_metrics_end_activities_jaccard',
 }
 
-# Filter to only columns that actually exist
+# Filter to existing columns
 test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
 
-if test_cols and 'mode' in evaluation_results_df.columns:
-    n_metrics = len(test_cols)
-    n_cols_grid = 3
-    n_rows_grid = (n_metrics + n_cols_grid - 1) // n_cols_grid
+# Color palette for modes
+mode_colors = {
+    'statistical': '#636EFA',
+    'petri_net': '#EF553B',
+    'petri_net_statistical': '#00CC96',
+    'petri_net_statistical_memory': '#B6E880',
+    'ml_duration_only': '#AB63FA',
+    'ml_duration_only_with_activity_past': '#FFA15A',
+    'ml_duration_only_with_activity_past_point_estimate': '#19D3F3',
+    'ml_global_model': '#FF6692',
+}
 
-    fig = make_subplots(
-        rows=n_rows_grid, cols=n_cols_grid,
-        subplot_titles=[c.replace('test_', '').replace('_', ' ').title()
-                        for c in test_cols],
-        vertical_spacing=0.08,
-        horizontal_spacing=0.08,
+if test_cols and 'mode' in evaluation_results_df.columns:
+
+    # ──────────────────────────────────────────────────────────────────
+    # Helper: normalise all metrics to 0-1 scale where 1 = BEST
+    # ──────────────────────────────────────────────────────────────────
+    def _normalise_metrics(df, cols, lower_set):
+        """Min-max normalise. For lower-is-better, invert so 1 = best."""
+        norm_df = df.copy()
+        for c in cols:
+            vals = df[c].dropna()
+            if len(vals) == 0:
+                continue
+            vmin, vmax = vals.min(), vals.max()
+            rng = vmax - vmin if vmax != vmin else 1.0
+            if c in lower_set:
+                # Invert: lowest raw → 1.0, highest raw → 0.0
+                norm_df[c] = (vmax - df[c]) / rng
+            else:
+                norm_df[c] = (df[c] - vmin) / rng
+        return norm_df
+
+    # Create short display labels for metrics
+    short_labels = {c: c.replace('test_', '').replace('_metrics_', ': ')
+                       .replace('_', ' ').title()
+                    for c in test_cols}
+
+    # ══════════════════════════════════════════════════════════════════
+    # CHART 1: HEATMAP — all modes × all metrics (normalised 0-1)
+    # ══════════════════════════════════════════════════════════════════
+    print("\n📊 Chart 1: Heatmap — mode × metric comparison")
+
+    # Average across processes for global view, per mode
+    mode_avg = evaluation_results_df.groupby('mode')[test_cols].mean()
+    mode_avg_norm = _normalise_metrics(mode_avg, test_cols, lower_is_better)
+
+    # Sort modes by overall score if available
+    if 'test_overall_score' in mode_avg.columns:
+        mode_avg_norm = mode_avg_norm.sort_values('test_overall_score', ascending=False)
+
+    fig_heatmap = go.Figure(data=go.Heatmap(
+        z=mode_avg_norm[test_cols].values,
+        x=[short_labels[c] for c in test_cols],
+        y=mode_avg_norm.index.tolist(),
+        colorscale='RdYlGn',
+        zmin=0, zmax=1,
+        text=mode_avg[test_cols].reindex(mode_avg_norm.index).values.round(3),
+        texttemplate='%{text}',
+        textfont=dict(size=9),
+        hovertemplate='Mode: %{y}<br>Metric: %{x}<br>Normalised: %{z:.2f}<br>Raw: %{text}<extra></extra>',
+        colorbar=dict(title='Score<br>(1=best)', tickvals=[0, 0.5, 1],
+                      ticktext=['Worst', 'Mid', 'Best']),
+    ))
+    fig_heatmap.update_layout(
+        title='<b>Mode Comparison Heatmap</b><br>'
+              '<sup>Normalised 0-1 (green = best). Raw values shown in cells.</sup>',
+        height=max(350, 60 * len(mode_avg_norm)),
+        width=max(900, 70 * len(test_cols)),
+        xaxis=dict(tickangle=45, tickfont=dict(size=9), side='bottom'),
+        yaxis=dict(tickfont=dict(size=11), autorange='reversed'),
+        margin=dict(l=200, b=180, t=80),
+    )
+    fig_heatmap.show()
+
+    # ══════════════════════════════════════════════════════════════════
+    # CHART 2: RADAR CHART — one per process, all modes overlaid
+    # ══════════════════════════════════════════════════════════════════
+    print("📊 Chart 2: Radar charts — mode profiles per process")
+
+    # Select a subset of key metrics for the radar (too many = unreadable)
+    radar_metrics = [c for c in [
+        'test_overall_score',
+        'test_control_flow_metrics_edge_f1_score',
+        'test_control_flow_metrics_start_activities_jaccard',
+        'test_control_flow_metrics_end_activities_jaccard',
+        'test_activity_metrics_activity_coverage_ratio',
+        'test_activity_metrics_js_divergence',
+        'test_duration_metrics_ks_statistic',
+        'test_basic_metrics_event_count_error',
+        'test_case_metrics_events_per_case_ks',
+    ] if c in test_cols]
+
+    radar_labels = [short_labels[c] for c in radar_metrics]
+    processes = evaluation_results_df['process'].unique()
+
+    n_proc = len(processes)
+    fig_radar = make_subplots(
+        rows=1, cols=n_proc,
+        specs=[[{'type': 'polar'}] * n_proc],
+        subplot_titles=[str(p) for p in processes],
     )
 
-    # Color palette for modes
-    mode_colors = {
-        'statistical': '#636EFA',
-        'petri_net': '#EF553B',
-        'petri_net_statistical': '#00CC96',
-        'ml_duration_only': '#AB63FA',
-        'ml_duration_only_with_activity_past': '#FFA15A',
-        'ml_duration_only_with_activity_past_point_estimate': '#19D3F3',
-        'ml_global_model': '#FF6692',
-    }
+    modes = evaluation_results_df['mode'].unique()
+    for proc_idx, proc in enumerate(processes):
+        proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
+        proc_norm = _normalise_metrics(proc_df, radar_metrics, lower_is_better)
 
-    for idx, col in enumerate(test_cols):
-        row = idx // n_cols_grid + 1
-        col_pos = idx % n_cols_grid + 1
+        for mode in modes:
+            mode_row = proc_norm[proc_norm['mode'] == mode]
+            if mode_row.empty:
+                continue
+            vals = mode_row[radar_metrics].iloc[0].tolist()
+            # Close the polygon
+            vals_closed = vals + [vals[0]]
+            labels_closed = radar_labels + [radar_labels[0]]
 
-        # Sort modes: best first
-        ascending = col in lower_is_better
-        df_sorted = evaluation_results_df[['mode', col]].dropna().sort_values(
-            col, ascending=ascending
-        )
-
-        for _, r in df_sorted.iterrows():
-            mode_name = r['mode']
-            fig.add_trace(
-                go.Bar(
-                    x=[mode_name],
-                    y=[r[col]],
-                    name=mode_name,
-                    marker_color=mode_colors.get(mode_name, '#888'),
-                    showlegend=(idx == 0),  # legend only on first subplot
-                    legendgroup=mode_name,
+            fig_radar.add_trace(
+                go.Scatterpolar(
+                    r=vals_closed,
+                    theta=labels_closed,
+                    name=mode,
+                    line=dict(color=mode_colors.get(mode, '#888'), width=2),
+                    fill='toself',
+                    opacity=0.3,
+                    showlegend=(proc_idx == 0),
+                    legendgroup=mode,
                 ),
-                row=row, col=col_pos,
+                row=1, col=proc_idx + 1,
             )
 
-        # Add "direction" annotation
-        direction = "↓ lower is better" if col in lower_is_better else "↑ higher is better"
-        fig.add_annotation(
-            text=direction, xref=f"x{idx+1}", yref=f"y{idx+1}",
-            x=0.5, y=1.05, xanchor='center', yanchor='bottom',
-            showarrow=False, font=dict(size=9, color='gray'),
-        )
-
-    fig.update_layout(
-        title_text="<b>Test Set Evaluation — All Metrics by Simulation Mode</b><br>"
-                   "<sup>Bars sorted by best-performing mode (leftmost = best)</sup>",
-        height=350 * n_rows_grid,
-        width=1200,
-        showlegend=True,
-        legend=dict(orientation='h', yanchor='bottom', y=-0.02, xanchor='center', x=0.5),
+    fig_radar.update_polars(
+        radialaxis=dict(range=[0, 1], tickvals=[0.25, 0.5, 0.75, 1.0],
+                        tickfont=dict(size=8)),
+        angularaxis=dict(tickfont=dict(size=8)),
     )
-    fig.update_xaxes(tickangle=45, tickfont=dict(size=8))
-    fig.show()
-    print("✅ Plotly visualization displayed.")
+    fig_radar.update_layout(
+        title='<b>Mode Profiles — Radar Chart per Process</b><br>'
+              '<sup>Normalised 0-1 (outer = best). Overlapping areas show where modes agree.</sup>',
+        height=500,
+        width=max(500 * n_proc, 800),
+        legend=dict(orientation='h', yanchor='bottom', y=-0.15,
+                    xanchor='center', x=0.5, font=dict(size=10)),
+    )
+    fig_radar.show()
+
+    # ══════════════════════════════════════════════════════════════════
+    # CHART 3: GROUPED BARS — key metrics, modes side by side per process
+    # ══════════════════════════════════════════════════════════════════
+    print("📊 Chart 3: Grouped bar comparison — key metrics per process")
+
+    key_metrics = [c for c in [
+        'test_overall_score',
+        'test_control_flow_metrics_edge_f1_score',
+        'test_activity_metrics_js_divergence',
+        'test_duration_metrics_ks_statistic',
+        'test_case_metrics_events_per_case_ks',
+    ] if c in test_cols]
+
+    n_key = len(key_metrics)
+    fig_bars = make_subplots(
+        rows=n_key, cols=1,
+        subplot_titles=[short_labels[c] + (' ↓' if c in lower_is_better else ' ↑')
+                        for c in key_metrics],
+        vertical_spacing=0.12,
+        shared_xaxes=True,
+    )
+
+    # X-axis = process names, one group of bars per mode
+    x_labels = [str(p) for p in processes]
+
+    for m_idx, metric in enumerate(key_metrics):
+        for mode in modes:
+            mode_df = evaluation_results_df[evaluation_results_df['mode'] == mode]
+            y_vals = []
+            for proc in processes:
+                row_val = mode_df[mode_df['process'] == proc][metric]
+                y_vals.append(float(row_val.iloc[0]) if len(row_val) > 0 else None)
+
+            fig_bars.add_trace(
+                go.Bar(
+                    x=x_labels, y=y_vals,
+                    name=mode,
+                    marker_color=mode_colors.get(mode, '#888'),
+                    showlegend=(m_idx == 0),
+                    legendgroup=mode,
+                ),
+                row=m_idx + 1, col=1,
+            )
+
+    fig_bars.update_layout(
+        title='<b>Key Metrics — Side-by-Side per Process</b><br>'
+              '<sup>↑ = higher is better, ↓ = lower is better</sup>',
+        height=280 * n_key,
+        width=max(800, 150 * len(x_labels) * len(modes)),
+        barmode='group',
+        legend=dict(orientation='h', yanchor='bottom', y=-0.05,
+                    xanchor='center', x=0.5, font=dict(size=10)),
+    )
+    fig_bars.update_xaxes(tickfont=dict(size=10))
+    fig_bars.show()
+
+    # ══════════════════════════════════════════════════════════════════
+    # CHART 4: RANKING TABLE — which mode wins on each metric × process
+    # ══════════════════════════════════════════════════════════════════
+    print("\n📊 Chart 4: Win count table — how many metrics each mode wins per process")
+
+    win_rows = []
+    for proc in processes:
+        proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
+        wins = {m: 0 for m in modes}
+        for c in test_cols:
+            vals = proc_df[['mode', c]].dropna()
+            if vals.empty:
+                continue
+            if c in lower_is_better:
+                best_idx = vals[c].idxmin()
+            else:
+                best_idx = vals[c].idxmax()
+            winner = vals.loc[best_idx, 'mode']
+            wins[winner] = wins.get(winner, 0) + 1
+        for m, count in wins.items():
+            win_rows.append({'process': proc, 'mode': m, 'wins': count})
+
+    wins_df = pd.DataFrame(win_rows)
+    wins_pivot = wins_df.pivot(index='mode', columns='process', values='wins').fillna(0)
+    wins_pivot['TOTAL'] = wins_pivot.sum(axis=1)
+    wins_pivot = wins_pivot.sort_values('TOTAL', ascending=False)
+
+    print("\n" + "="*60)
+    print("  METRIC WINS PER MODE (across all test metrics)")
+    print("="*60)
+    with pd.option_context('display.max_columns', None, 'display.width', 120):
+        print(wins_pivot.to_string())
+
+    # Also show as heatmap
+    fig_wins = go.Figure(data=go.Heatmap(
+        z=wins_pivot.values,
+        x=wins_pivot.columns.tolist(),
+        y=wins_pivot.index.tolist(),
+        colorscale='Blues',
+        text=wins_pivot.values.astype(int),
+        texttemplate='%{text}',
+        textfont=dict(size=14),
+        hovertemplate='Mode: %{y}<br>Process: %{x}<br>Wins: %{text}<extra></extra>',
+    ))
+    fig_wins.update_layout(
+        title='<b>Metric Wins per Mode × Process</b><br>'
+              '<sup>How many metrics each mode is #1 on (darker = more wins)</sup>',
+        height=max(300, 50 * len(wins_pivot)),
+        width=max(500, 100 * len(wins_pivot.columns)),
+        yaxis=dict(autorange='reversed'),
+        margin=dict(l=200, t=80),
+    )
+    fig_wins.show()
+
+    print("✅ All comparison charts displayed.")
 else:
     print("⚠️ No test metrics found in evaluation_results_df (TEMPORAL_SPLIT may be off).")
 
 # %% 
-Stop
+
 # %% [markdown]
 # # Data fusion
-
+stop
 # %%
 # Modelling the curves
 

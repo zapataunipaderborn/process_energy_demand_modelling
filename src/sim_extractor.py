@@ -199,6 +199,66 @@ def _derive_transitions_from_net(net, im, fm, sub_log, sub_df):
 
 
 # ---------------------------------------------------------------------------
+# History-dependent transition extraction (for memory-augmented simulation)
+# ---------------------------------------------------------------------------
+
+def _extract_history_weights(case_sorted):
+    """
+    Walk per-case activity sequences and build history-dependent
+    transition statistics.
+
+    Returns
+    -------
+    bigram_transitions : dict
+        {(prev_activity, current_activity): {next_activity: count}}
+        Second-order Markov: P(next | current, previous).
+    activity_count_transitions : dict
+        {(current_activity, times_current_seen_so_far): {next_activity: count}}
+        Repetition-aware: P(next | current, how many times current has
+        already appeared in this case).
+    """
+    bigram_transitions = defaultdict(lambda: defaultdict(int))
+    activity_count_transitions = defaultdict(lambda: defaultdict(int))
+
+    for case_id, case_acts in case_sorted.items():
+        if len(case_acts) == 0:
+            continue
+
+        activity_counter = defaultdict(int)  # how many times each activity seen so far
+
+        for idx in range(len(case_acts)):
+            current_act = case_acts.iloc[idx]['activity']
+
+            # Previous activity (for bigram)
+            prev_act = case_acts.iloc[idx - 1]['activity'] if idx > 0 else '__START__'
+
+            # How many times this activity has been seen before in this case
+            times_seen = activity_counter[current_act]
+            activity_counter[current_act] += 1
+
+            # Next activity
+            if idx + 1 < len(case_acts):
+                next_act = case_acts.iloc[idx + 1]['activity']
+            else:
+                next_act = '__END__'
+
+            # Record bigram: (prev, current) -> next
+            bigram_transitions[(prev_act, current_act)][next_act] += 1
+
+            # Record activity-count: (current, times_seen) -> next
+            activity_count_transitions[(current_act, times_seen)][next_act] += 1
+
+    # Convert defaultdicts to plain dicts for serialisation safety
+    bigram_transitions = {k: dict(v) for k, v in bigram_transitions.items()}
+    activity_count_transitions = {k: dict(v) for k, v in activity_count_transitions.items()}
+
+    print(f"    History weights: {len(bigram_transitions)} bigram keys, "
+          f"{len(activity_count_transitions)} activity-count keys")
+
+    return bigram_transitions, activity_count_transitions
+
+
+# ---------------------------------------------------------------------------
 # Shared: duration + raw-row extraction per activity (used by ALL modes)
 # ---------------------------------------------------------------------------
 
@@ -468,6 +528,11 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         if t.label is not None:
             label_stochastic[str(t.label).strip()] += weight
 
+    # ── Extract history-dependent transition weights ───────────────
+    bigram_transitions, activity_count_transitions = _extract_history_weights(
+        case_sorted
+    )
+
     process_model = {
         'net': net,
         'im': im,
@@ -475,6 +540,8 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         'stochastic_map': stochastic_map,
         'label_stochastic': dict(label_stochastic),
         'duration_map': duration_map,
+        'bigram_transitions': bigram_transitions,
+        'activity_count_transitions': activity_count_transitions,
     }
 
     return stats, process_model
@@ -523,7 +590,7 @@ def extract_process(df, mining_algorithm='inductive'):
     # Noise threshold is only used by the Inductive Miner.
     # 0.0 = keep all (identical to statistical), 0.2 = moderate filtering,
     # higher = stricter model with fewer paths.
-    noise_threshold = 0.6
+    noise_threshold = 0.2
 
     all_stats = []
     all_raw_rows = []
