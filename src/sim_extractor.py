@@ -105,9 +105,46 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
     net, im, fm : PetriNet, Marking, Marking
     """
     if algorithm == 'inductive':
-        net, im, fm = pm4py.discover_petri_net_inductive(
-            sub_log, noise_threshold=noise_threshold
-        )
+        if noise_threshold == 'tune':
+            print(f"    Tuning noise_threshold for Inductive Miner...")
+            best_net, best_im, best_fm = None, None, None
+            results = []
+            
+            # Test a grid of thresholds
+            for nt in [0.0, 0.2, 0.4, 0.6, 0.8]:
+                try:
+                    net_cand, im_cand, fm_cand = pm4py.discover_petri_net_inductive(
+                        sub_log, noise_threshold=nt
+                    )
+                    # Compute fitness using token replay
+                    replay_res = token_replay.apply(
+                        sub_log, net_cand, im_cand, fm_cand,
+                        parameters={'consider_remaining_in_fitness': True}
+                    )
+                    fitness = sum(r.get('trace_fitness', 0.0) for r in replay_res) / len(replay_res) if replay_res else 0.0
+                    results.append((nt, fitness, net_cand, im_cand, fm_cand))
+                    print(f"      nt={nt:.1f} -> fitness={fitness:.4f}")
+                except Exception as e:
+                    print(f"      nt={nt:.1f} -> Failed: {e}")
+                    
+            if not results:
+                # Fallback if tuning fails
+                print(f"      Tuning failed, falling back to nt=0.2")
+                net, im, fm = pm4py.discover_petri_net_inductive(sub_log, noise_threshold=0.2)
+            else:
+                # We want the highest noise threshold (simplest model) that maintains good fitness (> 0.8)
+                acceptable = [r for r in results if r[1] >= 0.8]
+                if acceptable:
+                    best_r = max(acceptable, key=lambda x: x[0])
+                else:
+                    best_r = max(results, key=lambda x: x[1])
+                
+                print(f"    Selected best noise_threshold: {best_r[0]:.1f} with fitness {best_r[1]:.4f}")
+                net, im, fm = best_r[2], best_r[3], best_r[4]
+        else:
+            net, im, fm = pm4py.discover_petri_net_inductive(
+                sub_log, noise_threshold=noise_threshold
+            )
     elif algorithm == 'heuristic':
         net, im, fm = pm4py.discover_petri_net_heuristics(sub_log)
     elif algorithm == 'alpha':

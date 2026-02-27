@@ -1042,7 +1042,13 @@ class SimModeller:
             X[col] = pd.to_numeric(X[col], errors='coerce')
         X = X.fillna(0.0)
 
-        probs = tr_model.predict_proba(X)[0]
+        if hasattr(tr_model, 'predict_proba'):
+            probs = tr_model.predict_proba(X)[0]
+        else:
+            pred_class = int(round(tr_model.predict(X)[0]))
+            probs = np.zeros(len(le.classes_))
+            if 0 <= pred_class < len(probs):
+                probs[pred_class] = 1.0
         return {
             str(cls): float(prob)
             for cls, prob in zip(le.classes_, probs)

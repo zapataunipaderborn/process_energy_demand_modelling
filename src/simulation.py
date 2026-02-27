@@ -1071,6 +1071,201 @@ class ProcessSimulation:
             print(f"  Completed {object_name} petri_net_statistical_memory "
                   f"with {activity_count} activities")
 
+    # ------------------------------------------------------------------
+    # Petri net structure + ML Probabilities (And Look-ahead routing)
+    # ------------------------------------------------------------------
+    def _simulate_petri_net_ml_for_case(self, case_id, object_attributes, start_time):
+        """
+        Simulate one case using ML-guided Petri net routing, Context-aware duration sampling,
+        Smart silent transition resolution (look-ahead routing), and End-of-case prediction.
+        """
+        current_sim_time = start_time.timestamp()
+        unique_objects = self.activity_stats[['object', 'object_type', 'higher_level_activity']].drop_duplicates()
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = str(obj_config['higher_level_activity']).strip() if pd.notna(obj_config['higher_level_activity']) else None
+            key = (object_name, object_type, higher_level_activity)
+
+            model = self.process_models.get(key) if self.process_models else None
+            if model is None:
+                print(f"  ⚠️ No Petri net for {key} — falling back to statistical simulation.")
+                self._simulate_statistical_for_object(case_id, object_attributes, current_sim_time, object_name, object_type, higher_level_activity)
+                continue
+
+            net = model['net']
+            im = model['im']
+            fm = model['fm']
+            max_case_length = model.get('max_case_length', 200)
+
+            marking = copy.copy(im)
+            activity_count = 0
+            activity_history = []
+            max_steps = max(max_case_length * 2, 50)
+            step = 0
+
+            print(f"\nCase {case_id}: Petri-net-ML simulation for {object_name} ({object_type})")
+
+            # Look-ahead helper for silent transitions
+            def get_reachable_labels(marking_, net_, max_depth=5):
+                reachable = set()
+                visited_markings = []
+                queue = [(marking_, 0)]
+                while queue:
+                    m, depth = queue.pop(0)
+                    if depth >= max_depth:
+                        continue
+                    # Approximate hashable marking for visited check
+                    m_hash = tuple(sorted((p.name, count) for p, count in m.items()))
+                    if m_hash in visited_markings:
+                        continue
+                    visited_markings.append(m_hash)
+
+                    for t in self._get_enabled_transitions(net_, m):
+                        if t.label is not None:
+                            reachable.add(str(t.label).strip())
+                        else:
+                            m_next = self._fire_transition(m, t)
+                            queue.append((m_next, depth + 1))
+                return frozenset(reachable)
+
+            while step < max_steps:
+                step += 1
+
+                # Check if we reached final marking exactly
+                if marking == fm:
+                    print(f"    Final marking reached after {activity_count} activities.")
+                    break
+                
+                # Check subset final marking
+                fm_reached = all(marking.get(p, 0) >= fm[p] for p in fm)
+                
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after {activity_count} activities.")
+                    break
+
+                # Separate silent vs labeled
+                label_to_transitions = defaultdict(list)
+                silent_transitions = []
+                for t in enabled:
+                    if t.label is not None:
+                        label_to_transitions[str(t.label).strip()].append(t)
+                    else:
+                        silent_transitions.append(t)
+
+                valid_labels = set(label_to_transitions.keys())
+
+                # Feature 1: Get ML Predictions for ALL possible next steps based on History & Attributes
+                prev_activity = activity_history[0][0] if activity_history else '__START__'
+                ml_probs = None
+                if self.ml_models is not None:
+                    # In `_get_next_activity`, it predicts transitions using ML
+                    ml_probs = self.ml_models.predict_transitions(
+                        prev_activity, object_name, object_type,
+                        higher_level_activity, object_attributes
+                    )
+
+                # Fallback to statistical if ML not available
+                if not ml_probs:
+                    prev_key = (prev_activity, object_name, object_type, higher_level_activity)
+                    if prev_key in self.activity_config:
+                        ml_probs = self.activity_config[prev_key].get('transitions', {})
+                    else:
+                        ml_probs = {}
+
+                # Feature 2: Smart Silent Transition Resolution (Look-Ahead Routing)
+                if silent_transitions and not label_to_transitions:
+                    # Only silent transitions enabled. Use the ML probs to pick the one that leads to the most probable label
+                    best_silent = None
+                    best_score = -1.0
+
+                    for st in silent_transitions:
+                        m_next = self._fire_transition(marking, st)
+                        reachable = get_reachable_labels(m_next, net)
+                        score = sum(ml_probs.get(lbl, 0.0) for lbl in reachable) if ml_probs else 1.0
+                        if score > best_score:
+                            best_score = score
+                            best_silent = st
+                    
+                    chosen_silent = best_silent if best_silent else random.choice(silent_transitions)
+                    marking = self._fire_transition(marking, chosen_silent)
+                    continue
+
+                if not label_to_transitions:
+                    break
+
+                # Feature 3: End-of-Case Prediction Integration
+                allow_end = False
+                end_prob = ml_probs.get('__END__', 0.0) if ml_probs else 0.0
+                
+                # If we are in a valid end state (subset of fm) AND ML favors ending highly
+                if fm_reached and end_prob > 0.5:
+                    print(f"    ML highly predicts __END__ ({end_prob:.2f}) and fm subset reached. Terminating early.")
+                    break
+
+                # Feature 4: ML-Guided Petri Net Routing (Masking)
+                # Filter ml probabilities to ONLY allow structurally valid labels
+                masked_probs = {lbl: ml_probs.get(lbl, 0.0) for lbl in valid_labels}
+                
+                sum_masked = sum(masked_probs.values())
+                if sum_masked > 0:
+                    probs = [masked_probs[lbl] / sum_masked for lbl in valid_labels]
+                else:
+                    # Fallback to uniform over valid labels if ML gave 0 to all valid labels
+                    probs = [1.0 / len(valid_labels)] * len(valid_labels)
+
+                chosen_label = str(np.random.choice(list(valid_labels), p=probs)).strip()
+
+                print(f"    Constrained ML Next: {chosen_label} (prob={dict(zip(list(valid_labels), probs)).get(chosen_label, 0):.2f})")
+
+                # Fire transition
+                candidates = label_to_transitions.get(chosen_label, [])
+                chosen_transition = random.choice(candidates)
+                marking = self._fire_transition(marking, chosen_transition)
+
+                # Feature 5: Context-Aware Duration Sampling
+                _HIST_MODES = ('ml_duration_only_with_activity_past', 'ml_global_model')
+                # For `petri_net_ml`, we manually tell _get_activity_duration to use the ML model
+                # Wait, if mode='petri_net_ml', _get_activity_duration doesn't use ML by default unless we tweak it.
+                # Let's temporarily flip the mode to 'ml' strictly for the duration call so it uses the XGBoost regressor.
+                original_mode = self.mode
+                self.mode = 'ml'
+                activity_duration = self._get_activity_duration(
+                    chosen_label, object_name, object_type, higher_level_activity,
+                    object_attributes=object_attributes,
+                    activity_history=activity_history,
+                    activity_index=activity_count
+                )
+                self.mode = original_mode
+
+                # Timestamps
+                start_time_obj = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += activity_duration * 60
+                end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id, activity=chosen_label,
+                    timestamp_start=start_time_obj, timestamp_end=end_time_obj,
+                    object_name=object_name, object_type=object_type,
+                    higher_level_activity=higher_level_activity,
+                    object_attributes=object_attributes,
+                )
+
+                activity_history.insert(0, (chosen_label, activity_duration))
+                activity_history = activity_history[:2]
+                activity_count += 1
+                current_sim_time += 1
+
+                print(f"    [{activity_count}] '{chosen_label}' (dur={activity_duration:.1f} min)")
+
+            if step >= max_steps:
+                print(f"    WARNING: Max steps ({max_steps}) reached.")
+            
+            print(f"  Completed {object_name} petri_net_ml with {activity_count} activities")
+
+
     def _simulate_statistical_for_object(self, case_id, object_attributes,
                                           current_sim_time, object_name,
                                           object_type,
@@ -1146,6 +1341,13 @@ class ProcessSimulation:
         # ── Petri net + memory (history-dependent) mode ───────────────
         if self.mode == 'petri_net_statistical_memory':
             self._simulate_petri_net_statistical_memory_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── Petri net + ML (new approach) ─────────────────────────────
+        if self.mode == 'petri_net_ml':
+            self._simulate_petri_net_ml_for_case(
                 case_id, object_attributes, start_time
             )
             return

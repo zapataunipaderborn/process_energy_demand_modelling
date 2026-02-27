@@ -1234,6 +1234,7 @@ MODES_TO_COMPARE = [
     'petri_net',
     'petri_net_statistical',
     'petri_net_statistical_memory',
+    'petri_net_ml',
     #'ml_duration_only',
     #'ml_duration_only_with_activity_past',
     #'ml_duration_only_with_activity_past_point_estimate',
@@ -1253,7 +1254,12 @@ for process in process_datasets_to_model.keys():
     production_plan = train_datasets[process]['production_plan']
 
     # ── Extract process statistics (from TRAIN only — shared by both modes)
-    activity_stats_df, raw_df, process_models = extract_process(df_train, mining_algorithm=MINING_ALGORITHM)
+    nt = 'tune' if 'petri_net_ml' in MODES_TO_COMPARE else 0.2
+    activity_stats_df, raw_df, process_models = extract_process(
+        df_train,
+        mining_algorithm=MINING_ALGORITHM,
+        noise_threshold=nt
+    )
 
     # ── Visualize mined Petri nets ────────────────────────────────────────
     if process_models:
@@ -1295,7 +1301,7 @@ for process in process_datasets_to_model.keys():
             model_types=ML_MODEL_TYPES,
             optimize_hyperparams=ML_OPTIMIZE_HYPERPARAMS,
             n_optuna_trials=ML_OPTUNA_TRIALS,
-            train_transitions=False,   # only duration for ml_duration_only
+            train_transitions=('petri_net_ml' in MODES_TO_COMPARE or 'ml' in MODES_TO_COMPARE),
         )
         ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
@@ -1307,7 +1313,7 @@ for process in process_datasets_to_model.keys():
         print("─"*80)
 
         mode_ml = ml_models if sim_mode not in ('statistical', 'petri_net') else None
-        mode_pm = process_models if sim_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
+        mode_pm = process_models if sim_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory', 'petri_net_ml') else None
 
         simulated_log = ProcessSimulation(
             activity_stats_df, production_plan,
@@ -1361,6 +1367,28 @@ for process in process_datasets_to_model.keys():
                         flattened[f"test_{category}_{metric_name}"] = value
                 else:
                     flattened[f"test_{category}"] = metrics
+                    
+            # ── Evaluate Full Case Profile (Process + Energy) ──
+            try:
+                # We need the sensor name. In this global evaluation block we don't naturally 
+                # have it iterating over 'sensors_to_model' like the Step 1-4 loop does.
+                # However, we can grab the first available sensor for this process from the config.
+                sensors = process_datasets_to_model_sensors.get(process, {}).get('sensors_to_model', [])
+                if sensors:
+                    target_sensor = sensors[0]
+                    # We only have energy_pipelines if the STEP 1-4 loop ran beforehand.
+                    # Assuming the pipelines are trained and stored in the global 'energy_pipelines' dict:
+                    full_emd = evaluate_full_simulated_cases(
+                        simulated_log, 
+                        df_test, 
+                        energy_pipelines, 
+                        target_sensor, 
+                        verbose=1
+                    )
+                    if full_emd is not None and not np.isnan(full_emd):
+                        flattened['test_full_profile_emd'] = full_emd
+            except Exception as e:
+                print(f"    [!] Full profile evaluation failed: {e}")
 
         evaluation_results_list.append(flattened)
 
@@ -1688,7 +1716,7 @@ if test_cols and 'mode' in evaluation_results_df.columns:
 
 # %% [markdown]
 # # Data fusion
-stop
+
 # %%
 # Modelling the curves
 
@@ -2270,6 +2298,7 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
 # =============================================================================
 
 def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1):
+    from scipy.stats import wasserstein_distance
     """
     Evaluate the trained pipeline on completely unseen, raw test curves.
     Ground truth = raw_values (never warped, never seen during training).
@@ -2298,6 +2327,7 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
         rmse = np.sqrt(mean_squared_error(raw_values, y_pred))
         r2   = r2_score(raw_values, y_pred)
         wape = np.sum(np.abs(raw_values - y_pred)) / np.sum(np.abs(raw_values)) * 100
+        emd  = wasserstein_distance(raw_values, y_pred)
 
         per_curve_metrics.append({
             'instance_id': curve['instance_id'],
@@ -2306,6 +2336,7 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
             'MAE':         mae,
             'RMSE':        rmse,
             'WAPE (%)':    wape,
+            'EMD':         emd,
             'R2':          r2,
         })
 
@@ -2320,6 +2351,7 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
         'MAE':      mean_absolute_error(all_true, all_pred),
         'RMSE':     np.sqrt(mean_squared_error(all_true, all_pred)),
         'WAPE (%)': np.sum(np.abs(all_true - all_pred)) / np.sum(np.abs(all_true)) * 100,
+        'EMD':      wasserstein_distance(all_true, all_pred),
         'R2':       r2_score(all_true, all_pred),
     }
 
@@ -2384,6 +2416,123 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
         plt.show()
 
     return metrics_df, agg_metrics
+
+
+# =============================================================================
+# STEP 5 — EVALUATE FULL SIMULATED CASES (PROCESS + ENERGY)
+# =============================================================================
+
+def evaluate_full_simulated_cases(simulated_log, real_log, energy_pipelines, sensor_to_model, verbose=1):
+    """
+    Evaluates the complete simulated case profile (from Process Simulation) 
+    against the actual complete case profile using the trained Energy Pipelines.
+    
+    Metrics: Earth Mover's Distance (Wasserstein Distance)
+    """
+    from scipy.stats import wasserstein_distance
+    from scipy.interpolate import interp1d
+    
+    if verbose:
+        print("\n" + "=" * 80)
+        print(f"STEP 5 — EVALUATING FULL CASE PROFILES (Sensor: {sensor_to_model})")
+        print("  Metric: Earth Mover's Distance (Wasserstein)")
+        print("=" * 80)
+
+    # 1. Group simulated log by case
+    sim_cases = simulated_log.groupby('case_id')
+    # 2. Group real log by case
+    real_cases = real_log.groupby('case_id')
+    
+    common_cases = set(sim_cases.groups.keys()).intersection(set(real_cases.groups.keys()))
+    if not common_cases:
+        print("    [!] No common cases found between simulated log and real log.")
+        return None
+
+    emd_scores = []
+    
+    for case_id in common_cases:
+        sim_group = sim_cases.get_group(case_id).sort_values('timestamp_start')
+        real_group = real_cases.get_group(case_id).sort_values('timestamp_start')
+        
+        # Build simulated full energy profile
+        sim_energy_profile = []
+        for _, row in sim_group.iterrows():
+            process = row.get('process', 'process_4') # Default fallback
+            obj = row['object']
+            act = row['activity']
+            
+            # Reconstruct attributes (if available, else empty)
+            attrs = {k.replace('attr_', ''): v for k, v in row.items() if k.startswith('attr_')}
+            
+            # Find pipeline
+            pipeline = energy_pipelines.get((process, obj, act, sensor_to_model))
+            
+            # Duration in seconds
+            dur_sec = max(1, int(row['duration']))
+            # We predict fixed length 100 curve by default, and stretch it to actual duration
+            if pipeline is not None:
+                # Need raw input to predict_raw_curve
+                # Since we don't have true raw_values for the simulated event, we pass a dummy
+                # array just to get the prediction of length 100, then interpolate it.
+                dummy_raw = np.zeros(100) 
+                
+                try:
+                    pred_curve = predict_raw_curve(dummy_raw, act, attrs, pipeline)
+                    # Interpolate pred_curve to match the event's duration (1 point per second for simplicity, or just use raw points)
+                    # We will just append the 100 points as the "shape" taking up that time block, 
+                    # but since EMD ignores temporal order, the exact stretch doesn't strictly matter 
+                    # as long as the distribution of values is proportional to duration. 
+                    # Let's resample based on duration so longer activities contribute more to the distribution
+                    if dur_sec != 100:
+                        f = interp1d(np.linspace(0, 1, len(pred_curve)), pred_curve, kind='linear')
+                        pred_curve_stretched = f(np.linspace(0, 1, dur_sec))
+                    else:
+                        pred_curve_stretched = pred_curve
+                        
+                    sim_energy_profile.extend(pred_curve_stretched)
+                except Exception as e:
+                    # If predict fails, assume 0
+                    sim_energy_profile.extend(np.zeros(dur_sec))
+            else:
+                # No pipeline for this activity (e.g. idle/silent)
+                sim_energy_profile.extend(np.zeros(dur_sec))
+                
+        # Build real full energy profile for this case
+        # We assume the real_log has 'sensor_to_model' directly, OR we aggregate from expanded 
+        # (This depends on where df_expanded vs df_test is pulled from. We will assume real_group 
+        # has the sensor columns or we pull from expanded)
+        
+        if sensor_to_model in real_group.columns:
+            real_energy_profile = []
+            for _, row in real_group.iterrows():
+                # For each event, if the sensor has a list/array of values, append them
+                val = row[sensor_to_model]
+                if isinstance(val, (list, np.ndarray)):
+                    real_energy_profile.extend(val)
+                elif pd.isna(val):
+                    continue
+                else:
+                    real_energy_profile.append(val)
+        else:
+             print(f"    [!] Sensor {sensor_to_model} not found in real log.")
+             return None
+             
+        if not real_energy_profile or not sim_energy_profile:
+             continue
+             
+        sim_arr = np.array(sim_energy_profile)
+        real_arr = np.array(real_energy_profile)
+        
+        # Calculate EMD
+        emd = wasserstein_distance(real_arr, sim_arr)
+        emd_scores.append(emd)
+        
+    avg_emd = np.mean(emd_scores) if emd_scores else np.nan
+    if verbose:
+        print(f"    Evaluated {len(emd_scores)} complete cases.")
+        print(f"    Average Case-Level EMD: {avg_emd:.4f}")
+        
+    return avg_emd
 
 # %%
 process_datasets_to_model['process_2']['expanded']
@@ -2521,6 +2670,7 @@ df_expanded['object_log']
 
 # %%
 all_results = []
+energy_pipelines = {}
 
 for process in process_datasets_to_model_sensors.keys():
 
@@ -2597,6 +2747,9 @@ for process in process_datasets_to_model_sensors.keys():
                 agg_metrics['object'] = object_to_model[0]
                 agg_metrics['activity'] = activity_to_model[0]
                 agg_metrics['sensor'] = sensor_to_model
+                
+                # Store pipeline for later full-case evaluation
+                energy_pipelines[(process[0], object_to_model[0], activity_to_model[0], sensor_to_model)] = pipeline
 
                 all_results.append(agg_metrics)
 
