@@ -112,6 +112,7 @@ def _default_regressor(model_type: str, random_state: int = 42):
             n_estimators=100, max_depth=4,
             objective='reg:absoluteerror',
             random_state=random_state, verbosity=0,
+            n_jobs=1,
         )
     if model_type == 'linear':
         return LinearRegression()
@@ -138,6 +139,7 @@ def _default_classifier(model_type: str, random_state: int = 42):
             n_estimators=100, max_depth=4,
             random_state=random_state, verbosity=0,
             eval_metric='mlogloss', use_label_encoder=False,
+            n_jobs=1,
         )
     if model_type in ('linear', 'lasso'):
         penalty = 'l1' if model_type == 'lasso' else 'l2'
@@ -170,6 +172,7 @@ def _optuna_regressor(trial, model_type: str, random_state: int = 42):
             subsample=trial.suggest_float('subsample', 0.5, 1.0),
             objective='reg:absoluteerror',
             random_state=random_state, verbosity=0,
+            n_jobs=1,
         )
     if model_type == 'linear':
         return LinearRegression()
@@ -204,6 +207,7 @@ def _optuna_classifier(trial, model_type: str, random_state: int = 42):
             subsample=trial.suggest_float('subsample', 0.5, 1.0),
             random_state=random_state, verbosity=0,
             eval_metric='mlogloss', use_label_encoder=False,
+            n_jobs=1,
         )
     if model_type in ('linear', 'lasso'):
         penalty = 'l1' if model_type == 'lasso' else 'l2'
@@ -402,7 +406,8 @@ class SimModeller:
             model.fit(X_tr, y_tr)
             return -mean_absolute_error(y_val, model.predict(X_val))
 
-        study = optuna.create_study(direction='maximize')
+        sampler = optuna.samplers.TPESampler(seed=self.random_state)
+        study = optuna.create_study(direction='maximize', sampler=sampler)
         study.optimize(objective, n_trials=self.n_optuna_trials,
                        show_progress_bar=False)
 
@@ -426,7 +431,8 @@ class SimModeller:
             model.fit(X_tr, y_tr)
             return accuracy_score(y_val, model.predict(X_val))
 
-        study = optuna.create_study(direction='maximize')
+        sampler = optuna.samplers.TPESampler(seed=self.random_state)
+        study = optuna.create_study(direction='maximize', sampler=sampler)
         study.optimize(objective, n_trials=self.n_optuna_trials,
                        show_progress_bar=False)
 
