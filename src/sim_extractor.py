@@ -10,6 +10,8 @@ import warnings
 import pm4py
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+from pm4py.algo.evaluation.generalization import algorithm as generalization_evaluator
+from pm4py.algo.evaluation.simplicity import algorithm as simplicity_evaluator
 
 # ---------------------------------------------------------------------------
 # Distribution helpers
@@ -135,11 +137,13 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
 
 def _evaluate_mined_model(sub_log, net, im, fm):
     """
-    Score one mined Petri net with a blend of replay fitness, precision,
-    and a mild complexity penalty.
+    Score one mined Petri net using an overall quality metric:
+    mean(fitness, precision, generalization, simplicity).
     """
     fitness = 0.0
     precision = None
+    generalization = None
+    simplicity = None
 
     try:
         replay = token_replay.apply(
@@ -167,21 +171,33 @@ def _evaluate_mined_model(sub_log, net, im, fm):
     if precision is None:
         precision = fitness
 
-    complexity = len(net.places) + len(net.transitions) + len(net.arcs)
-    simplicity = 1.0 / (1.0 + 0.005 * float(complexity))
+    try:
+        generalization = float(
+            generalization_evaluator.apply(sub_log, net, im, fm)
+        )
+    except Exception:
+        generalization = None
 
-    if (fitness + precision) > 0:
-        f1_like = 2.0 * fitness * precision / (fitness + precision)
-    else:
-        f1_like = 0.0
+    try:
+        simplicity = float(simplicity_evaluator.apply(net))
+    except Exception:
+        simplicity = None
 
-    score = 0.65 * f1_like + 0.25 * fitness + 0.10 * simplicity
+    components = [fitness, precision, generalization, simplicity]
+    valid_components = [
+        max(0.0, min(1.0, float(v)))
+        for v in components
+        if v is not None and np.isfinite(v)
+    ]
+
+    score = float(np.mean(valid_components)) if valid_components else 0.0
     return {
         'score': score,
+        'overall_metric': score,
         'fitness': fitness,
         'precision': precision,
+        'generalization': generalization,
         'simplicity': simplicity,
-        'complexity': complexity,
     }
 
 
@@ -739,7 +755,8 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
             f"      quality: score={eval_i['score']:.4f}, "
             f"fitness={eval_i['fitness']:.4f}, "
             f"precision={eval_i['precision']:.4f}, "
-            f"complexity={eval_i['complexity']}"
+            f"generalization={eval_i['generalization'] if eval_i['generalization'] is not None else 'n/a'}, "
+            f"simplicity={eval_i['simplicity'] if eval_i['simplicity'] is not None else 'n/a'}"
         )
 
         if eval_i['score'] > best_score:
@@ -888,7 +905,8 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
     optimize_mining_hyperparams : bool
         If True and ``mining_algorithm`` is in {'inductive', 'heuristic'},
         run a local search over candidate miner params and pick the best
-        model by a conformance/complexity score.
+        model by an overall quality metric (fitness, precision,
+        generalization, simplicity).
     mining_search_space : dict or None
         Optional search-space override:
         - 'inductive_noise_thresholds': list[float]
