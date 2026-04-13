@@ -1054,7 +1054,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
         'precision': np.nan,
         'generalization': np.nan,
         'simplicity': np.nan,
-        'structure_complexity': np.nan,
     }
 
     if len(sim_for_dfg) > 0 and len(real_for_dfg) > 0:
@@ -1066,9 +1065,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
             conformance_metrics['precision'] = _safe_precision(sim_log, ref_net, ref_im, ref_fm)
             conformance_metrics['generalization'] = _safe_generalization(sim_log, ref_net, ref_im, ref_fm)
             conformance_metrics['simplicity'] = _safe_simplicity(ref_net)
-
-            complexity = len(ref_net.places) + len(ref_net.transitions) + len(ref_net.arcs)
-            conformance_metrics['structure_complexity'] = float(complexity)
         except Exception as e:
             print(f"Conformance dimensions unavailable: {e}")
 
@@ -1094,7 +1090,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
         'precision': results['conformance_metrics'].get('precision'),
         'generalization': results['conformance_metrics'].get('generalization'),
         'simplicity': results['conformance_metrics'].get('simplicity'),
-        'structure_complexity_score': results['conformance_metrics'].get('structure_complexity'),
     }
 
     active_values = []
@@ -1104,10 +1099,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
             print(f"  {comp_name:30}: n/a")
             continue
         comp_val = float(comp_val)
-        if comp_name == 'structure_complexity_score':
-            comp_val = 1.0 / (1.0 + max(0.0, comp_val))
-        else:
-            comp_val = max(0.0, min(1.0, comp_val))
+        comp_val = max(0.0, min(1.0, comp_val))
         active_values.append(comp_val)
         print(f"  {comp_name:30}: {comp_val:.4f}")
 
@@ -1726,7 +1718,6 @@ enabled_test_metrics = {
     'test_conformance_metrics_precision',
     'test_conformance_metrics_generalization',
     'test_conformance_metrics_simplicity',
-    'test_conformance_metrics_structure_complexity',
 }
 
 # Metrics where LOWER is better
@@ -1741,7 +1732,6 @@ lower_is_better = {
     'test_case_metrics_events_per_case_ks',
     'test_case_metrics_mean_events_per_case_error',
     'test_case_metrics_median_events_per_case_error',
-    'test_conformance_metrics_structure_complexity',
 }
 
 # Metrics where HIGHER is better
