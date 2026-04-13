@@ -44,7 +44,22 @@ class ProcessSimulation:
     def __init__(self, activity_stats_df, production_plan,
                  mode='statistical', ml_models=None, process_models=None,
                  random_seed=42):
-        self.activity_stats = activity_stats_df
+        # Backward-compatible input handling: extract_process now returns
+        # (stats_df, raw_df, process_models), while older callers pass stats_df only.
+        if isinstance(activity_stats_df, (tuple, list)):
+            if len(activity_stats_df) == 0:
+                raise ValueError("activity_stats_df tuple/list is empty")
+            self.activity_stats = activity_stats_df[0]
+            if process_models is None and len(activity_stats_df) >= 3:
+                process_models = activity_stats_df[2]
+        else:
+            self.activity_stats = activity_stats_df
+
+        if not isinstance(self.activity_stats, pd.DataFrame):
+            raise TypeError(
+                "activity_stats_df must be a pandas DataFrame or the tuple returned by extract_process"
+            )
+
         self.production_plan = production_plan
         self.mode = mode
         self.ml_models = ml_models
