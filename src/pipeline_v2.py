@@ -1055,7 +1055,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
         'generalization': np.nan,
         'simplicity': np.nan,
         'structure_complexity': np.nan,
-        'structure_duplicate_task_ratio': np.nan,
     }
 
     if len(sim_for_dfg) > 0 and len(real_for_dfg) > 0:
@@ -1069,11 +1068,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
             conformance_metrics['simplicity'] = _safe_simplicity(ref_net)
 
             complexity = len(ref_net.places) + len(ref_net.transitions) + len(ref_net.arcs)
-            labels = [t.label for t in ref_net.transitions if t.label is not None]
-            dup_ratio = (1.0 - (len(set(labels)) / len(labels))) if labels else 0.0
-
             conformance_metrics['structure_complexity'] = float(complexity)
-            conformance_metrics['structure_duplicate_task_ratio'] = float(dup_ratio)
         except Exception as e:
             print(f"Conformance dimensions unavailable: {e}")
 
@@ -1088,28 +1083,42 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     # ========== 7. OVERALL QUALITY SCORE ==========
     print("\n7. OVERALL QUALITY ASSESSMENT")
     print("-" * 40)
-    
-    # Weighted quality score (based on literature importance)
-    quality_components = {
-        'Event Count': (1 - results['basic_metrics']['event_count_error'], 0.15),
-        'Activity Distribution': (1 - results['activity_metrics']['js_divergence'], 0.25),
-        'Duration Distribution': (1 - results['duration_metrics']['ks_statistic'], 0.20),
-        'Case Structure': (1 - results['case_metrics']['events_per_case_ks'], 0.15),
-        'Control Flow': (results['control_flow_metrics']['edge_f1_score'], 0.25)
+
+    # Active score requested by user:
+    # keep conformance metrics + mean duration + event_count_ratio.
+    # all active metrics have equal weight.
+    active_components = {
+        'event_count_ratio': results['basic_metrics']['event_count_ratio'],
+        'mean_duration_similarity': (1.0 - results['duration_metrics']['mean_duration_error']),
+        'fitness': results['conformance_metrics'].get('fitness'),
+        'precision': results['conformance_metrics'].get('precision'),
+        'generalization': results['conformance_metrics'].get('generalization'),
+        'simplicity': results['conformance_metrics'].get('simplicity'),
+        'structure_complexity_score': results['conformance_metrics'].get('structure_complexity'),
     }
+
+    active_values = []
+    print("\nActive Score Components:")
+    for comp_name, comp_val in active_components.items():
+        if pd.isna(comp_val):
+            print(f"  {comp_name:30}: n/a")
+            continue
+        comp_val = float(comp_val)
+        if comp_name == 'structure_complexity_score':
+            comp_val = 1.0 / (1.0 + max(0.0, comp_val))
+        else:
+            comp_val = max(0.0, min(1.0, comp_val))
+        active_values.append(comp_val)
+        print(f"  {comp_name:30}: {comp_val:.4f}")
+
+    overall_score = float(np.mean(active_values)) if active_values else np.nan
+    print(f"\nOVERALL QUALITY SCORE (active): {overall_score:.4f} (0=worst, 1=perfect)")
     
-    overall_score = sum(score * weight for (score, weight) in quality_components.values())
-    
-    print("Quality Components:")
-    for component, (score, weight) in quality_components.items():
-        print(f"  {component:20}: {score:.4f} (weight: {weight:.2f})")
-    print(f"\nOVERALL QUALITY SCORE: {overall_score:.4f} (0=worst, 1=perfect)")
-    
-    if overall_score >= 0.8:
+    if pd.notna(overall_score) and overall_score >= 0.8:
         quality_assessment = "EXCELLENT"
-    elif overall_score >= 0.6:
+    elif pd.notna(overall_score) and overall_score >= 0.6:
         quality_assessment = "GOOD"
-    elif overall_score >= 0.4:
+    elif pd.notna(overall_score) and overall_score >= 0.4:
         quality_assessment = "FAIR"
     else:
         quality_assessment = "POOR"
@@ -1118,44 +1127,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     
     results['overall_score'] = overall_score
     results['quality_assessment'] = quality_assessment
-
-    # Additive conformance composite (keeps old score untouched).
-    conf_components = {
-        'fitness': results['conformance_metrics'].get('fitness'),
-        'precision': results['conformance_metrics'].get('precision'),
-        'generalization': results['conformance_metrics'].get('generalization'),
-        'simplicity': results['conformance_metrics'].get('simplicity'),
-        'structure_complexity': results['conformance_metrics'].get('structure_complexity'),
-        'structure_duplicate_task_ratio': results['conformance_metrics'].get('structure_duplicate_task_ratio'),
-    }
-    conf_weights = {
-        'fitness': 0.30,
-        'precision': 0.25,
-        'generalization': 0.20,
-        'simplicity': 0.15,
-        'structure_complexity': 0.05,
-        'structure_duplicate_task_ratio': 0.05,
-    }
-
-    conf_score = 0.0
-    conf_weight_sum = 0.0
-    for c_name, c_val in conf_components.items():
-        if pd.isna(c_val):
-            continue
-        val = float(c_val)
-        if c_name in ('structure_complexity', 'structure_duplicate_task_ratio'):
-            val = 1.0 / (1.0 + max(0.0, val))
-        else:
-            val = max(0.0, min(1.0, val))
-        w = conf_weights[c_name]
-        conf_score += w * val
-        conf_weight_sum += w
-
-    results['conformance_score'] = (conf_score / conf_weight_sum) if conf_weight_sum > 0 else np.nan
-    if pd.notna(results['conformance_score']):
-        results['overall_score_extended'] = 0.75 * results['overall_score'] + 0.25 * results['conformance_score']
-    else:
-        results['overall_score_extended'] = results['overall_score']
     
     return results
 
@@ -1746,6 +1717,18 @@ import numpy as np
 test_cols = [c for c in evaluation_results_df.columns
              if c.startswith('test_') and evaluation_results_df[c].dtype in ('float64', 'float32', 'int64')]
 
+# Active metrics only (others remain computed/stored but are hidden in comparison dashboards).
+enabled_test_metrics = {
+    'test_overall_score',
+    'test_basic_metrics_event_count_ratio',
+    'test_duration_metrics_mean_duration_error',
+    'test_conformance_metrics_fitness',
+    'test_conformance_metrics_precision',
+    'test_conformance_metrics_generalization',
+    'test_conformance_metrics_simplicity',
+    'test_conformance_metrics_structure_complexity',
+}
+
 # Metrics where LOWER is better
 lower_is_better = {
     'test_basic_metrics_event_count_error',
@@ -1754,20 +1737,16 @@ lower_is_better = {
     'test_activity_metrics_frequency_mae',
     'test_duration_metrics_ks_statistic',
     'test_duration_metrics_mean_duration_error',
-    'test_duration_metrics_median_duration_error',
     'test_duration_metrics_std_duration_error',
     'test_case_metrics_events_per_case_ks',
     'test_case_metrics_mean_events_per_case_error',
     'test_case_metrics_median_events_per_case_error',
     'test_conformance_metrics_structure_complexity',
-    'test_conformance_metrics_structure_duplicate_task_ratio',
 }
 
 # Metrics where HIGHER is better
 higher_is_better = {
     'test_overall_score',
-    'test_overall_score_extended',
-    'test_conformance_score',
     'test_basic_metrics_event_count_ratio',
     'test_basic_metrics_case_count_ratio',
     'test_activity_metrics_activity_coverage_ratio',
@@ -1785,6 +1764,7 @@ higher_is_better = {
 }
 
 test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
+test_cols = [c for c in test_cols if c in enabled_test_metrics]
 
 # Short labels
 short_labels = {c: c.replace('test_', '').replace('_metrics_', ': ')
@@ -1842,8 +1822,6 @@ if test_cols and 'mode' in evaluation_results_df.columns:
 if test_cols and 'mode' in evaluation_results_df.columns:
     radar_metrics = [c for c in [
         'test_overall_score',
-        'test_overall_score_extended',
-        'test_conformance_score',
         'test_conformance_metrics_fitness',
         'test_conformance_metrics_precision',
         'test_conformance_metrics_generalization',
@@ -1910,8 +1888,6 @@ if test_cols and 'mode' in evaluation_results_df.columns:
 
     key_metrics = [c for c in [
         'test_overall_score',
-        'test_overall_score_extended',
-        'test_conformance_score',
         'test_conformance_metrics_fitness',
         'test_conformance_metrics_precision',
         'test_control_flow_metrics_edge_f1_score',
