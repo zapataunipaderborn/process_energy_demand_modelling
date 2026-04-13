@@ -86,7 +86,8 @@ def sample_from_dist(dist_name, dist_params):
 # pm4py mining helpers
 # ---------------------------------------------------------------------------
 
-def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
+def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
+                    heuristic_params=None):
     """
     Mine a Petri net from a pm4py-formatted event log sub-group.
 
@@ -99,6 +100,8 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
     noise_threshold : float
         Noise filtering for the Inductive Miner (0.0 = keep all, 1.0 = max filtering).
         Higher values produce stricter models that filter out infrequent paths.
+    heuristic_params : dict or None
+        Optional parameter dict for Heuristics Miner.
 
     Returns
     -------
@@ -109,7 +112,17 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
             sub_log, noise_threshold=noise_threshold
         )
     elif algorithm == 'heuristic':
-        net, im, fm = pm4py.discover_petri_net_heuristics(sub_log)
+        h_params = heuristic_params or {}
+        if h_params:
+            try:
+                net, im, fm = pm4py.discover_petri_net_heuristics(
+                    sub_log, **h_params
+                )
+            except TypeError:
+                # Keep backward compatibility across pm4py versions.
+                net, im, fm = pm4py.discover_petri_net_heuristics(sub_log)
+        else:
+            net, im, fm = pm4py.discover_petri_net_heuristics(sub_log)
     elif algorithm == 'alpha':
         net, im, fm = pm4py.discover_petri_net_alpha(sub_log)
     elif algorithm == 'ilp':
@@ -118,6 +131,113 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
         raise ValueError(f"Unknown mining algorithm: {algorithm}")
 
     return net, im, fm
+
+
+def _evaluate_mined_model(sub_log, net, im, fm):
+    """
+    Score one mined Petri net with a blend of replay fitness, precision,
+    and a mild complexity penalty.
+    """
+    fitness = 0.0
+    precision = None
+
+    try:
+        replay = token_replay.apply(
+            sub_log, net, im, fm,
+            parameters={'consider_remaining_in_fitness': True}
+        )
+        trace_scores = []
+        for item in replay:
+            if 'trace_fitness' in item and item['trace_fitness'] is not None:
+                trace_scores.append(float(item['trace_fitness']))
+            elif item.get('trace_is_fit') is True:
+                trace_scores.append(1.0)
+            else:
+                trace_scores.append(0.0)
+        if trace_scores:
+            fitness = float(np.mean(trace_scores))
+    except Exception:
+        fitness = 0.0
+
+    try:
+        precision = float(pm4py.precision_token_based_replay(sub_log, net, im, fm))
+    except Exception:
+        precision = None
+
+    if precision is None:
+        precision = fitness
+
+    complexity = len(net.places) + len(net.transitions) + len(net.arcs)
+    simplicity = 1.0 / (1.0 + 0.005 * float(complexity))
+
+    if (fitness + precision) > 0:
+        f1_like = 2.0 * fitness * precision / (fitness + precision)
+    else:
+        f1_like = 0.0
+
+    score = 0.65 * f1_like + 0.25 * fitness + 0.10 * simplicity
+    return {
+        'score': score,
+        'fitness': fitness,
+        'precision': precision,
+        'simplicity': simplicity,
+        'complexity': complexity,
+    }
+
+
+def _build_mining_candidates(algorithm, noise_threshold=0.2,
+                             heuristic_params=None,
+                             optimize_mining_hyperparams=False,
+                             mining_search_space=None):
+    """Build candidate miner parameter sets for local tuning."""
+    base = {
+        'noise_threshold': float(noise_threshold),
+        'heuristic_params': dict(heuristic_params or {}),
+    }
+
+    if not optimize_mining_hyperparams or algorithm not in ('inductive', 'heuristic'):
+        return [base]
+
+    search_space = mining_search_space or {}
+    candidates = []
+
+    if algorithm == 'inductive':
+        default_grid = [0.05, 0.10, 0.20, 0.30, 0.40]
+        noise_grid = search_space.get('inductive_noise_thresholds', default_grid)
+        for n in noise_grid:
+            n = float(max(0.0, min(1.0, n)))
+            candidates.append({'noise_threshold': n, 'heuristic_params': {}})
+
+    elif algorithm == 'heuristic':
+        default_grid = [
+            {'dependency_threshold': 0.3, 'and_threshold': 0.65, 'loop_two_threshold': 0.5},
+            {'dependency_threshold': 0.5, 'and_threshold': 0.65, 'loop_two_threshold': 0.5},
+            {'dependency_threshold': 0.7, 'and_threshold': 0.65, 'loop_two_threshold': 0.5},
+            {'dependency_threshold': 0.5, 'and_threshold': 0.50, 'loop_two_threshold': 0.5},
+            {'dependency_threshold': 0.5, 'and_threshold': 0.80, 'loop_two_threshold': 0.5},
+        ]
+        h_grid = search_space.get('heuristic_params_grid', default_grid)
+        for params in h_grid:
+            candidates.append({'noise_threshold': float(noise_threshold),
+                               'heuristic_params': dict(params or {})})
+
+    if not candidates:
+        candidates = [base]
+
+    # Deduplicate candidates while preserving order.
+    seen = set()
+    unique = []
+    for cand in candidates:
+        key = (
+            round(float(cand.get('noise_threshold', 0.0)), 6),
+            tuple(sorted((cand.get('heuristic_params') or {}).items())),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cand)
+
+    return unique
 
 
 def _get_stochastic_map(net, im, fm, log):
@@ -556,7 +676,10 @@ def _extract_manual(group, object_name, object_type, higher_level_activity,
 
 def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
                         case_sorted, duration_info, algorithm='inductive',
-                        noise_threshold=0.2):
+                        noise_threshold=0.2,
+                        heuristic_params=None,
+                        optimize_mining_hyperparams=False,
+                        mining_search_space=None):
     """
     Mine a Petri net from the sub-log and derive transitions, start/end
     from the mined model.
@@ -585,11 +708,61 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         timestamp_key='timestamp_start'
     )
 
-    # ── Mine the Petri net ────────────────────────────────────────────
-    print(f"    Mining Petri net with '{algorithm}' algorithm "
-          f"(noise_threshold={noise_threshold})...")
-    net, im, fm = _mine_petri_net(sub_log, algorithm,
-                                  noise_threshold=noise_threshold)
+    # ── Mine the Petri net (with optional local hyperparameter search) ─────
+    candidates = _build_mining_candidates(
+        algorithm,
+        noise_threshold=noise_threshold,
+        heuristic_params=heuristic_params,
+        optimize_mining_hyperparams=optimize_mining_hyperparams,
+        mining_search_space=mining_search_space,
+    )
+
+    best = None
+    best_score = float('-inf')
+    for idx, cand in enumerate(candidates, start=1):
+        cand_noise = cand.get('noise_threshold', noise_threshold)
+        cand_heur = cand.get('heuristic_params', {})
+        print(
+            f"    Mining Petri net with '{algorithm}' "
+            f"(candidate {idx}/{len(candidates)}): "
+            f"noise={cand_noise}, heur={cand_heur}"
+        )
+
+        net_i, im_i, fm_i = _mine_petri_net(
+            sub_log,
+            algorithm,
+            noise_threshold=cand_noise,
+            heuristic_params=cand_heur,
+        )
+        eval_i = _evaluate_mined_model(sub_log, net_i, im_i, fm_i)
+        print(
+            f"      quality: score={eval_i['score']:.4f}, "
+            f"fitness={eval_i['fitness']:.4f}, "
+            f"precision={eval_i['precision']:.4f}, "
+            f"complexity={eval_i['complexity']}"
+        )
+
+        if eval_i['score'] > best_score:
+            best_score = eval_i['score']
+            best = {
+                'net': net_i,
+                'im': im_i,
+                'fm': fm_i,
+                'eval': eval_i,
+                'cand': cand,
+            }
+
+    if best is None:
+        raise RuntimeError("No candidate Petri net could be mined.")
+
+    assert best is not None
+
+    net, im, fm = best['net'], best['im'], best['fm']
+    print(
+        f"    Selected params: noise={best['cand'].get('noise_threshold')}, "
+        f"heur={best['cand'].get('heuristic_params', {})} "
+        f"(score={best['eval']['score']:.4f})"
+    )
 
     print(f"    Petri net: {len(net.places)} places, "
           f"{len(net.transitions)} transitions, "
@@ -667,6 +840,12 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         'stochastic_map': stochastic_map,
         'label_stochastic': dict(label_stochastic),
         'duration_map': duration_map,
+        'mining_hyperparams': {
+            'algorithm': algorithm,
+            'noise_threshold': best['cand'].get('noise_threshold'),
+            'heuristic_params': best['cand'].get('heuristic_params', {}),
+            'optimization_metrics': best['eval'],
+        },
         'bigram_transitions': bigram_transitions,
         'activity_count_transitions': activity_count_transitions,
         'decision_weights': decision_weights,
@@ -680,7 +859,10 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2):
+def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
+                    heuristic_params=None,
+                    optimize_mining_hyperparams=False,
+                    mining_search_space=None):
     """
     Extract process statistics from an event log.
 
@@ -700,6 +882,17 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2):
     noise_threshold : float
         Noise filtering for the Inductive Miner (0.0 = keep all,
         1.0 = max filtering). Default 0.2.
+    heuristic_params : dict or None
+        Optional fixed Heuristics Miner params when
+        ``optimize_mining_hyperparams`` is False.
+    optimize_mining_hyperparams : bool
+        If True and ``mining_algorithm`` is in {'inductive', 'heuristic'},
+        run a local search over candidate miner params and pick the best
+        model by a conformance/complexity score.
+    mining_search_space : dict or None
+        Optional search-space override:
+        - 'inductive_noise_thresholds': list[float]
+        - 'heuristic_params_grid': list[dict]
 
     Returns
     -------
@@ -755,7 +948,10 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2):
             stats, process_model = _extract_with_pm4py(
                 group, object_name, object_type, higher_level_activity,
                 case_sorted, duration_info, algorithm=mining_algorithm,
-                noise_threshold=noise_threshold
+                noise_threshold=noise_threshold,
+                heuristic_params=heuristic_params,
+                optimize_mining_hyperparams=optimize_mining_hyperparams,
+                mining_search_space=mining_search_space,
             )
             if process_model is not None:
                 key = (object_name, object_type, higher_level_activity)
