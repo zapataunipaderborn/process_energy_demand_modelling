@@ -17,6 +17,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+np.random.seed(RANDOM_SEED)
 import chardet
 import plotly.io as pio
 from pathlib import Path
@@ -764,6 +765,22 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     """
     
     results = {}
+
+    # Work on copies and guarantee required columns exist to avoid KeyError
+    simulated_df = simulated_df.copy()
+    real_df = real_df.copy()
+
+    required_cols = [case_col, activity_col, start_col, end_col]
+    for col in required_cols:
+        if col not in simulated_df.columns:
+            simulated_df[col] = pd.Series(dtype='object')
+        if col not in real_df.columns:
+            real_df[col] = pd.Series(dtype='object')
+
+    simulated_df[start_col] = pd.to_datetime(simulated_df[start_col], errors='coerce')
+    simulated_df[end_col] = pd.to_datetime(simulated_df[end_col], errors='coerce')
+    real_df[start_col] = pd.to_datetime(real_df[start_col], errors='coerce')
+    real_df[end_col] = pd.to_datetime(real_df[end_col], errors='coerce')
     
     print("="*80)
     print("COMPREHENSIVE SIMULATION EVALUATION")
@@ -779,8 +796,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     event_ratio = sim_events / real_events if real_events > 0 else 0
     
     # Case counts  
-    sim_cases = simulated_df[case_col].nunique()
-    real_cases = real_df[case_col].nunique()
+    sim_cases = simulated_df[case_col].nunique() if case_col in simulated_df.columns else 0
+    real_cases = real_df[case_col].nunique() if case_col in real_df.columns else 0
     case_ratio = sim_cases / real_cases if real_cases > 0 else 0
     
     print(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio: {event_ratio:.3f}")
@@ -798,19 +815,22 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     print("-" * 40)
     
     # Activity frequencies
-    sim_activity_freq = simulated_df[activity_col].value_counts(normalize=True).sort_index()
-    real_activity_freq = real_df[activity_col].value_counts(normalize=True).sort_index()
+    sim_activity_freq = simulated_df[activity_col].dropna().value_counts(normalize=True).sort_index()
+    real_activity_freq = real_df[activity_col].dropna().value_counts(normalize=True).sort_index()
     
     # Align activities (handle missing activities)
-    all_activities = set(sim_activity_freq.index) | set(real_activity_freq.index)
-    sim_freq_aligned = pd.Series([sim_activity_freq.get(act, 0) for act in all_activities], index=all_activities)
-    real_freq_aligned = pd.Series([real_activity_freq.get(act, 0) for act in all_activities], index=all_activities)
-    
-    # Jensen-Shannon divergence for activity distributions
-    js_divergence = jensenshannon(sim_freq_aligned.values, real_freq_aligned.values)
-    
-    # Mean Absolute Error of frequencies
-    freq_mae = np.mean(np.abs(sim_freq_aligned.values - real_freq_aligned.values))
+    all_activities = sorted(set(sim_activity_freq.index) | set(real_activity_freq.index))
+    if all_activities:
+        sim_freq_aligned = pd.Series([sim_activity_freq.get(act, 0) for act in all_activities], index=all_activities)
+        real_freq_aligned = pd.Series([real_activity_freq.get(act, 0) for act in all_activities], index=all_activities)
+        # Jensen-Shannon divergence for activity distributions
+        js_divergence = jensenshannon(sim_freq_aligned.values, real_freq_aligned.values)
+        # Mean Absolute Error of frequencies
+        freq_mae = np.mean(np.abs(sim_freq_aligned.values - real_freq_aligned.values))
+    else:
+        # No activities to compare -> treat as worst similarity.
+        js_divergence = 1.0
+        freq_mae = 1.0
     
     print(f"Activity Coverage - Real: {len(real_activity_freq)}, Sim: {len(sim_activity_freq)}")
     print(f"Jensen-Shannon Divergence (activities): {js_divergence:.4f} (0=perfect, 1=worst)")
@@ -829,17 +849,32 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     # Calculate durations
     sim_durations = (simulated_df[end_col] - simulated_df[start_col]).dt.total_seconds() / 60
     real_durations = (real_df[end_col] - real_df[start_col]).dt.total_seconds() / 60
-    
-    # Statistical comparison
-    duration_ks_stat, duration_ks_pvalue = stats.ks_2samp(sim_durations, real_durations)
-    
-    # Duration statistics comparison
-    duration_stats = pd.DataFrame({
-        'Real': [real_durations.mean(), real_durations.median(), real_durations.std()],
-        'Simulated': [sim_durations.mean(), sim_durations.median(), sim_durations.std()],
-    }, index=['Mean', 'Median', 'Std'])
-    
-    duration_stats['Error'] = np.abs(duration_stats['Simulated'] - duration_stats['Real']) / duration_stats['Real']
+    sim_durations = sim_durations.replace([np.inf, -np.inf], np.nan).dropna()
+    real_durations = real_durations.replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(sim_durations) > 0 and len(real_durations) > 0:
+        # Statistical comparison
+        duration_ks_stat, duration_ks_pvalue = stats.ks_2samp(sim_durations, real_durations)
+
+        # Duration statistics comparison
+        duration_stats = pd.DataFrame({
+            'Real': [real_durations.mean(), real_durations.median(), real_durations.std()],
+            'Simulated': [sim_durations.mean(), sim_durations.median(), sim_durations.std()],
+        }, index=['Mean', 'Median', 'Std'])
+
+        duration_stats['Error'] = np.where(
+            duration_stats['Real'] != 0,
+            np.abs(duration_stats['Simulated'] - duration_stats['Real']) / np.abs(duration_stats['Real']),
+            1.0
+        )
+    else:
+        duration_ks_stat, duration_ks_pvalue = 1.0, 0.0
+        duration_stats = pd.DataFrame(
+            {'Real': [np.nan, np.nan, np.nan],
+             'Simulated': [np.nan, np.nan, np.nan],
+             'Error': [1.0, 1.0, 1.0]},
+            index=['Mean', 'Median', 'Std']
+        )
     
     print("Duration Statistics:")
     print(duration_stats.round(3))
@@ -859,18 +894,31 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     print("-" * 40)
     
     # Events per case
-    sim_events_per_case = simulated_df.groupby(case_col).size()
-    real_events_per_case = real_df.groupby(case_col).size()
-    
-    # Statistical test for events per case
-    events_per_case_ks, events_per_case_pvalue = stats.ks_2samp(sim_events_per_case, real_events_per_case)
-    
-    case_stats = pd.DataFrame({
-        'Real': [real_events_per_case.mean(), real_events_per_case.median(), real_events_per_case.std()],
-        'Simulated': [sim_events_per_case.mean(), sim_events_per_case.median(), sim_events_per_case.std()],
-    }, index=['Mean', 'Median', 'Std'])
-    
-    case_stats['Error'] = np.abs(case_stats['Simulated'] - case_stats['Real']) / case_stats['Real']
+    sim_events_per_case = simulated_df.groupby(case_col).size() if len(simulated_df) > 0 else pd.Series(dtype=float)
+    real_events_per_case = real_df.groupby(case_col).size() if len(real_df) > 0 else pd.Series(dtype=float)
+
+    if len(sim_events_per_case) > 0 and len(real_events_per_case) > 0:
+        # Statistical test for events per case
+        events_per_case_ks, events_per_case_pvalue = stats.ks_2samp(sim_events_per_case, real_events_per_case)
+
+        case_stats = pd.DataFrame({
+            'Real': [real_events_per_case.mean(), real_events_per_case.median(), real_events_per_case.std()],
+            'Simulated': [sim_events_per_case.mean(), sim_events_per_case.median(), sim_events_per_case.std()],
+        }, index=['Mean', 'Median', 'Std'])
+
+        case_stats['Error'] = np.where(
+            case_stats['Real'] != 0,
+            np.abs(case_stats['Simulated'] - case_stats['Real']) / np.abs(case_stats['Real']),
+            1.0
+        )
+    else:
+        events_per_case_ks, events_per_case_pvalue = 1.0, 0.0
+        case_stats = pd.DataFrame(
+            {'Real': [np.nan, np.nan, np.nan],
+             'Simulated': [np.nan, np.nan, np.nan],
+             'Error': [1.0, 1.0, 1.0]},
+            index=['Mean', 'Median', 'Std']
+        )
     
     print("Events per Case Statistics:")
     print(case_stats.round(3))
@@ -888,16 +936,24 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
     print("-" * 40)
     
     # Create event logs for pm4py
-    sim_log = pm4py.format_dataframe(simulated_df, case_id=case_col, activity_key=activity_col, timestamp_key=start_col)
-    real_log = pm4py.format_dataframe(real_df, case_id=case_col, activity_key=activity_col, timestamp_key=start_col)
-    
-    # Discover DFGs
-    sim_dfg, sim_start, sim_end = pm4py.discover_dfg(sim_log)
-    real_dfg, real_start, real_end = pm4py.discover_dfg(real_log)
-    
-    # Compare DFG edges
-    sim_edges = set(sim_dfg.keys())
-    real_edges = set(real_dfg.keys())
+    sim_for_dfg = simulated_df.dropna(subset=[case_col, activity_col, start_col])
+    real_for_dfg = real_df.dropna(subset=[case_col, activity_col, start_col])
+
+    if len(sim_for_dfg) > 0 and len(real_for_dfg) > 0:
+        sim_log = pm4py.format_dataframe(sim_for_dfg, case_id=case_col, activity_key=activity_col, timestamp_key=start_col)
+        real_log = pm4py.format_dataframe(real_for_dfg, case_id=case_col, activity_key=activity_col, timestamp_key=start_col)
+
+        # Discover DFGs
+        sim_dfg, sim_start, sim_end = pm4py.discover_dfg(sim_log)
+        real_dfg, real_start, real_end = pm4py.discover_dfg(real_log)
+
+        # Compare DFG edges
+        sim_edges = set(sim_dfg.keys())
+        real_edges = set(real_dfg.keys())
+    else:
+        sim_edges, real_edges = set(), set()
+        sim_start, real_start = {}, {}
+        sim_end, real_end = {}, {}
     
     edge_precision = len(sim_edges & real_edges) / len(sim_edges) if len(sim_edges) > 0 else 0
     edge_recall = len(sim_edges & real_edges) / len(real_edges) if len(real_edges) > 0 else 0
@@ -1042,6 +1098,14 @@ def visualize_heuristic_nets(df_compare, simulated_log):
     simulated_log : pd.DataFrame
         DataFrame containing the simulated event log data.
     """
+    required_cols = {'case_id', 'activity', 'timestamp_start'}
+    if simulated_log is None or simulated_log.empty:
+        print("Skipping heuristic-net visualization: simulated log is empty.")
+        return
+    if not required_cols.issubset(set(simulated_log.columns)):
+        print("Skipping heuristic-net visualization: simulated log is missing required columns.")
+        return
+
     with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_real, \
          tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_sim:
         
@@ -1115,7 +1179,12 @@ SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only
 #   'alpha'      – pm4py Alpha Miner → classic algorithm
 #   'manual'     – original manual extraction (no process mining)
 # ─────────────────────────────────────────────────────────────────────────────
-MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
+#MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
+MINING_ALGORITHM = 'heuristic'
+#MINING_ALGORITHM = 'alpha'
+
+# Petri-net miner variants to compare when mode names include the algorithm.
+PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
@@ -1231,9 +1300,11 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
     'statistical',
-    'petri_net',
-    'petri_net_statistical',
-    'petri_net_statistical_memory',
+    'petri_net_alpha',
+    'petri_net_heuristic',
+    'petri_net_inductive',
+    #'petri_net_statistical',
+    #'petri_net_statistical_memory',
     #'ml_duration_only',
     #'ml_duration_only_with_activity_past',
     #'ml_duration_only_with_activity_past_point_estimate',
@@ -1252,15 +1323,53 @@ for process in process_datasets_to_model.keys():
     df_train        = train_datasets[process]['event_log']
     production_plan = train_datasets[process]['production_plan']
 
-    # ── Extract process statistics (from TRAIN only — shared by both modes)
-    activity_stats_df, raw_df, process_models = extract_process(df_train, mining_algorithm=MINING_ALGORITHM)
+    # ── Extract process statistics for non-Petri modes (shared baseline) ─────
+    activity_stats_df, raw_df, process_models = extract_process(
+        df_train,
+        mining_algorithm=MINING_ALGORITHM
+    )
+
+    # ── Extract process models for each requested Petri-net algorithm ─────────
+    petri_mode_algorithms = []
+    for mode_name in MODES_TO_COMPARE:
+        if mode_name.startswith('petri_net_'):
+            mode_alg = mode_name.replace('petri_net_', '', 1).strip().lower()
+            if mode_alg in PETRI_NET_ALGORITHMS:
+                petri_mode_algorithms.append(mode_alg)
+
+    # Preserve order while removing duplicates
+    petri_mode_algorithms = list(dict.fromkeys(petri_mode_algorithms))
+
+    extraction_by_algorithm = {
+        MINING_ALGORITHM: {
+            'activity_stats_df': activity_stats_df,
+            'raw_df': raw_df,
+            'process_models': process_models,
+        }
+    }
+
+    for mode_alg in petri_mode_algorithms:
+        if mode_alg in extraction_by_algorithm:
+            continue
+        pm_activity_stats_df, pm_raw_df, pm_process_models = extract_process(
+            df_train,
+            mining_algorithm=mode_alg
+        )
+        extraction_by_algorithm[mode_alg] = {
+            'activity_stats_df': pm_activity_stats_df,
+            'raw_df': pm_raw_df,
+            'process_models': pm_process_models,
+        }
 
     # ── Visualize mined Petri nets ────────────────────────────────────────
-    if process_models:
+    for alg_name, extracted in extraction_by_algorithm.items():
+        models_for_alg = extracted['process_models']
+        if not models_for_alg:
+            continue
         print("\n" + "="*50)
-        print("MINED PETRI NETS")
+        print(f"MINED PETRI NETS ({alg_name})")
         print("="*50)
-        for key, model in process_models.items():
+        for key, model in models_for_alg.items():
             obj_name, obj_type, hla = key
             print(f"\n  Petri net: {obj_name} ({obj_type}) — {hla}")
             print(f"    Places: {len(model['net'].places)}, "
@@ -1306,12 +1415,26 @@ for process in process_datasets_to_model.keys():
         print(f"  ▶ SIMULATION MODE: {sim_mode.upper()}")
         print("─"*80)
 
-        mode_ml = ml_models if sim_mode not in ('statistical', 'petri_net') else None
-        mode_pm = process_models if sim_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
+        mode_algorithm = None
+        simulation_mode = sim_mode
+        mode_activity_stats_df = activity_stats_df
+
+        if sim_mode.startswith('petri_net_'):
+            mode_algorithm = sim_mode.replace('petri_net_', '', 1).strip().lower()
+            if mode_algorithm not in extraction_by_algorithm:
+                raise ValueError(
+                    f"Unsupported Petri-net mode '{sim_mode}'. "
+                    f"Expected one of: {[f'petri_net_{a}' for a in PETRI_NET_ALGORITHMS]}"
+                )
+            simulation_mode = 'petri_net'
+            mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
+
+        mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
+        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
         simulated_log = ProcessSimulation(
-            activity_stats_df, production_plan,
-            mode=sim_mode, ml_models=mode_ml,
+            mode_activity_stats_df, production_plan,
+            mode=simulation_mode, ml_models=mode_ml,
             process_models=mode_pm,
         ).run()
 
@@ -1332,7 +1455,13 @@ for process in process_datasets_to_model.keys():
         visualize_heuristic_nets(df_compare_train, simulated_log)
 
         # Flatten train results
-        flattened = {'process': process, 'mode': sim_mode, 'split': split_label}
+        flattened = {
+            'process': process,
+            'mode': sim_mode,
+            'simulation_mode': simulation_mode,
+            'mining_algorithm': mode_algorithm if mode_algorithm else MINING_ALGORITHM,
+            'split': split_label
+        }
         for category, metrics in eval_train.items():
             if isinstance(metrics, dict):
                 for metric_name, value in metrics.items():
@@ -2112,7 +2241,8 @@ def build_and_train_pipeline(
                 m.fit(X_train, y_train)
                 return r2_score(y_val, m.predict(X_val))
 
-            study = optuna.create_study(direction='maximize')
+            sampler = optuna.samplers.TPESampler(seed=random_state)
+            study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             best_params = study.best_params
             if name in ('Gradient Boosting', 'Random Forest'):
@@ -2845,7 +2975,8 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
                 return r2_score(y_test, y_pred)
             
             # Run Optuna study
-            study = optuna.create_study(direction='maximize')
+            sampler = optuna.samplers.TPESampler(seed=random_state)
+            study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             
             # Get best parameters

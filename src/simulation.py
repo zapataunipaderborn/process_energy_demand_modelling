@@ -268,8 +268,10 @@ class ProcessSimulation:
             print(f"    No transitions available - ending process")
             return None
 
-        activities    = list(transitions.keys())
-        probabilities = list(transitions.values())
+        # Sort to make sampling independent from dict insertion order.
+        transition_items = sorted(transitions.items(), key=lambda kv: str(kv[0]))
+        activities    = [a for a, _ in transition_items]
+        probabilities = [p for _, p in transition_items]
         prob_sum      = sum(probabilities)
 
         if prob_sum <= 0:
@@ -361,7 +363,11 @@ class ProcessSimulation:
         Given a set of enabled transitions, pick one using stochastic
         weights.  Falls back to uniform random if no weights available.
         """
-        enabled_list = list(enabled)
+        # Sort to make sampling independent from set iteration order.
+        enabled_list = sorted(
+            list(enabled),
+            key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
+        )
         weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
         total = sum(weights)
         if total <= 0:
