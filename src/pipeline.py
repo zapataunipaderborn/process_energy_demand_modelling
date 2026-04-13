@@ -1177,14 +1177,16 @@ SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only
 #   'inductive'  – pm4py Inductive Miner → guarantees a sound Petri net
 #   'heuristic'  – pm4py Heuristics Miner → better noise filtering
 #   'alpha'      – pm4py Alpha Miner → classic algorithm
+#   'ilp'        – pm4py ILP Miner → precise/sound, can be strict
 #   'manual'     – original manual extraction (no process mining)
 # ─────────────────────────────────────────────────────────────────────────────
 #MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
 MINING_ALGORITHM = 'heuristic'
 #MINING_ALGORITHM = 'alpha'
+#MINING_ALGORITHM = 'ilp'
 
 # Petri-net miner variants to compare when mode names include the algorithm.
-PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']
+PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive', 'ilp']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
@@ -1303,6 +1305,7 @@ MODES_TO_COMPARE = [
     'petri_net_alpha',
     'petri_net_heuristic',
     'petri_net_inductive',
+    'petri_net_ilp',
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
     #'ml_duration_only',

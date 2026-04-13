@@ -95,7 +95,7 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
     sub_log : pd.DataFrame
         pm4py-formatted event log (case:concept:name, concept:name, time:timestamp).
     algorithm : str
-        'inductive', 'heuristic', or 'alpha'.
+        'inductive', 'heuristic', 'alpha', or 'ilp'.
     noise_threshold : float
         Noise filtering for the Inductive Miner (0.0 = keep all, 1.0 = max filtering).
         Higher values produce stricter models that filter out infrequent paths.
@@ -112,6 +112,8 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2):
         net, im, fm = pm4py.discover_petri_net_heuristics(sub_log)
     elif algorithm == 'alpha':
         net, im, fm = pm4py.discover_petri_net_alpha(sub_log)
+    elif algorithm == 'ilp':
+        net, im, fm = pm4py.discover_petri_net_ilp(sub_log)
     else:
         raise ValueError(f"Unknown mining algorithm: {algorithm}")
 
@@ -693,6 +695,7 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2):
         - 'inductive' (default) — pm4py Inductive Miner → sound Petri net
         - 'heuristic' — pm4py Heuristics Miner → noise-tolerant
         - 'alpha' — pm4py Alpha Miner → classic algorithm
+        - 'ilp' — pm4py ILP Miner → precise/sound, can be strict
         - 'manual' — original manual extraction (no process mining)
     noise_threshold : float
         Noise filtering for the Inductive Miner (0.0 = keep all,
