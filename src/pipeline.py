@@ -1264,6 +1264,29 @@ import pandas as pd
 from sim_extractor import extract_process
 from simulation import ProcessSimulation
 from sim_modeller import SimModeller
+from process_0_generator import generate_process_0_dataset
+
+ENABLE_PROCESS_0 = True
+PROCESS_0_CONFIG = {
+    'num_cases': 80,
+    'num_machines': 4,
+    'rework_probability': 0.25,
+    'failure_probability': 0.12,
+    'random_seed': RANDOM_SEED,
+}
+
+if ENABLE_PROCESS_0:
+    process_datasets_to_model['process_0'] = generate_process_0_dataset(**PROCESS_0_CONFIG)
+    print(f"Added synthetic process_0 with {len(process_datasets_to_model['process_0']['event_log'])} events")
+
+# Restrict evaluation scope for focused testing.
+EVALUATION_PROCESSES = ['process_0', 'process_2']
+_available_eval_processes = [p for p in EVALUATION_PROCESSES if p in process_datasets_to_model]
+process_datasets_to_model = {
+    p: process_datasets_to_model[p]
+    for p in _available_eval_processes
+}
+print(f"Evaluation processes: {_available_eval_processes}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIMULATION MODE TOGGLE
@@ -1420,6 +1443,8 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
     'statistical',
+    'dual_timestamp_window',
+    'dual_strict_lockstep',
     'petri_net_alpha',
     'petri_net_heuristic',
     'petri_net_inductive',
@@ -1538,7 +1563,14 @@ for process in process_datasets_to_model.keys():
 
     # ── Train ML models once (shared by ml-based modes) ───────────────────
     ml_models = None
-    if any(m != 'statistical' for m in MODES_TO_COMPARE):
+    ml_required_modes = {
+        'ml',
+        'ml_duration_only',
+        'ml_duration_only_with_activity_past',
+        'ml_duration_only_with_activity_past_point_estimate',
+        'ml_global_model',
+    }
+    if any(m in ml_required_modes for m in MODES_TO_COMPARE):
         print("\n" + "="*50)
         print(f"TRAINING ML MODELS  (types={ML_MODEL_TYPES}, "
               f"optuna={ML_OPTIMIZE_HYPERPARAMS})")
@@ -1579,7 +1611,15 @@ for process in process_datasets_to_model.keys():
             simulation_mode = 'petri_net'
             mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
 
-        mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
+        no_ml_modes = (
+            'statistical',
+            'petri_net',
+            'petri_net_statistical',
+            'petri_net_statistical_memory',
+            'dual_timestamp_window',
+            'dual_strict_lockstep',
+        )
+        mode_ml = ml_models if simulation_mode not in no_ml_modes else None
         mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
         simulated_log = ProcessSimulation(

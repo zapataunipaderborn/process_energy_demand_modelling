@@ -311,10 +311,18 @@ class ProcessSimulation:
                 print(f"      {key} - is_start: {self.activity_config[key]['is_start']}")
         
         return start_activities
+
+    def _infer_perspective(self, higher_level_activity):
+        """Infer event perspective from higher-level activity metadata."""
+        hla = str(higher_level_activity).strip().lower() if pd.notna(higher_level_activity) else ''
+        if 'material' in hla:
+            return 'material_flow'
+        return 'machine_state'
     
     def _log_event(self, case_id, activity, timestamp_start, timestamp_end, 
                    object_name, object_type, higher_level_activity, object_attributes):
         """Log a simulation event"""
+        perspective = self._infer_perspective(higher_level_activity)
         self.events.append({
             'case_id': str(case_id).strip(),
             'activity': str(activity).strip(),
@@ -323,7 +331,8 @@ class ProcessSimulation:
             'object': str(object_name).strip(),
             'object_type': str(object_type).strip(),
             'higher_level_activity': str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None,
-            'object_attributes': object_attributes
+            'object_attributes': object_attributes,
+            'perspective': perspective,
         })
     
     # ------------------------------------------------------------------
@@ -1147,9 +1156,144 @@ class ProcessSimulation:
             current_activity = next_activity
             current_sim_time += 1
 
+    def _simulate_statistical_for_object_buffer(self, case_id, object_attributes,
+                                                start_time, object_name,
+                                                object_type, higher_level_activity):
+        """Statistical simulation for one object, returning buffered events only."""
+        buffered = []
+        current_sim_time = start_time.timestamp()
+
+        start_activities = self._get_start_activities(
+            object_name, object_type, higher_level_activity
+        )
+        if not start_activities:
+            return buffered
+
+        current_activity = random.choice(start_activities)
+        activity_count = 0
+        activity_history = []
+
+        while current_activity:
+            _HIST_MODES = ('ml_duration_only_with_activity_past',
+                           'ml_duration_only_with_activity_past_point_estimate',
+                           'ml_global_model')
+            activity_duration = self._get_activity_duration(
+                current_activity, object_name, object_type,
+                higher_level_activity, object_attributes,
+                activity_history=activity_history if self.mode in _HIST_MODES else None,
+                activity_index=activity_count,
+            )
+
+            ts_start = datetime.fromtimestamp(current_sim_time)
+            current_sim_time += activity_duration * 60
+            ts_end = datetime.fromtimestamp(current_sim_time)
+
+            buffered.append({
+                'case_id': str(case_id).strip(),
+                'activity': str(current_activity).strip(),
+                'timestamp_start': ts_start,
+                'timestamp_end': ts_end,
+                'object': str(object_name).strip(),
+                'object_type': str(object_type).strip(),
+                'higher_level_activity': str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None,
+                'object_attributes': object_attributes,
+                'perspective': self._infer_perspective(higher_level_activity),
+            })
+
+            activity_history.insert(0, (current_activity, activity_duration))
+            activity_history = activity_history[:2]
+            activity_count += 1
+
+            next_activity = self._get_next_activity(
+                current_activity, object_name, object_type,
+                higher_level_activity, object_attributes,
+            )
+            if not next_activity:
+                break
+            current_activity = next_activity
+            current_sim_time += 1
+
+        return buffered
+
+    def _merge_dual_events(self, material_events, machine_events, strategy='timestamp_window'):
+        """Merge perspective streams with either time-window or strict lockstep policy."""
+        material_sorted = sorted(material_events, key=lambda e: e['timestamp_start'])
+        machine_sorted = sorted(machine_events, key=lambda e: e['timestamp_start'])
+
+        if strategy == 'strict_lockstep':
+            merged = []
+            m_i, s_i = 0, 0
+            while m_i < len(material_sorted) or s_i < len(machine_sorted):
+                if m_i < len(material_sorted):
+                    merged.append(material_sorted[m_i])
+                    m_i += 1
+                if s_i < len(machine_sorted):
+                    merged.append(machine_sorted[s_i])
+                    s_i += 1
+            return merged
+
+        # Default: timestamp-window merge.
+        combined = material_sorted + machine_sorted
+        return sorted(
+            combined,
+            key=lambda e: (
+                e['timestamp_start'],
+                0 if e.get('perspective') == 'material_flow' else 1,
+                e.get('object', ''),
+                e.get('activity', ''),
+            )
+        )
+
+    def _simulate_dual_for_case(self, case_id, object_attributes, start_time, merge_strategy):
+        """Simulate material and machine perspectives independently, then merge."""
+        unique_objects = self.activity_stats[
+            ['object', 'object_type', 'higher_level_activity']
+        ].drop_duplicates()
+
+        material_events = []
+        machine_events = []
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            perspective = self._infer_perspective(higher_level_activity)
+            buffered = self._simulate_statistical_for_object_buffer(
+                case_id, object_attributes, start_time,
+                object_name, object_type, higher_level_activity
+            )
+            if perspective == 'material_flow':
+                material_events.extend(buffered)
+            else:
+                machine_events.extend(buffered)
+
+        merged = self._merge_dual_events(
+            material_events, machine_events,
+            strategy=merge_strategy,
+        )
+        self.events.extend(merged)
+
     def _simulate_process_for_case(self, case_id, object_attributes, start_time):
         """Simulate process for one case using probabilistic end transitions"""
         print(f"[DEBUG _simulate_process_for_case] self.mode = '{self.mode}'")
+        if self.mode == 'dual_timestamp_window':
+            self._simulate_dual_for_case(
+                case_id, object_attributes, start_time,
+                merge_strategy='timestamp_window'
+            )
+            return
+
+        if self.mode == 'dual_strict_lockstep':
+            self._simulate_dual_for_case(
+                case_id, object_attributes, start_time,
+                merge_strategy='strict_lockstep'
+            )
+            return
+
         # ── Petri net mode delegates to its own method ────────────────
         if self.mode == 'petri_net':
             self._simulate_petri_net_for_case(
