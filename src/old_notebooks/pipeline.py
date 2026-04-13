@@ -751,67 +751,6 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import pm4py
-from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
-
-try:
-    from pm4py.algo.evaluation.generalization import algorithm as pm4py_generalization
-except Exception:
-    pm4py_generalization = None
-
-try:
-    from pm4py.algo.evaluation.simplicity import algorithm as pm4py_simplicity
-except Exception:
-    pm4py_simplicity = None
-
-
-def _mean_trace_fitness(log_df, net, im, fm):
-    """Compute mean trace fitness from token replay; returns np.nan on failure."""
-    try:
-        replay = token_replay.apply(
-            log_df, net, im, fm,
-            parameters={'consider_remaining_in_fitness': True}
-        )
-        scores = []
-        for item in replay:
-            if 'trace_fitness' in item and item['trace_fitness'] is not None:
-                scores.append(float(item['trace_fitness']))
-            elif item.get('trace_is_fit') is True:
-                scores.append(1.0)
-            else:
-                scores.append(0.0)
-        return float(np.mean(scores)) if scores else np.nan
-    except Exception:
-        return np.nan
-
-
-def _safe_precision(log_df, net, im, fm):
-    """Compute token-based precision; returns np.nan on failure."""
-    try:
-        return float(pm4py.precision_token_based_replay(log_df, net, im, fm))
-    except Exception:
-        return np.nan
-
-
-def _safe_generalization(log_df, net, im, fm):
-    """Compute pm4py generalization when available; returns np.nan otherwise."""
-    if pm4py_generalization is None:
-        return np.nan
-    try:
-        return float(pm4py_generalization.apply(log_df, net, im, fm))
-    except Exception:
-        return np.nan
-
-
-def _safe_simplicity(net):
-    """Compute simplicity; prefer pm4py metric and fall back to complexity proxy."""
-    if pm4py_simplicity is not None:
-        try:
-            return float(pm4py_simplicity.apply(net))
-        except Exception:
-            pass
-
-    complexity = len(net.places) + len(net.transitions) + len(net.arcs)
-    return float(1.0 / (1.0 + 0.005 * float(complexity)))
 
 def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id', 
                                        activity_col='activity', start_col='timestamp_start', 
@@ -1045,72 +984,31 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
         'end_activities_jaccard': end_jaccard
     }
     
-    # ========== 6. CLASSIC PROCESS-MINING DIMENSIONS (ADDITIVE) ==========
-    print("\n6. CLASSIC PROCESS-MINING DIMENSIONS")
+    # ========== 6. OVERALL QUALITY SCORE ==========
+    print("\n6. OVERALL QUALITY ASSESSMENT")
     print("-" * 40)
-
-    conformance_metrics = {
-        'fitness': np.nan,
-        'precision': np.nan,
-        'generalization': np.nan,
-        'simplicity': np.nan,
-    }
-
-    if len(sim_for_dfg) > 0 and len(real_for_dfg) > 0:
-        try:
-            # Mine a reference model from the real log and replay simulated traces on it.
-            ref_net, ref_im, ref_fm = pm4py.discover_petri_net_inductive(real_log)
-
-            conformance_metrics['fitness'] = _mean_trace_fitness(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['precision'] = _safe_precision(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['generalization'] = _safe_generalization(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['simplicity'] = _safe_simplicity(ref_net)
-        except Exception as e:
-            print(f"Conformance dimensions unavailable: {e}")
-
-    for m_name, m_val in conformance_metrics.items():
-        if pd.isna(m_val):
-            print(f"{m_name:35}: n/a")
-        else:
-            print(f"{m_name:35}: {m_val:.4f}")
-
-    results['conformance_metrics'] = conformance_metrics
-
-    # ========== 7. OVERALL QUALITY SCORE ==========
-    print("\n7. OVERALL QUALITY ASSESSMENT")
-    print("-" * 40)
-
-    # Active score requested by user:
-    # keep conformance metrics + mean duration + event_count_ratio.
-    # all active metrics have equal weight.
-    active_components = {
-        'event_count_ratio': results['basic_metrics']['event_count_ratio'],
-        'mean_duration_similarity': (1.0 - results['duration_metrics']['mean_duration_error']),
-        'fitness': results['conformance_metrics'].get('fitness'),
-        'precision': results['conformance_metrics'].get('precision'),
-        'generalization': results['conformance_metrics'].get('generalization'),
-        'simplicity': results['conformance_metrics'].get('simplicity'),
-    }
-
-    active_values = []
-    print("\nActive Score Components:")
-    for comp_name, comp_val in active_components.items():
-        if pd.isna(comp_val):
-            print(f"  {comp_name:30}: n/a")
-            continue
-        comp_val = float(comp_val)
-        comp_val = max(0.0, min(1.0, comp_val))
-        active_values.append(comp_val)
-        print(f"  {comp_name:30}: {comp_val:.4f}")
-
-    overall_score = float(np.mean(active_values)) if active_values else np.nan
-    print(f"\nOVERALL QUALITY SCORE (active): {overall_score:.4f} (0=worst, 1=perfect)")
     
-    if pd.notna(overall_score) and overall_score >= 0.8:
+    # Weighted quality score (based on literature importance)
+    quality_components = {
+        'Event Count': (1 - results['basic_metrics']['event_count_error'], 0.15),
+        'Activity Distribution': (1 - results['activity_metrics']['js_divergence'], 0.25),
+        'Duration Distribution': (1 - results['duration_metrics']['ks_statistic'], 0.20),
+        'Case Structure': (1 - results['case_metrics']['events_per_case_ks'], 0.15),
+        'Control Flow': (results['control_flow_metrics']['edge_f1_score'], 0.25)
+    }
+    
+    overall_score = sum(score * weight for (score, weight) in quality_components.values())
+    
+    print("Quality Components:")
+    for component, (score, weight) in quality_components.items():
+        print(f"  {component:20}: {score:.4f} (weight: {weight:.2f})")
+    print(f"\nOVERALL QUALITY SCORE: {overall_score:.4f} (0=worst, 1=perfect)")
+    
+    if overall_score >= 0.8:
         quality_assessment = "EXCELLENT"
-    elif pd.notna(overall_score) and overall_score >= 0.6:
+    elif overall_score >= 0.6:
         quality_assessment = "GOOD"
-    elif pd.notna(overall_score) and overall_score >= 0.4:
+    elif overall_score >= 0.4:
         quality_assessment = "FAIR"
     else:
         quality_assessment = "POOR"
@@ -1709,17 +1607,6 @@ import numpy as np
 test_cols = [c for c in evaluation_results_df.columns
              if c.startswith('test_') and evaluation_results_df[c].dtype in ('float64', 'float32', 'int64')]
 
-# Active metrics only (others remain computed/stored but are hidden in comparison dashboards).
-enabled_test_metrics = {
-    'test_overall_score',
-    'test_basic_metrics_event_count_ratio',
-    'test_duration_metrics_mean_duration_error',
-    'test_conformance_metrics_fitness',
-    'test_conformance_metrics_precision',
-    'test_conformance_metrics_generalization',
-    'test_conformance_metrics_simplicity',
-}
-
 # Metrics where LOWER is better
 lower_is_better = {
     'test_basic_metrics_event_count_error',
@@ -1728,6 +1615,7 @@ lower_is_better = {
     'test_activity_metrics_frequency_mae',
     'test_duration_metrics_ks_statistic',
     'test_duration_metrics_mean_duration_error',
+    'test_duration_metrics_median_duration_error',
     'test_duration_metrics_std_duration_error',
     'test_case_metrics_events_per_case_ks',
     'test_case_metrics_mean_events_per_case_error',
@@ -1742,10 +1630,6 @@ higher_is_better = {
     'test_activity_metrics_activity_coverage_ratio',
     'test_duration_metrics_ks_pvalue',
     'test_case_metrics_events_per_case_pvalue',
-    'test_conformance_metrics_fitness',
-    'test_conformance_metrics_precision',
-    'test_conformance_metrics_generalization',
-    'test_conformance_metrics_simplicity',
     'test_control_flow_metrics_edge_precision',
     'test_control_flow_metrics_edge_recall',
     'test_control_flow_metrics_edge_f1_score',
@@ -1754,7 +1638,6 @@ higher_is_better = {
 }
 
 test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
-test_cols = [c for c in test_cols if c in enabled_test_metrics]
 
 # Short labels
 short_labels = {c: c.replace('test_', '').replace('_metrics_', ': ')
@@ -1777,78 +1660,196 @@ def _normalise_metrics(df, cols, lower_set):
     return norm_df
 
 # %% 
-# ── HEATMAP + METRIC TABLE (+ LATEX) ─────────────────────────────────────────
+# ── CHART 1: HEATMAP — normalised modes × metrics ────────────────────────────
 if test_cols and 'mode' in evaluation_results_df.columns:
     mode_avg = evaluation_results_df.groupby('mode')[test_cols].mean()
     mode_avg_norm = _normalise_metrics(mode_avg, test_cols, lower_is_better)
-
     if 'test_overall_score' in mode_avg_norm.columns:
         mode_avg_norm = mode_avg_norm.sort_values('test_overall_score', ascending=False)
 
-    # Short and paper-friendly metric names
-    short_labels = {
-        'test_overall_score': 'Overall',
-        'test_basic_metrics_event_count_ratio': 'EvtRatio',
-        'test_duration_metrics_mean_duration_error': 'MeanDurErr',
-        'test_conformance_metrics_fitness': 'Fitness',
-        'test_conformance_metrics_precision': 'Precision',
-        'test_conformance_metrics_generalization': 'Generaliz',
-        'test_conformance_metrics_simplicity': 'Simplicity',
-    }
+    # Build annotation matrix with raw values
+    annot_df = mode_avg[test_cols].reindex(mode_avg_norm.index).round(3)
 
-    display_cols = [short_labels.get(c, c.replace('test_', '')) for c in test_cols]
-
-    # Heatmap data (normalised), annotations are raw values.
+    display_cols = [short_labels[c] for c in test_cols]
     plot_df = mode_avg_norm[test_cols].copy()
     plot_df.columns = display_cols
 
-    annot_df = mode_avg[test_cols].reindex(mode_avg_norm.index).round(3)
-    annot_df.columns = display_cols
+    annot_vals = annot_df.copy()
+    annot_vals.columns = display_cols
 
-    fig, ax = plt.subplots(figsize=(max(10, len(test_cols) * 1.0),
+    fig, ax = plt.subplots(figsize=(max(14, len(test_cols) * 0.9),
                                     max(3, len(mode_avg_norm) * 0.8)))
-    sns.heatmap(
-        plot_df,
-        annot=annot_df,
-        fmt='',
-        cmap='RdYlGn',
-        vmin=0,
-        vmax=1,
-        linewidths=0.5,
-        ax=ax,
-        cbar_kws={'label': 'Normalised score (1 = best)'}
-    )
-    ax.set_title('Mode vs Metrics Heatmap (normalised colors, raw values in cells)',
-                 fontsize=12, fontweight='bold')
+    sns.heatmap(plot_df, annot=annot_vals, fmt='', cmap='RdYlGn',
+                vmin=0, vmax=1, linewidths=0.5, ax=ax,
+                cbar_kws={'label': 'Score (1 = best)'})
+    ax.set_title('Mode Comparison Heatmap\n(normalised 0–1, green = best; raw values in cells)',
+                 fontsize=13, fontweight='bold')
     ax.set_ylabel('')
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
     ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
     plt.tight_layout()
     plt.show()
 
-    # Table below the heatmap (raw metrics, shortened names)
-    metrics_table = mode_avg[test_cols].reindex(mode_avg_norm.index).round(4)
-    metrics_table.columns = display_cols
+# %%
+# ── CHART 2: RADAR / SPIDER — mode profiles per process ──────────────────────
+if test_cols and 'mode' in evaluation_results_df.columns:
+    radar_metrics = [c for c in [
+        'test_overall_score',
+        'test_control_flow_metrics_edge_f1_score',
+        'test_control_flow_metrics_start_activities_jaccard',
+        'test_control_flow_metrics_end_activities_jaccard',
+        'test_activity_metrics_activity_coverage_ratio',
+        'test_activity_metrics_js_divergence',
+        'test_duration_metrics_ks_statistic',
+        'test_basic_metrics_event_count_error',
+        'test_case_metrics_events_per_case_ks',
+    ] if c in test_cols]
 
-    print("\n" + "=" * 80)
-    print("METRICS TABLE (RAW VALUES, SHORT NAMES)")
-    print("=" * 80)
-    with pd.option_context('display.max_columns', None, 'display.width', 200):
-        print(metrics_table.to_string())
+    radar_labels = [short_labels[c] for c in radar_metrics]
+    processes = evaluation_results_df['process'].unique()
+    modes = evaluation_results_df['mode'].unique()
 
-    # LaTeX table for paper
-    latex_table = metrics_table.to_latex(
-        index=True,
-        float_format='%.4f',
-        caption='Mode-wise process simulation metrics (short names).',
-        label='tab:mode_metrics_short',
-        escape=False
-    )
+    mode_colors_list = plt.cm.tab10(np.linspace(0, 1, len(modes)))
+    mode_cmap = {m: mode_colors_list[i] for i, m in enumerate(modes)}
 
-    print("\n" + "=" * 80)
-    print("LATEX TABLE (COPY INTO PAPER)")
-    print("=" * 80)
-    print(latex_table)
+    n_proc = len(processes)
+    fig, axes = plt.subplots(1, n_proc, figsize=(6 * n_proc, 5),
+                             subplot_kw=dict(polar=True))
+    if n_proc == 1:
+        axes = [axes]
+
+    angles = np.linspace(0, 2 * np.pi, len(radar_metrics), endpoint=False).tolist()
+    angles += angles[:1]  # close
+    labels_closed = radar_labels + [radar_labels[0]]
+
+    for proc_idx, proc in enumerate(processes):
+        ax = axes[proc_idx]
+        proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
+        proc_norm = _normalise_metrics(proc_df, radar_metrics, lower_is_better)
+
+        for mode in modes:
+            mode_row = proc_norm[proc_norm['mode'] == mode]
+            if mode_row.empty:
+                continue
+            vals = mode_row[radar_metrics].iloc[0].tolist()
+            vals += vals[:1]
+            ax.plot(angles, vals, 'o-', linewidth=1.5, label=mode,
+                    color=mode_cmap[mode], markersize=3)
+            ax.fill(angles, vals, alpha=0.08, color=mode_cmap[mode])
+
+        ax.set_thetagrids(np.degrees(angles[:-1]), radar_labels, fontsize=7)
+        ax.set_ylim(0, 1)
+        ax.set_title(str(proc), fontsize=11, fontweight='bold', pad=20)
+
+    axes[0].legend(loc='upper left', bbox_to_anchor=(-0.3, 1.15),
+                   fontsize=8, ncol=min(len(modes), 4))
+    fig.suptitle('Mode Profiles — Radar Chart per Process\n'
+                 '(outer = best, normalised 0–1)',
+                 fontsize=13, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+# %%
+# ── CHART 3: GROUPED BARS — key metrics side-by-side per process ──────────────
+if test_cols and 'mode' in evaluation_results_df.columns:
+    processes = evaluation_results_df['process'].unique()
+    modes = evaluation_results_df['mode'].unique()
+
+    key_metrics = [c for c in [
+        'test_overall_score',
+        'test_control_flow_metrics_edge_f1_score',
+        'test_activity_metrics_js_divergence',
+        'test_duration_metrics_ks_statistic',
+        'test_case_metrics_events_per_case_ks',
+    ] if c in test_cols]
+
+    n_key = len(key_metrics)
+    fig, axes = plt.subplots(n_key, 1, figsize=(max(8, 2.5 * len(processes) * len(modes) / 3),
+                                                 3.5 * n_key),
+                             sharex=True)
+    if n_key == 1:
+        axes = [axes]
+
+    x = np.arange(len(processes))
+    width = 0.8 / len(modes)
+
+    mode_colors_bar = plt.cm.Set2(np.linspace(0, 1, len(modes)))
+
+    for m_idx, metric in enumerate(key_metrics):
+        ax = axes[m_idx]
+        for i, mode in enumerate(modes):
+            mode_df = evaluation_results_df[evaluation_results_df['mode'] == mode]
+            y_vals = []
+            for proc in processes:
+                row_val = mode_df[mode_df['process'] == proc][metric]
+                y_vals.append(float(row_val.iloc[0]) if len(row_val) > 0 else 0)
+            ax.bar(x + i * width, y_vals, width, label=mode if m_idx == 0 else '',
+                   color=mode_colors_bar[i], edgecolor='white', linewidth=0.5)
+
+        direction = '↓ lower' if metric in lower_is_better else '↑ higher'
+        ax.set_ylabel(short_labels[metric], fontsize=9)
+        ax.set_title(f'{short_labels[metric]}  ({direction} is better)',
+                     fontsize=10, fontweight='bold')
+        ax.tick_params(axis='y', labelsize=8)
+
+    axes[-1].set_xticks(x + width * (len(modes) - 1) / 2)
+    axes[-1].set_xticklabels([str(p) for p in processes], fontsize=10)
+    axes[0].legend(loc='upper center', bbox_to_anchor=(0.5, 1.35),
+                   ncol=min(len(modes), 4), fontsize=8)
+    fig.suptitle('Key Metrics — Side-by-Side per Process',
+                 fontsize=13, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    plt.show()
+
+# %%
+# ── CHART 4: WIN COUNT HEATMAP — which mode wins most metrics ─────────────────
+if test_cols and 'mode' in evaluation_results_df.columns:
+    processes = evaluation_results_df['process'].unique()
+    modes = evaluation_results_df['mode'].unique()
+
+    win_rows = []
+    for proc in processes:
+        proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
+        wins = {m: 0 for m in modes}
+        for c in test_cols:
+            vals = proc_df[['mode', c]].dropna()
+            if vals.empty:
+                continue
+            if c in lower_is_better:
+                best_idx = vals[c].idxmin()
+            else:
+                best_idx = vals[c].idxmax()
+            winner = vals.loc[best_idx, 'mode']
+            wins[winner] = wins.get(winner, 0) + 1
+        for m, count in wins.items():
+            win_rows.append({'process': proc, 'mode': m, 'wins': count})
+
+    wins_df = pd.DataFrame(win_rows)
+    wins_pivot = wins_df.pivot(index='mode', columns='process', values='wins').fillna(0)
+    wins_pivot['TOTAL'] = wins_pivot.sum(axis=1)
+    wins_pivot = wins_pivot.sort_values('TOTAL', ascending=False).astype(int)
+
+    print("\n" + "="*60)
+    print("  METRIC WINS PER MODE (across all test metrics)")
+    print("="*60)
+    with pd.option_context('display.max_columns', None, 'display.width', 120):
+        print(wins_pivot.to_string())
+
+    fig, ax = plt.subplots(figsize=(max(6, len(wins_pivot.columns) * 1.2),
+                                    max(3, len(wins_pivot) * 0.7)))
+    sns.heatmap(wins_pivot, annot=True, fmt='d', cmap='Blues',
+                linewidths=0.5, ax=ax,
+                cbar_kws={'label': 'Number of metrics won'})
+    ax.set_title('Metric Wins per Mode × Process\n'
+                 '(how many metrics each mode is #1 on)',
+                 fontsize=12, fontweight='bold')
+    ax.set_ylabel('')
+    ax.set_xticklabels(ax.get_xticklabels(), fontsize=10)
+    ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
+    plt.tight_layout()
+    plt.show()
+
+    print("✅ All comparison charts displayed.")
 
 # %% 
 
