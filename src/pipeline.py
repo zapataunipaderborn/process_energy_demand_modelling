@@ -1186,7 +1186,23 @@ MINING_ALGORITHM = 'heuristic'
 #MINING_ALGORITHM = 'ilp'
 
 # Petri-net miner variants to compare when mode names include the algorithm.
-PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive', 'ilp']
+PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
+#   Runs local per-group search during extraction and keeps best model.
+# ─────────────────────────────────────────────────────────────────────────────
+OPTIMIZE_MINING_HYPERPARAMS = True
+MINING_SEARCH_SPACE = {
+    'inductive_noise_thresholds': [0.05, 0.10, 0.20, 0.30, 0.40],
+    'heuristic_params_grid': [
+        {'dependency_threshold': 0.30, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.50, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.70, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.50, 'and_threshold': 0.50, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.50, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
+    ],
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
@@ -1314,6 +1330,20 @@ MODES_TO_COMPARE = [
     #'ml_global_model',
 ]
 
+# Keep requested modes, but drop Petri-net variants that are not enabled.
+_filtered_modes = []
+for _mode_name in MODES_TO_COMPARE:
+    if _mode_name.startswith('petri_net_'):
+        _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
+        if _mode_alg not in PETRI_NET_ALGORITHMS:
+            print(
+                f"⚠️ Skipping unsupported mode '{_mode_name}' "
+                f"(enabled algorithms: {PETRI_NET_ALGORITHMS})"
+            )
+            continue
+    _filtered_modes.append(_mode_name)
+MODES_TO_COMPARE = _filtered_modes
+
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
 
@@ -1329,7 +1359,9 @@ for process in process_datasets_to_model.keys():
     # ── Extract process statistics for non-Petri modes (shared baseline) ─────
     activity_stats_df, raw_df, process_models = extract_process(
         df_train,
-        mining_algorithm=MINING_ALGORITHM
+        mining_algorithm=MINING_ALGORITHM,
+        optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
+        mining_search_space=MINING_SEARCH_SPACE,
     )
 
     # ── Extract process models for each requested Petri-net algorithm ─────────
@@ -1356,7 +1388,9 @@ for process in process_datasets_to_model.keys():
             continue
         pm_activity_stats_df, pm_raw_df, pm_process_models = extract_process(
             df_train,
-            mining_algorithm=mode_alg
+            mining_algorithm=mode_alg,
+            optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
+            mining_search_space=MINING_SEARCH_SPACE,
         )
         extraction_by_algorithm[mode_alg] = {
             'activity_stats_df': pm_activity_stats_df,
@@ -1425,10 +1459,11 @@ for process in process_datasets_to_model.keys():
         if sim_mode.startswith('petri_net_'):
             mode_algorithm = sim_mode.replace('petri_net_', '', 1).strip().lower()
             if mode_algorithm not in extraction_by_algorithm:
-                raise ValueError(
-                    f"Unsupported Petri-net mode '{sim_mode}'. "
+                print(
+                    f"⚠️ Skipping unsupported Petri-net mode '{sim_mode}'. "
                     f"Expected one of: {[f'petri_net_{a}' for a in PETRI_NET_ALGORITHMS]}"
                 )
+                continue
             simulation_mode = 'petri_net'
             mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
 
