@@ -1777,202 +1777,78 @@ def _normalise_metrics(df, cols, lower_set):
     return norm_df
 
 # %% 
-# ── CHART 1: HEATMAP — normalised modes × metrics ────────────────────────────
+# ── HEATMAP + METRIC TABLE (+ LATEX) ─────────────────────────────────────────
 if test_cols and 'mode' in evaluation_results_df.columns:
     mode_avg = evaluation_results_df.groupby('mode')[test_cols].mean()
     mode_avg_norm = _normalise_metrics(mode_avg, test_cols, lower_is_better)
+
     if 'test_overall_score' in mode_avg_norm.columns:
         mode_avg_norm = mode_avg_norm.sort_values('test_overall_score', ascending=False)
 
-    # Build annotation matrix with raw values
-    annot_df = mode_avg[test_cols].reindex(mode_avg_norm.index).round(3)
+    # Short and paper-friendly metric names
+    short_labels = {
+        'test_overall_score': 'Overall',
+        'test_basic_metrics_event_count_ratio': 'EvtRatio',
+        'test_duration_metrics_mean_duration_error': 'MeanDurErr',
+        'test_conformance_metrics_fitness': 'Fitness',
+        'test_conformance_metrics_precision': 'Precision',
+        'test_conformance_metrics_generalization': 'Generaliz',
+        'test_conformance_metrics_simplicity': 'Simplicity',
+    }
 
-    display_cols = [short_labels[c] for c in test_cols]
+    display_cols = [short_labels.get(c, c.replace('test_', '')) for c in test_cols]
+
+    # Heatmap data (normalised), annotations are raw values.
     plot_df = mode_avg_norm[test_cols].copy()
     plot_df.columns = display_cols
 
-    annot_vals = annot_df.copy()
-    annot_vals.columns = display_cols
+    annot_df = mode_avg[test_cols].reindex(mode_avg_norm.index).round(3)
+    annot_df.columns = display_cols
 
-    fig, ax = plt.subplots(figsize=(max(14, len(test_cols) * 0.9),
+    fig, ax = plt.subplots(figsize=(max(10, len(test_cols) * 1.0),
                                     max(3, len(mode_avg_norm) * 0.8)))
-    sns.heatmap(plot_df, annot=annot_vals, fmt='', cmap='RdYlGn',
-                vmin=0, vmax=1, linewidths=0.5, ax=ax,
-                cbar_kws={'label': 'Score (1 = best)'})
-    ax.set_title('Mode Comparison Heatmap\n(normalised 0–1, green = best; raw values in cells)',
-                 fontsize=13, fontweight='bold')
-    ax.set_ylabel('')
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
-    ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
-    plt.tight_layout()
-    plt.show()
-
-# %%
-# ── CHART 2: RADAR / SPIDER — mode profiles per process ──────────────────────
-if test_cols and 'mode' in evaluation_results_df.columns:
-    radar_metrics = [c for c in [
-        'test_overall_score',
-        'test_conformance_metrics_fitness',
-        'test_conformance_metrics_precision',
-        'test_conformance_metrics_generalization',
-        'test_conformance_metrics_simplicity',
-        'test_control_flow_metrics_edge_f1_score',
-        'test_control_flow_metrics_start_activities_jaccard',
-        'test_control_flow_metrics_end_activities_jaccard',
-        'test_activity_metrics_activity_coverage_ratio',
-        'test_activity_metrics_js_divergence',
-        'test_duration_metrics_ks_statistic',
-        'test_basic_metrics_event_count_error',
-        'test_case_metrics_events_per_case_ks',
-    ] if c in test_cols]
-
-    radar_labels = [short_labels[c] for c in radar_metrics]
-    processes = evaluation_results_df['process'].unique()
-    modes = evaluation_results_df['mode'].unique()
-
-    mode_colors_list = plt.cm.tab10(np.linspace(0, 1, len(modes)))
-    mode_cmap = {m: mode_colors_list[i] for i, m in enumerate(modes)}
-
-    n_proc = len(processes)
-    fig, axes = plt.subplots(1, n_proc, figsize=(6 * n_proc, 5),
-                             subplot_kw=dict(polar=True))
-    if n_proc == 1:
-        axes = [axes]
-
-    angles = np.linspace(0, 2 * np.pi, len(radar_metrics), endpoint=False).tolist()
-    angles += angles[:1]  # close
-    labels_closed = radar_labels + [radar_labels[0]]
-
-    for proc_idx, proc in enumerate(processes):
-        ax = axes[proc_idx]
-        proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
-        proc_norm = _normalise_metrics(proc_df, radar_metrics, lower_is_better)
-
-        for mode in modes:
-            mode_row = proc_norm[proc_norm['mode'] == mode]
-            if mode_row.empty:
-                continue
-            vals = mode_row[radar_metrics].iloc[0].tolist()
-            vals += vals[:1]
-            ax.plot(angles, vals, 'o-', linewidth=1.5, label=mode,
-                    color=mode_cmap[mode], markersize=3)
-            ax.fill(angles, vals, alpha=0.08, color=mode_cmap[mode])
-
-        ax.set_thetagrids(np.degrees(angles[:-1]), radar_labels, fontsize=7)
-        ax.set_ylim(0, 1)
-        ax.set_title(str(proc), fontsize=11, fontweight='bold', pad=20)
-
-    axes[0].legend(loc='upper left', bbox_to_anchor=(-0.3, 1.15),
-                   fontsize=8, ncol=min(len(modes), 4))
-    fig.suptitle('Mode Profiles — Radar Chart per Process\n'
-                 '(outer = best, normalised 0–1)',
-                 fontsize=13, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.show()
-
-# %%
-# ── CHART 3: GROUPED BARS — key metrics side-by-side per process ──────────────
-if test_cols and 'mode' in evaluation_results_df.columns:
-    processes = evaluation_results_df['process'].unique()
-    modes = evaluation_results_df['mode'].unique()
-
-    key_metrics = [c for c in [
-        'test_overall_score',
-        'test_conformance_metrics_fitness',
-        'test_conformance_metrics_precision',
-        'test_control_flow_metrics_edge_f1_score',
-        'test_activity_metrics_js_divergence',
-        'test_duration_metrics_ks_statistic',
-        'test_case_metrics_events_per_case_ks',
-    ] if c in test_cols]
-
-    n_key = len(key_metrics)
-    fig, axes = plt.subplots(n_key, 1, figsize=(max(8, 2.5 * len(processes) * len(modes) / 3),
-                                                 3.5 * n_key),
-                             sharex=True)
-    if n_key == 1:
-        axes = [axes]
-
-    x = np.arange(len(processes))
-    width = 0.8 / len(modes)
-
-    mode_colors_bar = plt.cm.Set2(np.linspace(0, 1, len(modes)))
-
-    for m_idx, metric in enumerate(key_metrics):
-        ax = axes[m_idx]
-        for i, mode in enumerate(modes):
-            mode_df = evaluation_results_df[evaluation_results_df['mode'] == mode]
-            y_vals = []
-            for proc in processes:
-                row_val = mode_df[mode_df['process'] == proc][metric]
-                y_vals.append(float(row_val.iloc[0]) if len(row_val) > 0 else 0)
-            ax.bar(x + i * width, y_vals, width, label=mode if m_idx == 0 else '',
-                   color=mode_colors_bar[i], edgecolor='white', linewidth=0.5)
-
-        direction = '↓ lower' if metric in lower_is_better else '↑ higher'
-        ax.set_ylabel(short_labels[metric], fontsize=9)
-        ax.set_title(f'{short_labels[metric]}  ({direction} is better)',
-                     fontsize=10, fontweight='bold')
-        ax.tick_params(axis='y', labelsize=8)
-
-    axes[-1].set_xticks(x + width * (len(modes) - 1) / 2)
-    axes[-1].set_xticklabels([str(p) for p in processes], fontsize=10)
-    axes[0].legend(loc='upper center', bbox_to_anchor=(0.5, 1.35),
-                   ncol=min(len(modes), 4), fontsize=8)
-    fig.suptitle('Key Metrics — Side-by-Side per Process',
-                 fontsize=13, fontweight='bold', y=1.01)
-    plt.tight_layout()
-    plt.show()
-
-# %%
-# ── CHART 4: WIN COUNT HEATMAP — which mode wins most metrics ─────────────────
-if test_cols and 'mode' in evaluation_results_df.columns:
-    processes = evaluation_results_df['process'].unique()
-    modes = evaluation_results_df['mode'].unique()
-
-    win_rows = []
-    for proc in processes:
-        proc_df = evaluation_results_df[evaluation_results_df['process'] == proc]
-        wins = {m: 0 for m in modes}
-        for c in test_cols:
-            vals = proc_df[['mode', c]].dropna()
-            if vals.empty:
-                continue
-            if c in lower_is_better:
-                best_idx = vals[c].idxmin()
-            else:
-                best_idx = vals[c].idxmax()
-            winner = vals.loc[best_idx, 'mode']
-            wins[winner] = wins.get(winner, 0) + 1
-        for m, count in wins.items():
-            win_rows.append({'process': proc, 'mode': m, 'wins': count})
-
-    wins_df = pd.DataFrame(win_rows)
-    wins_pivot = wins_df.pivot(index='mode', columns='process', values='wins').fillna(0)
-    wins_pivot['TOTAL'] = wins_pivot.sum(axis=1)
-    wins_pivot = wins_pivot.sort_values('TOTAL', ascending=False).astype(int)
-
-    print("\n" + "="*60)
-    print("  METRIC WINS PER MODE (across all test metrics)")
-    print("="*60)
-    with pd.option_context('display.max_columns', None, 'display.width', 120):
-        print(wins_pivot.to_string())
-
-    fig, ax = plt.subplots(figsize=(max(6, len(wins_pivot.columns) * 1.2),
-                                    max(3, len(wins_pivot) * 0.7)))
-    sns.heatmap(wins_pivot, annot=True, fmt='d', cmap='Blues',
-                linewidths=0.5, ax=ax,
-                cbar_kws={'label': 'Number of metrics won'})
-    ax.set_title('Metric Wins per Mode × Process\n'
-                 '(how many metrics each mode is #1 on)',
+    sns.heatmap(
+        plot_df,
+        annot=annot_df,
+        fmt='',
+        cmap='RdYlGn',
+        vmin=0,
+        vmax=1,
+        linewidths=0.5,
+        ax=ax,
+        cbar_kws={'label': 'Normalised score (1 = best)'}
+    )
+    ax.set_title('Mode vs Metrics Heatmap (normalised colors, raw values in cells)',
                  fontsize=12, fontweight='bold')
     ax.set_ylabel('')
-    ax.set_xticklabels(ax.get_xticklabels(), fontsize=10)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
     ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
     plt.tight_layout()
     plt.show()
 
-    print("✅ All comparison charts displayed.")
+    # Table below the heatmap (raw metrics, shortened names)
+    metrics_table = mode_avg[test_cols].reindex(mode_avg_norm.index).round(4)
+    metrics_table.columns = display_cols
+
+    print("\n" + "=" * 80)
+    print("METRICS TABLE (RAW VALUES, SHORT NAMES)")
+    print("=" * 80)
+    with pd.option_context('display.max_columns', None, 'display.width', 200):
+        print(metrics_table.to_string())
+
+    # LaTeX table for paper
+    latex_table = metrics_table.to_latex(
+        index=True,
+        float_format='%.4f',
+        caption='Mode-wise process simulation metrics (short names).',
+        label='tab:mode_metrics_short',
+        escape=False
+    )
+
+    print("\n" + "=" * 80)
+    print("LATEX TABLE (COPY INTO PAPER)")
+    print("=" * 80)
+    print(latex_table)
 
 # %% 
 
