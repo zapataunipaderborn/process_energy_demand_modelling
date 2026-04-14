@@ -1315,7 +1315,6 @@ MINING_SEARCH_SPACE = {
 #   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
 # ─────────────────────────────────────────────────────────────────────────────
 ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
-ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
 ML_OPTIMIZE_HYPERPARAMS = False    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
 
@@ -1416,22 +1415,19 @@ else:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODES TO COMPARE
-#   We run BOTH modes on every process so results appear side by side.
+#   Execution A/B switch:
+#   - 'offline_baseline'   → existing offline/statistical flow
+#   - 'petri_ml_warped'    → Petri-constrained ML probabilities/durations
+#   - 'compare_both'       → run both modes for side-by-side metrics
 # ─────────────────────────────────────────────────────────────────────────────
-MODES_TO_COMPARE = [
-    'statistical',
-    'petri_net_alpha',
-    'petri_net_heuristic',
-    'petri_net_inductive',
-    'petri_net_combined',
-    'petri_net_ilp',
-    #'petri_net_statistical',
-    #'petri_net_statistical_memory',
-    #'ml_duration_only',
-    #'ml_duration_only_with_activity_past',
-    #'ml_duration_only_with_activity_past_point_estimate',
-    #'ml_global_model',
-]
+MODE_EXECUTION = 'compare_both'  # 'offline_baseline' | 'petri_ml_warped' | 'compare_both'
+
+if MODE_EXECUTION == 'offline_baseline':
+    MODES_TO_COMPARE = ['offline_baseline']
+elif MODE_EXECUTION == 'petri_ml_warped':
+    MODES_TO_COMPARE = ['petri_ml_warped']
+else:
+    MODES_TO_COMPARE = ['offline_baseline', 'petri_ml_warped']
 
 # Keep requested modes, but drop Petri-net variants that are not enabled.
 _filtered_modes = []
@@ -1538,7 +1534,10 @@ for process in process_datasets_to_model.keys():
 
     # ── Train ML models once (shared by ml-based modes) ───────────────────
     ml_models = None
-    if any(m != 'statistical' for m in MODES_TO_COMPARE):
+    if any(m in ('petri_ml_warped', 'ml', 'ml_duration_only',
+                 'ml_duration_only_with_activity_past',
+                 'ml_duration_only_with_activity_past_point_estimate',
+                 'ml_global_model') for m in MODES_TO_COMPARE):
         print("\n" + "="*50)
         print(f"TRAINING ML MODELS  (types={ML_MODEL_TYPES}, "
               f"optuna={ML_OPTIMIZE_HYPERPARAMS})")
@@ -1547,7 +1546,7 @@ for process in process_datasets_to_model.keys():
             model_types=ML_MODEL_TYPES,
             optimize_hyperparams=ML_OPTIMIZE_HYPERPARAMS,
             n_optuna_trials=ML_OPTUNA_TRIALS,
-            train_transitions=False,   # only duration for ml_duration_only
+            train_transitions=True,
         )
         ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
@@ -1568,7 +1567,15 @@ for process in process_datasets_to_model.keys():
         simulation_mode = sim_mode
         mode_activity_stats_df = activity_stats_df
 
-        if sim_mode.startswith('petri_net_'):
+        if sim_mode == 'offline_baseline':
+            simulation_mode = 'statistical'
+            mode_algorithm = None
+            mode_activity_stats_df = activity_stats_df
+        elif sim_mode == 'petri_ml_warped':
+            simulation_mode = 'petri_ml_warped'
+            mode_algorithm = MINING_ALGORITHM
+            mode_activity_stats_df = extraction_by_algorithm[MINING_ALGORITHM]['activity_stats_df']
+        elif sim_mode.startswith('petri_net_'):
             mode_algorithm = sim_mode.replace('petri_net_', '', 1).strip().lower()
             if mode_algorithm not in extraction_by_algorithm:
                 print(
@@ -1580,7 +1587,7 @@ for process in process_datasets_to_model.keys():
             mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
 
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
-        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
+        mode_pm = extraction_by_algorithm.get(mode_algorithm if mode_algorithm else MINING_ALGORITHM, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory', 'petri_ml_warped') else None
 
         simulated_log_train = ProcessSimulation(
             mode_activity_stats_df, production_plan,

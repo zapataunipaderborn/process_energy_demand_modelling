@@ -54,6 +54,7 @@ except ImportError:
     _OPTUNA_AVAILABLE = False
 
 from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+from sklearn.dummy import DummyClassifier
 from sklearn.neural_network import MLPRegressor, MLPClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (
@@ -130,8 +131,8 @@ def _default_regressor(model_type: str, random_state: int = 42):
 def _default_classifier(model_type: str, random_state: int = 42):
     """Return a classifier instance with sensible defaults."""
     if model_type in ('mean', 'median'):
-        # Baselines aren't meaningful for classification but shouldn't crash
-        return _ConstantPredictor(strategy=model_type)
+        # Probabilistic baseline for classification paths.
+        return DummyClassifier(strategy='most_frequent')
     if model_type == 'xgboost':
         if not _XGBOOST_AVAILABLE:
             raise RuntimeError("xgboost not installed")
@@ -198,7 +199,7 @@ def _optuna_regressor(trial, model_type: str, random_state: int = 42):
 def _optuna_classifier(trial, model_type: str, random_state: int = 42):
     """Return a classifier with Optuna-suggested hyper-parameters."""
     if model_type in ('mean', 'median'):
-        return _ConstantPredictor(strategy=model_type)
+        return DummyClassifier(strategy='most_frequent')
     if model_type == 'xgboost':
         return XGBClassifier(
             n_estimators=trial.suggest_int('n_estimators', 50, 300),
@@ -640,8 +641,15 @@ class SimModeller:
             best_tr_type = None
             best_tr_metrics = None
             tr_results = {}
+            transition_model_types = [
+                m for m in self.model_types if m not in ('mean', 'median')
+            ]
 
-            for mtype in self.model_types:
+            if not transition_model_types:
+                # No meaningful classifier configured.
+                continue
+
+            for mtype in transition_model_types:
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
@@ -848,6 +856,7 @@ class SimModeller:
         object_type: str,
         higher_level_activity,
         object_attributes: dict,
+        activity_history: list | None = None,
     ) -> float | None:
         """
         Predict a sampled duration (minutes) for one activity instance.
@@ -865,6 +874,24 @@ class SimModeller:
 
         dur_model, feature_cols, _mtype = self.duration_models[key]
         features = self._attrs_to_features(object_attributes, feature_cols)
+
+        if activity_history is not None:
+            le = self.activity_label_encoder
+            for i in range(2):
+                act_col = f'prev_activity_{i+1}'
+                dur_col = f'prev_duration_{i+1}'
+                if act_col in feature_cols:
+                    if i < len(activity_history):
+                        act_name, act_dur = activity_history[i]
+                        encoded = -1
+                        if le is not None and str(act_name) in le.classes_:
+                            encoded = int(le.transform([str(act_name)])[0])
+                        features[act_col] = encoded
+                        features[dur_col] = act_dur
+                    else:
+                        features[act_col] = -1
+                        features[dur_col] = 0.0
+
         X = pd.DataFrame([features])[feature_cols]
         for col in X.columns:
             X[col] = pd.to_numeric(X[col], errors='coerce')
@@ -1029,6 +1056,7 @@ class SimModeller:
         object_type: str,
         higher_level_activity,
         object_attributes: dict,
+        activity_history: list | None = None,
     ) -> dict | None:
         """
         Predict transition probabilities as ``{next_activity: probability}``.
@@ -1043,16 +1071,116 @@ class SimModeller:
 
         tr_model, le, feature_cols, _mtype = self.transition_models[key]
         features = self._attrs_to_features(object_attributes, feature_cols)
+
+        if activity_history is not None:
+            hist_le = self.activity_label_encoder
+            for i in range(2):
+                act_col = f'prev_activity_{i+1}'
+                dur_col = f'prev_duration_{i+1}'
+                if act_col in feature_cols:
+                    if i < len(activity_history):
+                        act_name, act_dur = activity_history[i]
+                        encoded = -1
+                        if hist_le is not None and str(act_name) in hist_le.classes_:
+                            encoded = int(hist_le.transform([str(act_name)])[0])
+                        features[act_col] = encoded
+                        features[dur_col] = act_dur
+                    else:
+                        features[act_col] = -1
+                        features[dur_col] = 0.0
+
         X = pd.DataFrame([features])[feature_cols]
         for col in X.columns:
             X[col] = pd.to_numeric(X[col], errors='coerce')
         X = X.fillna(0.0)
 
-        probs = tr_model.predict_proba(X)[0]
+        if hasattr(tr_model, 'predict_proba'):
+            probs = tr_model.predict_proba(X)[0]
+            return {
+                str(cls): float(prob)
+                for cls, prob in zip(le.classes_, probs)
+            }
+
+        # Defensive fallback for any classifier without predict_proba.
+        pred_label = str(tr_model.predict(X)[0])
         return {
-            str(cls): float(prob)
-            for cls, prob in zip(le.classes_, probs)
+            str(cls): 1.0 if str(cls) == pred_label else 0.0
+            for cls in le.classes_
         }
+
+    def predict_transition_proba_with_curve(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        curve_features: list | np.ndarray | None = None,
+        activity_history: list | None = None,
+    ) -> dict | None:
+        """Transition probabilities with optional warped-curve features.
+
+        Warped curve values are injected as object attributes using keys
+        ``warped_0``, ``warped_1``, ... and can be consumed when trained
+        feature columns include matching ``attr_warped_*`` fields.
+        """
+        attrs = dict(object_attributes or {})
+        if curve_features is not None:
+            for i, v in enumerate(list(curve_features)):
+                attrs[f'warped_{i}'] = float(v)
+        return self.predict_transitions(
+            activity=activity,
+            object_name=object_name,
+            object_type=object_type,
+            higher_level_activity=higher_level_activity,
+            object_attributes=attrs,
+            activity_history=activity_history,
+        )
+
+    def predict_duration_with_curve(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        curve_features: list | np.ndarray | None = None,
+        activity_history: list | None = None,
+    ) -> float | None:
+        """Duration prediction with optional warped-curve features."""
+        attrs = dict(object_attributes or {})
+        if curve_features is not None:
+            for i, v in enumerate(list(curve_features)):
+                attrs[f'warped_{i}'] = float(v)
+        return self.predict_duration(
+            activity=activity,
+            object_name=object_name,
+            object_type=object_type,
+            higher_level_activity=higher_level_activity,
+            object_attributes=attrs,
+            activity_history=activity_history,
+        )
+
+    def sample_duration_with_curve(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        curve_features: list | np.ndarray | None = None,
+        activity_history: list | None = None,
+    ) -> float | None:
+        """Alias for stochastic duration prediction with optional curve features."""
+        return self.predict_duration_with_curve(
+            activity=activity,
+            object_name=object_name,
+            object_type=object_type,
+            higher_level_activity=higher_level_activity,
+            object_attributes=object_attributes,
+            curve_features=curve_features,
+            activity_history=activity_history,
+        )
 
     # ------------------------------------------------------------------
     # Utilities

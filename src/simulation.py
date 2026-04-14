@@ -70,19 +70,25 @@ class ProcessSimulation:
         random.seed(random_seed)
         np.random.seed(random_seed)
 
-        if self.mode in ('ml', 'ml_duration_only',
-                        'ml_duration_only_with_activity_past',
-                        'ml_duration_only_with_activity_past_point_estimate',
-                        'ml_global_model') \
-                and self.ml_models is None:
+        if self.mode in (
+            'ml',
+            'ml_duration_only',
+            'ml_duration_only_with_activity_past',
+            'ml_duration_only_with_activity_past_point_estimate',
+            'ml_global_model',
+            'petri_ml_warped',
+        ) and self.ml_models is None:
             print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no ml_models "
                   "provided – falling back to statistical mode.")
             self.mode = 'statistical'
 
         # Petri net mode validation
-        if self.mode in ('petri_net', 'petri_net_statistical',
-                         'petri_net_statistical_memory') \
-                and (self.process_models is None or len(self.process_models) == 0):
+        if self.mode in (
+            'petri_net',
+            'petri_net_statistical',
+            'petri_ml_warped',
+            'petri_net_statistical_memory',
+        ) and (self.process_models is None or len(self.process_models) == 0):
             print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no "
                   "process_models provided – falling back to statistical mode.")
             self.mode = 'statistical'
@@ -154,7 +160,7 @@ class ProcessSimulation:
         key = (activity, object_name, object_type, higher_level_activity)
 
         # ── Full ML path (duration + ML std) ──────────────────────────────
-        if self.mode == 'ml' and self.ml_models is not None:
+        if self.mode in ('ml', 'petri_ml_warped') and self.ml_models is not None:
             ml_dur = self.ml_models.predict_duration(
                 activity, object_name, object_type,
                 higher_level_activity, object_attributes
@@ -1092,6 +1098,202 @@ class ProcessSimulation:
             print(f"  Completed {object_name} petri_net_statistical_memory "
                   f"with {activity_count} activities")
 
+    def _simulate_petri_ml_warped_for_case(self, case_id, object_attributes, start_time):
+        """Petri-constrained ML simulation.
+
+        Petri net constrains enabled labels; ML provides probabilities and
+        duration sampling. Statistical transitions are only an emergency
+        fallback.
+        """
+        TEMPERATURE = 1.0
+        EPS = 1e-12
+
+        current_sim_time = start_time.timestamp()
+        unique_objects = (
+            self.activity_stats[['object', 'object_type', 'higher_level_activity']]
+            .drop_duplicates()
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key = (object_name, object_type, higher_level_activity)
+            model = self.process_models.get(key) if self.process_models else None
+            if model is None:
+                print(f"  No Petri net for {key} — falling back to statistical simulation.")
+                self._simulate_statistical_for_object(
+                    case_id, object_attributes, current_sim_time,
+                    object_name, object_type, higher_level_activity
+                )
+                continue
+
+            net = model['net']
+            im = model['im']
+            fm = model['fm']
+            decision_weights = model.get('decision_weights', {})
+            label_stochastic = model.get('label_stochastic', {})
+            max_case_length = model.get('max_case_length', 200)
+
+            marking = copy.copy(im)
+            activity_count = 0
+            prev_activity = None
+            activity_history = []
+            max_steps = max(max_case_length * 2, 50)
+            step = 0
+
+            print(f"\nCase {case_id}: Petri-ML-warped simulation for {object_name} ({object_type})")
+
+            while step < max_steps:
+                step += 1
+
+                if marking == fm:
+                    break
+                fm_reached = all(marking.get(p, 0) >= fm[p] for p in fm)
+                if fm_reached and activity_count > 0:
+                    break
+
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    break
+
+                label_to_transitions = defaultdict(list)
+                silent_transitions = []
+                for t in enabled:
+                    if t.label is not None:
+                        label_to_transitions[str(t.label).strip()].append(t)
+                    else:
+                        silent_transitions.append(t)
+
+                if not label_to_transitions:
+                    chosen_tau = random.choice(silent_transitions)
+                    marking = self._fire_transition(marking, chosen_tau)
+                    continue
+
+                valid_labels = set(label_to_transitions.keys())
+
+                if activity_count == 0:
+                    start_acts = self._get_start_activities(
+                        object_name, object_type, higher_level_activity
+                    )
+                    candidates = [a for a in start_acts if a in valid_labels]
+                    if not candidates:
+                        candidates = list(valid_labels)
+                    if not candidates:
+                        break
+                    chosen_label = random.choice(candidates)
+                else:
+                    # Build ML probabilities.
+                    ml_probs = None
+                    if self.ml_models is not None and prev_activity is not None:
+                        ml_probs = self.ml_models.predict_transition_proba_with_curve(
+                            activity=prev_activity,
+                            object_name=object_name,
+                            object_type=object_type,
+                            higher_level_activity=higher_level_activity,
+                            object_attributes=object_attributes,
+                            curve_features=object_attributes.get('warped_curve_features'),
+                            activity_history=activity_history,
+                        )
+
+                    # 1) ML masked to enabled (+ optional __END__).
+                    masked = {}
+                    if ml_probs:
+                        all_labels = set(valid_labels)
+                        if '__END__' in ml_probs:
+                            all_labels.add('__END__')
+                        for lbl in all_labels:
+                            masked[lbl] = max(0.0, float(ml_probs.get(lbl, 0.0)))
+
+                    # 2) Petri decision prior fallback.
+                    if sum(masked.values()) <= 0:
+                        dp_key = frozenset(valid_labels)
+                        dp_weights = decision_weights.get(dp_key, {})
+                        if dp_weights:
+                            for lbl in set(valid_labels) | {'__END__'}:
+                                masked[lbl] = max(0.0, float(dp_weights.get(lbl, 0.0)))
+                        elif label_stochastic:
+                            for lbl in valid_labels:
+                                masked[lbl] = max(0.0, float(label_stochastic.get(lbl, 0.0)))
+
+                    # 3) Uniform over enabled labels.
+                    if sum(masked.values()) <= 0:
+                        for lbl in valid_labels:
+                            masked[lbl] = 1.0
+
+                    # 4) Emergency statistical fallback.
+                    if sum(masked.values()) <= 0 and prev_activity is not None:
+                        prev_key = (prev_activity, object_name, object_type, higher_level_activity)
+                        tr = self.activity_config.get(prev_key, {}).get('transitions', {})
+                        for lbl, p in tr.items():
+                            if lbl in valid_labels or lbl == '__END__':
+                                masked[lbl] = max(0.0, float(p))
+
+                    acts = list(masked.keys())
+                    probs = np.array([masked[a] for a in acts], dtype=float)
+                    if probs.sum() <= 0:
+                        acts = list(valid_labels)
+                        probs = np.ones(len(acts), dtype=float)
+
+                    probs = probs / probs.sum()
+                    if TEMPERATURE != 1.0:
+                        probs = np.exp(np.log(probs + EPS) / TEMPERATURE)
+                        probs = probs / probs.sum()
+
+                    chosen_label = str(np.random.choice(acts, p=probs)).strip()
+                    if chosen_label == '__END__':
+                        break
+
+                candidates = label_to_transitions.get(chosen_label, [])
+                if not candidates:
+                    break
+                chosen_transition = random.choice(candidates)
+                marking = self._fire_transition(marking, chosen_transition)
+
+                # ML duration with stochasticity when available.
+                duration = None
+                if self.ml_models is not None:
+                    duration = self.ml_models.sample_duration_with_curve(
+                        activity=chosen_label,
+                        object_name=object_name,
+                        object_type=object_type,
+                        higher_level_activity=higher_level_activity,
+                        object_attributes=object_attributes,
+                        curve_features=object_attributes.get('warped_curve_features'),
+                        activity_history=activity_history,
+                    )
+                if duration is None:
+                    duration = self._get_activity_duration(
+                        chosen_label, object_name, object_type,
+                        higher_level_activity, object_attributes,
+                        activity_index=activity_count,
+                    )
+
+                start_time_obj = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += float(duration) * 60
+                end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id,
+                    activity=chosen_label,
+                    timestamp_start=start_time_obj,
+                    timestamp_end=end_time_obj,
+                    object_name=object_name,
+                    object_type=object_type,
+                    higher_level_activity=higher_level_activity,
+                    object_attributes=object_attributes,
+                )
+
+                prev_activity = chosen_label
+                activity_history.insert(0, (chosen_label, float(duration)))
+                activity_history = activity_history[:2]
+                activity_count += 1
+                current_sim_time += 1
+
     def _simulate_statistical_for_object(self, case_id, object_attributes,
                                           current_sim_time, object_name,
                                           object_type,
@@ -1167,6 +1369,13 @@ class ProcessSimulation:
         # ── Petri net + memory (history-dependent) mode ───────────────
         if self.mode == 'petri_net_statistical_memory':
             self._simulate_petri_net_statistical_memory_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── Petri net + ML warped curve mode ───────────────────────
+        if self.mode == 'petri_ml_warped':
+            self._simulate_petri_ml_warped_for_case(
                 case_id, object_attributes, start_time
             )
             return
