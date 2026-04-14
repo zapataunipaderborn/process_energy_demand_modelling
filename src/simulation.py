@@ -43,7 +43,7 @@ class ProcessSimulation:
 
     def __init__(self, activity_stats_df, production_plan,
                  mode='statistical', ml_models=None, process_models=None,
-                 random_seed=42):
+                 random_seed=42, petri_coordination_mode='plain'):
         # Backward-compatible input handling: extract_process now returns
         # (stats_df, raw_df, process_models), while older callers pass stats_df only.
         if isinstance(activity_stats_df, (tuple, list)):
@@ -64,6 +64,10 @@ class ProcessSimulation:
         self.mode = mode
         self.ml_models = ml_models
         self.process_models = process_models  # Petri nets from sim_extractor
+        self.petri_coordination_mode = str(petri_coordination_mode).strip().lower()
+        if self.petri_coordination_mode not in ('plain', 'causal_sync', 'material_nested'):
+            print(f"[ProcessSimulation] WARNING: unknown petri_coordination_mode='{self.petri_coordination_mode}', using 'plain'.")
+            self.petri_coordination_mode = 'plain'
         print(f"[DEBUG __init__] mode={self.mode}, "
               f"process_models is None: {process_models is None}, "
               f"process_models len: {len(process_models) if process_models else 'N/A'}")
@@ -83,9 +87,10 @@ class ProcessSimulation:
         if self.mode in ('petri_net', 'petri_net_statistical',
                          'petri_net_statistical_memory') \
                 and (self.process_models is None or len(self.process_models) == 0):
-            print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no "
-                  "process_models provided – falling back to statistical mode.")
-            self.mode = 'statistical'
+            raise ValueError(
+                f"mode='{self.mode}' requires non-empty process_models; "
+                "Petri-net simulation cannot run without mined Petri nets."
+            )
 
         # Verification: confirm global model is loaded for ml_global_model
         if self.mode == 'ml_global_model' and self.ml_models is not None:
@@ -407,6 +412,7 @@ class ProcessSimulation:
             .drop_duplicates()
         )
 
+        contexts = []
         for _, obj_config in unique_objects.iterrows():
             object_name = str(obj_config['object']).strip()
             object_type = str(obj_config['object_type']).strip()
@@ -417,122 +423,361 @@ class ProcessSimulation:
 
             key = (object_name, object_type, higher_level_activity)
             model = self.process_models.get(key) if self.process_models else None
-
             if model is None:
-                # No Petri net for this group → fall back to statistical
-                print(f"  No Petri net for {key} — falling back to "
-                      f"statistical simulation.")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
+                print(f"  No Petri net for {key} — skipping this group in Petri mode.")
                 continue
 
-            net = model['net']
-            im  = model['im']
-            fm  = model['fm']
-            stochastic_map = model.get('stochastic_map', {})
-            duration_map   = model.get('duration_map', {})
-            max_case_length = model.get('max_case_length', 200)
+            contexts.append({
+                'object_name': object_name,
+                'object_type': object_type,
+                'higher_level_activity': higher_level_activity,
+                'perspective': self._infer_perspective(higher_level_activity),
+                'net': model['net'],
+                'im': model['im'],
+                'fm': model['fm'],
+                'stochastic_map': model.get('stochastic_map', {}),
+                'duration_map': model.get('duration_map', {}),
+                'max_case_length': model.get('max_case_length', 200),
+            })
 
-            # Start the token game
-            marking = copy.copy(im)
+        if not contexts:
+            print("  No Petri net contexts available for this case.")
+            return
+
+        machine_contexts = [c for c in contexts if c['perspective'] == 'machine_state']
+        material_contexts = [c for c in contexts if c['perspective'] == 'material_flow']
+
+        def _duration_for(ctx, activity_label):
+            act_key = (
+                activity_label,
+                ctx['object_name'],
+                ctx['object_type'],
+                ctx['higher_level_activity'],
+            )
+            if act_key in self.activity_config:
+                config = self.activity_config[act_key]
+                dist_name = config.get('dist_name', 'norm')
+                dist_params = config.get('dist_params')
+                if dist_params and any(p != 0 for p in dist_params[1:]):
+                    return sample_from_dist(dist_name, dist_params)
+                return max(0.1, config['duration'])
+
+            if activity_label in ctx['duration_map']:
+                dn, dp = ctx['duration_map'][activity_label]
+                return sample_from_dist(dn, dp)
+
+            print(f"    WARNING: No duration info for '{activity_label}' — using 10 min default.")
+            return 10.0
+
+        def _final_reached(marking, fm):
+            if marking == fm:
+                return True
+            return all(marking.get(p, 0) >= fm[p] for p in fm)
+
+        def _advance_tau_until_label(state, target_label, max_tau_steps=30):
+            tau_steps = 0
+            while tau_steps < max_tau_steps:
+                enabled = self._get_enabled_transitions(state['ctx']['net'], state['marking'])
+                if not enabled:
+                    return enabled
+                if any((t.label is not None and str(t.label).strip() == target_label) for t in enabled):
+                    return enabled
+                tau_enabled = [t for t in enabled if t.label is None]
+                if not tau_enabled:
+                    return enabled
+                chosen_tau = self._choose_transition(set(tau_enabled), state['ctx']['stochastic_map'])
+                state['marking'] = self._fire_transition(state['marking'], chosen_tau)
+                tau_steps += 1
+            return self._get_enabled_transitions(state['ctx']['net'], state['marking'])
+
+        def _run_machine_subprocess(machine_ctx, start_ts):
+            """Run one machine Petri net cycle as a nested subprocess and return end timestamp."""
+            local_time = start_ts
+            marking = copy.copy(machine_ctx['im'])
             activity_count = 0
-            max_steps = max(max_case_length * 2, 50)  # guard from training data
+            max_steps = max(machine_ctx['max_case_length'] * 2, 50)
             step = 0
-
-            print(f"\nCase {case_id}: Petri net simulation for {object_name} "
-                  f"({object_type})")
 
             while step < max_steps:
                 step += 1
-
-                # Check if we reached the final marking
-                if marking == fm:
-                    print(f"    Final marking reached after {activity_count} "
-                          f"activities.")
+                if _final_reached(marking, machine_ctx['fm']):
                     break
 
-                # Check also if fm is a subset of marking (common pattern)
-                fm_reached = all(
-                    marking.get(p, 0) >= fm[p] for p in fm
-                )
-                if fm_reached and activity_count > 0:
-                    print(f"    Final marking subset reached after "
-                          f"{activity_count} activities.")
-                    break
-
-                # Find enabled transitions
-                enabled = self._get_enabled_transitions(net, marking)
+                enabled = self._get_enabled_transitions(machine_ctx['net'], marking)
                 if not enabled:
-                    print(f"    No enabled transitions — deadlock after "
-                          f"{activity_count} activities.")
                     break
 
-                # Choose which transition to fire
-                chosen = self._choose_transition(enabled, stochastic_map)
-
-                # Fire the transition (update marking)
+                chosen = self._choose_transition(enabled, machine_ctx['stochastic_map'])
                 marking = self._fire_transition(marking, chosen)
 
-                # If this is a visible transition (has a label), log event
-                if chosen.label is not None:
+                if chosen.label is None:
+                    continue
+
+                activity_label = str(chosen.label).strip()
+                activity_duration = _duration_for(machine_ctx, activity_label)
+
+                start_time_obj = datetime.fromtimestamp(local_time)
+                local_time += activity_duration * 60
+                end_time_obj = datetime.fromtimestamp(local_time)
+
+                self._log_event(
+                    case_id=case_id,
+                    activity=activity_label,
+                    timestamp_start=start_time_obj,
+                    timestamp_end=end_time_obj,
+                    object_name=machine_ctx['object_name'],
+                    object_type=machine_ctx['object_type'],
+                    higher_level_activity=machine_ctx['higher_level_activity'],
+                    object_attributes=object_attributes,
+                )
+                activity_count += 1
+                local_time += 1
+
+                if activity_label == 'cleanup':
+                    break
+
+            return local_time, activity_count
+
+        # Material-driven nested execution:
+        # material net is the outer orchestrator and machine nets are nested subprocesses.
+        if self.petri_coordination_mode == 'material_nested' and machine_contexts and material_contexts:
+            for mat_ctx in material_contexts:
+                marking = copy.copy(mat_ctx['im'])
+                activity_count = 0
+                max_steps = max(mat_ctx['max_case_length'] * 2, 50)
+                step = 0
+
+                print(f"\nCase {case_id}: Material-driven nested Petri simulation for {mat_ctx['object_name']} ({mat_ctx['object_type']})")
+
+                while step < max_steps:
+                    step += 1
+
+                    if _final_reached(marking, mat_ctx['fm']):
+                        print(f"    Final marking reached after {activity_count} activities.")
+                        break
+
+                    enabled = self._get_enabled_transitions(mat_ctx['net'], marking)
+                    if not enabled:
+                        print(f"    No enabled transitions — deadlock after {activity_count} activities.")
+                        break
+
+                    chosen = self._choose_transition(enabled, mat_ctx['stochastic_map'])
+                    marking = self._fire_transition(marking, chosen)
+
+                    if chosen.label is None:
+                        continue
+
+                    material_label = str(chosen.label).strip()
+                    start_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                    # Default material duration when there is no nested machine call.
+                    fallback_minutes = _duration_for(mat_ctx, material_label)
+                    end_ts = current_sim_time + fallback_minutes * 60
+
+                    machine_name = None
+                    if material_label.startswith('material_process_'):
+                        machine_name = material_label.replace('material_process_', '', 1)
+                    elif material_label.startswith('material_rework_'):
+                        machine_name = material_label.replace('material_rework_', '', 1)
+
+                    if machine_name:
+                        machine_ctx = next(
+                            (mc for mc in machine_contexts if mc['object_name'] == machine_name),
+                            None,
+                        )
+                        if machine_ctx is not None:
+                            nested_end, nested_count = _run_machine_subprocess(machine_ctx, current_sim_time)
+                            if nested_end > current_sim_time:
+                                end_ts = nested_end
+                            print(f"    Nested machine '{machine_name}' executed with {nested_count} events.")
+
+                    current_sim_time = end_ts
+                    end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                    self._log_event(
+                        case_id=case_id,
+                        activity=material_label,
+                        timestamp_start=start_time_obj,
+                        timestamp_end=end_time_obj,
+                        object_name=mat_ctx['object_name'],
+                        object_type=mat_ctx['object_type'],
+                        higher_level_activity=mat_ctx['higher_level_activity'],
+                        object_attributes=object_attributes,
+                    )
+
+                    activity_count += 1
+                    current_sim_time += 1
+                    print(f"    [{activity_count}] Fired '{material_label}'")
+
+                if step >= max_steps:
+                    print(f"    WARNING: Max steps ({max_steps}) reached for {mat_ctx['object_name']} — stopping.")
+
+                print(f"  Completed nested material Petri simulation with {activity_count} activities")
+
+            return
+
+        # If both perspectives exist and requested, run synchronized causal Petri execution.
+        if self.petri_coordination_mode == 'causal_sync' and machine_contexts and material_contexts:
+            material_states = [
+                {
+                    'ctx': c,
+                    'marking': copy.copy(c['im']),
+                }
+                for c in material_contexts
+            ]
+
+            for m_ctx in machine_contexts:
+                m_state = {
+                    'ctx': m_ctx,
+                    'marking': copy.copy(m_ctx['im']),
+                }
+                activity_count = 0
+                max_steps = max(m_ctx['max_case_length'] * 2, 50)
+                step = 0
+
+                print(f"\nCase {case_id}: Causal Petri simulation for {m_ctx['object_name']} ({m_ctx['object_type']})")
+
+                while step < max_steps:
+                    step += 1
+
+                    if _final_reached(m_state['marking'], m_ctx['fm']):
+                        print(f"    Final marking reached after {activity_count} activities.")
+                        break
+
+                    enabled = self._get_enabled_transitions(m_ctx['net'], m_state['marking'])
+                    if not enabled:
+                        print(f"    No enabled transitions — deadlock after {activity_count} activities.")
+                        break
+
+                    chosen = self._choose_transition(enabled, m_ctx['stochastic_map'])
+                    m_state['marking'] = self._fire_transition(m_state['marking'], chosen)
+
+                    if chosen.label is None:
+                        continue
+
                     activity_label = str(chosen.label).strip()
+                    activity_duration = _duration_for(m_ctx, activity_label)
 
-                    # Get duration from the duration map or activity config
-                    act_key = (activity_label, object_name, object_type,
-                               higher_level_activity)
-
-                    if act_key in self.activity_config:
-                        config = self.activity_config[act_key]
-                        dist_name = config.get('dist_name', 'norm')
-                        dist_params = config.get('dist_params')
-                        if dist_params and any(p != 0 for p in dist_params[1:]):
-                            activity_duration = sample_from_dist(
-                                dist_name, dist_params
-                            )
-                        else:
-                            activity_duration = max(0.1, config['duration'])
-                    elif activity_label in duration_map:
-                        dn, dp = duration_map[activity_label]
-                        activity_duration = sample_from_dist(dn, dp)
-                    else:
-                        print(f"    WARNING: No duration info for "
-                              f"'{activity_label}' — using 10 min default.")
-                        activity_duration = 10.0
-
-                    # Calculate timestamps
                     start_time_obj = datetime.fromtimestamp(current_sim_time)
                     current_sim_time += activity_duration * 60
                     end_time_obj = datetime.fromtimestamp(current_sim_time)
 
-                    # Log the event
                     self._log_event(
                         case_id=case_id,
                         activity=activity_label,
                         timestamp_start=start_time_obj,
                         timestamp_end=end_time_obj,
-                        object_name=object_name,
-                        object_type=object_type,
-                        higher_level_activity=higher_level_activity,
+                        object_name=m_ctx['object_name'],
+                        object_type=m_ctx['object_type'],
+                        higher_level_activity=m_ctx['higher_level_activity'],
                         object_attributes=object_attributes,
                     )
 
-                    activity_count += 1
-                    current_sim_time += 1  # 1 second gap
+                    # Causal handshake inside Petri mode:
+                    # machine running -> material_process_<machine>
+                    # machine fault   -> material_rework_<machine>
+                    target_material_label = None
+                    if activity_label == 'running':
+                        target_material_label = f"material_process_{m_ctx['object_name']}"
+                    elif activity_label == 'fault':
+                        target_material_label = f"material_rework_{m_ctx['object_name']}"
 
-                    print(f"    [{activity_count}] Fired '{activity_label}' "
-                          f"(dur={activity_duration:.1f} min)")
-                else:
-                    # Silent (tau) transition — no event logged
-                    pass
+                    if target_material_label is not None:
+                        for mat_state in material_states:
+                            enabled_mat = _advance_tau_until_label(mat_state, target_material_label)
+                            candidates = [
+                                t for t in enabled_mat
+                                if t.label is not None and str(t.label).strip() == target_material_label
+                            ]
+                            if not candidates:
+                                continue
+
+                            chosen_mat = self._choose_transition(set(candidates), mat_state['ctx']['stochastic_map'])
+                            mat_state['marking'] = self._fire_transition(mat_state['marking'], chosen_mat)
+
+                            # Keep machine/material causally aligned on the same interval.
+                            self._log_event(
+                                case_id=case_id,
+                                activity=target_material_label,
+                                timestamp_start=start_time_obj,
+                                timestamp_end=end_time_obj,
+                                object_name=mat_state['ctx']['object_name'],
+                                object_type=mat_state['ctx']['object_type'],
+                                higher_level_activity=mat_state['ctx']['higher_level_activity'],
+                                object_attributes=object_attributes,
+                            )
+                            break
+
+                    activity_count += 1
+                    current_sim_time += 1
+
+                    print(f"    [{activity_count}] Fired '{activity_label}' (dur={activity_duration:.1f} min)")
+
+                    if activity_label == 'cleanup':
+                        break
+
+                if step >= max_steps:
+                    print(f"    WARNING: Max steps ({max_steps}) reached for {m_ctx['object_name']} — stopping.")
+
+                print(f"  Completed {m_ctx['object_name']} causal Petri simulation with {activity_count} activities")
+
+            return
+
+        # Default Petri token-game path: plain independent execution
+        # (or fallback when causal/nested prerequisites are not present).
+        for ctx in contexts:
+            marking = copy.copy(ctx['im'])
+            activity_count = 0
+            max_steps = max(ctx['max_case_length'] * 2, 50)
+            step = 0
+
+            print(f"\nCase {case_id}: Petri net simulation for {ctx['object_name']} ({ctx['object_type']})")
+
+            while step < max_steps:
+                step += 1
+
+                if _final_reached(marking, ctx['fm']):
+                    print(f"    Final marking reached after {activity_count} activities.")
+                    break
+
+                enabled = self._get_enabled_transitions(ctx['net'], marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after {activity_count} activities.")
+                    break
+
+                chosen = self._choose_transition(enabled, ctx['stochastic_map'])
+                marking = self._fire_transition(marking, chosen)
+
+                if chosen.label is None:
+                    continue
+
+                activity_label = str(chosen.label).strip()
+                activity_duration = _duration_for(ctx, activity_label)
+
+                start_time_obj = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += activity_duration * 60
+                end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id,
+                    activity=activity_label,
+                    timestamp_start=start_time_obj,
+                    timestamp_end=end_time_obj,
+                    object_name=ctx['object_name'],
+                    object_type=ctx['object_type'],
+                    higher_level_activity=ctx['higher_level_activity'],
+                    object_attributes=object_attributes,
+                )
+
+                activity_count += 1
+                current_sim_time += 1
+
+                print(f"    [{activity_count}] Fired '{activity_label}' (dur={activity_duration:.1f} min)")
 
             if step >= max_steps:
-                print(f"    WARNING: Max steps ({max_steps}) reached for "
-                      f"{object_name} — stopping.")
+                print(f"    WARNING: Max steps ({max_steps}) reached for {ctx['object_name']} — stopping.")
 
-            print(f"  Completed {object_name} Petri net simulation with "
-                  f"{activity_count} activities")
+            print(f"  Completed {ctx['object_name']} Petri net simulation with {activity_count} activities")
 
     # ------------------------------------------------------------------
     # Combined: Petri net structure + statistical/ML probabilities
@@ -588,12 +833,7 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                print(f"  ⚠️ No Petri net for {key} — FALLING BACK to "
-                      f"statistical simulation (this means results = statistical!)")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
+                print(f"  ⚠️ No Petri net for {key} — skipping this group in Petri mode.")
                 continue
             
             print(f"  ✅ Petri net FOUND for {key}")
@@ -855,12 +1095,7 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                print(f"  ⚠️ No Petri net for {key} — falling back to "
-                      f"statistical simulation.")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
+                print(f"  ⚠️ No Petri net for {key} — skipping this group in Petri mode.")
                 continue
 
             net = model['net']
@@ -1277,6 +1512,144 @@ class ProcessSimulation:
         )
         self.events.extend(merged)
 
+    def _simulate_dual_causal_sync_for_case(self, case_id, object_attributes, start_time):
+        """Simulate with a causal machine-material handshake.
+
+        Rules:
+        - Material processing for machine X can happen only when machine X is in running.
+        - Material rework for machine X can happen only when machine X is in fault.
+        - Machine states may continue independently, but material transitions advance
+          only through these synchronized links.
+        """
+        unique_objects = self.activity_stats[
+            ['object', 'object_type', 'higher_level_activity']
+        ].drop_duplicates()
+
+        machine_rows = []
+        material_rows = []
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+            perspective = self._infer_perspective(higher_level_activity)
+            item = (object_name, object_type, higher_level_activity)
+            if perspective == 'material_flow':
+                material_rows.append(item)
+            else:
+                machine_rows.append(item)
+
+        machine_rows = sorted(machine_rows, key=lambda t: (t[0], t[2] or ''))
+        if not machine_rows:
+            # Fallback: if no machine perspective exists, keep old dual behavior.
+            self._simulate_dual_for_case(case_id, object_attributes, start_time, 'timestamp_window')
+            return
+
+        material_id = None
+        if isinstance(object_attributes, dict):
+            material_id = object_attributes.get('material_id')
+        if not material_id and str(case_id).startswith('order_'):
+            material_id = str(case_id).replace('order_', 'material_')
+
+        selected_material = None
+        if material_rows:
+            if material_id:
+                for item in material_rows:
+                    if item[0] == material_id:
+                        selected_material = item
+                        break
+            if selected_material is None:
+                selected_material = sorted(material_rows, key=lambda t: (t[0], t[2] or ''))[0]
+                material_id = selected_material[0]
+
+        material_activity = None
+        if selected_material is not None:
+            mat_obj, mat_type, mat_hla = selected_material
+            mat_starts = self._get_start_activities(mat_obj, mat_type, mat_hla)
+            if mat_starts:
+                material_activity = random.choice(mat_starts)
+
+        current_sim_time = start_time.timestamp()
+        for machine_name, machine_type, machine_hla in machine_rows:
+            m_starts = self._get_start_activities(machine_name, machine_type, machine_hla)
+            if not m_starts:
+                continue
+
+            machine_activity = random.choice(m_starts)
+            machine_steps = 0
+            while machine_activity and machine_steps < 20:
+                duration = self._get_activity_duration(
+                    machine_activity, machine_name, machine_type,
+                    machine_hla, object_attributes,
+                    activity_history=None,
+                    activity_index=machine_steps,
+                )
+                ts_start = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += duration * 60
+                ts_end = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id,
+                    activity=machine_activity,
+                    timestamp_start=ts_start,
+                    timestamp_end=ts_end,
+                    object_name=machine_name,
+                    object_type=machine_type,
+                    higher_level_activity=machine_hla,
+                    object_attributes=object_attributes,
+                )
+
+                # Causal synchronization between machine state and material flow.
+                if selected_material is not None and material_activity:
+                    mat_obj, mat_type, mat_hla = selected_material
+                    expected_process = f"material_process_{machine_name}"
+                    expected_rework = f"material_rework_{machine_name}"
+
+                    if machine_activity == 'running' and material_activity == expected_process:
+                        self._log_event(
+                            case_id=case_id,
+                            activity=material_activity,
+                            timestamp_start=ts_start,
+                            timestamp_end=ts_end,
+                            object_name=mat_obj,
+                            object_type=mat_type,
+                            higher_level_activity=mat_hla,
+                            object_attributes=object_attributes,
+                        )
+                        material_activity = self._get_next_activity(
+                            material_activity, mat_obj, mat_type, mat_hla, object_attributes
+                        )
+
+                    if machine_activity == 'fault' and material_activity == expected_rework:
+                        self._log_event(
+                            case_id=case_id,
+                            activity=material_activity,
+                            timestamp_start=ts_start,
+                            timestamp_end=ts_end,
+                            object_name=mat_obj,
+                            object_type=mat_type,
+                            higher_level_activity=mat_hla,
+                            object_attributes=object_attributes,
+                        )
+                        material_activity = self._get_next_activity(
+                            material_activity, mat_obj, mat_type, mat_hla, object_attributes
+                        )
+
+                next_machine = self._get_next_activity(
+                    machine_activity, machine_name, machine_type,
+                    machine_hla, object_attributes,
+                )
+                machine_steps += 1
+
+                # Run one production cycle per machine before moving to next machine.
+                if machine_activity == 'cleanup':
+                    break
+
+                machine_activity = next_machine
+                current_sim_time += 1
+
     def _simulate_process_for_case(self, case_id, object_attributes, start_time):
         """Simulate process for one case using probabilistic end transitions"""
         print(f"[DEBUG _simulate_process_for_case] self.mode = '{self.mode}'")
@@ -1291,6 +1664,12 @@ class ProcessSimulation:
             self._simulate_dual_for_case(
                 case_id, object_attributes, start_time,
                 merge_strategy='strict_lockstep'
+            )
+            return
+
+        if self.mode == 'dual_causal_sync':
+            self._simulate_dual_causal_sync_for_case(
+                case_id, object_attributes, start_time
             )
             return
 

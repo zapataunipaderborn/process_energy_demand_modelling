@@ -1250,6 +1250,25 @@ def visualize_heuristic_nets(df_compare, simulated_log):
         if os.path.exists(temp_sim_path):
             os.unlink(temp_sim_path)
 
+
+def visualize_petri_net_inline(net, im, fm, title):
+    """Render a Petri net inline to avoid external viewer issues."""
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_img:
+        temp_path = temp_img.name
+
+    try:
+        pm4py.save_vis_petri_net(net, im, fm, temp_path)
+        img = mpimg.imread(temp_path)
+        plt.figure(figsize=(10, 6))
+        plt.imshow(img)
+        plt.title(title, fontsize=12, fontweight='bold')
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
 # %%
 print(process_datasets.keys())
 
@@ -1442,9 +1461,6 @@ else:
 #   We run BOTH modes on every process so results appear side by side.
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
-    'statistical',
-    'dual_timestamp_window',
-    'dual_strict_lockstep',
     'petri_net_alpha',
     'petri_net_heuristic',
     'petri_net_inductive',
@@ -1458,9 +1474,27 @@ MODES_TO_COMPARE = [
     #'ml_global_model',
 ]
 
+# Controls for discovered-net visualization during extraction.
+VISUALIZE_DISCOVERED_NETS = True
+DISCOVERED_NETS_PROCESS_FILTER = {'process_0'}
+DISCOVERED_NETS_ALGORITHM_FILTER = {'heuristic'}
+DISCOVERED_NETS_MAX_PER_PROCESS_ALG = 20
+
+# Hard guard: this pipeline run is Petri-only simulation.
+PETRI_ONLY_SIMULATION = True
+
+# Petri coordination mode:
+#   'plain'           -> no machine/material coordination (independent Petri execution)
+#   'causal_sync'     -> machine events trigger causal material Petri transitions
+#   'material_nested' -> material flow is outer net, machine Petri nets run as nested subprocesses
+PETRI_COORDINATION_MODE = 'plain'
+
 # Keep requested modes, but drop Petri-net variants that are not enabled.
 _filtered_modes = []
 for _mode_name in MODES_TO_COMPARE:
+    if PETRI_ONLY_SIMULATION and not _mode_name.startswith('petri_net_'):
+        print(f"⚠️ Skipping non-Petri mode '{_mode_name}' (Petri-only simulation enabled)")
+        continue
     if _mode_name.startswith('petri_net_'):
         _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
         if _mode_alg == 'combined':
@@ -1534,10 +1568,26 @@ for process in process_datasets_to_model.keys():
         models_for_alg = extracted['process_models']
         if not models_for_alg:
             continue
+
+        if VISUALIZE_DISCOVERED_NETS:
+            if DISCOVERED_NETS_PROCESS_FILTER and process not in DISCOVERED_NETS_PROCESS_FILTER:
+                continue
+            if DISCOVERED_NETS_ALGORITHM_FILTER and alg_name not in DISCOVERED_NETS_ALGORITHM_FILTER:
+                continue
+        else:
+            continue
+
         print("\n" + "="*50)
         print(f"MINED PETRI NETS ({alg_name})")
         print("="*50)
+        rendered_count = 0
         for key, model in models_for_alg.items():
+            if rendered_count >= DISCOVERED_NETS_MAX_PER_PROCESS_ALG:
+                print(
+                    f"\n  ... truncated net preview at {DISCOVERED_NETS_MAX_PER_PROCESS_ALG} nets "
+                    f"for {process}/{alg_name}"
+                )
+                break
             obj_name, obj_type, hla = key
             print(f"\n  Petri net: {obj_name} ({obj_type}) — {hla}")
             print(f"    Places: {len(model['net'].places)}, "
@@ -1551,8 +1601,11 @@ for process in process_datasets_to_model.keys():
             if model.get('label_stochastic'):
                 print(f"    Stochastic weights: {model['label_stochastic']}")
             try:
-                pm4py.view_petri_net(model['net'], model['im'], model['fm'],
-                                     format='png')
+                visualize_petri_net_inline(
+                    model['net'], model['im'], model['fm'],
+                    title=f"{process} | {alg_name} | {obj_name} ({obj_type}) — {hla}"
+                )
+                rendered_count += 1
             except Exception as e:
                 print(f"    (Could not render Petri net: {e})")
 
@@ -1618,6 +1671,7 @@ for process in process_datasets_to_model.keys():
             'petri_net_statistical_memory',
             'dual_timestamp_window',
             'dual_strict_lockstep',
+            'dual_causal_sync',
         )
         mode_ml = ml_models if simulation_mode not in no_ml_modes else None
         mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
@@ -1626,6 +1680,7 @@ for process in process_datasets_to_model.keys():
             mode_activity_stats_df, production_plan,
             mode=simulation_mode, ml_models=mode_ml,
             process_models=mode_pm,
+            petri_coordination_mode=PETRI_COORDINATION_MODE,
         ).run()
 
         print(f"\n  Simulated log ({sim_mode}): {len(simulated_log)} events")
