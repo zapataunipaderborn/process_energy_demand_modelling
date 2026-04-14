@@ -1582,13 +1582,13 @@ for process in process_datasets_to_model.keys():
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
         mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
-        simulated_log = ProcessSimulation(
+        simulated_log_train = ProcessSimulation(
             mode_activity_stats_df, production_plan,
             mode=simulation_mode, ml_models=mode_ml,
             process_models=mode_pm,
         ).run()
 
-        print(f"\n  Simulated log ({sim_mode}): {len(simulated_log)} events")
+        print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
 
         # ══════════════════════════════════════════════════════════════════
         # EVALUATION — TRAIN SET
@@ -1597,12 +1597,12 @@ for process in process_datasets_to_model.keys():
         print(f"\n  🔍 EVALUATION ON {split_label}  [{sim_mode}]")
         print("  " + "="*76)
 
-        eval_train = comprehensive_simulation_evaluation(simulated_log, df_train)
+        eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train)
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
-        #plot_simulation_comparison(simulated_log, df_train)
+        #plot_simulation_comparison(simulated_log_train, df_train)
         df_compare_train = df_train.dropna(subset=['case_id'])
-        visualize_heuristic_nets(df_compare_train, simulated_log)
+        visualize_heuristic_nets(df_compare_train, simulated_log_train)
 
         # Flatten train results
         flattened = {
@@ -1624,15 +1624,26 @@ for process in process_datasets_to_model.keys():
         # ══════════════════════════════════════════════════════════════════
         df_test = test_datasets[process]['event_log'] if test_datasets else None
         if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
+            production_plan_test = test_datasets[process]['production_plan']
+            simulated_log_test = ProcessSimulation(
+                mode_activity_stats_df,
+                production_plan_test,
+                mode=simulation_mode,
+                ml_models=mode_ml,
+                process_models=mode_pm,
+            ).run()
+
+            print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
+
             print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
             print("  " + "="*76)
 
-            eval_test = comprehensive_simulation_evaluation(simulated_log, df_test)
+            eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test)
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
-            #plot_simulation_comparison(simulated_log, df_test)
+            #plot_simulation_comparison(simulated_log_test, df_test)
             df_compare_test = df_test.dropna(subset=['case_id'])
-            visualize_heuristic_nets(df_compare_test, simulated_log)
+            visualize_heuristic_nets(df_compare_test, simulated_log_test)
 
             for category, metrics in eval_test.items():
                 if isinstance(metrics, dict):
