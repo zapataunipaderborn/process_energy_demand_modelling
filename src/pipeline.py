@@ -1913,7 +1913,6 @@ if test_cols and 'mode' in evaluation_results_df.columns:
 
 # %% [markdown]
 # # Data fusion
-stop
 # %%
 # Modelling the curves
 
@@ -2837,14 +2836,7 @@ print(results_df)
 # %%
 results_df 
 
-# %%
-stop
 
-# %%
-results_df 
-
-# %%
-stop
 
 # %%
 import pandas as pd
@@ -3237,17 +3229,3 @@ custom_models = {'Linear Regression': LinearRegression, 'Gradient Boosting': Gra
 training_results = train_position_based_regression(df_expanded, 'temp_nach_WR2_(WT2)_5s_energy', ['Step-032 = Umlauf'], models=custom_models, optimize_hyperparams=False, n_trials=20)
 
 # %%
-
-
-# %%
-
-
-# %%
-
-
-# %%
-
-# %%
-
-
-
