@@ -97,6 +97,13 @@ class ProcessSimulation:
 
         self.env = None
         self.events = []
+        self.transition_sampling_diagnostics = {
+            'choices_total': 0,
+            'choices_with_weighted_candidates': 0,
+            'choices_uniform_fallback': 0,
+            'enabled_transitions_total': 0,
+            'enabled_transitions_missing_weight': 0,
+        }
 
         # Process configuration - build from activity_stats only
         self._build_activity_config()
@@ -325,6 +332,16 @@ class ProcessSimulation:
             'higher_level_activity': str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None,
             'object_attributes': object_attributes
         })
+
+    def _get_statistical_max_steps(self, object_name, object_type, higher_level_activity):
+        """Upper bound for statistical path length to avoid runaway loops."""
+        n_activities = sum(
+            1
+            for (activity, obj, obj_type, hla) in self.activity_config.keys()
+            if obj == object_name and obj_type == object_type and hla == higher_level_activity
+        )
+        # Generous cap: enough for repetitions, but prevents pathological loops.
+        return max(20, n_activities * 8)
     
     # ------------------------------------------------------------------
     # Petri net token-game simulation
@@ -361,18 +378,32 @@ class ProcessSimulation:
     def _choose_transition(self, enabled, stochastic_map):
         """
         Given a set of enabled transitions, pick one using stochastic
-        weights.  Falls back to uniform random if no weights available.
+        weights. Unseen transitions (missing in stochastic_map) get 0 weight.
+        Falls back to uniform random only if no enabled transition has
+        positive weight.
         """
         # Sort to make sampling independent from set iteration order.
         enabled_list = sorted(
             list(enabled),
             key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
         )
-        weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
-        total = sum(weights)
+        raw_weights = [float(stochastic_map.get(t, 0.0)) for t in enabled_list]
+        pos_weights = [max(0.0, w) for w in raw_weights]
+
+        # Diagnostics for precision analysis.
+        self.transition_sampling_diagnostics['choices_total'] += 1
+        self.transition_sampling_diagnostics['enabled_transitions_total'] += len(enabled_list)
+        self.transition_sampling_diagnostics['enabled_transitions_missing_weight'] += sum(
+            1 for t in enabled_list if t not in stochastic_map
+        )
+
+        total = sum(pos_weights)
         if total <= 0:
+            self.transition_sampling_diagnostics['choices_uniform_fallback'] += 1
             return random.choice(enabled_list)
-        probs = [w / total for w in weights]
+
+        self.transition_sampling_diagnostics['choices_with_weighted_candidates'] += 1
+        probs = [w / total for w in pos_weights]
         return np.random.choice(enabled_list, p=probs)
 
     def _simulate_petri_net_for_case(self, case_id, object_attributes,
@@ -410,9 +441,8 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                # No Petri net for this group → fall back to statistical
-                print(f"  No Petri net for {key} — falling back to "
-                      f"statistical simulation.")
+                # Fallback keeps full process coverage when a per-group net is unavailable.
+                print(f"  No Petri net for {key} — falling back to statistical simulation.")
                 self._simulate_statistical_for_object(
                     case_id, object_attributes, current_sim_time,
                     object_name, object_type, higher_level_activity
@@ -423,13 +453,14 @@ class ProcessSimulation:
             im  = model['im']
             fm  = model['fm']
             stochastic_map = model.get('stochastic_map', {})
+            decision_weights = model.get('decision_weights', {})
             duration_map   = model.get('duration_map', {})
             max_case_length = model.get('max_case_length', 200)
 
             # Start the token game
             marking = copy.copy(im)
             activity_count = 0
-            max_steps = max(max_case_length * 2, 50)  # guard from training data
+            max_steps = max(int(np.ceil(max_case_length * 1.10)) + 3, 20)
             step = 0
 
             print(f"\nCase {case_id}: Petri net simulation for {object_name} "
@@ -460,8 +491,39 @@ class ProcessSimulation:
                           f"{activity_count} activities.")
                     break
 
-                # Choose which transition to fire
-                chosen = self._choose_transition(enabled, stochastic_map)
+                # Build current labelled choice set for decision-point control.
+                label_to_transitions = defaultdict(list)
+                for t in enabled:
+                    if t.label is not None:
+                        label_to_transitions[str(t.label).strip()].append(t)
+
+                # Prefer decision-point constrained label choice when available.
+                chosen = None
+                if label_to_transitions:
+                    valid_labels = set(label_to_transitions.keys())
+                    dp_key = frozenset(valid_labels)
+                    dp_weights = decision_weights.get(dp_key, {})
+
+                    if dp_weights:
+                        label_candidates = list(valid_labels)
+                        if '__END__' in dp_weights:
+                            label_candidates.append('__END__')
+
+                        label_probs = [max(0.0, float(dp_weights.get(lbl, 0.0))) for lbl in label_candidates]
+                        total_lp = sum(label_probs)
+                        if total_lp > 0:
+                            label_probs = [p / total_lp for p in label_probs]
+                            chosen_label = str(np.random.choice(label_candidates, p=label_probs)).strip()
+                            if chosen_label == '__END__':
+                                print("    Decision-point selected END — stopping process.")
+                                break
+                            candidates = set(label_to_transitions.get(chosen_label, []))
+                            if candidates:
+                                chosen = self._choose_transition(candidates, stochastic_map)
+
+                # Fallback: token-game stochastic choice over all enabled transitions.
+                if chosen is None:
+                    chosen = self._choose_transition(enabled, stochastic_map)
 
                 # Fire the transition (update marking)
                 marking = self._fire_transition(marking, chosen)
@@ -601,7 +663,7 @@ class ProcessSimulation:
             marking = copy.copy(im)
             activity_count = 0
             activity_history = []
-            max_steps = max(max_case_length * 2, 50)  # Change 4: guard from data
+            max_steps = max(int(np.ceil(max_case_length * 1.10)) + 3, 20)
             step = 0
 
             print(f"\nCase {case_id}: Petri-net-statistical simulation "
@@ -869,7 +931,7 @@ class ProcessSimulation:
             activity_history = []        # ordered list of fired labels
             activity_counts_map = defaultdict(int)  # {label: times_fired}
             prev_activity = '__START__'  # sentinel for first step
-            max_steps = max(max_case_length * 2, 50)  # Change 4
+            max_steps = max(int(np.ceil(max_case_length * 1.10)) + 3, 20)
             step = 0
 
             print(f"\nCase {case_id}: Petri-net-memory simulation "
@@ -1110,8 +1172,16 @@ class ProcessSimulation:
         current_activity = random.choice(start_activities)
         activity_count = 0
         activity_history = []
+        max_steps = self._get_statistical_max_steps(
+            object_name, object_type, higher_level_activity
+        )
 
         while current_activity:
+            if activity_count >= max_steps:
+                print(f"  WARNING: Max statistical steps ({max_steps}) reached for "
+                      f"{object_name} ({object_type}); stopping to avoid runaway loops.")
+                break
+
             _HIST_MODES = ('ml_duration_only_with_activity_past',
                            'ml_duration_only_with_activity_past_point_estimate',
                            'ml_global_model')
@@ -1186,78 +1256,25 @@ class ProcessSimulation:
             higher_level_activity = str(obj_config['higher_level_activity']).strip() if pd.notna(obj_config['higher_level_activity']) else None
             
             print(f"\nCase {case_id}: Simulating {object_name} ({object_type}) process")
-            
-            # Get start activities
-            start_activities = self._get_start_activities(object_name, object_type, higher_level_activity)
-            
-            if not start_activities:
-                print(f"  WARNING: No start activities found for {object_name} ({object_type}) - SKIPPING!")
-                continue
-                
-            # Choose a random start activity
-            current_activity = random.choice(start_activities)
-            print(f"  Starting with activity: {current_activity}")
-            
-            # Follow the process flow with probabilistic ending
-            activity_count = 0
-            # Track last 2 activities/durations for the _with_activity_past mode
-            activity_history = []   # [(activity_name, duration), ...] most recent first
-
-            while current_activity:
-                print(f"    Processing activity {activity_count + 1}: {current_activity}")
-                
-                # Get duration (pass history for modes that use it)
-                _HIST_MODES = ('ml_duration_only_with_activity_past',
-                               'ml_duration_only_with_activity_past_point_estimate',
-                               'ml_global_model')
-                activity_duration = self._get_activity_duration(
-                    current_activity, object_name, object_type,
-                    higher_level_activity, object_attributes,
-                    activity_history=activity_history if self.mode in _HIST_MODES else None,
-                    activity_index=activity_count,
-                )
-                
-                # Calculate timestamps
-                start_time_obj = datetime.fromtimestamp(current_sim_time)
-                current_sim_time += activity_duration * 60
-                end_time_obj = datetime.fromtimestamp(current_sim_time)
-                
-                # Log the event
-                self._log_event(
-                    case_id=case_id,
-                    activity=current_activity,
-                    timestamp_start=start_time_obj,
-                    timestamp_end=end_time_obj,
-                    object_name=object_name,
-                    object_type=object_type,
-                    higher_level_activity=higher_level_activity,
-                    object_attributes=object_attributes
-                )
-                
-                # Update activity history (most-recent-first, keep last 2)
-                activity_history.insert(0, (current_activity, activity_duration))
-                activity_history = activity_history[:2]
-
-                activity_count += 1
-                
-                # Get next activity (which may return None if __END__ is chosen)
-                next_activity = self._get_next_activity(
-                    current_activity, object_name, object_type,
-                    higher_level_activity, object_attributes
-                )
-                
-                if not next_activity:
-                    print(f"    Process ended after {current_activity}")
-                    break
-                
-                current_activity = next_activity
-                current_sim_time += 1  # 1 second gap
-            
-            print(f"  Completed {object_name} process with {activity_count} activities")
+            self._simulate_statistical_for_object(
+                case_id=case_id,
+                object_attributes=object_attributes,
+                current_sim_time=current_sim_time,
+                object_name=object_name,
+                object_type=object_type,
+                higher_level_activity=higher_level_activity,
+            )
     
     def run(self):
         """Run the simulation with probabilistic end transitions"""
         self.events = []
+        self.transition_sampling_diagnostics = {
+            'choices_total': 0,
+            'choices_with_weighted_candidates': 0,
+            'choices_uniform_fallback': 0,
+            'enabled_transitions_total': 0,
+            'enabled_transitions_missing_weight': 0,
+        }
         
         print(f"Starting simulation with {len(self.production_plan)} cases...")
         print(f"Activity config has {len(self.activity_config)} activity configurations")
@@ -1282,6 +1299,23 @@ class ProcessSimulation:
         print(f"SIMULATION COMPLETED")
         print(f"Total events generated: {len(self.events)}")
         print(f"{'='*50}")
+
+        # Print transition-choice diagnostics for Petri-net modes.
+        if self.mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory'):
+            diag = self.transition_sampling_diagnostics
+            choices_total = max(1, diag['choices_total'])
+            enabled_total = max(1, diag['enabled_transitions_total'])
+            missing_ratio = diag['enabled_transitions_missing_weight'] / enabled_total
+            uniform_ratio = diag['choices_uniform_fallback'] / choices_total
+            print("Transition sampling diagnostics:")
+            print(f"  choices_total: {diag['choices_total']}")
+            print(f"  weighted_choices: {diag['choices_with_weighted_candidates']}")
+            print(f"  uniform_fallback_choices: {diag['choices_uniform_fallback']} ({uniform_ratio:.2%})")
+            print(
+                "  enabled_missing_weight: "
+                f"{diag['enabled_transitions_missing_weight']} "
+                f"({missing_ratio:.2%} of enabled transitions)"
+            )
         
         # Convert to DataFrame
         simulated_df = pd.DataFrame(self.events)

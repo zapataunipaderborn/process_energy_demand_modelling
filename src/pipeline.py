@@ -813,9 +813,36 @@ def _safe_simplicity(net):
     complexity = len(net.places) + len(net.transitions) + len(net.arcs)
     return float(1.0 / (1.0 + 0.005 * float(complexity)))
 
+
+def _safe_discover_reference_model(log_df, algorithm='inductive'):
+    """Discover a Petri net with the requested algorithm; returns (net, im, fm) or None."""
+    try:
+        algorithm = str(algorithm).strip().lower()
+        if algorithm == 'inductive':
+            return pm4py.discover_petri_net_inductive(log_df)
+        if algorithm == 'heuristic':
+            return pm4py.discover_petri_net_heuristics(log_df)
+        if algorithm == 'alpha':
+            return pm4py.discover_petri_net_alpha(log_df)
+        if algorithm == 'ilp':
+            return pm4py.discover_petri_net_ilp(log_df)
+    except Exception:
+        return None
+    return None
+
+
+def _compute_conformance_bundle(eval_log, net, im, fm):
+    """Compute all conformance dimensions for eval_log against a fixed reference model."""
+    return {
+        'fitness': _mean_trace_fitness(eval_log, net, im, fm),
+        'precision': _safe_precision(eval_log, net, im, fm),
+        'generalization': _safe_generalization(eval_log, net, im, fm),
+        'simplicity': _safe_simplicity(net),
+    }
+
 def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id', 
                                        activity_col='activity', start_col='timestamp_start', 
-                                       end_col='timestamp_end'):
+                                       end_col='timestamp_end', own_ref_algorithm='inductive'):
     """
     Comprehensive evaluation of simulation quality based on process mining literature
     
@@ -1054,17 +1081,47 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
         'precision': np.nan,
         'generalization': np.nan,
         'simplicity': np.nan,
+        # Diagnostics split by reference model type.
+        'precision_common_ref': np.nan,
+        'precision_own_ref': np.nan,
+        'precision_real_self_baseline': np.nan,
+        'precision_delta_own_minus_common': np.nan,
     }
 
     if len(sim_for_dfg) > 0 and len(real_for_dfg) > 0:
         try:
-            # Mine a reference model from the real log and replay simulated traces on it.
-            ref_net, ref_im, ref_fm = pm4py.discover_petri_net_inductive(real_log)
+            # Common reference: model mined from real log (legacy behavior).
+            common_ref = _safe_discover_reference_model(real_log, algorithm='inductive')
+            if common_ref is None:
+                raise RuntimeError("Could not discover common reference model from real log")
+            ref_net, ref_im, ref_fm = common_ref
+            common_bundle = _compute_conformance_bundle(sim_log, ref_net, ref_im, ref_fm)
 
-            conformance_metrics['fitness'] = _mean_trace_fitness(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['precision'] = _safe_precision(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['generalization'] = _safe_generalization(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['simplicity'] = _safe_simplicity(ref_net)
+            # Keep legacy keys mapped to the common reference values.
+            conformance_metrics['fitness'] = common_bundle['fitness']
+            conformance_metrics['precision'] = common_bundle['precision']
+            conformance_metrics['generalization'] = common_bundle['generalization']
+            conformance_metrics['simplicity'] = common_bundle['simplicity']
+            conformance_metrics['precision_common_ref'] = common_bundle['precision']
+
+            # Baseline strictness check: real log against its own discovered model.
+            conformance_metrics['precision_real_self_baseline'] = _safe_precision(
+                real_log, ref_net, ref_im, ref_fm
+            )
+
+            # Own reference: model mined from simulated log using same family.
+            own_ref = _safe_discover_reference_model(sim_log, algorithm=own_ref_algorithm)
+            if own_ref is not None:
+                own_net, own_im, own_fm = own_ref
+                conformance_metrics['precision_own_ref'] = _safe_precision(
+                    sim_log, own_net, own_im, own_fm
+                )
+
+            if pd.notna(conformance_metrics['precision_own_ref']) and pd.notna(conformance_metrics['precision_common_ref']):
+                conformance_metrics['precision_delta_own_minus_common'] = (
+                    float(conformance_metrics['precision_own_ref'])
+                    - float(conformance_metrics['precision_common_ref'])
+                )
         except Exception as e:
             print(f"Conformance dimensions unavailable: {e}")
 
@@ -1073,6 +1130,12 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
             print(f"{m_name:35}: n/a")
         else:
             print(f"{m_name:35}: {m_val:.4f}")
+
+    print("\nPrecision Diagnostics:")
+    print(f"  common_ref (sim vs real-mined model): {conformance_metrics['precision_common_ref']}")
+    print(f"  own_ref (sim vs sim-mined model):     {conformance_metrics['precision_own_ref']}")
+    print(f"  real_self_baseline:                   {conformance_metrics['precision_real_self_baseline']}")
+    print(f"  delta (own-common):                   {conformance_metrics['precision_delta_own_minus_common']}")
 
     results['conformance_metrics'] = conformance_metrics
 
@@ -1295,7 +1358,9 @@ PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
 #   Runs local per-group search during extraction and keeps best model.
 # ─────────────────────────────────────────────────────────────────────────────
 OPTIMIZE_MINING_HYPERPARAMS = True
-MINING_SEARCH_SPACE = {
+MINING_SEARCH_SPACE_PROFILE = 'balanced'  # 'balanced' | 'strict_precision'
+
+_MINING_SEARCH_SPACE_BALANCED = {
     'inductive_noise_thresholds': [0.05, 0.10, 0.20, 0.30, 0.40],
     'heuristic_params_grid': [
         {'dependency_threshold': 0.30, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
@@ -1305,6 +1370,23 @@ MINING_SEARCH_SPACE = {
         {'dependency_threshold': 0.50, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
     ],
 }
+
+_MINING_SEARCH_SPACE_STRICT = {
+    # Favor stricter inductive filtering to reduce over-permissive behavior.
+    'inductive_noise_thresholds': [0.20, 0.30, 0.40, 0.50, 0.60],
+    # Favor higher dependency thresholds for heuristics miner.
+    'heuristic_params_grid': [
+        {'dependency_threshold': 0.70, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.80, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.85, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.90, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
+    ],
+}
+
+if MINING_SEARCH_SPACE_PROFILE == 'strict_precision':
+    MINING_SEARCH_SPACE = _MINING_SEARCH_SPACE_STRICT
+else:
+    MINING_SEARCH_SPACE = _MINING_SEARCH_SPACE_BALANCED
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
@@ -1582,13 +1664,13 @@ for process in process_datasets_to_model.keys():
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
         mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
-        simulated_log = ProcessSimulation(
+        simulated_log_train = ProcessSimulation(
             mode_activity_stats_df, production_plan,
             mode=simulation_mode, ml_models=mode_ml,
             process_models=mode_pm,
         ).run()
 
-        print(f"\n  Simulated log ({sim_mode}): {len(simulated_log)} events")
+        print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
 
         # ══════════════════════════════════════════════════════════════════
         # EVALUATION — TRAIN SET
@@ -1597,12 +1679,16 @@ for process in process_datasets_to_model.keys():
         print(f"\n  🔍 EVALUATION ON {split_label}  [{sim_mode}]")
         print("  " + "="*76)
 
-        eval_train = comprehensive_simulation_evaluation(simulated_log, df_train)
+        eval_train = comprehensive_simulation_evaluation(
+            simulated_log_train,
+            df_train,
+            own_ref_algorithm=(mode_algorithm if mode_algorithm else MINING_ALGORITHM),
+        )
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
-        #plot_simulation_comparison(simulated_log, df_train)
+        #plot_simulation_comparison(simulated_log_train, df_train)
         df_compare_train = df_train.dropna(subset=['case_id'])
-        visualize_heuristic_nets(df_compare_train, simulated_log)
+        visualize_heuristic_nets(df_compare_train, simulated_log_train)
 
         # Flatten train results
         flattened = {
@@ -1624,15 +1710,30 @@ for process in process_datasets_to_model.keys():
         # ══════════════════════════════════════════════════════════════════
         df_test = test_datasets[process]['event_log'] if test_datasets else None
         if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
+            production_plan_test = test_datasets[process]['production_plan']
+            simulated_log_test = ProcessSimulation(
+                mode_activity_stats_df,
+                production_plan_test,
+                mode=simulation_mode,
+                ml_models=mode_ml,
+                process_models=mode_pm,
+            ).run()
+
+            print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
+
             print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
             print("  " + "="*76)
 
-            eval_test = comprehensive_simulation_evaluation(simulated_log, df_test)
+            eval_test = comprehensive_simulation_evaluation(
+                simulated_log_test,
+                df_test,
+                own_ref_algorithm=(mode_algorithm if mode_algorithm else MINING_ALGORITHM),
+            )
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
-            #plot_simulation_comparison(simulated_log, df_test)
+            #plot_simulation_comparison(simulated_log_test, df_test)
             df_compare_test = df_test.dropna(subset=['case_id'])
-            visualize_heuristic_nets(df_compare_test, simulated_log)
+            visualize_heuristic_nets(df_compare_test, simulated_log_test)
 
             for category, metrics in eval_test.items():
                 if isinstance(metrics, dict):

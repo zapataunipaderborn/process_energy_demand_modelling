@@ -137,8 +137,12 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
 
 def _evaluate_mined_model(sub_log, net, im, fm):
     """
-    Score one mined Petri net using an overall quality metric:
-    mean(fitness, precision, generalization, simplicity).
+    Score one mined Petri net with a precision-focused objective.
+
+    Rationale:
+    - High fitness + low precision indicates over-permissive models.
+    - Precision gets larger weight than other dimensions.
+    - Additional penalty is applied when fitness exceeds precision.
     """
     fitness = 0.0
     precision = None
@@ -183,17 +187,37 @@ def _evaluate_mined_model(sub_log, net, im, fm):
     except Exception:
         simplicity = None
 
-    components = [fitness, precision, generalization, simplicity]
-    valid_components = [
-        max(0.0, min(1.0, float(v)))
-        for v in components
-        if v is not None and np.isfinite(v)
-    ]
+    # Weighted aggregation with emphasis on precision.
+    weighted_terms = []
+    weight_sum = 0.0
 
-    score = float(np.mean(valid_components)) if valid_components else 0.0
+    if fitness is not None and np.isfinite(fitness):
+        weighted_terms.append(0.20 * max(0.0, min(1.0, float(fitness))))
+        weight_sum += 0.20
+    if precision is not None and np.isfinite(precision):
+        weighted_terms.append(0.50 * max(0.0, min(1.0, float(precision))))
+        weight_sum += 0.50
+    if generalization is not None and np.isfinite(generalization):
+        weighted_terms.append(0.20 * max(0.0, min(1.0, float(generalization))))
+        weight_sum += 0.20
+    if simplicity is not None and np.isfinite(simplicity):
+        weighted_terms.append(0.10 * max(0.0, min(1.0, float(simplicity))))
+        weight_sum += 0.10
+
+    base_score = (sum(weighted_terms) / weight_sum) if weight_sum > 0 else 0.0
+
+    # Penalize permissiveness when fitness is much higher than precision.
+    permissiveness_gap = max(0.0, float(fitness) - float(precision))
+    low_precision_gap = max(0.0, 0.35 - float(precision))
+    score = base_score - 0.35 * permissiveness_gap - 0.40 * low_precision_gap
+    score = max(0.0, min(1.0, score))
+
     return {
         'score': score,
         'overall_metric': score,
+        'base_score': base_score,
+        'permissiveness_gap': permissiveness_gap,
+        'low_precision_gap': low_precision_gap,
         'fitness': fitness,
         'precision': precision,
         'generalization': generalization,
@@ -733,8 +757,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         mining_search_space=mining_search_space,
     )
 
-    best = None
-    best_score = float('-inf')
+    evaluated_candidates = []
     for idx, cand in enumerate(candidates, start=1):
         cand_noise = cand.get('noise_threshold', noise_threshold)
         cand_heur = cand.get('heuristic_params', {})
@@ -753,21 +776,43 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         eval_i = _evaluate_mined_model(sub_log, net_i, im_i, fm_i)
         print(
             f"      quality: score={eval_i['score']:.4f}, "
+            f"base={eval_i.get('base_score', np.nan):.4f}, "
+            f"perm_gap={eval_i.get('permissiveness_gap', np.nan):.4f}, "
+            f"low_prec_gap={eval_i.get('low_precision_gap', np.nan):.4f}, "
             f"fitness={eval_i['fitness']:.4f}, "
             f"precision={eval_i['precision']:.4f}, "
             f"generalization={eval_i['generalization'] if eval_i['generalization'] is not None else 'n/a'}, "
             f"simplicity={eval_i['simplicity'] if eval_i['simplicity'] is not None else 'n/a'}"
         )
 
-        if eval_i['score'] > best_score:
-            best_score = eval_i['score']
-            best = {
-                'net': net_i,
-                'im': im_i,
-                'fm': fm_i,
-                'eval': eval_i,
-                'cand': cand,
-            }
+        evaluated_candidates.append({
+            'net': net_i,
+            'im': im_i,
+            'fm': fm_i,
+            'eval': eval_i,
+            'cand': cand,
+        })
+
+    # Prefer candidates that meet a minimum precision threshold to avoid
+    # selecting permissive models with high fitness but poor precision.
+    PRECISION_FLOOR = 0.30
+    viable = [
+        c for c in evaluated_candidates
+        if c['eval'].get('precision') is not None
+        and np.isfinite(c['eval'].get('precision'))
+        and float(c['eval'].get('precision')) >= PRECISION_FLOOR
+    ]
+
+    if viable:
+        print(f"    Precision floor active: {len(viable)}/{len(evaluated_candidates)} "
+              f"candidates with precision >= {PRECISION_FLOOR:.2f}")
+        selection_pool = viable
+    else:
+        print(f"    Precision floor fallback: no candidate reached {PRECISION_FLOOR:.2f}; "
+              "selecting best score among all candidates")
+        selection_pool = evaluated_candidates
+
+    best = max(selection_pool, key=lambda c: float(c['eval'].get('score', float('-inf')))) if selection_pool else None
 
     if best is None:
         raise RuntimeError("No candidate Petri net could be mined.")
