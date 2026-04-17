@@ -1949,6 +1949,10 @@ import matplotlib.pyplot as plt
 # STEP 1 — RAW SPLIT (before ANY preprocessing touches the data)
 # =============================================================================
 
+# Canonical reference length used for DBA/training by default.
+# Change this value once to use a different reference grid length.
+REFERENCE_LENGTH = 100
+
 def split_curves(df_expanded, variable, activities, objects,
                  test_size=0.15, random_state=42, verbose=1):
     """
@@ -2419,18 +2423,13 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
     """
     Predict energy for a single raw, unseen curve using the trained pipeline.
 
-    Steps
-    -----
-    1. DTW the raw curve to reference_curve (train barycenter) to get a
-       position mapping. Only the pipeline's reference_curve is used —
-       no test statistics are computed.
-    2. For each raw time step, look up its mapped barycenter position and
-       build a feature row using pipeline's all_keys / key_types (train-derived).
-    3. One-hot encode, then align columns to feature_columns:
-         - missing columns (unseen category levels) -> filled with 0
-         - extra columns (unseen test-only levels)  -> dropped
-    4. model.predict() returns values in original energy units because the
-       model was trained on DTW-aligned curves that preserve the original scale.
+     Steps
+     -----
+     1. Build canonical features for all reference positions 0..fixed_length-1.
+     2. Predict exactly fixed_length values in the canonical (DBA) space.
+     3. DTW-align raw curve to reference_curve and decode predictions back to
+         raw length using the DTW correspondence (inverse-like mapping).
+     4. Return one prediction per raw time step in original energy units.
 
     Parameters
     ----------
@@ -2444,27 +2443,20 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
     y_pred : np.ndarray  shape (len(raw_values),), original energy units
     """
     reference_curve = pipeline['reference_curve']
-    fixed_length    = pipeline['fixed_length']
+    # Use the trained reference length as the source of truth at inference.
+    fixed_length    = len(reference_curve)
     model           = pipeline['model']
     feature_columns = pipeline['feature_columns']
     all_keys        = pipeline['all_keys']
     key_types       = pipeline['key_types']
 
-    alignment = dtw(raw_values, reference_curve, keep_internals=True)
-    raw_to_ref_pos = {}
-    for qi, ri in zip(alignment.index1, alignment.index2):
-        if qi not in raw_to_ref_pos:
-            raw_to_ref_pos[qi] = ri
-
-    rows = []
-    for raw_idx in range(len(raw_values)):
-        ref_pos = raw_to_ref_pos.get(raw_idx, raw_idx)
-        ref_pos = min(ref_pos, fixed_length - 1)
-
+    # 1) Predict in canonical space (fixed_length points)
+    rows_ref = []
+    for ref_pos in range(fixed_length):
         row = {
-            'position_idx':      ref_pos,
-            'curve_length':      len(raw_values),
-            'activity':          activity,
+            'position_idx': ref_pos,
+            'curve_length': len(raw_values),
+            'activity': activity,
         }
         for key in all_keys:
             value = attributes.get(key, None)
@@ -2475,19 +2467,40 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
                     row[key] = np.nan
             else:
                 row[key] = str(value) if value is not None else 'None'
-        rows.append(row)
+        rows_ref.append(row)
 
-    X_raw = pd.DataFrame(rows)
-
+    X_ref = pd.DataFrame(rows_ref)
     categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
-    X_raw = pd.get_dummies(X_raw, columns=categorical_cols, drop_first=True)
+    X_ref = pd.get_dummies(X_ref, columns=categorical_cols, drop_first=True)
 
     for col in feature_columns:
-        if col not in X_raw.columns:
-            X_raw[col] = 0
-    X_raw = X_raw[feature_columns]
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+    y_ref_pred = model.predict(X_ref)
 
-    return model.predict(X_raw)
+    # 2) Decode canonical predictions to raw timeline using DTW path
+    alignment = dtw(raw_values, reference_curve, keep_internals=True)
+    buckets = [[] for _ in range(len(raw_values))]
+
+    for qi, ri in zip(alignment.index1, alignment.index2):
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+            continue
+
+        # Robust fallback: use nearest mapped raw index from the DTW path.
+        nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+        _ = nearest_qi
+        y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
 
 
 # =============================================================================
@@ -2799,7 +2812,7 @@ for process in process_datasets_to_model_sensors.keys():
                 pipeline = build_and_train_pipeline(
                     train_curves,
                     variable=sensor_to_model,
-                    fixed_length=100,
+                    fixed_length=REFERENCE_LENGTH,
                     val_size=0.2,
                     random_state=42,
                     models=custom_models,
