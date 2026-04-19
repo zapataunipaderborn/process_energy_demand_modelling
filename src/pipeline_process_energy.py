@@ -2186,6 +2186,8 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     print("=" * 80)
     print(latex_table)
 
+
+# %% 
 # ── TEST SET PROFILE EVALUATION ──────────────────────────────────────────────
 print("\n" + "=" * 80)
 print("TEST EVALUATION: PREDICTED vs REAL SENSOR PROFILES")
@@ -2236,7 +2238,7 @@ if all_profile_results:
     print("\nOVERALL TEST DYNAMIC PROFILE METRICS:")
     print(profile_results_df.to_string(index=False, float_format='%.4f'))
 
-# %% 
+
 
 # %% [markdown]
 # # Data fusion
