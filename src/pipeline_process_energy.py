@@ -813,9 +813,9 @@ def _safe_simplicity(net):
     complexity = len(net.places) + len(net.transitions) + len(net.arcs)
     return float(1.0 / (1.0 + 0.005 * float(complexity)))
 
-def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id', 
-                                       activity_col='activity', start_col='timestamp_start', 
-                                       end_col='timestamp_end'):
+def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=None,
+                                       case_col='case_id', activity_col='activity', 
+                                       start_col='timestamp_start', end_col='timestamp_end'):
     """
     Comprehensive evaluation of simulation quality based on process mining literature
     
@@ -1076,8 +1076,76 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, case_col='case_id
 
     results['conformance_metrics'] = conformance_metrics
 
-    # ========== 7. OVERALL QUALITY SCORE ==========
-    print("\n7. OVERALL QUALITY ASSESSMENT")
+    # ========== 7. ENERGY PROFILE METRICS ==========
+    energy_results = {}
+    if real_expanded_df is not None and len(simulated_df) > 0 and 'simulated_energy_curves' in simulated_df.columns:
+        print("\n7. ENERGY PROFILE METRICS (Simulation vs Reality)")
+        print("-" * 40)
+        
+        # We need to compare curves for matching (Case, Activity) pairs
+        sensor_metrics = {}
+        
+        # Flatten all simulated curves from the log
+        for idx, row in simulated_df.iterrows():
+            sim_curves = row.get('simulated_energy_curves', {})
+            if not sim_curves:
+                continue
+            
+            cid = row[case_col]
+            act = row[activity_col]
+            
+            # Find the REAL curve for this case/activity in the test expanded df
+            # We filter for the specific case and activity.
+            # Note: There might be multiple instances, we take the one closest in sequence if needed,
+            # but for now we look for any match in that case.
+            real_case_act = real_expanded_df[
+                (real_expanded_df['case_id_log'] == cid) & 
+                (real_expanded_df['activity_log'] == act)
+            ]
+            
+            if real_case_act.empty:
+                continue
+                
+            for sensor, y_sim in sim_curves.items():
+                if sensor in real_case_act.columns:
+                    y_real = real_case_act[sensor].dropna().values
+                    if len(y_real) > 1:
+                        # Resample either sim or real to match lengths for direct comparison
+                        # using simple linear interpolation (like in sim_extractor)
+                        if len(y_sim) != len(y_real):
+                            from scipy.interpolate import interp1d
+                            x_old = np.linspace(0, 1, len(y_sim))
+                            f = interp1d(x_old, y_sim, kind='linear', fill_value='extrapolate')
+                            x_new = np.linspace(0, 1, len(y_real))
+                            y_sim_resampled = f(x_new)
+                        else:
+                            y_sim_resampled = y_sim
+                        
+                        mae = np.mean(np.abs(y_real - y_sim_resampled))
+                        rmse = np.sqrt(np.mean((y_real - y_sim_resampled)**2))
+                        denom = np.sum(np.abs(y_real))
+                        wape = np.sum(np.abs(y_real - y_sim_resampled)) / denom if denom > 0 else 0
+                        
+                        if sensor not in sensor_metrics:
+                            sensor_metrics[sensor] = {'mae': [], 'rmse': [], 'wape': []}
+                        sensor_metrics[sensor]['mae'].append(mae)
+                        sensor_metrics[sensor]['rmse'].append(rmse)
+                        sensor_metrics[sensor]['wape'].append(wape)
+        
+        # Aggregate per sensor
+        agg_energy = {}
+        for sensor, m in sensor_metrics.items():
+            s_mae = np.mean(m['mae'])
+            s_rmse = np.mean(m['rmse'])
+            s_wape = np.mean(m['wape'])
+            agg_energy[sensor] = {'MAE': s_mae, 'RMSE': s_rmse, 'WAPE': s_wape}
+            print(f"  {sensor:40}: MAE={s_mae:.2f}, RMSE={s_rmse:.2f}, WAPE={s_wape:.4f}")
+        
+        results['energy_metrics'] = agg_energy
+        energy_results = agg_energy
+
+    # ========== 8. OVERALL QUALITY SCORE ==========
+    print("\n8. OVERALL QUALITY ASSESSMENT")
     print("-" * 40)
 
     # Active score requested by user:
@@ -1672,7 +1740,10 @@ for process in process_datasets_to_model.keys():
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
         #plot_simulation_comparison(simulated_log_train, df_train)
         df_compare_train = df_train.dropna(subset=['case_id'])
-        visualize_heuristic_nets(df_compare_train, simulated_log_train)
+        try:
+            visualize_heuristic_nets(df_compare_train, simulated_log_train)
+        except Exception as e:
+            print(f"  ⚠️ Skipping Graphviz visualization (Train): {e}")
 
         # Flatten train results
         flattened = {
@@ -1713,7 +1784,10 @@ for process in process_datasets_to_model.keys():
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
             #plot_simulation_comparison(simulated_log_test, df_test)
             df_compare_test = df_test.dropna(subset=['case_id'])
-            visualize_heuristic_nets(df_compare_test, simulated_log_test)
+            try:
+                visualize_heuristic_nets(df_compare_test, simulated_log_test)
+            except Exception as e:
+                print(f"  ⚠️ Skipping Graphviz visualization (Test): {e}")
 
             for category, metrics in eval_test.items():
                 if isinstance(metrics, dict):
@@ -1769,6 +1843,8 @@ for process in process_datasets_to_model.keys():
     _energy_modes_requested = [
         m for m in MODES_TO_COMPARE if m in _ENERGY_AWARE_MODES
     ]
+    all_energy_pipelines = {}  # Global store for evaluation
+    VERBOSE_EVAL = False        # Set to True for detailed logs
 
     if _energy_modes_requested:
         # Identify best non-energy Petri-net mode by TRAIN overall score
@@ -1880,7 +1956,7 @@ for process in process_datasets_to_model.keys():
                                     'Gradient Boosting': GradientBoostingRegressor,
                                 },
                                 optimize_hyperparams=False,
-                                verbose=0
+                                verbose=VERBOSE_EVAL
                             )
                             
                             def _make_predict_fn(ep_bound):
@@ -1920,16 +1996,19 @@ for process in process_datasets_to_model.keys():
                             energy_pipelines=_energy_pipelines,
                             duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
                             logit_bias_clip=ENERGY_LOGIT_BIAS_CLIP,
+                            verbose=VERBOSE_EVAL,
                         ).run()
 
                     _energy_sim_train = _run_energy_sim(
                         production_plan, _best_base_stats, _best_base_pm
                     )
-                    print(f"\n  Simulated log TRAIN ({_energy_mode}): "
-                          f"{len(_energy_sim_train)} events")
+                    if VERBOSE_EVAL:
+                        print(f"\n  Simulated log TRAIN ({_energy_mode}): "
+                              f"{len(_energy_sim_train)} events")
 
+                    # Use _df_expanded_train for energy comparison in comprehensive_simulation_evaluation
                     _eval_train = comprehensive_simulation_evaluation(
-                        _energy_sim_train, df_train
+                        _energy_sim_train, df_train, real_expanded_df=_df_expanded_train
                     )
 
                     _energy_flattened = {
@@ -1941,7 +2020,12 @@ for process in process_datasets_to_model.keys():
                         'selected_mode':     _best_base_row['mode'],
                     }
                     for _cat, _met in _eval_train.items():
-                        if isinstance(_met, dict):
+                        if _cat == 'energy_metrics' and isinstance(_met, dict):
+                            # Special handling to flatten nested energy metrics
+                            for _sensor, _vals in _met.items():
+                                for _mn, _mv in _vals.items():
+                                    _energy_flattened[f"train_energy_{_sensor}_{_mn}"] = _mv
+                        elif isinstance(_met, dict):
                             for _mn, _mv in _met.items():
                                 _energy_flattened[f"train_{_cat}_{_mn}"] = _mv
                         else:
@@ -1951,17 +2035,23 @@ for process in process_datasets_to_model.keys():
                     _df_test = test_datasets[process]['event_log'] if test_datasets else None
                     if TEMPORAL_SPLIT and _df_test is not None and len(_df_test) > 0:
                         _pp_test = test_datasets[process]['production_plan']
+                        _exp_test = test_datasets[process]['expanded']
                         _energy_sim_test = _run_energy_sim(
                             _pp_test, _best_base_stats, _best_base_pm
                         )
-                        print(f"\n  Simulated log TEST  ({_energy_mode}): "
-                              f"{len(_energy_sim_test)} events")
+                        if VERBOSE_EVAL:
+                            print(f"\n  Simulated log TEST  ({_energy_mode}): "
+                                  f"{len(_energy_sim_test)} events")
 
                         _eval_test = comprehensive_simulation_evaluation(
-                            _energy_sim_test, _df_test
+                            _energy_sim_test, _df_test, real_expanded_df=_exp_test
                         )
                         for _cat, _met in _eval_test.items():
-                            if isinstance(_met, dict):
+                            if _cat == 'energy_metrics' and isinstance(_met, dict):
+                                for _sensor, _vals in _met.items():
+                                    for _mn, _mv in _vals.items():
+                                        _energy_flattened[f"test_energy_{_sensor}_{_mn}"] = _mv
+                            elif isinstance(_met, dict):
                                 for _mn, _mv in _met.items():
                                     _energy_flattened[f"test_{_cat}_{_mn}"] = _mv
                             else:
@@ -2071,6 +2161,17 @@ lower_is_better = {
     'test_case_metrics_median_events_per_case_error',
 }
 
+# Dynamic injection of detect energy columns
+if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
+    for c in evaluation_results_df.columns:
+        if c.startswith('test_energy_'):
+            enabled_test_metrics.add(c)
+            # MAE, RMSE, WAPE are all "lower is better"
+            if any(m in c for m in ['MAE', 'RMSE', 'WAPE']):
+                lower_is_better.add(c)
+            elif 'R2' in c:
+                higher_is_better.add(c)
+
 # Metrics where HIGHER is better
 higher_is_better = {
     'test_overall_score',
@@ -2093,10 +2194,17 @@ higher_is_better = {
 test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
 test_cols = [c for c in test_cols if c in enabled_test_metrics]
 
-# Short labels
-short_labels = {c: c.replace('test_', '').replace('_metrics_', ': ')
-                   .replace('_', ' ').title()
-                for c in test_cols}
+# Short labels for standard and energy metrics
+short_labels = {}
+for c in test_cols:
+    if c.startswith('test_energy_'):
+        # test_energy_Sensor_MAE -> Sen: MAE
+        parts = c.split('_')
+        sensor = parts[2]
+        metric = parts[-1]
+        short_labels[c] = f"{sensor[:3]}: {metric}"
+    else:
+        short_labels[c] = c.replace('test_', '').replace('_metrics_', ': ').replace('_', ' ').title()
 
 def _normalise_metrics(df, cols, lower_set):
     """Min-max normalise. For lower-is-better, invert so 1 = best."""
@@ -2122,8 +2230,10 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     if 'test_overall_score' in mode_avg_norm.columns:
         mode_avg_norm = mode_avg_norm.sort_values('test_overall_score', ascending=False)
 
-    # Short and paper-friendly metric names
-    short_labels = {
+    display_cols = [short_labels.get(c, c.replace('test_', '')) for c in test_cols]
+    
+    # Specific overrides for very common process metrics
+    overrides = {
         'test_overall_score': 'Overall',
         'test_basic_metrics_event_count_ratio': 'EvtRatio',
         'test_duration_metrics_mean_duration_error': 'MeanDurErr',
@@ -2132,8 +2242,7 @@ if test_cols and 'mode' in evaluation_results_df.columns:
         'test_conformance_metrics_generalization': 'Generaliz',
         'test_conformance_metrics_simplicity': 'Simplicity',
     }
-
-    display_cols = [short_labels.get(c, c.replace('test_', '')) for c in test_cols]
+    display_cols = [overrides.get(c, short_labels.get(c, c)) for c in test_cols]
 
     # Heatmap data (normalised), annotations are raw values.
     plot_df = mode_avg_norm[test_cols].copy()
@@ -2188,57 +2297,117 @@ if test_cols and 'mode' in evaluation_results_df.columns:
 
 
 # %% 
-# ── TEST SET PROFILE EVALUATION ──────────────────────────────────────────────
-print("\n" + "=" * 80)
-print("TEST EVALUATION: PREDICTED vs REAL SENSOR PROFILES")
-print("=" * 80)
-
+# ── STANDALONE PROFILE EVALUATION (TRAIN & TEST) ──────────────────────────────
 from sim_extractor import evaluate_pipeline_on_test, split_curves
-all_profile_results = []
+profile_summary_records = []
+
 if 'process_datasets_to_model_sensors' in dir():
     for process, config in process_datasets_to_model_sensors.items():
-        if process not in test_datasets: continue
-        df_expanded_test = test_datasets[process].get('expanded')
-        if df_expanded_test is None: continue
-        
-        _config = process_datasets_to_model_sensors[process]
-        activities_to_model = _config.get('activities_to_model', [])
-        objects_to_model = _config.get('objects_to_model', [])
-        sensors_to_model = _config.get('sensors_to_model', [])
-        
+        sensors_to_model = config.get('sensors_to_model', [])
+        activities_to_model = config.get('activities_to_model', [])
+        objects_to_model = config.get('objects_to_model', [])
+
         for sensor in sensors_to_model:
-            if process in all_energy_pipelines and sensor in all_energy_pipelines[process]:
-                _, test_curves = split_curves(
-                    df_expanded_test,
-                    variable=sensor,
-                    activities=activities_to_model,
-                    objects=objects_to_model,
-                    test_size=1.0, # 100% test since this is the global test split
-                    random_state=42,
-                    verbose=0
+            if process not in all_energy_pipelines or sensor not in all_energy_pipelines[process]:
+                continue
+            
+            pipeline = all_energy_pipelines[process][sensor]['full_pipeline']
+            
+            # Evaluate on TRAIN (60%)
+            df_train_exp = train_datasets[process].get('expanded')
+            if df_train_exp is not None:
+                # We use verbose=0 because we just want the metrics here
+                train_curves, _ = split_curves(df_train_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
+                _, tr_agg = evaluate_pipeline_on_test(train_curves, pipeline, verbose=0)
+                tr_agg.update({'process': process, 'sensor': sensor, 'split': 'TRAIN'})
+                profile_summary_records.append(tr_agg)
+                
+            # Evaluate on TEST (40%)
+            df_test_exp = test_datasets[process].get('expanded')
+            if df_test_exp is not None:
+                test_curves, _ = split_curves(df_test_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
+                _, ts_agg = evaluate_pipeline_on_test(test_curves, pipeline, verbose=0)
+                ts_agg.update({'process': process, 'sensor': sensor, 'split': 'TEST'})
+                profile_summary_records.append(ts_agg)
+
+if profile_summary_records:
+    profile_summary_df = pd.DataFrame(profile_summary_records)
+    print("\n" + "="*80)
+    print("ENERGY PROFILE STANDALONE ML METRICS (TRAIN VS TEST)")
+    print("="*80)
+    # Pivot for cleaner comparison
+    pivot_cols = ['MAE', 'RMSE', 'WAPE', 'R2']
+    available_metrics = [c for c in pivot_cols if c in profile_summary_df.columns]
+    summary_pivot = profile_summary_df.pivot_table(index=['process', 'sensor'], columns='split', values=available_metrics)
+    print(summary_pivot.round(4).to_string())
+
+# ── SIMULATION CURVE VISUALS (SIMULATED VS REAL) ───────────────────────────
+# We look for simulated logs in evaluation_results_list that have 'simulated_energy_curves'
+print("\n" + "="*80)
+print("VISUAL COMPARISON: SIMULATED (TEST RUN) VS REAL DATA")
+print("="*80)
+
+# We sample a few cases from the most recent test simulation run
+# (This logic assumes we want to visualize the 'energy-aware' results)
+test_sim_logs = [r for r in evaluation_results_list if 'test_energy_metrics' in r]
+if test_sim_logs:
+    # We choose the first process/sensor for visualization
+    for process, sensors in all_energy_pipelines.items():
+        exp_test = test_datasets[process].get('expanded')
+        if exp_test is None: continue
+        
+        for sensor in sensors:
+            # Re-predicting alignment is handled inside evaluate_pipeline_on_test
+            # but here we want to show specifically the simulation's path.
+            # We call the visualizer on the test curves specifically for this sensor.
+            test_curves, _ = split_curves(exp_test, sensor, 
+                                        process_datasets_to_model_sensors[process]['activities_to_model'],
+                                        process_datasets_to_model_sensors[process]['objects_to_model'],
+                                        test_size=0.0, verbose=0)
+            
+            if test_curves:
+                print(f"\nVisualizing Generalization Performance -> Process: {process} | Sensor: {sensor}")
+                evaluate_pipeline_on_test(
+                    test_curves, 
+                    all_energy_pipelines[process][sensor]['full_pipeline'], 
+                    max_plot_curves=6, 
+                    verbose=1 # This will trigger plt.show()
                 )
-                
-                pipeline = all_energy_pipelines[process][sensor]['full_pipeline']
-                
-                if len(test_curves) > 0:
-                    print(f"\nEvaluating Profile Generation -> Process: {process} | Sensor: {sensor}")
-                    metrics_df, agg_metrics = evaluate_pipeline_on_test(
-                        test_curves,
-                        pipeline,
-                        max_plot_curves=6,
-                        verbose=1 # Prints the visuals and table
-                    )
-                    
-                    agg_metrics['process'] = process
-                    agg_metrics['sensor'] = sensor
-                    all_profile_results.append(agg_metrics)
-
-if all_profile_results:
-    profile_results_df = pd.DataFrame(all_profile_results)
-    print("\nOVERALL TEST DYNAMIC PROFILE METRICS:")
-    print(profile_results_df.to_string(index=False, float_format='%.4f'))
 
 
+
+# ── FINAL CONSOLIDATED ENERGY PERFORMANCE REPORT ───────────────────────────
+print("\n" + "█"*80)
+print("█   FINAL ENERGY PERFORMANCE REPORT (SIMULATION QUALITY)             █")
+print("█"*80)
+
+energy_metrics_summary = []
+if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
+    for c in evaluation_results_df.columns:
+        if c.startswith('test_energy_'):
+            # More robust parsing: everything between 'test_energy_' and '_[Metric]'
+            # Metrics are MAE, RMSE, WAPE, R2
+            metric = c.split('_')[-1]
+            sensor = c.replace('test_energy_', '').replace(f'_{metric}', '')
+            
+            val = evaluation_results_df[c].mean()
+            energy_metrics_summary.append({
+                'Sensor': sensor,
+                'Metric': metric,
+                'Value': val
+            })
+
+if energy_metrics_summary:
+    edf = pd.DataFrame(energy_metrics_summary)
+    # Pivot for clean display
+    report_pivot = edf.pivot_table(index='Sensor', columns='Metric', values='Value')
+    print("\nMEAN ENERGY ERRORS ACROSS ALL MODES (TEST SET):")
+    print("-" * 40)
+    print(report_pivot.round(4).to_string())
+else:
+    print("\n⚠️  No energy simulation metrics found in the final results.")
+
+print("\n" + "█"*80 + "\n")
 
 # %% [markdown]
 # # Data fusion

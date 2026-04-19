@@ -1429,9 +1429,14 @@ def split_curves(df_expanded, variable, activities, objects,
         print(f"Total curves extracted : {len(curves_data)}")
 
     all_ids = list(range(len(curves_data)))
-    train_ids, test_ids = train_test_split(
-        all_ids, test_size=test_size, random_state=random_state
-    )
+    if test_size <= 0:
+        train_ids, test_ids = all_ids, []
+    elif test_size >= 1.0:
+        train_ids, test_ids = [], all_ids
+    else:
+        train_ids, test_ids = train_test_split(
+            all_ids, test_size=test_size, random_state=random_state
+        )
     train_curves = [curves_data[i] for i in train_ids]
     test_curves  = [curves_data[i] for i in test_ids]
 

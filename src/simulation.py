@@ -49,7 +49,8 @@ class ProcessSimulation:
                  energy_state_columns=None,
                  energy_pipelines=None,
                  duration_scale_clip=None,
-                 logit_bias_clip=None):
+                 logit_bias_clip=None,
+                 verbose=True):
         # Backward-compatible input handling: extract_process now returns
         # (stats_df, raw_df, process_models), while older callers pass stats_df only.
         if isinstance(activity_stats_df, (tuple, list)):
@@ -60,6 +61,8 @@ class ProcessSimulation:
                 process_models = activity_stats_df[2]
         else:
             self.activity_stats = activity_stats_df
+            
+        self.verbose = verbose
 
         if not isinstance(self.activity_stats, pd.DataFrame):
             raise TypeError(
@@ -1274,10 +1277,11 @@ class ProcessSimulation:
             else:
                 current_energy_state = None
 
-            mode_tag = ('dur+tr' if enable_duration and enable_transitions
-                        else 'dur' if enable_duration else 'tr')
-            print(f"\nCase {case_id}: energy-aware PN simulation "
-                  f"[{mode_tag}] for {object_name} ({object_type})")
+            if self.verbose:
+                mode_tag = ('dur+tr' if enable_duration and enable_transitions
+                            else 'dur' if enable_duration else 'tr')
+                print(f"\nCase {case_id}: energy-aware PN simulation "
+                      f"[{mode_tag}] for {object_name} ({object_type})")
 
             while step < max_steps:
                 step += 1
@@ -1342,7 +1346,8 @@ class ProcessSimulation:
 
                 if chosen_transition.label is not None:
                     chosen_label = str(chosen_transition.label).strip()
-                    print(f"    Next: {chosen_label} (source={weight_source})")
+                    if self.verbose:
+                        print(f"    Next: {chosen_label} (source={weight_source})")
 
                     # ── Evaluate duration using the BASE ML or STAT config
                     base_dur = self._get_activity_duration(
@@ -1366,10 +1371,12 @@ class ProcessSimulation:
 
                             # Mathematically correct duration scaling:
                             activity_duration = max(0.1, base_dur * scale)
-                            print(f"    Duration: {activity_duration:.1f} min "
-                                  f"(base={base_dur:.1f}, scale={scale:.3f})")
+                            if self.verbose:
+                                print(f"    Duration: {activity_duration:.1f} min "
+                                      f"(base={base_dur:.1f}, scale={scale:.3f})")
                         except Exception as exc:
-                            print(f"    WARNING: duration energy scale failed: {exc}")
+                            if self.verbose:
+                                print(f"    WARNING: duration energy scale failed: {exc}")
                             activity_duration = base_dur
                     else:
                         activity_duration = base_dur
@@ -1417,6 +1424,13 @@ class ProcessSimulation:
                                          object_attributes=object_attributes,
                                      ) if predict_fn is not None
                                      else np.asarray(ref_curve, dtype=float))
+                            
+                            # Log the full curve for evaluation later
+                            if self.results and self.results[-1]['activity'] == chosen_label:
+                                if 'simulated_energy_curves' not in self.results[-1]:
+                                    self.results[-1]['simulated_energy_curves'] = {}
+                                self.results[-1]['simulated_energy_curves'][sensor] = curve
+
                             from sim_extractor import _energy_summary
                             new_energy_state.update(_energy_summary(curve, sensor))
                         except Exception as exc:
@@ -1445,8 +1459,9 @@ class ProcessSimulation:
                 current_sim_time += 1  # 1-second gap between activities
 
                 if chosen_label is not None:
-                    print(f"    [{activity_count}] '{chosen_label}' "
-                          f"dur={activity_duration:.1f} min")
+                    if self.verbose:
+                        print(f"    [{activity_count}] '{chosen_label}' "
+                              f"dur={activity_duration:.1f} min")
 
             if step >= max_steps:
                 print(f"    WARNING: max steps ({max_steps}) reached.")
