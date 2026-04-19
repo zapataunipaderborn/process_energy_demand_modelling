@@ -1426,10 +1426,10 @@ class ProcessSimulation:
                                      else np.asarray(ref_curve, dtype=float))
                             
                             # Log the full curve for evaluation later
-                            if self.results and self.results[-1]['activity'] == chosen_label:
-                                if 'simulated_energy_curves' not in self.results[-1]:
-                                    self.results[-1]['simulated_energy_curves'] = {}
-                                self.results[-1]['simulated_energy_curves'][sensor] = curve
+                            if self.events and self.events[-1]['activity'] == chosen_label:
+                                if 'simulated_energy_curves' not in self.events[-1]:
+                                    self.events[-1]['simulated_energy_curves'] = {}
+                                self.events[-1]['simulated_energy_curves'][sensor] = curve
 
                             from sim_extractor import _energy_summary
                             new_energy_state.update(_energy_summary(curve, sensor))
