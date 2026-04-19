@@ -1186,7 +1186,7 @@ def plot_simulation_comparison(simulated_df, real_df, case_col='case_id',
     axes[1,1].legend()
     
     plt.tight_layout()
-    plt.show()
+    pass
 
 
 def visualize_heuristic_nets(df_compare, simulated_log):
@@ -1241,7 +1241,7 @@ def visualize_heuristic_nets(df_compare, simulated_log):
         ax2.axis('off')
         
         plt.tight_layout()
-        plt.show()
+        pass
         
     finally:
         # Clean up temporary files
@@ -1258,6 +1258,22 @@ print(process_datasets.keys())
 #rocess_datasets_to_model = {'process_4': process_datasets['process_4']}
 
 process_datasets_to_model = process_datasets
+
+process_datasets_to_model_sensors = process_datasets_to_model.copy()
+process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
+process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['Erhitzer']
+process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
+process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
+
+process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
+process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
+
+process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
+process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
+process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
+process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
 
 # %%
 import pandas as pd
@@ -1360,7 +1376,7 @@ ML_OPTUNA_TRIALS        = 20
 #   TRAIN_RATIO    : fraction of cases used for training (e.g. 0.80 = 80%)
 # ─────────────────────────────────────────────────────────────────────────────
 TEMPORAL_SPLIT = True
-TRAIN_RATIO    = 0.50
+TRAIN_RATIO    = 0.60
 
 
 def _split_process_datasets(datasets, train_ratio=0.80):
@@ -1445,7 +1461,10 @@ if TEMPORAL_SPLIT:
 else:
     print("\n📌 NO SPLIT – using all data for extraction & training")
     train_datasets = process_datasets_to_model
-    test_datasets  = None
+    test_datasets  = process_datasets_to_model
+
+all_energy_pipelines = {}
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1836,8 +1855,10 @@ for process in process_datasets_to_model.keys():
                         from sklearn.ensemble import GradientBoostingRegressor
 
                         _energy_pipelines = {}
-                        _activities_list = _df_expanded_train['activity_log'].dropna().unique().tolist()
-                        _objects_list = _df_expanded_train['object_log'].dropna().unique().tolist()
+                        
+                        _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
+                        _activities_list = _config.get('activities_to_model', _df_expanded_train['activity_log'].dropna().unique().tolist())
+                        _objects_list = _config.get('objects_to_model', _df_expanded_train['object_log'].dropna().unique().tolist())
                         
                         for _sensor in _sensors:
                             print(f"\n  ℹ️ Training dynamic ML curve for sensor: {_sensor}")
@@ -1869,8 +1890,11 @@ for process in process_datasets_to_model.keys():
                                 
                             _energy_pipelines[_sensor] = {
                                 'reference_curve': _ep_pipeline['reference_curve'],
-                                'predict_fn': _make_predict_fn(_ep_pipeline)
+                                'predict_fn': _make_predict_fn(_ep_pipeline),
+                                'full_pipeline': _ep_pipeline 
                             }
+                            
+                        all_energy_pipelines[process] = _energy_pipelines
                             
                     except Exception as _exc:
                         print(f"⚠️  extract_energy_modifiers or ML curve modeling failed: {_exc}")
@@ -2137,7 +2161,7 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
     ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
     plt.tight_layout()
-    plt.show()
+    pass
 
     # Table below the heatmap (raw metrics, shortened names)
     metrics_table = mode_avg[test_cols].reindex(mode_avg_norm.index).round(4)
@@ -2161,6 +2185,56 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     print("\n" + "=" * 80)
     print("=" * 80)
     print(latex_table)
+
+# ── TEST SET PROFILE EVALUATION ──────────────────────────────────────────────
+print("\n" + "=" * 80)
+print("TEST EVALUATION: PREDICTED vs REAL SENSOR PROFILES")
+print("=" * 80)
+
+from sim_extractor import evaluate_pipeline_on_test, split_curves
+all_profile_results = []
+if 'process_datasets_to_model_sensors' in dir():
+    for process, config in process_datasets_to_model_sensors.items():
+        if process not in test_datasets: continue
+        df_expanded_test = test_datasets[process].get('expanded')
+        if df_expanded_test is None: continue
+        
+        _config = process_datasets_to_model_sensors[process]
+        activities_to_model = _config.get('activities_to_model', [])
+        objects_to_model = _config.get('objects_to_model', [])
+        sensors_to_model = _config.get('sensors_to_model', [])
+        
+        for sensor in sensors_to_model:
+            if process in all_energy_pipelines and sensor in all_energy_pipelines[process]:
+                _, test_curves = split_curves(
+                    df_expanded_test,
+                    variable=sensor,
+                    activities=activities_to_model,
+                    objects=objects_to_model,
+                    test_size=1.0, # 100% test since this is the global test split
+                    random_state=42,
+                    verbose=0
+                )
+                
+                pipeline = all_energy_pipelines[process][sensor]['full_pipeline']
+                
+                if len(test_curves) > 0:
+                    print(f"\nEvaluating Profile Generation -> Process: {process} | Sensor: {sensor}")
+                    metrics_df, agg_metrics = evaluate_pipeline_on_test(
+                        test_curves,
+                        pipeline,
+                        max_plot_curves=6,
+                        verbose=1 # Prints the visuals and table
+                    )
+                    
+                    agg_metrics['process'] = process
+                    agg_metrics['sensor'] = sensor
+                    all_profile_results.append(agg_metrics)
+
+if all_profile_results:
+    profile_results_df = pd.DataFrame(all_profile_results)
+    print("\nOVERALL TEST DYNAMIC PROFILE METRICS:")
+    print(profile_results_df.to_string(index=False, float_format='%.4f'))
 
 # %% 
 

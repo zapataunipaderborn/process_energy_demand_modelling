@@ -1495,7 +1495,7 @@ def plot_training_curves(train_curves, n_plot=12, figsize_per_row=(14, 2.5), ver
         fontsize=11, fontweight='bold', y=1.01
     )
     plt.tight_layout()
-    plt.show()
+    plt.savefig("tmp.png"); plt.close()
 
 
 # =============================================================================
@@ -2054,7 +2054,7 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
             fontsize=14, fontweight='bold', y=1.02
         )
         plt.tight_layout()
-        plt.show()
+        plt.savefig("tmp.png"); plt.close()
 
     return metrics_df, agg_metrics
 
