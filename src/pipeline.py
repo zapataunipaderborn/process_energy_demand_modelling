@@ -296,7 +296,7 @@ for (obj, change), group in activity_groups:
     row['timestamp_start'] = start_time
     row['timestamp_end'] = end_time
     row['activity'] = status
-    row['object_attributes'] = {"none": "none"}  # Add the "none": "none" key-value pair
+    row['object_attributes'] = {"none": "none"}  # Add the "none": "none" key-value pairk
     activity_rows.append(row)
 
 df_activities = pd.DataFrame(activity_rows)
@@ -1922,6 +1922,7 @@ from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
 from dtw import dtw
 from tslearn.barycenters import dtw_barycenter_averaging
 import optuna
@@ -1940,7 +1941,9 @@ import matplotlib.pyplot as plt
 # 5. get_dummies       — defined on training data; at predict time, test columns
 #                        are aligned to feature_columns (missing → 0, extra → dropped).
 #                        Val instances share training-level categories (correct).
-# 6. predict_raw_curve — only the pipeline (fitted on train) is used; no test
+# 6. scaler            — numeric columns (including curve_length) are scaled
+#                        with statistics fitted on train only.
+# 7. predict_raw_curve — only the pipeline (fitted on train) is used; no test
 #                        value influences any fitted statistic.
 # =============================================================================
 
@@ -2300,6 +2303,23 @@ def build_and_train_pipeline(
 
     feature_columns = X_all.columns.tolist()
 
+    # Scale numeric features (position, curve length, and numeric attributes)
+    # using train-only statistics to avoid leakage.
+    numeric_feature_cols = ['position_idx', 'curve_length'] + [
+        k for k in all_keys if key_types[k] == 'numeric'
+    ]
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
+            X_train[numeric_feature_cols]
+        )
+        X_val.loc[:, numeric_feature_cols] = feature_scaler.transform(
+            X_val[numeric_feature_cols]
+        )
+
     if verbose:
         print(f"\n     Train: {len(train_inst)} curves / {len(X_train)} points")
         print(f"     Val  : {len(val_inst)} curves / {len(X_val)} points")
@@ -2408,6 +2428,8 @@ def build_and_train_pipeline(
         'all_keys':        all_keys,
         'key_types':       key_types,
         'feature_columns': feature_columns,
+        'feature_scaler':  feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
         'val_r2':          all_results[best_name]['val_r2'],
         'all_results':     all_results,
     }
@@ -2447,6 +2469,8 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
     fixed_length    = len(reference_curve)
     model           = pipeline['model']
     feature_columns = pipeline['feature_columns']
+    feature_scaler  = pipeline.get('feature_scaler', None)
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
     all_keys        = pipeline['all_keys']
     key_types       = pipeline['key_types']
 
@@ -2477,6 +2501,12 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
         if col not in X_ref.columns:
             X_ref[col] = 0
     X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
     y_ref_pred = model.predict(X_ref)
 
     # 2) Decode canonical predictions to raw timeline using DTW path
