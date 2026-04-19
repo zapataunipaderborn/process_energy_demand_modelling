@@ -986,3 +986,333 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
     raw_df   = pd.DataFrame(all_raw_rows)
 
     return stats_df, raw_df, process_models
+
+
+# ---------------------------------------------------------------------------
+# Energy modifier extraction
+# ---------------------------------------------------------------------------
+
+def _energy_summary(curve: np.ndarray, sensor_name: str) -> dict:
+    """Reduce a 1-D sensor curve to 3 scalar features."""
+    return {
+        f'{sensor_name}_mean': float(np.mean(curve)),
+        f'{sensor_name}_end':  float(curve[-1]),
+        f'{sensor_name}_std':  float(np.std(curve)),
+    }
+
+
+def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log',
+                                timestamp_start_col='timestamp_start_log',
+                                datetime_energy_col='datetime_energy'):
+    """
+    For every activity instance in df_expanded, compute the energy-state
+    feature vector from the *actual* sensor measurements.
+
+    Returns
+    -------
+    records : list[dict]
+        Each dict has:
+          - 'activity'  : str
+          - 'duration'  : float  (minutes)
+          - 'next_activity' : str  (or '__END__')
+          - one key per sensor × 3 features  (mean, end, std)
+    energy_state_columns : list[str]
+        Ordered list of the 3×N feature names.
+    """
+    records = []
+
+    # Determine feature column order once
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+
+    # Group by activity instance
+    group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
+    available_group_cols = [c for c in group_cols if c in df_expanded.columns]
+
+    df = df_expanded.dropna(subset=[activity_col]).copy()
+    df[datetime_energy_col] = pd.to_datetime(df[datetime_energy_col])
+
+    df['_instance_id'] = df.groupby(available_group_cols).ngroup()
+
+    for instance_id, grp in df.groupby('_instance_id'):
+        grp = grp.sort_values(datetime_energy_col)
+
+        activity = str(grp[activity_col].iloc[0]).strip()
+
+        # Duration in minutes
+        ts_col = 'timestamp_start_log'
+        te_col = 'timestamp_end_log'
+        if ts_col in grp.columns and te_col in grp.columns:
+            ts = pd.to_datetime(grp[ts_col].iloc[0])
+            te = pd.to_datetime(grp[te_col].iloc[0])
+            duration = max(0.1, (te - ts).total_seconds() / 60)
+        else:
+            duration = None
+
+        if duration is None:
+            continue
+
+        # Build energy state from actual sensor curves
+        row = {'activity': activity, 'duration': duration}
+        ok = True
+        for sensor in sensors:
+            if sensor not in grp.columns:
+                raise ValueError(
+                    f"extract_energy_modifiers: sensor column '{sensor}' not found "
+                    f"in df_expanded. Available columns: {list(grp.columns)}"
+                )
+            curve = grp[sensor].dropna().values
+            if len(curve) < 2:
+                ok = False
+                break
+            row.update(_energy_summary(curve, sensor))
+
+        if not ok:
+            continue
+
+        records.append(row)
+
+    # Derive next_activity per (case, object, activity sequence)
+    # We do a simple lag on the sorted records per case
+    df_recs = pd.DataFrame(records)
+    return df_recs, energy_state_columns
+
+
+def extract_energy_modifiers(
+    df_expanded,
+    sensors,
+    activity_col='activity_log',
+    duration_model_class=None,
+    duration_model_params=None,
+    transition_model_class=None,
+    transition_model_params=None,
+    min_transitions=30,
+    timestamp_start_col='timestamp_start_log',
+    datetime_energy_col='datetime_energy',
+):
+    """
+    Mine energy-modifier models from *training* df_expanded.
+
+    For each activity label:
+      - duration modifier  : regressor that predicts log(duration/mean_duration)
+                             from the energy-state vector.
+      - transition modifier: classifier that predicts P(next_activity | energy_state).
+
+    Parameters
+    ----------
+    df_expanded : pd.DataFrame
+        Training expanded df (must contain *_log columns and sensor *_energy columns).
+    sensors : list[str]
+        Sensor column names to use (must exist in df_expanded).
+    activity_col : str
+    duration_model_class : sklearn regressor class  (default: Lasso)
+    duration_model_params : dict
+    transition_model_class : sklearn classifier class  (default: LogisticRegression)
+    transition_model_params : dict
+    min_transitions : int
+        Minimum number of observed transitions required to fit a transition modifier.
+
+    Returns
+    -------
+    energy_duration_modifiers : dict[activity → fitted model]
+    energy_transition_modifiers : dict[activity → fitted model]
+    energy_state_columns : list[str]   (3 × N, ordered)
+    """
+    from sklearn.linear_model import Lasso, LogisticRegression
+
+    if duration_model_class is None:
+        duration_model_class = Lasso
+    if duration_model_params is None:
+        duration_model_params = {'alpha': 0.1}
+    if transition_model_class is None:
+        transition_model_class = LogisticRegression
+    if transition_model_params is None:
+        transition_model_params = {'penalty': 'l2', 'C': 1.0, 'max_iter': 1000}
+
+    print("\n" + "=" * 70)
+    print("ENERGY MODIFIER EXTRACTION")
+    print("=" * 70)
+    print(f"  Sensors          : {sensors}")
+    print(f"  Duration model   : {duration_model_class.__name__}({duration_model_params})")
+    print(f"  Transition model : {transition_model_class.__name__}({transition_model_params})")
+
+    # ── Build energy-state matrix from actual sensor curves ───────────────
+    df_recs, energy_state_columns = _build_energy_state_matrix(
+        df_expanded, sensors,
+        activity_col=activity_col,
+        timestamp_start_col=timestamp_start_col,
+        datetime_energy_col=datetime_energy_col,
+    )
+
+    if df_recs.empty:
+        print("  WARNING: no valid activity instances found — returning empty modifiers.")
+        return {}, {}, energy_state_columns
+
+    # Compute next_activity as the next row's activity within each (case, object)
+    # We rely on the order already embedded inside df_expanded
+    group_cols = ['case_id_log', 'object_log']
+    available = [c for c in group_cols if c in df_expanded.columns]
+    if available:
+        df_sorted = df_expanded.dropna(subset=[activity_col]).sort_values(
+            available + ['timestamp_start_log']
+        ).copy()
+        df_sorted['_next_activity'] = (
+            df_sorted.groupby(available)[activity_col].shift(-1).fillna('__END__')
+        )
+        # Map instance → next_activity via timestamp_start_log
+        ts_to_next = dict(zip(
+            df_sorted['timestamp_start_log'].astype(str),
+            df_sorted['_next_activity'].astype(str)
+        ))
+        # Attach next_activity to df_recs — use a best-effort join
+        # (df_recs was built per instance so we re-derive from df_expanded)
+        df_next = (
+            df_sorted[[activity_col, 'timestamp_start_log', '_next_activity']]
+            .drop_duplicates()
+            .copy()
+        )
+        df_next.columns = ['activity', 'timestamp_start_log', 'next_activity']
+        # We can't directly join df_recs to df_next without an instance key,
+        # so rebuild with next_activity included.
+        df_recs = _build_energy_state_matrix_with_next(
+            df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+        )
+        energy_state_columns_check = []
+        for s in sensors:
+            energy_state_columns_check += [f'{s}_mean', f'{s}_end', f'{s}_std']
+        energy_state_columns = energy_state_columns_check
+    else:
+        df_recs['next_activity'] = '__END__'
+
+    if df_recs.empty:
+        print("  WARNING: no valid instances with next_activity — returning empty modifiers.")
+        return {}, {}, energy_state_columns
+
+    print(f"  Total instances  : {len(df_recs)}")
+
+    # ── Per-activity modifiers ────────────────────────────────────────────
+    energy_duration_modifiers = {}
+    energy_transition_modifiers = {}
+
+    for activity, grp_act in df_recs.groupby('activity'):
+        X = grp_act[energy_state_columns].values
+        n = len(grp_act)
+
+        # Training-time column means — attached to every model so the
+        # simulation can synthesise a fallback energy state without a
+        # live prediction pipeline.
+        train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+
+        # ── Duration modifier ─────────────────────────────────────────
+        mean_dur = grp_act['duration'].mean()
+        if mean_dur > 0 and n >= 5:
+            y_dur = np.log(grp_act['duration'].values / mean_dur)
+            try:
+                mdl = duration_model_class(**duration_model_params)
+                mdl.fit(X, y_dur)
+                mdl._mean_duration        = mean_dur
+                mdl._train_feature_mean   = train_feature_mean  # ← fallback state
+                energy_duration_modifiers[str(activity)] = mdl
+                print(f"  [{activity}] duration modifier fitted  (n={n})")
+            except Exception as exc:
+                print(f"  [{activity}] duration modifier FAILED: {exc}")
+
+        # ── Transition modifier ────────────────────────────────────────
+        y_tr = grp_act['next_activity'].values
+        n_classes = len(set(y_tr))
+        if n >= min_transitions and n_classes >= 2:
+            try:
+                clf = transition_model_class(**transition_model_params)
+                clf.fit(X, y_tr)
+                clf._train_feature_mean   = train_feature_mean  # ← fallback state
+                energy_transition_modifiers[str(activity)] = clf
+                print(f"  [{activity}] transition modifier fitted (n={n}, classes={list(set(y_tr))})")
+            except Exception as exc:
+                print(f"  [{activity}] transition modifier FAILED: {exc}")
+        else:
+            reason = (f"n={n} < {min_transitions}" if n < min_transitions
+                      else f"only {n_classes} class")
+            print(f"  [{activity}] transition modifier SKIPPED ({reason})")
+
+    print(f"\n  Duration modifiers  : {len(energy_duration_modifiers)} activities")
+    print(f"  Transition modifiers: {len(energy_transition_modifiers)} activities")
+    print(f"  Energy state cols   : {energy_state_columns}")
+
+    return energy_duration_modifiers, energy_transition_modifiers, energy_state_columns
+
+
+def _build_energy_state_matrix_with_next(
+    df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+):
+    """
+    Like _build_energy_state_matrix but also resolves next_activity
+    from the chronological order within each (case, object) group.
+    """
+    records = []
+
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+
+    group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
+    available_group_cols = [c for c in group_cols if c in df_expanded.columns]
+
+    df = df_expanded.dropna(subset=[activity_col]).copy()
+    df[datetime_energy_col] = pd.to_datetime(df[datetime_energy_col])
+    df[timestamp_start_col] = pd.to_datetime(df[timestamp_start_col])
+    df['_instance_id'] = df.groupby(available_group_cols).ngroup()
+
+    # Build ordered list of instances per (case, object) for next_activity
+    order_cols = [c for c in ['case_id_log', 'object_log'] if c in df.columns]
+    instance_info = (
+        df.groupby('_instance_id')
+        .agg(
+            activity=(activity_col, 'first'),
+            ts=(timestamp_start_col, 'first'),
+            **{c: (c, 'first') for c in order_cols}
+        )
+        .sort_values(order_cols + ['ts'])
+        .reset_index()
+    )
+    # next_activity within each (case, object)
+    if order_cols:
+        instance_info['next_activity'] = (
+            instance_info.groupby(order_cols)['activity'].shift(-1).fillna('__END__')
+        )
+    else:
+        instance_info['next_activity'] = '__END__'
+
+    next_map = dict(zip(instance_info['_instance_id'], instance_info['next_activity']))
+
+    for instance_id, grp in df.groupby('_instance_id'):
+        grp = grp.sort_values(datetime_energy_col)
+        activity = str(grp[activity_col].iloc[0]).strip()
+
+        ts_col_end = 'timestamp_end_log'
+        if timestamp_start_col in grp.columns and ts_col_end in grp.columns:
+            ts = pd.to_datetime(grp[timestamp_start_col].iloc[0])
+            te = pd.to_datetime(grp[ts_col_end].iloc[0])
+            duration = max(0.1, (te - ts).total_seconds() / 60)
+        else:
+            continue
+
+        row = {'activity': activity, 'duration': duration,
+               'next_activity': str(next_map.get(instance_id, '__END__'))}
+        ok = True
+        for sensor in sensors:
+            if sensor not in grp.columns:
+                raise ValueError(
+                    f"Sensor column '{sensor}' not found in df_expanded. "
+                    f"Available: {list(grp.columns)}"
+                )
+            curve = grp[sensor].dropna().values
+            if len(curve) < 2:
+                ok = False
+                break
+            row.update(_energy_summary(curve, sensor))
+
+        if ok:
+            records.append(row)
+
+    return pd.DataFrame(records)
