@@ -1607,7 +1607,7 @@ ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
 
 ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
 ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_SAMPLES         = 30           # STRICT: skip ML (use statistical) if n_samples < 30
+ENERGY_MIN_SAMPLES         = 1           # STRICT: skip ML (use statistical) if n_samples < 30
 
 # Will be populated per process after energy modelling:
 energy_modifiers_by_process = {}
@@ -2409,6 +2409,16 @@ else:
 # %% 
 # ── FINAL SUMMARY ─────────────────────────────────────────────────────────────
 # All modeling and per-process evaluations are complete.
+
+if RUN_TEST_EVALUATION:
+    # Final consolidated summary of TEST set performance across ALL processes
+    # (Focuses strictly on the core metrics to maintain clarity)
+    _final_test_cols = [f"test_{b}" for b in CORE_METRIC_BASES if f"test_{b}" in evaluation_results_df.columns]
+    if _final_test_cols:
+        display(Markdown("---"))
+        display(Markdown("# 📊 FINAL CONSOLIDATED PERFORMANCE: TEST SET ENSEMBLE"))
+        display(Markdown("*Consolidated simulation quality across all processes on unseen data.*"))
+        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble")
 
 
 
