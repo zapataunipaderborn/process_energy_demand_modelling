@@ -89,6 +89,179 @@ from IPython.display import display, Markdown
 from pm4py.util import constants
 constants.SHOW_PROGRESS_BAR = False
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VISUALIZATION UTILITIES — HEATMAP ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Metrics where LOWER is better (prefixes like train_ or test_ are stripped before checking)
+METRICS_LOWER_IS_BETTER = {
+    'basic_metrics_event_count_error',
+    'basic_metrics_case_count_error',
+    'activity_metrics_js_divergence',
+    'activity_metrics_frequency_mae',
+    'duration_metrics_ks_statistic',
+    'duration_metrics_mean_duration_error',
+    'duration_metrics_median_duration_error',
+    'duration_metrics_std_duration_error',
+    'case_metrics_events_per_case_ks',
+    'case_metrics_median_events_per_case_error',
+}
+
+# The core set of metrics the user wants to see in the heatmaps
+CORE_METRIC_BASES = [
+    'overall_score',
+    'basic_metrics_event_count_ratio',
+    'duration_metrics_mean_duration_error',
+    'duration_metrics_median_duration_error', 
+    'conformance_metrics_fitness',
+    'conformance_metrics_precision',
+    'conformance_metrics_generalization',
+    'conformance_metrics_simplicity',
+]
+
+# Default definitions to avoid NameError when testing is skipped
+process_test_cols = []
+energy_test_cols = []
+enabled_test_metrics = set()
+lower_is_better = set()
+higher_is_better = set()
+
+# Metrics where HIGHER is better (prefixes like train_ or test_ are stripped before checking)
+METRICS_HIGHER_IS_BETTER = {
+
+    'overall_score',
+    'basic_metrics_event_count_ratio',
+    'basic_metrics_case_count_ratio',
+    'activity_metrics_activity_coverage_ratio',
+    'duration_metrics_ks_pvalue',
+    'case_metrics_events_per_case_pvalue',
+    'conformance_metrics_fitness',
+    'conformance_metrics_precision',
+    'conformance_metrics_generalization',
+    'conformance_metrics_simplicity',
+    'control_flow_metrics_edge_precision',
+    'control_flow_metrics_edge_recall',
+    'control_flow_metrics_edge_f1_score',
+    'control_flow_metrics_start_activities_jaccard',
+    'control_flow_metrics_end_activities_jaccard',
+}
+
+def _normalise_metrics(df, cols, lower_set_test_prefixed=None):
+    """Min-max normalise. Inverts lower-is-better metrics so 1 = best."""
+    norm_df = df.copy()
+    
+    # We strip prefixes for the 'lower is better' check to be phase-agnostic
+    base_lower_names = set()
+    if lower_set_test_prefixed:
+        base_lower_names = {s.replace('test_', '').replace('train_', '') for s in lower_set_test_prefixed}
+    
+    # Add our static base names
+    base_lower_names.update(METRICS_LOWER_IS_BETTER)
+
+    for c in cols:
+        vals = df[c].dropna()
+        if len(vals) == 0:
+            continue
+        vmin, vmax = vals.min(), vals.max()
+        rng = vmax - vmin if vmax != vmin else 1.0
+        
+        clean_c = c.replace('test_', '').replace('train_', '')
+        
+        # Check if it's lower-is-better
+        is_lower = clean_c in base_lower_names or any(m in clean_c for m in ['MAE', 'RMSE', 'WAPE'])
+        # (Exception: R2 is higher is better)
+        if 'R2' in clean_c: is_lower = False
+
+        if is_lower:
+            norm_df[c] = (vmax - df[c]) / rng
+        else:
+            norm_df[c] = (df[c] - vmin) / rng
+    return norm_df
+
+
+def _plot_results_heatmap(cols, title, metric_type='process', local_df=None):
+    """Displays a normalized heatmap for comparing different simulation modes."""
+    # Use global evaluation_results_df if no local_df is provided
+    target_df = local_df if local_df is not None else globals().get('evaluation_results_df')
+    
+    if not cols or target_df is None or target_df.empty or 'mode' not in target_df.columns:
+        return
+    
+    # Filter columns that actually exist in the dataframe AND are numeric
+    valid_cols = [
+        c for c in cols 
+        if c in target_df.columns and target_df[c].dtype in ('float64', 'float32', 'int64', 'int32')
+    ]
+    if not valid_cols:
+        return
+
+    # Phase-agnostic normalization
+    mode_avg = target_df.groupby('mode')[valid_cols].mean()
+    # We pass higher_is_better if it exists globally, otherwise empty set for base check
+    global_lower = globals().get('lower_is_better', set())
+    mode_avg_norm = _normalise_metrics(mode_avg, valid_cols, global_lower)
+    
+    # Sort by overall score if available
+    sort_opts = ['test_overall_score', 'train_overall_score', valid_cols[0]]
+    sort_key = next((k for k in sort_opts if k in mode_avg_norm.columns), valid_cols[0])
+    mode_avg_norm = mode_avg_norm.sort_values(sort_key, ascending=False)
+    
+    # Generate labels dynamically
+    current_labels = {
+        'train_overall_score': 'Overall',
+        'test_overall_score':  'Overall',
+        'train_basic_metrics_event_count_ratio': 'EvtRatio',
+        'test_basic_metrics_event_count_ratio':  'EvtRatio',
+        'train_duration_metrics_mean_duration_error': 'MeanDurErr',
+        'test_duration_metrics_mean_duration_error':  'MeanDurErr',
+        'train_duration_metrics_median_duration_error': 'MedDurErr',
+        'test_duration_metrics_median_duration_error':  'MedDurErr',
+        'train_conformance_metrics_fitness': 'Fitness',
+        'test_conformance_metrics_fitness':  'Fitness',
+        'train_conformance_metrics_precision': 'Precision',
+        'test_conformance_metrics_precision':  'Precision',
+        'train_conformance_metrics_generalization': 'Generaliz',
+        'test_conformance_metrics_generalization':  'Generaliz',
+        'train_conformance_metrics_simplicity': 'Simplicity',
+        'test_conformance_metrics_simplicity':  'Simplicity',
+    }
+    
+    for c in valid_cols:
+        if c in current_labels:
+            continue
+        if '_energy_' in c:
+
+            parts = c.split('_')
+            sensor = parts[2]
+            metric = parts[-1]
+            current_labels[c] = f"{sensor[:3]}: {metric}"
+        else:
+            current_labels[c] = c.replace('test_', '').replace('train_', '').replace('_metrics_', ': ').replace('_', ' ').title()
+    
+    disp_cols = [current_labels[c] for c in valid_cols]
+    plot_df = mode_avg_norm[valid_cols].copy()
+    plot_df.columns = disp_cols
+    annot_df = mode_avg[valid_cols].reindex(mode_avg_norm.index).round(3)
+    annot_df.columns = disp_cols
+
+    fig, ax = plt.subplots(figsize=(max(10, len(valid_cols) * 1.2), max(3, len(mode_avg_norm) * 0.8)))
+    sns.heatmap(plot_df, annot=annot_df, fmt='', cmap='RdYlGn', vmin=0, vmax=1, linewidths=0.5, ax=ax,
+                cbar_kws={'label': 'Normalised score (1 = best)'})
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_ylabel('')
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+    # Log/Table summary
+    metrics_table = mode_avg[valid_cols].reindex(mode_avg_norm.index).round(4)
+    metrics_table.columns = disp_cols
+    print(f"\n{title.upper()}")
+    print("-" * len(title))
+    with pd.option_context('display.max_columns', None, 'display.width', 200):
+        print(metrics_table.to_string())
+
 # %% [markdown]
 # # Define Paths and Load Datasets
 
@@ -1499,8 +1672,10 @@ ML_OPTUNA_TRIALS        = 20
 #                    False → use all data (no split, single evaluation)
 #   TRAIN_RATIO    : fraction of cases used for training (e.g. 0.80 = 80%)
 # ─────────────────────────────────────────────────────────────────────────────
-TEMPORAL_SPLIT = True
-TRAIN_RATIO    = 0.60
+TEMPORAL_SPLIT     = True
+TRAIN_RATIO        = 0.80
+RUN_TEST_EVALUATION = True # Fast mode: skip heavy test-set simulation & curve extraction
+
 
 
 def _split_process_datasets(datasets, train_ratio=0.80):
@@ -2006,52 +2181,57 @@ for process in process_datasets_to_model.keys():
 
 
                         # ── Train Dynamic ML Curve Predictors ──────────────────
-                        from sim_extractor import split_curves, build_and_train_pipeline, predict_raw_curve
-                        from sklearn.linear_model import LinearRegression
-                        from sklearn.ensemble import GradientBoostingRegressor
+                        # Only run this if we actually want to evaluate on Test results
+                        # as this DTW-based training is the slowest part of the pipeline.
+                        if RUN_TEST_EVALUATION:
+                            from sim_extractor import split_curves, build_and_train_pipeline, predict_raw_curve
+                            from sklearn.linear_model import LinearRegression
+                            from sklearn.ensemble import GradientBoostingRegressor
 
-                        _energy_pipelines = {}
-                        
-                        _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
-                        _activities_list = _config.get('activities_to_model', _df_expanded_train['activity_log'].dropna().unique().tolist())
-                        _objects_list = _config.get('objects_to_model', _df_expanded_train['object_log'].dropna().unique().tolist())
-                        
-                        for _sensor in _sensors:
-                            print(f"\n  ℹ️ Training dynamic ML curve for sensor: {_sensor}")
-                            _train_curves, _ = split_curves(
-                                _df_expanded_train,
-                                variable=_sensor,
-                                activities=_activities_list,
-                                objects=_objects_list,
-                                test_size=0.0, # All data into train since we do global temporal split
-                                verbose=0,
-                            )
-                            _ep_pipeline = build_and_train_pipeline(
-                                _train_curves,
-                                variable=_sensor,
-                                fixed_length=100,
-                                val_size=0.2, # Validation internally handles R2 evaluation
-                                models={
-                                    'Linear Regression': LinearRegression,
-                                    'Gradient Boosting': GradientBoostingRegressor,
-                                },
-                                optimize_hyperparams=False,
-                                verbose=VERBOSE_EVAL
-                            )
+                            _energy_pipelines = {}
                             
-                            def _make_predict_fn(ep_bound):
-                                return lambda raw_values, activity, object_attributes: predict_raw_curve(
-                                    raw_values, activity, object_attributes, pipeline=ep_bound
+                            _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
+                            _activities_list = _config.get('activities_to_model', _df_expanded_train['activity_log'].dropna().unique().tolist())
+                            _objects_list = _config.get('objects_to_model', _df_expanded_train['object_log'].dropna().unique().tolist())
+                            
+                            for _sensor in _sensors:
+                                print(f"\n  ℹ️ Training dynamic ML curve for sensor: {_sensor}")
+                                _train_curves, _ = split_curves(
+                                    _df_expanded_train,
+                                    variable=_sensor,
+                                    activities=_activities_list,
+                                    objects=_objects_list,
+                                    test_size=0.0, # All data into train since we do global temporal split
+                                    verbose=0,
+                                )
+                                _ep_pipeline = build_and_train_pipeline(
+                                    _train_curves,
+                                    variable=_sensor,
+                                    fixed_length=100,
+                                    val_size=0.2, # Validation internally handles R2 evaluation
+                                    models={
+                                        'Linear Regression': LinearRegression,
+                                        'Gradient Boosting': GradientBoostingRegressor,
+                                    },
+                                    optimize_hyperparams=False,
+                                    verbose=VERBOSE_EVAL
                                 )
                                 
-                            _energy_pipelines[_sensor] = {
-                                'reference_curve': _ep_pipeline['reference_curve'],
-                                'predict_fn': _make_predict_fn(_ep_pipeline),
-                                'full_pipeline': _ep_pipeline 
-                            }
-                            
-                        all_energy_pipelines[process] = _energy_pipelines
-                            
+                                def _make_predict_fn(ep_bound):
+                                    return lambda raw_values, activity, object_attributes: predict_raw_curve(
+                                        raw_values, activity, object_attributes, pipeline=ep_bound
+                                    )
+                                    
+                                _energy_pipelines[_sensor] = {
+                                    'reference_curve': _ep_pipeline['reference_curve'],
+                                    'predict_fn': _make_predict_fn(_ep_pipeline),
+                                    'full_pipeline': _ep_pipeline 
+                                }
+                                
+                            all_energy_pipelines[process] = _energy_pipelines
+                        else:
+                            _energy_pipelines = {}
+
                     except Exception as _exc:
                         print(f"⚠️  extract_energy_modifiers or ML curve modeling failed: {_exc}")
                         _energy_dur_mods, _energy_tr_mods, _energy_state_cols = {}, {}, []
@@ -2111,34 +2291,56 @@ for process in process_datasets_to_model.keys():
                         else:
                             _energy_flattened[f"train_{_cat}"] = _met
 
-                    # ── Test evaluation ───────────────────────────────────
-                    _df_test = test_datasets[process]['event_log'] if test_datasets else None
-                    if TEMPORAL_SPLIT and _df_test is not None and len(_df_test) > 0:
-                        _pp_test = test_datasets[process]['production_plan']
-                        _exp_test = test_datasets[process]['expanded']
-                        _energy_sim_test = _run_energy_sim(
-                            _pp_test, _best_base_stats, _best_base_pm
-                        )
-                        if VERBOSE_EVAL:
-                            print(f"\n  Simulated log TEST  ({_energy_mode}): "
-                                  f"{len(_energy_sim_test)} events")
+                    # ── Test evaluation (Guarded for speed) ────────────────
+                    if RUN_TEST_EVALUATION:
+                        _df_test = test_datasets[process]['event_log'] if test_datasets else None
+                        if TEMPORAL_SPLIT and _df_test is not None and len(_df_test) > 0:
+                            _pp_test = test_datasets[process]['production_plan']
+                            _exp_test = test_datasets[process]['expanded']
+                            _energy_sim_test = _run_energy_sim(
+                                _pp_test, _best_base_stats, _best_base_pm
+                            )
+                            if VERBOSE_EVAL:
+                                print(f"\n  Simulated log TEST  ({_energy_mode}): "
+                                      f"{len(_energy_sim_test)} events")
 
-                        _eval_test = comprehensive_simulation_evaluation(
-                            _energy_sim_test, _df_test, real_expanded_df=_exp_test
-                        )
-                        for _cat, _met in _eval_test.items():
-                            if _cat == 'energy_metrics' and isinstance(_met, dict):
-                                for _sensor, _vals in _met.items():
-                                    for _mn, _mv in _vals.items():
-                                        _energy_flattened[f"test_energy_{_sensor}_{_mn}"] = _mv
-                            elif isinstance(_met, dict):
-                                for _mn, _mv in _met.items():
-                                    _energy_flattened[f"test_{_cat}_{_mn}"] = _mv
-                            else:
-                                _energy_flattened[f"test_{_cat}"] = _met
+                            _eval_test = comprehensive_simulation_evaluation(
+                                _energy_sim_test, _df_test, real_expanded_df=_exp_test
+                            )
+                            for _cat, _met in _eval_test.items():
+                                if _cat == 'energy_metrics' and isinstance(_met, dict):
+                                    for _sensor, _vals in _met.items():
+                                        for _mn, _mv in _vals.items():
+                                            _energy_flattened[f"test_energy_{_sensor}_{_mn}"] = _mv
+                                elif isinstance(_met, dict):
+                                    for _mn, _mv in _met.items():
+                                        _energy_flattened[f"test_{_cat}_{_mn}"] = _mv
+                                else:
+                                    _energy_flattened[f"test_{_cat}"] = _met
 
                     process_mode_results.append(_energy_flattened)
                     evaluation_results_list.append(_energy_flattened)
+
+
+        # ── Intermediate Per-Process Training Heatmap ─────────────────────
+        if process_mode_results:
+            _proc_df = pd.DataFrame(process_mode_results)
+            
+            # Specifically filter for the CORE metrics the user wants to see
+            _train_cols = []
+            for _base in CORE_METRIC_BASES:
+                _full = f"train_{_base}"
+                if _full in _proc_df.columns:
+                    _train_cols.append(_full)
+            
+            # If no core metrics found, fall back to any training metric (fast fallback)
+            if not _train_cols:
+                _train_cols = [c for c in _proc_df.columns if c.startswith('train_') and not c.startswith('train_energy_')]
+            
+            display(Markdown(f"## 📊 Training Verification: {process.upper()}"))
+            display(Markdown(f"*Evaluation on training data using real energy curves (verification of modifier fitting)*"))
+            _plot_results_heatmap(_train_cols, f"Training Quality: {process}", local_df=_proc_df)
+
 
 # Convert the results list into a DataFrame
 evaluation_results_df = pd.DataFrame(evaluation_results_list)
@@ -2205,158 +2407,9 @@ else:
 # # Data fusion
 
 # %% 
-# ══════════════════════════════════════════════════════════════════════════════
-# VISUALIZATION — MODE COMPARISON DASHBOARD  (seaborn / matplotlib)
-# ══════════════════════════════════════════════════════════════════════════════
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
+# ── FINAL SUMMARY ─────────────────────────────────────────────────────────────
+# All modeling and per-process evaluations are complete.
 
-# Select test columns (numeric only)
-test_cols = [c for c in evaluation_results_df.columns
-             if c.startswith('test_') and evaluation_results_df[c].dtype in ('float64', 'float32', 'int64')]
-
-# Active metrics only (others remain computed/stored but are hidden in comparison dashboards).
-enabled_test_metrics = {
-    'test_overall_score',
-    'test_basic_metrics_event_count_ratio',
-    'test_duration_metrics_mean_duration_error',
-    'test_conformance_metrics_fitness',
-    'test_conformance_metrics_precision',
-    'test_conformance_metrics_generalization',
-    'test_conformance_metrics_simplicity',
-}
-
-# Metrics where LOWER is better
-lower_is_better = {
-    'test_basic_metrics_event_count_error',
-    'test_basic_metrics_case_count_error',
-    'test_activity_metrics_js_divergence',
-    'test_activity_metrics_frequency_mae',
-    'test_duration_metrics_ks_statistic',
-    'test_duration_metrics_mean_duration_error',
-    'test_duration_metrics_std_duration_error',
-    'test_case_metrics_events_per_case_ks',
-    'test_case_metrics_mean_events_per_case_error',
-    'test_case_metrics_median_events_per_case_error',
-}
-
-# Dynamic injection of detect energy columns
-if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
-    for c in evaluation_results_df.columns:
-        if c.startswith('test_energy_'):
-            enabled_test_metrics.add(c)
-            # MAE, RMSE, WAPE are all "lower is better"
-            if any(m in c for m in ['MAE', 'RMSE', 'WAPE']):
-                lower_is_better.add(c)
-            elif 'R2' in c:
-                higher_is_better.add(c)
-
-# Metrics where HIGHER is better
-higher_is_better = {
-    'test_overall_score',
-    'test_basic_metrics_event_count_ratio',
-    'test_basic_metrics_case_count_ratio',
-    'test_activity_metrics_activity_coverage_ratio',
-    'test_duration_metrics_ks_pvalue',
-    'test_case_metrics_events_per_case_pvalue',
-    'test_conformance_metrics_fitness',
-    'test_conformance_metrics_precision',
-    'test_conformance_metrics_generalization',
-    'test_conformance_metrics_simplicity',
-    'test_control_flow_metrics_edge_precision',
-    'test_control_flow_metrics_edge_recall',
-    'test_control_flow_metrics_edge_f1_score',
-    'test_control_flow_metrics_start_activities_jaccard',
-    'test_control_flow_metrics_end_activities_jaccard',
-}
-
-process_test_cols = [c for c in test_cols if not c.startswith('test_energy_') and (c in lower_is_better or c in higher_is_better) and c in enabled_test_metrics]
-energy_test_cols = [c for c in test_cols if c.startswith('test_energy_')]
-
-# Short labels for standard and energy metrics
-short_labels = {}
-for c in test_cols:
-    if c.startswith('test_energy_'):
-        # test_energy_Sensor_MAE -> Sen: MAE
-        parts = c.split('_')
-        sensor = parts[2]
-        metric = parts[-1]
-        short_labels[c] = f"{sensor[:3]}: {metric}"
-    else:
-        short_labels[c] = c.replace('test_', '').replace('_metrics_', ': ').replace('_', ' ').title()
-
-def _normalise_metrics(df, cols, lower_set):
-    """Min-max normalise. For lower-is-better, invert so 1 = best."""
-    norm_df = df.copy()
-    for c in cols:
-        vals = df[c].dropna()
-        if len(vals) == 0:
-            continue
-        vmin, vmax = vals.min(), vals.max()
-        rng = vmax - vmin if vmax != vmin else 1.0
-        if c in lower_set:
-            norm_df[c] = (vmax - df[c]) / rng
-        else:
-            norm_df[c] = (df[c] - vmin) / rng
-    return norm_df
-
-# %% 
-# ── HEATMAPS + METRIC TABLES (+ LATEX) ───────────────────────────────────────
-
-def _plot_results_heatmap(cols, title, metric_type='process'):
-    if not cols or 'mode' not in evaluation_results_df.columns:
-        return
-    
-    mode_avg = evaluation_results_df.groupby('mode')[cols].mean()
-    mode_avg_norm = _normalise_metrics(mode_avg, cols, lower_is_better)
-    
-    sort_key = 'test_overall_score' if 'test_overall_score' in mode_avg_norm.columns else cols[0]
-    mode_avg_norm = mode_avg_norm.sort_values(sort_key, ascending=False)
-    
-    current_short_labels = {c: short_labels.get(c, c) for c in cols}
-    disp_cols = [current_short_labels[c] for c in cols]
-    
-    plot_df = mode_avg_norm[cols].copy()
-    plot_df.columns = disp_cols
-    annot_df = mode_avg[cols].reindex(mode_avg_norm.index).round(3)
-    annot_df.columns = disp_cols
-
-    fig, ax = plt.subplots(figsize=(max(10, len(cols) * 1.2), max(3, len(mode_avg_norm) * 0.8)))
-    sns.heatmap(plot_df, annot=annot_df, fmt='', cmap='RdYlGn', vmin=0, vmax=1, linewidths=0.5, ax=ax,
-                cbar_kws={'label': 'Normalised score (1 = best)'})
-    ax.set_title(title, fontsize=12, fontweight='bold')
-    ax.set_ylabel('')
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
-    plt.tight_layout()
-    plt.show()
-
-    # Table
-    metrics_table = mode_avg[cols].reindex(mode_avg_norm.index).round(4)
-    metrics_table.columns = disp_cols
-    print(f"\n{title.upper()}")
-    print("-" * len(title))
-    with pd.option_context('display.max_columns', None, 'display.width', 200):
-        print(metrics_table.to_string())
-
-# 1. Standard Process Heatmap
-_plot_results_heatmap(process_test_cols, "Simulation Quality: Standard Process Metrics")
-
-# Export LaTeX for paper (Process only)
-if process_test_cols:
-    mode_avg = evaluation_results_df.groupby('mode')[process_test_cols].mean()
-    metrics_table = mode_avg[process_test_cols].round(4)
-    metrics_table.columns = [short_labels.get(c, c) for c in process_test_cols]
-    latex_table = metrics_table.to_latex(
-        index=True, float_format='%.4f',
-        caption='Mode-wise process simulation metrics.',
-        label='tab:mode_metrics_short', escape=False
-    )
-    print("\nLATEX TABLE (PROCESS):")
-    print(latex_table)
-
-# 2. Energy Accuracy Heatmap (REMOVED per user request)
-# _plot_results_heatmap(energy_test_cols, "Energy Profile Accuracy: ML Curve Metrics")
 
 
 # %% 
@@ -2385,26 +2438,29 @@ if 'process_datasets_to_model_sensors' in dir():
                 tr_agg.update({'process': process, 'sensor': sensor, 'split': 'TRAIN'})
                 profile_summary_records.append(tr_agg)
                 
-            # Evaluate on TEST (40%)
-            df_test_exp = test_datasets[process].get('expanded')
-            if df_test_exp is not None:
-                test_curves, _ = split_curves(df_test_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
-                metrics_df, ts_agg = evaluate_pipeline_on_test(test_curves, pipeline, verbose=0)
-                
-                # Get per-activity averages to show 'Subprocess' granularity
-                if not metrics_df.empty:
-                    activity_metrics = metrics_df.groupby('activity')[['MAE', 'RMSE', 'WAPE (%)', 'R2']].mean().reset_index()
-                    for _, act_row in activity_metrics.iterrows():
-                        summary_rec = {
-                            'Dataset': process,
-                            'Subprocess': act_row['activity'],
-                            'Sensor': sensor,
-                            'MAE': act_row['MAE'],
-                            'RMSE': act_row['RMSE'],
-                            'WAPE': act_row['WAPE (%)'],
-                            'R2': act_row['R2']
-                        }
-                        profile_summary_records.append(summary_rec)
+            # Evaluate on TEST (40%) - Guarded for speed
+            if RUN_TEST_EVALUATION:
+                df_test_exp = test_datasets[process].get('expanded')
+                if df_test_exp is not None and not df_test_exp.empty:
+                    test_curves, _ = split_curves(df_test_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
+                    if test_curves:
+                        metrics_df, ts_agg = evaluate_pipeline_on_test(test_curves, pipeline, verbose=0)
+                        
+                        # Get per-activity averages to show 'Subprocess' granularity
+                        if not metrics_df.empty:
+                            activity_metrics = metrics_df.groupby('activity')[['MAE', 'RMSE', 'WAPE (%)', 'R2']].mean().reset_index()
+                            for _, act_row in activity_metrics.iterrows():
+                                summary_rec = {
+                                    'Dataset': process,
+                                    'Subprocess': act_row['activity'],
+                                    'Sensor': sensor,
+                                    'MAE': act_row['MAE'],
+                                    'RMSE': act_row['RMSE'],
+                                    'WAPE': act_row['WAPE (%)'],
+                                    'R2': act_row['R2']
+                                }
+                                profile_summary_records.append(summary_rec)
+
 
 if profile_summary_records:
     profile_summary_df = pd.DataFrame(profile_summary_records)
