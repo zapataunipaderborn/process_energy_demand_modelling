@@ -1010,12 +1010,13 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
 
     Returns
     -------
-    records : list[dict]
-        Each dict has:
-          - 'activity'  : str
-          - 'duration'  : float  (minutes)
-          - 'next_activity' : str  (or '__END__')
-          - one key per sensor × 3 features  (mean, end, std)
+    records : pd.DataFrame
+        Each row has:
+          - 'case_id'
+          - 'activity'
+          - 'timestamp_start'
+          - 'duration'
+          - one key per sensor × 3 features (mean, end, std)
     energy_state_columns : list[str]
         Ordered list of the 3×N feature names.
     """
@@ -1027,22 +1028,30 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
 
     # Group by activity instance
-    group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
+    activity_col = activity_col if activity_col in df_expanded.columns else 'activity'
+    timestamp_start_col = timestamp_start_col if timestamp_start_col in df_expanded.columns else 'timestamp_start'
+    case_col = 'case_id_log' if 'case_id_log' in df_expanded.columns else 'case_id'
+
+    group_cols = [case_col, activity_col, timestamp_start_col]
     available_group_cols = [c for c in group_cols if c in df_expanded.columns]
 
     df = df_expanded.dropna(subset=[activity_col]).copy()
-    df[datetime_energy_col] = pd.to_datetime(df[datetime_energy_col])
+    if datetime_energy_col in df.columns:
+        df[datetime_energy_col] = pd.to_datetime(df[datetime_energy_col])
 
     df['_instance_id'] = df.groupby(available_group_cols).ngroup()
 
     for instance_id, grp in df.groupby('_instance_id'):
-        grp = grp.sort_values(datetime_energy_col)
+        if datetime_energy_col in grp.columns:
+            grp = grp.sort_values(datetime_energy_col)
 
         activity = str(grp[activity_col].iloc[0]).strip()
+        case_id  = grp[case_col].iloc[0]
+        ts_val   = grp[timestamp_start_col].iloc[0]
 
         # Duration in minutes
-        ts_col = 'timestamp_start_log'
-        te_col = 'timestamp_end_log'
+        ts_col = 'timestamp_start_log' if 'timestamp_start_log' in grp.columns else 'timestamp_start'
+        te_col = 'timestamp_end_log' if 'timestamp_end_log' in grp.columns else 'timestamp_end'
         if ts_col in grp.columns and te_col in grp.columns:
             ts = pd.to_datetime(grp[ts_col].iloc[0])
             te = pd.to_datetime(grp[te_col].iloc[0])
@@ -1050,33 +1059,97 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
         else:
             duration = None
 
-        if duration is None:
-            continue
-
         # Build energy state from actual sensor curves
-        row = {'activity': activity, 'duration': duration}
+        row = {
+            'case_id': case_id,
+            'activity': activity,
+            'timestamp_start': ts_val,
+            'duration': duration
+        }
         ok = True
         for sensor in sensors:
             if sensor not in grp.columns:
-                raise ValueError(
-                    f"extract_energy_modifiers: sensor column '{sensor}' not found "
-                    f"in df_expanded. Available columns: {list(grp.columns)}"
-                )
+                continue
             curve = grp[sensor].dropna().values
-            if len(curve) < 2:
-                ok = False
-                break
-            row.update(_energy_summary(curve, sensor))
-
-        if not ok:
-            continue
+            if len(curve) < 1:
+                # If no data for this sensor, fill with 0
+                row.update({f'{sensor}_mean': 0.0, f'{sensor}_end': 0.0, f'{sensor}_std': 0.0})
+            else:
+                row.update(_energy_summary(curve, sensor))
 
         records.append(row)
 
-    # Derive next_activity per (case, object, activity sequence)
-    # We do a simple lag on the sorted records per case
     df_recs = pd.DataFrame(records)
     return df_recs, energy_state_columns
+
+
+def build_energy_features_for_raw_df(raw_df, df_expanded, sensors):
+    """
+    Combine base ML features (raw_df) with energy-state features (from df_expanded).
+
+    The energy features for instance $i$ will be the energy summary 
+    (mean, end, std) of the PREVIOUS activity $(i-1)$ in that case.
+    This allows the ML model to use the "state of the machine" after the 
+    previous task to predict the duration/transition of the current task.
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame
+        Base features (activity, prev_activity, etc.)
+    df_expanded : pd.DataFrame
+        Event log joined with energy sensor data.
+    sensors : list[str]
+        Names of sensor columns to extract features for.
+
+    Returns
+    -------
+    pd.DataFrame
+        The raw_df with additional energy columns.
+    """
+    if df_expanded is None or not sensors:
+        return raw_df
+
+    print(f"  ── Building Energy Features for ML Training (Sensors: {sensors}) ──")
+    
+    # 1. Extract energy state for every activity instance
+    energy_df, energy_cols = _build_energy_state_matrix(df_expanded, sensors)
+    
+    if energy_df.empty:
+        print("    [!] No energy data instances found in df_expanded.")
+        return raw_df
+
+    # 2. Join energy_df into raw_df
+    # We join on case_id, activity, and timestamp_start to match instances exactly.
+    # Note: timestamps must have same resolution/type.
+    raw_df = raw_df.copy()
+    raw_df['timestamp_start'] = pd.to_datetime(raw_df['timestamp_start'])
+    energy_df['timestamp_start'] = pd.to_datetime(energy_df['timestamp_start'])
+    
+    # Avoid duplicate columns if they exist
+    cols_to_use = ['case_id', 'activity', 'timestamp_start'] + energy_cols
+    merged = pd.merge(
+        raw_df, 
+        energy_df[cols_to_use], 
+        on=['case_id', 'activity', 'timestamp_start'], 
+        how='left'
+    )
+    
+    # 3. Shift energy features to be "previous state"
+    # We want activity i to have features [standard_i, energy_i-1]
+    # Sort by case and activity_index to ensure temporal order
+    merged = merged.sort_values(['case_id', 'activity_index'])
+    
+    for col in energy_cols:
+        prev_col = f'energy_prev_{col}'
+        # Shift within each case
+        merged[prev_col] = merged.groupby('case_id')[col].shift(1).fillna(0.0)
+    
+    # Remove the "current" energy cols to prevent leakage 
+    # (we shouldn't use current energy to predict current duration)
+    merged = merged.drop(columns=energy_cols)
+    
+    print(f"    ✓ Added {len(energy_cols)} 'energy_prev_*' features.")
+    return merged
 
 
 def extract_energy_modifiers(
