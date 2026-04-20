@@ -2191,8 +2191,8 @@ higher_is_better = {
     'test_control_flow_metrics_end_activities_jaccard',
 }
 
-test_cols = [c for c in test_cols if c in lower_is_better or c in higher_is_better]
-test_cols = [c for c in test_cols if c in enabled_test_metrics]
+process_test_cols = [c for c in test_cols if not c.startswith('test_energy_') and (c in lower_is_better or c in higher_is_better) and c in enabled_test_metrics]
+energy_test_cols = [c for c in test_cols if c.startswith('test_energy_')]
 
 # Short labels for standard and energy metrics
 short_labels = {}
@@ -2222,78 +2222,61 @@ def _normalise_metrics(df, cols, lower_set):
     return norm_df
 
 # %% 
-# ── HEATMAP + METRIC TABLE (+ LATEX) ─────────────────────────────────────────
-if test_cols and 'mode' in evaluation_results_df.columns:
-    mode_avg = evaluation_results_df.groupby('mode')[test_cols].mean()
-    mode_avg_norm = _normalise_metrics(mode_avg, test_cols, lower_is_better)
+# ── HEATMAPS + METRIC TABLES (+ LATEX) ───────────────────────────────────────
 
-    if 'test_overall_score' in mode_avg_norm.columns:
-        mode_avg_norm = mode_avg_norm.sort_values('test_overall_score', ascending=False)
-
-    display_cols = [short_labels.get(c, c.replace('test_', '')) for c in test_cols]
+def _plot_results_heatmap(cols, title, metric_type='process'):
+    if not cols or 'mode' not in evaluation_results_df.columns:
+        return
     
-    # Specific overrides for very common process metrics
-    overrides = {
-        'test_overall_score': 'Overall',
-        'test_basic_metrics_event_count_ratio': 'EvtRatio',
-        'test_duration_metrics_mean_duration_error': 'MeanDurErr',
-        'test_conformance_metrics_fitness': 'Fitness',
-        'test_conformance_metrics_precision': 'Precision',
-        'test_conformance_metrics_generalization': 'Generaliz',
-        'test_conformance_metrics_simplicity': 'Simplicity',
-    }
-    display_cols = [overrides.get(c, short_labels.get(c, c)) for c in test_cols]
+    mode_avg = evaluation_results_df.groupby('mode')[cols].mean()
+    mode_avg_norm = _normalise_metrics(mode_avg, cols, lower_is_better)
+    
+    sort_key = 'test_overall_score' if 'test_overall_score' in mode_avg_norm.columns else cols[0]
+    mode_avg_norm = mode_avg_norm.sort_values(sort_key, ascending=False)
+    
+    current_short_labels = {c: short_labels.get(c, c) for c in cols}
+    disp_cols = [current_short_labels[c] for c in cols]
+    
+    plot_df = mode_avg_norm[cols].copy()
+    plot_df.columns = disp_cols
+    annot_df = mode_avg[cols].reindex(mode_avg_norm.index).round(3)
+    annot_df.columns = disp_cols
 
-    # Heatmap data (normalised), annotations are raw values.
-    plot_df = mode_avg_norm[test_cols].copy()
-    plot_df.columns = display_cols
-
-    annot_df = mode_avg[test_cols].reindex(mode_avg_norm.index).round(3)
-    annot_df.columns = display_cols
-
-    fig, ax = plt.subplots(figsize=(max(10, len(test_cols) * 1.0),
-                                    max(3, len(mode_avg_norm) * 0.8)))
-    sns.heatmap(
-        plot_df,
-        annot=annot_df,
-        fmt='',
-        cmap='RdYlGn',
-        vmin=0,
-        vmax=1,
-        linewidths=0.5,
-        ax=ax,
-        cbar_kws={'label': 'Normalised score (1 = best)'}
-    )
-    ax.set_title('Mode vs Metrics Heatmap (normalised colors, raw values in cells)',
-                 fontsize=12, fontweight='bold')
+    fig, ax = plt.subplots(figsize=(max(10, len(cols) * 1.2), max(3, len(mode_avg_norm) * 0.8)))
+    sns.heatmap(plot_df, annot=annot_df, fmt='', cmap='RdYlGn', vmin=0, vmax=1, linewidths=0.5, ax=ax,
+                cbar_kws={'label': 'Normalised score (1 = best)'})
+    ax.set_title(title, fontsize=12, fontweight='bold')
     ax.set_ylabel('')
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
-    ax.set_yticklabels(ax.get_yticklabels(), fontsize=10)
     plt.tight_layout()
-    pass
+    plt.show()
 
-    # Table below the heatmap (raw metrics, shortened names)
-    metrics_table = mode_avg[test_cols].reindex(mode_avg_norm.index).round(4)
-    metrics_table.columns = display_cols
-
-    print("\n" + "=" * 80)
-    print("METRICS TABLE (RAW VALUES, SHORT NAMES)")
-    print("=" * 80)
+    # Table
+    metrics_table = mode_avg[cols].reindex(mode_avg_norm.index).round(4)
+    metrics_table.columns = disp_cols
+    print(f"\n{title.upper()}")
+    print("-" * len(title))
     with pd.option_context('display.max_columns', None, 'display.width', 200):
         print(metrics_table.to_string())
 
-    # LaTeX table for paper
-    latex_table = metrics_table.to_latex(
-        index=True,
-        float_format='%.4f',
-        caption='Mode-wise process simulation metrics (short names).',
-        label='tab:mode_metrics_short',
-        escape=False
-    )
+# 1. Standard Process Heatmap
+_plot_results_heatmap(process_test_cols, "Simulation Quality: Standard Process Metrics")
 
-    print("\n" + "=" * 80)
-    print("=" * 80)
+# Export LaTeX for paper (Process only)
+if process_test_cols:
+    mode_avg = evaluation_results_df.groupby('mode')[process_test_cols].mean()
+    metrics_table = mode_avg[process_test_cols].round(4)
+    metrics_table.columns = [short_labels.get(c, c) for c in process_test_cols]
+    latex_table = metrics_table.to_latex(
+        index=True, float_format='%.4f',
+        caption='Mode-wise process simulation metrics.',
+        label='tab:mode_metrics_short', escape=False
+    )
+    print("\nLATEX TABLE (PROCESS):")
     print(latex_table)
+
+# 2. Energy Accuracy Heatmap
+_plot_results_heatmap(energy_test_cols, "Energy Profile Accuracy: ML Curve Metrics")
 
 
 # %% 
