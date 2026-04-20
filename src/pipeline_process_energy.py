@@ -1398,6 +1398,15 @@ process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
 process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
 process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
 
+processes_to_run = ['process_3']
+# Filter the original dictionary
+process_datasets_to_model = {
+    k: v for k, v in process_datasets.items() 
+    if k in processes_to_run
+}
+# The rest of your configuration will now only see process_3
+process_datasets_to_model_sensors = process_datasets_to_model.copy()
+
 # %%
 import pandas as pd
 from sim_extractor import extract_process
@@ -1637,6 +1646,8 @@ for process in process_datasets_to_model.keys():
     print("\n" + "="*80)
     print(f"ANALYZING {process.upper()}")
     print("="*80)
+    display(Markdown(f"# 🔍 Process: {process.upper()}"))
+
 
     # Use the pre-split dictionaries
     df_train        = train_datasets[process]['event_log']
@@ -1711,6 +1722,9 @@ for process in process_datasets_to_model.keys():
                 report("\n" + "="*len(title_str))
                 report(title_str)
                 report("="*len(title_str) + "\n")
+                display(Markdown(f"### 🌐 Petri Net: {obj_name} ({obj_type})"))
+                display(Markdown(f"*Process: {process} | Mining Algorithm: {alg_name}*"))
+
                 
                 # In Jupyter, this will display the Graphviz object
                 view_obj = pm4py.view_petri_net(model['net'], model['im'], model['fm'], format='png')
@@ -2439,6 +2453,8 @@ if test_sim_logs:
             
             if test_curves:
                 report(f"\nVisualizing Generalization Performance -> Process: {process} | Sensor: {sensor}")
+                display(Markdown(f"## 📈 Energy Curve Generalization: {sensor}"))
+                display(Markdown(f"*Process: {process} | Visualizing Simulated vs Real paths*"))
                 evaluate_pipeline_on_test(
                     test_curves, 
                     all_energy_pipelines[process][sensor]['full_pipeline'], 
