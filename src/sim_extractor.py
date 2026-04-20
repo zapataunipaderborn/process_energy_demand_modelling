@@ -2022,8 +2022,14 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
 
         fig, axes = plt.subplots(
             n_rows, n_cols,
-            figsize=(14, 3.5 * n_rows)
+            figsize=(14, 4.5 * n_rows) # Increased height for suptitle room
         )
+
+        # Very prominent main overall title for the figure
+        fig.suptitle(f"ENERGY CURVE EVALUATION (TEST SET)\nSensor: {pipeline.get('variable_name', 'Unknown')}", 
+                     fontsize=18, fontweight='bold', color='navy', y=0.98)
+        
+        plt.subplots_adjust(top=0.9) # Make room for suptitle
 
         axes = np.array(axes).reshape(-1)  # flatten safely
 

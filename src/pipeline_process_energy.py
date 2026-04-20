@@ -5,11 +5,20 @@
 
 # %%
 
+import os
+# Disable ALL progress bars (tqdm) to silence pm4py replay noise
+os.environ["TQDM_DISABLE"] = "1"
+
 import logging
 import sys
 import warnings
 
 # --- LOGGING AND REDIRECTION SETUP ---
+# Silence pm4py internal logs and TBR replay messages
+logging.getLogger("pm4py").setLevel(logging.ERROR)
+# Silence other potential noise
+logging.getLogger("fsspec").setLevel(logging.ERROR)
+
 LOG_FILE = "pipeline_execution.log"
 
 # Configure logging
@@ -74,6 +83,11 @@ import tempfile
 
 pio.renderers.default='notebook'
 pd.options.mode.chained_assignment = None
+from IPython.display import display, Markdown
+
+# Force pm4py to hide progress bars
+from pm4py.util import constants
+constants.SHOW_PROGRESS_BAR = False
 
 # %% [markdown]
 # # Define Paths and Load Datasets
@@ -1700,8 +1714,16 @@ for process in process_datasets_to_model.keys():
             if model.get('label_stochastic'):
                 print(f"    Stochastic weights: {model['label_stochastic']}")
             try:
-                pm4py.view_petri_net(model['net'], model['im'], model['fm'],
-                                     format='png')
+                # Add a very prominent title above the Petri net view
+                title_str = f"PETRI NET VIEW: {obj_name} ({obj_type}) | Process: {process} | Alg: {alg_name}"
+                report("\n" + "="*len(title_str))
+                report(title_str)
+                report("="*len(title_str) + "\n")
+                
+                # In Jupyter, this will display the Graphviz object
+                view_obj = pm4py.view_petri_net(model['net'], model['im'], model['fm'], format='png')
+                if view_obj:
+                    display(view_obj)
             except Exception as e:
                 print(f"    (Could not render Petri net: {e})")
 
@@ -2316,8 +2338,8 @@ if process_test_cols:
     print("\nLATEX TABLE (PROCESS):")
     print(latex_table)
 
-# 2. Energy Accuracy Heatmap
-_plot_results_heatmap(energy_test_cols, "Energy Profile Accuracy: ML Curve Metrics")
+# 2. Energy Accuracy Heatmap (REMOVED per user request)
+# _plot_results_heatmap(energy_test_cols, "Energy Profile Accuracy: ML Curve Metrics")
 
 
 # %% 
@@ -2350,20 +2372,43 @@ if 'process_datasets_to_model_sensors' in dir():
             df_test_exp = test_datasets[process].get('expanded')
             if df_test_exp is not None:
                 test_curves, _ = split_curves(df_test_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
-                _, ts_agg = evaluate_pipeline_on_test(test_curves, pipeline, verbose=0)
-                ts_agg.update({'process': process, 'sensor': sensor, 'split': 'TEST'})
-                profile_summary_records.append(ts_agg)
+                metrics_df, ts_agg = evaluate_pipeline_on_test(test_curves, pipeline, verbose=0)
+                
+                # Get per-activity averages to show 'Subprocess' granularity
+                if not metrics_df.empty:
+                    activity_metrics = metrics_df.groupby('activity')[['MAE', 'RMSE', 'WAPE (%)', 'R2']].mean().reset_index()
+                    for _, act_row in activity_metrics.iterrows():
+                        summary_rec = {
+                            'Dataset': process,
+                            'Subprocess': act_row['activity'],
+                            'Sensor': sensor,
+                            'MAE': act_row['MAE'],
+                            'RMSE': act_row['RMSE'],
+                            'WAPE': act_row['WAPE (%)'],
+                            'R2': act_row['R2']
+                        }
+                        profile_summary_records.append(summary_rec)
 
 if profile_summary_records:
     profile_summary_df = pd.DataFrame(profile_summary_records)
     report("\n" + "="*80)
-    report("ENERGY PROFILE STANDALONE ML METRICS (TRAIN VS TEST)")
+    report("DETAILED ENERGY PROFILE METRICS PER DATASET & SUBPROCESS (TEST SET)")
     report("="*80)
-    # Pivot for cleaner comparison
+    
+    # Pivot for clean display: Dataset, Subprocess, Sensor as index
     pivot_cols = ['MAE', 'RMSE', 'WAPE', 'R2']
     available_metrics = [c for c in pivot_cols if c in profile_summary_df.columns]
-    summary_pivot = profile_summary_df.pivot_table(index=['process', 'sensor'], columns='split', values=available_metrics)
+    summary_pivot = profile_summary_df.pivot_table(
+        index=['Dataset', 'Subprocess', 'Sensor'], 
+        values=available_metrics
+    )
+    
+    # Reorder columns as requested
+    final_cols = [c for c in ['MAE', 'RMSE', 'WAPE', 'R2'] if c in summary_pivot.columns]
+    summary_pivot = summary_pivot[final_cols]
+    
     report(summary_pivot.round(4).to_string())
+    display(summary_pivot.round(4))
 
 # ── SIMULATION CURVE VISUALS (SIMULATED VS REAL) ───────────────────────────
 # We look for simulated logs in evaluation_results_list that have 'simulated_energy_curves'
@@ -2407,31 +2452,47 @@ report("█"*80)
 
 energy_metrics_summary = []
 if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
-    for c in evaluation_results_df.columns:
-        if c.startswith('test_energy_'):
-            # More robust parsing: everything between 'test_energy_' and '_[Metric]'
-            # Metrics are MAE, RMSE, WAPE, R2
+    energy_cols = [c for c in evaluation_results_df.columns if c.startswith('test_energy_')]
+    
+    records = []
+    for _, row in evaluation_results_df.iterrows():
+        proc = row['process']
+        mode = row['mode']
+        # Focus on the energy-aware modes for the detailed report
+        if mode not in _ENERGY_AWARE_MODES:
+            continue
+            
+        for c in energy_cols:
             metric = c.split('_')[-1]
             sensor = c.replace('test_energy_', '').replace(f'_{metric}', '')
-            
-            val = evaluation_results_df[c].mean()
-            energy_metrics_summary.append({
-                'Sensor': sensor,
-                'Metric': metric,
-                'Value': val
-            })
+            val = row[c]
+            if pd.notna(val):
+                records.append({
+                    'Dataset': proc,
+                    'Sensor': sensor,
+                    'Metric': metric,
+                    'Value': val
+                })
 
-if energy_metrics_summary:
-    edf = pd.DataFrame(energy_metrics_summary)
-    # Pivot for clean display
-    report_pivot = edf.pivot_table(index='Sensor', columns='Metric', values='Value')
-    report("\nMEAN ENERGY ERRORS ACROSS ALL MODES (TEST SET):")
-    report("-" * 40)
+if records:
+    edf = pd.DataFrame(records)
+    # Pivot for clean display: Dataset and Sensor as index, Metric as columns
+    report_pivot = edf.pivot_table(index=['Dataset', 'Sensor'], columns='Metric', values='Value', aggfunc='mean')
+    
+    # Ensure all requested metrics are in columns
+    final_cols = [c for c in ['MAE', 'RMSE', 'WAPE', 'R2'] if c in report_pivot.columns]
+    report_pivot = report_pivot[final_cols]
+    
+    report("\nDETAILED ENERGY PROFILE METRICS PER DATASET (TEST SET):")
+    report("-" * 80)
+    # Output to both log (via report/string) and notebook (via display)
+    # report() handles the log and the safe stdout
     report(report_pivot.round(4).to_string())
+    # display() ensures the beautiful interactive table in the notebook
+    display(report_pivot.round(4))
 else:
     report("\n⚠️  No energy simulation metrics found in the final results.")
 
 report("\n" + "█"*80 + "\n")
 
-# %% [markdown]
-# # Data fusion
+# %% 
