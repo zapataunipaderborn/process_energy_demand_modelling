@@ -5,13 +5,59 @@
 
 # %%
 
+import logging
+import sys
+import warnings
+
+# --- LOGGING AND REDIRECTION SETUP ---
+LOG_FILE = "pipeline_execution.log"
+
+# Configure logging
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode='w',  # Overwrite each run
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Capture all library warnings (pm4py, pandas, etc.)
+logging.captureWarnings(True)
+
+# Save original stdout for notebook reports
+_original_stdout = sys.stdout
+
+def report(*args, **kwargs):
+    """
+    Prints to both the original notebook console and the log file.
+    Use this for high-level metrics and summaries.
+    """
+    # Print to the 'real' console/notebook
+    print(*args, file=_original_stdout, flush=True, **kwargs)
+    # Log the report content to the file as well
+    logging.info("[REPORT] " + " ".join(map(str, args)))
+
+class StreamToLogger:
+    """Redirects stdout/stderr to logging."""
+    def __init__(self, logger_func):
+        self.logger_func = logger_func
+        self.buffer = ""
+    def write(self, data):
+        for line in data.splitlines():
+            if line.strip():
+                self.logger_func(line.strip())
+    def flush(self):
+        pass
+
+# Redirect all standard prints and errors to the log file
+sys.stdout = StreamToLogger(logging.info)
+sys.stderr = StreamToLogger(logging.error)
+
 import random
 import itertools
 import os
 from datetime import datetime, timedelta
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
-#import simulation
 import simpy
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -22,14 +68,9 @@ import chardet
 import plotly.io as pio
 from pathlib import Path
 import pm4py
-
 import plotly.express as px
-
-from pathlib import Path
-
 import matplotlib.image as mpimg
 import tempfile
-
 
 pio.renderers.default='notebook'
 pd.options.mode.chained_assignment = None
@@ -843,13 +884,13 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     real_df[start_col] = pd.to_datetime(real_df[start_col], errors='coerce')
     real_df[end_col] = pd.to_datetime(real_df[end_col], errors='coerce')
     
-    print("="*80)
-    print("COMPREHENSIVE SIMULATION EVALUATION")
-    print("="*80)
+    report("="*80)
+    report("COMPREHENSIVE SIMULATION EVALUATION")
+    report("="*80)
     
     # ========== 1. BASIC PROCESS METRICS ==========
-    print("\n1. BASIC PROCESS METRICS")
-    print("-" * 40)
+    report("\n1. BASIC PROCESS METRICS")
+    report("-" * 40)
     
     # Event counts
     sim_events = len(simulated_df)
@@ -861,8 +902,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     real_cases = real_df[case_col].nunique() if case_col in real_df.columns else 0
     case_ratio = sim_cases / real_cases if real_cases > 0 else 0
     
-    print(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio: {event_ratio:.3f}")
-    print(f"Cases - Real: {real_cases}, Sim: {sim_cases}, Ratio: {case_ratio:.3f}")
+    report(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio: {event_ratio:.3f}")
+    report(f"Cases - Real: {real_cases}, Sim: {sim_cases}, Ratio: {case_ratio:.3f}")
     
     results['basic_metrics'] = {
         'event_count_ratio': event_ratio,
@@ -872,8 +913,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     }
     
     # ========== 2. ACTIVITY FREQUENCY ANALYSIS ==========
-    print("\n2. ACTIVITY FREQUENCY ANALYSIS")
-    print("-" * 40)
+    report("\n2. ACTIVITY FREQUENCY ANALYSIS")
+    report("-" * 40)
     
     # Activity frequencies
     sim_activity_freq = simulated_df[activity_col].dropna().value_counts(normalize=True).sort_index()
@@ -893,9 +934,9 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         js_divergence = 1.0
         freq_mae = 1.0
     
-    print(f"Activity Coverage - Real: {len(real_activity_freq)}, Sim: {len(sim_activity_freq)}")
-    print(f"Jensen-Shannon Divergence (activities): {js_divergence:.4f} (0=perfect, 1=worst)")
-    print(f"Mean Absolute Error (frequencies): {freq_mae:.4f}")
+    report(f"Activity Coverage - Real: {len(real_activity_freq)}, Sim: {len(sim_activity_freq)}")
+    report(f"Jensen-Shannon Divergence (activities): {js_divergence:.4f} (0=perfect, 1=worst)")
+    report(f"Mean Absolute Error (frequencies): {freq_mae:.4f}")
     
     results['activity_metrics'] = {
         'js_divergence': js_divergence,
@@ -904,8 +945,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     }
     
     # ========== 3. DURATION ANALYSIS ==========
-    print("\n3. DURATION ANALYSIS")
-    print("-" * 40)
+    report("\n3. DURATION ANALYSIS")
+    report("-" * 40)
     
     # Calculate durations
     sim_durations = (simulated_df[end_col] - simulated_df[start_col]).dt.total_seconds() / 60
@@ -937,10 +978,10 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
             index=['Mean', 'Median', 'Std']
         )
     
-    print("Duration Statistics:")
-    print(duration_stats.round(3))
-    print(f"\nKolmogorov-Smirnov Test: KS={duration_ks_stat:.4f}, p-value={duration_ks_pvalue:.4f}")
-    print(f"(p > 0.05 suggests distributions are similar)")
+    report("Duration Statistics:")
+    report(duration_stats.round(3))
+    report(f"\nKolmogorov-Smirnov Test: KS={duration_ks_stat:.4f}, p-value={duration_ks_pvalue:.4f}")
+    report(f"(p > 0.05 suggests distributions are similar)")
     
     results['duration_metrics'] = {
         'ks_statistic': duration_ks_stat,
@@ -951,8 +992,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     }
     
     # ========== 4. CASE-LEVEL ANALYSIS ==========
-    print("\n4. CASE-LEVEL ANALYSIS")
-    print("-" * 40)
+    report("\n4. CASE-LEVEL ANALYSIS")
+    report("-" * 40)
     
     # Events per case
     sim_events_per_case = simulated_df.groupby(case_col).size() if len(simulated_df) > 0 else pd.Series(dtype=float)
@@ -981,9 +1022,9 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
             index=['Mean', 'Median', 'Std']
         )
     
-    print("Events per Case Statistics:")
-    print(case_stats.round(3))
-    print(f"\nKS Test (events per case): KS={events_per_case_ks:.4f}, p-value={events_per_case_pvalue:.4f}")
+    report("Events per Case Statistics:")
+    report(case_stats.round(3))
+    report(f"\nKS Test (events per case): KS={events_per_case_ks:.4f}, p-value={events_per_case_pvalue:.4f}")
     
     results['case_metrics'] = {
         'events_per_case_ks': events_per_case_ks,
@@ -993,8 +1034,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     }
     
     # ========== 5. CONTROL-FLOW ANALYSIS ==========
-    print("\n5. CONTROL-FLOW ANALYSIS (Directly-Follows Graph)")
-    print("-" * 40)
+    report("\n5. CONTROL-FLOW ANALYSIS (Directly-Follows Graph)")
+    report("-" * 40)
     
     # Create event logs for pm4py
     sim_for_dfg = simulated_df.dropna(subset=[case_col, activity_col, start_col])
@@ -1020,10 +1061,10 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     edge_recall = len(sim_edges & real_edges) / len(real_edges) if len(real_edges) > 0 else 0
     edge_f1 = 2 * (edge_precision * edge_recall) / (edge_precision + edge_recall) if (edge_precision + edge_recall) > 0 else 0
     
-    print(f"DFG Edges - Real: {len(real_edges)}, Sim: {len(sim_edges)}, Common: {len(sim_edges & real_edges)}")
-    print(f"Edge Precision: {edge_precision:.4f}")
-    print(f"Edge Recall: {edge_recall:.4f}")
-    print(f"Edge F1-Score: {edge_f1:.4f}")
+    report(f"DFG Edges - Real: {len(real_edges)}, Sim: {len(sim_edges)}, Common: {len(sim_edges & real_edges)}")
+    report(f"Edge Precision: {edge_precision:.4f}")
+    report(f"Edge Recall: {edge_recall:.4f}")
+    report(f"Edge F1-Score: {edge_f1:.4f}")
     
     # Compare start/end activities (convert dict keys to sets)
     sim_start_set = set(sim_start.keys())
@@ -1034,8 +1075,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     start_jaccard = len(sim_start_set & real_start_set) / len(sim_start_set | real_start_set) if len(sim_start_set | real_start_set) > 0 else 0
     end_jaccard = len(sim_end_set & real_end_set) / len(sim_end_set | real_end_set) if len(sim_end_set | real_end_set) > 0 else 0
     
-    print(f"Start Activities Jaccard: {start_jaccard:.4f}")
-    print(f"End Activities Jaccard: {end_jaccard:.4f}")
+    report(f"Start Activities Jaccard: {start_jaccard:.4f}")
+    report(f"End Activities Jaccard: {end_jaccard:.4f}")
     
     results['control_flow_metrics'] = {
         'edge_precision': edge_precision,
@@ -1046,8 +1087,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     }
     
     # ========== 6. CLASSIC PROCESS-MINING DIMENSIONS (ADDITIVE) ==========
-    print("\n6. CLASSIC PROCESS-MINING DIMENSIONS")
-    print("-" * 40)
+    report("\n6. CLASSIC PROCESS-MINING DIMENSIONS")
+    report("-" * 40)
 
     conformance_metrics = {
         'fitness': np.nan,
@@ -1070,17 +1111,17 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
 
     for m_name, m_val in conformance_metrics.items():
         if pd.isna(m_val):
-            print(f"{m_name:35}: n/a")
+            report(f"{m_name:35}: n/a")
         else:
-            print(f"{m_name:35}: {m_val:.4f}")
+            report(f"{m_name:35}: {m_val:.4f}")
 
     results['conformance_metrics'] = conformance_metrics
 
     # ========== 7. ENERGY PROFILE METRICS ==========
     energy_results = {}
     if real_expanded_df is not None and len(simulated_df) > 0 and 'simulated_energy_curves' in simulated_df.columns:
-        print("\n7. ENERGY PROFILE METRICS (Simulation vs Reality)")
-        print("-" * 40)
+        report("\n7. ENERGY PROFILE METRICS (Simulation vs Reality)")
+        report("-" * 40)
         
         # We need to compare curves for matching (Case, Activity) pairs
         sensor_metrics = {}
@@ -1139,14 +1180,14 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
             s_rmse = np.mean(m['rmse'])
             s_wape = np.mean(m['wape'])
             agg_energy[sensor] = {'MAE': s_mae, 'RMSE': s_rmse, 'WAPE': s_wape}
-            print(f"  {sensor:40}: MAE={s_mae:.2f}, RMSE={s_rmse:.2f}, WAPE={s_wape:.4f}")
+            report(f"  {sensor:40}: MAE={s_mae:.2f}, RMSE={s_rmse:.2f}, WAPE={s_wape:.4f}")
         
         results['energy_metrics'] = agg_energy
         energy_results = agg_energy
 
     # ========== 8. OVERALL QUALITY SCORE ==========
-    print("\n8. OVERALL QUALITY ASSESSMENT")
-    print("-" * 40)
+    report("\n8. OVERALL QUALITY ASSESSMENT")
+    report("-" * 40)
 
     # Active score requested by user:
     # keep conformance metrics + mean duration + event_count_ratio.
@@ -1161,18 +1202,18 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     }
 
     active_values = []
-    print("\nActive Score Components:")
+    report("\nActive Score Components:")
     for comp_name, comp_val in active_components.items():
         if pd.isna(comp_val):
-            print(f"  {comp_name:30}: n/a")
+            report(f"  {comp_name:30}: n/a")
             continue
         comp_val = float(comp_val)
         comp_val = max(0.0, min(1.0, comp_val))
         active_values.append(comp_val)
-        print(f"  {comp_name:30}: {comp_val:.4f}")
+        report(f"  {comp_name:30}: {comp_val:.4f}")
 
     overall_score = float(np.mean(active_values)) if active_values else np.nan
-    print(f"\nOVERALL QUALITY SCORE (active): {overall_score:.4f} (0=worst, 1=perfect)")
+    report(f"\nOVERALL QUALITY SCORE (active): {overall_score:.4f} (0=worst, 1=perfect)")
     
     if pd.notna(overall_score) and overall_score >= 0.8:
         quality_assessment = "EXCELLENT"
@@ -1183,7 +1224,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     else:
         quality_assessment = "POOR"
     
-    print(f"QUALITY ASSESSMENT: {quality_assessment}")
+    report(f"QUALITY ASSESSMENT: {quality_assessment}")
     
     results['overall_score'] = overall_score
     results['quality_assessment'] = quality_assessment
@@ -2086,9 +2127,9 @@ evaluation_results_df.to_parquet(
 evaluation_results_df
 
 # ── Per-process breakdown: show modes sorted by test_overall_score ────────
-print("\n" + "="*80)
-print("PER-PROCESS RESULTS — MODES SORTED BY test_overall_score")
-print("="*80)
+report("\n" + "="*80)
+report("PER-PROCESS RESULTS — MODES SORTED BY test_overall_score")
+report("="*80)
 
 sort_col = 'test_overall_score'
 if sort_col in evaluation_results_df.columns:
@@ -2106,17 +2147,17 @@ if sort_col in evaluation_results_df.columns:
     display_cols = [c for c in display_cols if c in evaluation_results_df.columns]
 
     for process_name, grp in evaluation_results_df.groupby('process'):
-        print(f"\n{'─'*80}")
-        print(f"  PROCESS: {process_name}")
-        print(f"{'─'*80}")
+        report(f"\n{'─'*80}")
+        report(f"  PROCESS: {process_name}")
+        report(f"{'─'*80}")
         sorted_grp = grp.sort_values(sort_col, ascending=False)
         # Pretty-print with pandas
         with pd.option_context('display.max_columns', None,
                                'display.width', 200,
                                'display.max_colwidth', 30):
-            print(sorted_grp[display_cols].to_string(index=False))
+            report(sorted_grp[display_cols].to_string(index=False))
 else:
-    print(f"  Column '{sort_col}' not found — skipping per-process ranking.")
+    report(f"  Column '{sort_col}' not found — skipping per-process ranking.")
     print(f"  Available columns: {list(evaluation_results_df.columns)}")
 
 # %% 
@@ -2315,20 +2356,20 @@ if 'process_datasets_to_model_sensors' in dir():
 
 if profile_summary_records:
     profile_summary_df = pd.DataFrame(profile_summary_records)
-    print("\n" + "="*80)
-    print("ENERGY PROFILE STANDALONE ML METRICS (TRAIN VS TEST)")
-    print("="*80)
+    report("\n" + "="*80)
+    report("ENERGY PROFILE STANDALONE ML METRICS (TRAIN VS TEST)")
+    report("="*80)
     # Pivot for cleaner comparison
     pivot_cols = ['MAE', 'RMSE', 'WAPE', 'R2']
     available_metrics = [c for c in pivot_cols if c in profile_summary_df.columns]
     summary_pivot = profile_summary_df.pivot_table(index=['process', 'sensor'], columns='split', values=available_metrics)
-    print(summary_pivot.round(4).to_string())
+    report(summary_pivot.round(4).to_string())
 
 # ── SIMULATION CURVE VISUALS (SIMULATED VS REAL) ───────────────────────────
 # We look for simulated logs in evaluation_results_list that have 'simulated_energy_curves'
-print("\n" + "="*80)
-print("VISUAL COMPARISON: SIMULATED (TEST RUN) VS REAL DATA")
-print("="*80)
+report("\n" + "="*80)
+report("VISUAL COMPARISON: SIMULATED (TEST RUN) VS REAL DATA")
+report("="*80)
 
 # We sample a few cases from the most recent test simulation run
 # (This logic assumes we want to visualize the 'energy-aware' results)
@@ -2349,7 +2390,7 @@ if test_sim_logs:
                                         test_size=0.0, verbose=0)
             
             if test_curves:
-                print(f"\nVisualizing Generalization Performance -> Process: {process} | Sensor: {sensor}")
+                report(f"\nVisualizing Generalization Performance -> Process: {process} | Sensor: {sensor}")
                 evaluate_pipeline_on_test(
                     test_curves, 
                     all_energy_pipelines[process][sensor]['full_pipeline'], 
@@ -2360,9 +2401,9 @@ if test_sim_logs:
 
 
 # ── FINAL CONSOLIDATED ENERGY PERFORMANCE REPORT ───────────────────────────
-print("\n" + "█"*80)
-print("█   FINAL ENERGY PERFORMANCE REPORT (SIMULATION QUALITY)             █")
-print("█"*80)
+report("\n" + "█"*80)
+report("█   FINAL ENERGY PERFORMANCE REPORT (SIMULATION QUALITY)             █")
+report("█"*80)
 
 energy_metrics_summary = []
 if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
@@ -2384,13 +2425,13 @@ if energy_metrics_summary:
     edf = pd.DataFrame(energy_metrics_summary)
     # Pivot for clean display
     report_pivot = edf.pivot_table(index='Sensor', columns='Metric', values='Value')
-    print("\nMEAN ENERGY ERRORS ACROSS ALL MODES (TEST SET):")
-    print("-" * 40)
-    print(report_pivot.round(4).to_string())
+    report("\nMEAN ENERGY ERRORS ACROSS ALL MODES (TEST SET):")
+    report("-" * 40)
+    report(report_pivot.round(4).to_string())
 else:
-    print("\n⚠️  No energy simulation metrics found in the final results.")
+    report("\n⚠️  No energy simulation metrics found in the final results.")
 
-print("\n" + "█"*80 + "\n")
+report("\n" + "█"*80 + "\n")
 
 # %% [markdown]
 # # Data fusion
