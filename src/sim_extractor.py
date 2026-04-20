@@ -1083,11 +1083,9 @@ def extract_energy_modifiers(
     df_expanded,
     sensors,
     activity_col='activity_log',
-    duration_model_class=None,
-    duration_model_params=None,
-    transition_model_class=None,
-    transition_model_params=None,
-    min_transitions=30,
+    duration_models=None,
+    transition_models=None,
+    min_samples=30,
     timestamp_start_col='timestamp_start_log',
     datetime_energy_col='datetime_energy',
 ):
@@ -1119,23 +1117,12 @@ def extract_energy_modifiers(
     energy_transition_modifiers : dict[activity → fitted model]
     energy_state_columns : list[str]   (3 × N, ordered)
     """
-    from sklearn.linear_model import Lasso, LogisticRegression
-
-    if duration_model_class is None:
-        duration_model_class = Lasso
-    if duration_model_params is None:
-        duration_model_params = {'alpha': 0.1}
-    if transition_model_class is None:
-        transition_model_class = LogisticRegression
-    if transition_model_params is None:
-        transition_model_params = {'penalty': 'l2', 'C': 1.0, 'max_iter': 1000}
-
     print("\n" + "=" * 70)
     print("ENERGY MODIFIER EXTRACTION")
     print("=" * 70)
     print(f"  Sensors          : {sensors}")
-    print(f"  Duration model   : {duration_model_class.__name__}({duration_model_params})")
-    print(f"  Transition model : {transition_model_class.__name__}({transition_model_params})")
+    print(f"  Duration models  : {duration_models}")
+    print(f"  Transition models: {transition_models}")
 
     # ── Build energy-state matrix from actual sensor curves ───────────────
     df_recs, energy_state_columns = _build_energy_state_matrix(
@@ -1149,97 +1136,146 @@ def extract_energy_modifiers(
         print("  WARNING: no valid activity instances found — returning empty modifiers.")
         return {}, {}, energy_state_columns
 
-    # Compute next_activity as the next row's activity within each (case, object)
-    # We rely on the order already embedded inside df_expanded
-    group_cols = ['case_id_log', 'object_log']
-    available = [c for c in group_cols if c in df_expanded.columns]
-    if available:
-        df_sorted = df_expanded.dropna(subset=[activity_col]).sort_values(
-            available + ['timestamp_start_log']
-        ).copy()
-        df_sorted['_next_activity'] = (
-            df_sorted.groupby(available)[activity_col].shift(-1).fillna('__END__')
-        )
-        # Map instance → next_activity via timestamp_start_log
-        ts_to_next = dict(zip(
-            df_sorted['timestamp_start_log'].astype(str),
-            df_sorted['_next_activity'].astype(str)
-        ))
-        # Attach next_activity to df_recs — use a best-effort join
-        # (df_recs was built per instance so we re-derive from df_expanded)
-        df_next = (
-            df_sorted[[activity_col, 'timestamp_start_log', '_next_activity']]
-            .drop_duplicates()
-            .copy()
-        )
-        df_next.columns = ['activity', 'timestamp_start_log', 'next_activity']
-        # We can't directly join df_recs to df_next without an instance key,
-        # so rebuild with next_activity included.
-        df_recs = _build_energy_state_matrix_with_next(
-            df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
-        )
-        energy_state_columns_check = []
-        for s in sensors:
-            energy_state_columns_check += [f'{s}_mean', f'{s}_end', f'{s}_std']
-        energy_state_columns = energy_state_columns_check
-    else:
-        df_recs['next_activity'] = '__END__'
+    if duration_models is None: duration_models = ['xgboost']
+    if transition_models is None: transition_models = ['logistic']
+
+    # Local registry of models
+    from xgboost import XGBRegressor
+    from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import r2_score, accuracy_score
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+
+    def get_regressor(name):
+        if name == 'xgboost': return XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.1, subsample=0.8, verbosity=0, random_state=42)
+        if name == 'linear': return LinearRegression()
+        if name == 'lasso': return Lasso(alpha=0.1, random_state=42)
+        if name == 'mlp': return MLPRegressor(hidden_layer_sizes=(50,), max_iter=500, random_state=42)
+        return XGBRegressor(n_estimators=100, random_state=42) # fallback
+
+    def get_classifier(name):
+        if name == 'logistic': return LogisticRegression(max_iter=1000, random_state=42)
+        if name == 'random_forest': return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
+        return LogisticRegression(max_iter=1000, random_state=42) # fallback
+
+    df_recs = _build_energy_state_matrix_with_next(
+        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+    )
+    
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
 
     if df_recs.empty:
         print("  WARNING: no valid instances with next_activity — returning empty modifiers.")
-        return {}, {}, energy_state_columns
+        return {}, {}, energy_state_columns, {}
 
     print(f"  Total instances  : {len(df_recs)}")
 
     # ── Per-activity modifiers ────────────────────────────────────────────
     energy_duration_modifiers = {}
     energy_transition_modifiers = {}
+    model_choices_report = {}
 
     for activity, grp_act in df_recs.groupby('activity'):
         X = grp_act[energy_state_columns].values
         n = len(grp_act)
-
-        # Training-time column means — attached to every model so the
-        # simulation can synthesise a fallback energy state without a
-        # live prediction pipeline.
+        
+        # Training-time column means — fallback energy state
         train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+        
+        act_report = {
+            'Duration Approach': f'Statistical Base Method (n={n}<{min_samples})',
+            'Transition Approach': f'Statistical Base Method (n={n}<{min_samples})'
+        }
 
-        # ── Duration modifier ─────────────────────────────────────────
-        mean_dur = grp_act['duration'].mean()
-        if mean_dur > 0 and n >= 5:
-            y_dur = np.log(grp_act['duration'].values / mean_dur)
-            try:
-                mdl = duration_model_class(**duration_model_params)
-                mdl.fit(X, y_dur)
-                mdl._mean_duration        = mean_dur
-                mdl._train_feature_mean   = train_feature_mean  # ← fallback state
-                energy_duration_modifiers[str(activity)] = mdl
-                print(f"  [{activity}] duration modifier fitted  (n={n})")
-            except Exception as exc:
-                print(f"  [{activity}] duration modifier FAILED: {exc}")
+        # ── ML Eligibility Check ───────────────────────────────────────
+        if n >= min_samples:
+            # Prepare split for competition
+            y_dur_raw = grp_act['duration'].values
+            mean_dur = y_dur_raw.mean()
+            if mean_dur > 0:
+                y_dur = np.log(y_dur_raw / mean_dur)
+            else:
+                y_dur = y_dur_raw
+                
+            y_tr = grp_act['next_activity'].values
+            n_classes = len(set(y_tr))
 
-        # ── Transition modifier ────────────────────────────────────────
-        y_tr = grp_act['next_activity'].values
-        n_classes = len(set(y_tr))
-        if n >= min_transitions and n_classes >= 2:
-            try:
-                clf = transition_model_class(**transition_model_params)
-                clf.fit(X, y_tr)
-                clf._train_feature_mean   = train_feature_mean  # ← fallback state
-                energy_transition_modifiers[str(activity)] = clf
-                print(f"  [{activity}] transition modifier fitted (n={n}, classes={list(set(y_tr))})")
-            except Exception as exc:
-                print(f"  [{activity}] transition modifier FAILED: {exc}")
-        else:
-            reason = (f"n={n} < {min_transitions}" if n < min_transitions
-                      else f"only {n_classes} class")
-            print(f"  [{activity}] transition modifier SKIPPED ({reason})")
+            # Train/Val Split
+            X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
+                X, y_dur, y_tr, test_size=0.2, random_state=42
+            )
+
+            # --- Duration Model Selection ---
+            if mean_dur > 0:
+                best_dur_score = -float('inf')
+                best_dur_name = duration_models[0]
+                
+                for model_name in duration_models:
+                    try:
+                        mdl = get_regressor(model_name)
+                        mdl.fit(X_tr, yd_tr)
+                        preds = mdl.predict(X_val)
+                        score = r2_score(yd_val, preds)
+                        if score > best_dur_score:
+                            best_dur_score = score
+                            best_dur_name = model_name
+                    except Exception:
+                        pass
+                
+                # Re-train best on ALL data
+                try:
+                    best_mdl = get_regressor(best_dur_name)
+                    best_mdl.fit(X, y_dur)
+                    best_mdl._mean_duration = mean_dur
+                    best_mdl._train_feature_mean = train_feature_mean
+                    energy_duration_modifiers[str(activity)] = best_mdl
+                    act_report['Duration Approach'] = best_dur_name
+                    print(f"  [{activity}] Duration -> {best_dur_name} (val R2: {best_dur_score:.3f})")
+                except Exception as exc:
+                    print(f"  [{activity}] Duration FAILED: {exc}")
+
+            # --- Transition Model Selection ---
+            if n_classes >= 2:
+                best_tr_score = -float('inf')
+                best_tr_name = transition_models[0]
+                
+                for model_name in transition_models:
+                    try:
+                        clf = get_classifier(model_name)
+                        clf.fit(X_tr, yt_tr)
+                        preds = clf.predict(X_val)
+                        score = accuracy_score(yt_val, preds)
+                        if score > best_tr_score:
+                            best_tr_score = score
+                            best_tr_name = model_name
+                    except Exception:
+                        pass
+                
+                # Re-train best on ALL data
+                try:
+                    best_clf = get_classifier(best_tr_name)
+                    best_clf.fit(X, y_tr)
+                    best_clf._train_feature_mean = train_feature_mean
+                    energy_transition_modifiers[str(activity)] = best_clf
+                    act_report['Transition Approach'] = best_tr_name
+                    print(f"  [{activity}] Transition -> {best_tr_name} (val Acc: {best_tr_score:.3f})")
+                except Exception as exc:
+                    print(f"  [{activity}] Transition FAILED: {exc}")
+            else:
+                act_report['Transition Approach'] = f'Statistical Base Method (1 class)'
+
+        model_choices_report[str(activity)] = act_report
 
     print(f"\n  Duration modifiers  : {len(energy_duration_modifiers)} activities")
     print(f"  Transition modifiers: {len(energy_transition_modifiers)} activities")
-    print(f"  Energy state cols   : {energy_state_columns}")
-
-    return energy_duration_modifiers, energy_transition_modifiers, energy_state_columns
+    
+    return energy_duration_modifiers, energy_transition_modifiers, energy_state_columns, model_choices_report
 
 
 def _build_energy_state_matrix_with_next(

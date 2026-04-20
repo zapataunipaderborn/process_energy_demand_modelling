@@ -25,7 +25,7 @@ LOG_FILE = "pipeline_execution.log"
 logging.basicConfig(
     filename=LOG_FILE,
     filemode='w',  # Overwrite each run
-    level=logging.DEBUG,
+    level=logging.INFO, # <-- MUST BE INFO. DEBUG causes Numba/Matplotlib to flood bytecode logs
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -1383,15 +1383,15 @@ print(process_datasets.keys())
 process_datasets_to_model = process_datasets
 
 process_datasets_to_model_sensors = process_datasets_to_model.copy()
-process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
-process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['Erhitzer']
-process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
-process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
+# process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
+# process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['Erhitzer']
+# process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
+# process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
-process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
-process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
+# process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
+# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+# process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
 process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
@@ -1415,25 +1415,17 @@ from sim_extractor import extract_energy_modifiers
 
 from xgboost import XGBRegressor
 
-# ── Duration modifier model ────────────────────────────────────────────────
-# Swap this class (and its params) to use any sklearn-compatible regressor,
-# e.g. Lasso, Ridge, XGBRegressor, GradientBoostingRegressor, etc.
-ENERGY_DURATION_MODEL_CLASS    = XGBRegressor
-ENERGY_DURATION_MODEL_PARAMS   = {
-    'n_estimators':   100,
-    'max_depth':      3,
-    'learning_rate':  0.1,
-    'subsample':      0.8,
-    'verbosity':      0,
-}
+# ── Duration modifier models ───────────────────────────────────────────────
+# List of sklearn-compatible regressor types to compete per activity
+ENERGY_DURATION_MODELS    = ['xgboost', 'linear', 'lasso', 'mlp']
 
-# ── Transition modifier model ──────────────────────────────────────────────
-ENERGY_TRANSITION_MODEL_CLASS  = LogisticRegression
-ENERGY_TRANSITION_MODEL_PARAMS = {'penalty': 'l2', 'C': 1.0, 'max_iter': 1000}
+# ── Transition modifier models ─────────────────────────────────────────────
+# List of classifier types to compete per activity
+ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
 
 ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
 ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_TRANSITIONS     = 30           # skip transition modifier if data sparse
+ENERGY_MIN_SAMPLES         = 30           # STRICT: skip ML (use statistical) if n_samples < 30
 
 # Will be populated per process after energy modelling:
 energy_modifiers_by_process = {}
@@ -1467,7 +1459,7 @@ PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
 # MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
 #   Runs local per-group search during extraction and keeps best model.
 # ─────────────────────────────────────────────────────────────────────────────
-OPTIMIZE_MINING_HYPERPARAMS = True
+OPTIMIZE_MINING_HYPERPARAMS = False
 MINING_SEARCH_SPACE = {
     'inductive_noise_thresholds': [0.05, 0.10, 0.20, 0.30, 0.40],
     'heuristic_params_grid': [
@@ -1972,21 +1964,32 @@ for process in process_datasets_to_model.keys():
                     print("⚠️  No sensors found for this process — skipping energy modifiers.")
                 else:
                     try:
-                        _energy_dur_mods, _energy_tr_mods, _energy_state_cols = \
+                        _energy_dur_mods, _energy_tr_mods, _energy_state_cols, _model_choices_report = \
                             extract_energy_modifiers(
                                 df_expanded=_df_expanded_train,
                                 sensors=_sensors,
-                                duration_model_class=ENERGY_DURATION_MODEL_CLASS,
-                                duration_model_params=ENERGY_DURATION_MODEL_PARAMS,
-                                transition_model_class=ENERGY_TRANSITION_MODEL_CLASS,
-                                transition_model_params=ENERGY_TRANSITION_MODEL_PARAMS,
-                                min_transitions=ENERGY_MIN_TRANSITIONS,
+                                duration_models=ENERGY_DURATION_MODELS,
+                                transition_models=ENERGY_TRANSITION_MODELS,
+                                min_samples=ENERGY_MIN_SAMPLES,
                             )
                         energy_modifiers_by_process[process] = {
                             'duration':    _energy_dur_mods,
                             'transition':  _energy_tr_mods,
                             'columns':     _energy_state_cols,
+                            'report':      _model_choices_report
                         }
+
+                        # Print Model Choices Tracking Report
+                        if _model_choices_report:
+                            report("\n" + "="*80)
+                            report(f"ENERGY MODIFIER APPROACH TRACKING | Process: {process}")
+                            report("="*80)
+                            _choices_df = pd.DataFrame.from_dict(_model_choices_report, orient='index').reset_index()
+                            _choices_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
+                            _choices_df.insert(0, 'Dataset/Process', process)
+                            report(_choices_df.to_string(index=False))
+                            display(_choices_df)
+
 
                         # ── Train Dynamic ML Curve Predictors ──────────────────
                         from sim_extractor import split_curves, build_and_train_pipeline, predict_raw_curve
