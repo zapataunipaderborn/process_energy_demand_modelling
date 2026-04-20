@@ -2097,11 +2097,12 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
             ax.set_visible(False)
 
         plt.suptitle(
-            "Test Evaluation: Raw Predicted vs Raw Actual (original energy units)",
+            f"Test Evaluation: Raw Predicted vs Raw Actual (original energy units)\nSensor: {pipeline.get('variable_name', 'Unknown')}",
             fontsize=14, fontweight='bold', y=1.02
         )
         plt.tight_layout()
-        plt.savefig("tmp.png"); plt.close()
+        plt.show()  # Ensure plots are displayed in the notebook
+
 
     return metrics_df, agg_metrics
 

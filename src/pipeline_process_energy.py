@@ -2499,34 +2499,6 @@ report("\n" + "="*80)
 report("VISUAL COMPARISON: SIMULATED (TEST RUN) VS REAL DATA")
 report("="*80)
 
-# We sample a few cases from the most recent test simulation run
-# (This logic assumes we want to visualize the 'energy-aware' results)
-test_sim_logs = [r for r in evaluation_results_list if 'test_energy_metrics' in r]
-if test_sim_logs:
-    # We choose the first process/sensor for visualization
-    for process, sensors in all_energy_pipelines.items():
-        exp_test = test_datasets[process].get('expanded')
-        if exp_test is None: continue
-        
-        for sensor in sensors:
-            # Re-predicting alignment is handled inside evaluate_pipeline_on_test
-            # but here we want to show specifically the simulation's path.
-            # We call the visualizer on the test curves specifically for this sensor.
-            test_curves, _ = split_curves(exp_test, sensor, 
-                                        process_datasets_to_model_sensors[process]['activities_to_model'],
-                                        process_datasets_to_model_sensors[process]['objects_to_model'],
-                                        test_size=0.0, verbose=0)
-            
-            if test_curves:
-                report(f"\nVisualizing Generalization Performance -> Process: {process} | Sensor: {sensor}")
-                display(Markdown(f"## 📈 Energy Curve Generalization: {sensor}"))
-                display(Markdown(f"*Process: {process} | Visualizing Simulated vs Real paths*"))
-                evaluate_pipeline_on_test(
-                    test_curves, 
-                    all_energy_pipelines[process][sensor]['full_pipeline'], 
-                    max_plot_curves=6, 
-                    verbose=1 # This will trigger plt.show()
-                )
 
 
 
@@ -2580,4 +2552,31 @@ else:
 
 report("\n" + "█"*80 + "\n")
 
-# %% 
+# ── POST-REPORT VISUALIZATIONS: GENERALIZATION GALLERY ───────────────────────
+# (Note: Placed at the very end to provide a final visual verification of curve fitting)
+if RUN_TEST_EVALUATION:
+    for process, sensors in all_energy_pipelines.items():
+        exp_test = test_datasets[process].get('expanded')
+        if exp_test is None: continue
+        
+        for sensor in sensors:
+            # We filter for the test curves for this specific process/sensor combo
+            test_curves, _ = split_curves(exp_test, sensor, 
+                                        process_datasets_to_model_sensors[process]['activities_to_model'],
+                                        process_datasets_to_model_sensors[process]['objects_to_model'],
+                                        test_size=0.0, verbose=0)
+            
+            if test_curves:
+                display(Markdown("---"))
+                display(Markdown(f"## 🎨 Generalization Gallery: {sensor.upper()}"))
+                display(Markdown(f"*Visual verification of ML curve prediction vs Real ground-truth (Test Set)*"))
+                
+                # evaluate_pipeline_on_test uses a 3x2 grid by default for max_plot_curves=6
+                evaluate_pipeline_on_test(
+                    test_curves, 
+                    all_energy_pipelines[process][sensor]['full_pipeline'], 
+                    max_plot_curves=6, 
+                    verbose=1 
+                )
+
+# %%
