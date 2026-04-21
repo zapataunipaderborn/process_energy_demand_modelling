@@ -2371,22 +2371,684 @@ def _compute_metrics(real_vals, pred_vals):
     return {'R²': np.nan, 'MAE': np.nan, 'RMSE': np.nan, 'WAPE': np.nan, 'n_steps': int(valid.sum())}
 
 
-def plot_scm_simulation(scm, sim_one_step, sim_autoregressive,
-                        scm_all=None, sim_all_one_step=None, sim_all_autoregressive=None):
+def _extract_curves_from_df(df, target_cols, activity_col, attr_cols, min_len=5):
+    """
+    Extract one curve dict per activity segment per target from a flat time-series df.
+    Each segment = consecutive rows with the same ef_activity_log value.
+    Returns list[dict] with keys: instance_id, activity, target, original_values,
+    original_length, attributes.
+    """
+    if activity_col and activity_col in df.columns:
+        seg_ids = (df[activity_col] != df[activity_col].shift()).cumsum()
+    else:
+        seg_ids = pd.Series(np.ones(len(df), dtype=int), index=df.index)
+
+    curves = []
+    instance_id = 0
+    for seg_id, seg_df in df.groupby(seg_ids):
+        activity   = seg_df[activity_col].iloc[0] if activity_col else 'unknown'
+        attributes = {c: seg_df[c].iloc[0] for c in attr_cols}
+        for target in target_cols:
+            vals = seg_df[target].dropna().values.astype(float)
+            if len(vals) < min_len:
+                continue
+            curves.append({
+                'instance_id':     instance_id,
+                'activity':        activity,
+                'target':          target,
+                'original_values': vals,
+                'original_length': len(vals),
+                'attributes':      attributes,
+            })
+        instance_id += 1
+    return curves
+
+
+def _align_curve_dtw(query, reference):
+    """DTW-align query onto the reference grid — average where multiple query
+    points map to the same reference position."""
+    from dtw import dtw as _dtw
+    alignment = _dtw(query, reference, keep_internals=True)
+    aligned = np.zeros(len(reference))
+    counts  = np.zeros(len(reference))
+    for qi, ri in zip(alignment.index1, alignment.index2):
+        aligned[ri] += query[qi]
+        counts[ri]  += 1
+    counts = np.where(counts == 0, 1, counts)
+    return aligned / counts
+
+
+def _predict_with_dtw(raw_values, activity, attributes, pipeline):
+    """
+    Predict energy for one raw curve using a trained DBA pipeline.
+    1. Predict fixed_length values in canonical space.
+    2. DTW-align raw curve to reference and map predictions back to raw timeline.
+    """
+    from dtw import dtw as _dtw
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler')
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+
+    rows_ref = []
+    for ref_pos in range(fixed_length):
+        row = {'position_idx': ref_pos, 'curve_length': len(raw_values), 'activity': activity}
+        for key in all_keys:
+            val = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:    row[key] = float(val) if val is not None else np.nan
+                except: row[key] = np.nan
+            else:
+                row[key] = str(val) if val is not None else 'None'
+        rows_ref.append(row)
+
+    X_ref = pd.DataFrame(rows_ref)
+    cat_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_ref = pd.get_dummies(X_ref, columns=cat_cols, drop_first=True)
+    for col in feature_columns:
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
+    y_ref_pred = model.predict(X_ref)
+
+    alignment  = _dtw(raw_values, reference_curve, keep_internals=True)
+    buckets    = [[] for _ in range(len(raw_values))]
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+    return y_raw_pred
+
+
+def train_curve_model(df_train, df_test, fixed_length=100):
+    """
+    DBA + DTW reference-curve model — one pipeline per target variable.
+
+    Training (train split only):
+      1. Extract one curve per activity segment per target.
+      2. Compute DBA barycenter over all train curves for that target.
+      3. DTW-align every train curve to its barycenter.
+      4. Train XGBRegressor: (position_idx, curve_length, activity, attr_*) → value.
+
+    Prediction (test split):
+      For each test activity segment, DTW-align the raw segment to the reference
+      curve and decode the canonical predictions back to the raw timeline.
+
+    No lags, no AR — errors cannot compound across segments.
+    """
+    from tslearn.barycenters import dtw_barycenter_averaging
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split as _tts
+
+    target_cols  = [
+        c for c in df_train.columns
+        if c.endswith('_energy') and not c.startswith('ef')
+        and pd.api.types.is_numeric_dtype(df_train[c])
+    ]
+    activity_col = 'ef_activity_log' if 'ef_activity_log' in df_train.columns else None
+    attr_cols    = [c for c in df_train.columns if c.startswith('attr_')
+                    and not pd.api.types.is_numeric_dtype(df_train[c])]
+
+    train_curves = _extract_curves_from_df(df_train, target_cols, activity_col, attr_cols)
+    test_curves  = _extract_curves_from_df(df_test,  target_cols, activity_col, attr_cols)
+
+    report(f"\n[CurveModel] Train curves: {len(train_curves)} | Test curves: {len(test_curves)}")
+
+    pipelines, metrics = {}, {}
+
+    for target in target_cols:
+        tr_curves = [c for c in train_curves if c['target'] == target]
+        te_curves = [c for c in test_curves  if c['target'] == target]
+
+        if len(tr_curves) < 3:
+            continue
+
+        # 1. DBA barycenter from train curves only
+        resampled = np.array([
+            np.interp(np.linspace(0, 1, fixed_length),
+                      np.linspace(0, 1, len(c['original_values'])),
+                      c['original_values'])
+            for c in tr_curves
+        ])[:, :, np.newaxis]
+        reference_curve = dtw_barycenter_averaging(resampled, barycenter_size=fixed_length)[:, 0]
+
+        # 2. DTW-align train curves to barycenter
+        for c in tr_curves:
+            c['aligned_values'] = _align_curve_dtw(c['original_values'], reference_curve)
+
+        # 3. Infer attribute key types from train only
+        all_keys  = sorted({k for c in tr_curves for k in c['attributes'].keys()})
+        key_types = {}
+        for key in all_keys:
+            is_num = True
+            for c in tr_curves:
+                try:    float(c['attributes'].get(key, 'x'))
+                except: is_num = False; break
+            key_types[key] = 'numeric' if is_num else 'category'
+
+        # 4. Build regression dataset
+        rows = []
+        for c in tr_curves:
+            for pos in range(fixed_length):
+                row = {
+                    'position_idx': pos,
+                    'curve_length': c['original_length'],
+                    'activity':     c['activity'],
+                    'instance_id':  c['instance_id'],
+                    'y':            c['aligned_values'][pos],
+                }
+                for key in all_keys:
+                    val = c['attributes'].get(key, None)
+                    if key_types[key] == 'numeric':
+                        try:    row[key] = float(val) if val is not None else np.nan
+                        except: row[key] = np.nan
+                    else:
+                        row[key] = str(val) if val is not None else 'None'
+                rows.append(row)
+
+        df_reg = pd.DataFrame(rows)
+        cat_cols_reg = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+        X_all = pd.get_dummies(
+            df_reg[['position_idx', 'curve_length', 'activity'] + all_keys],
+            columns=cat_cols_reg, drop_first=True
+        )
+        y_all = df_reg['y'].values
+        feature_columns = X_all.columns.tolist()
+
+        # Val split by instance — no point-level leakage
+        unique_ids = df_reg['instance_id'].unique()
+        tr_ids, val_ids = _tts(unique_ids, test_size=0.2, random_state=42)
+        tr_mask  = df_reg['instance_id'].isin(tr_ids)
+        val_mask = df_reg['instance_id'].isin(val_ids)
+        X_tr, X_val = X_all[tr_mask].copy(), X_all[val_mask].copy()
+        y_tr, y_val = y_all[tr_mask],         y_all[val_mask]
+
+        # Scale numeric features
+        num_feat_cols = ['position_idx', 'curve_length'] + [k for k in all_keys if key_types[k] == 'numeric']
+        num_feat_cols = [c for c in num_feat_cols if c in X_tr.columns]
+        scaler = StandardScaler()
+        X_tr.loc[:, num_feat_cols]  = scaler.fit_transform(X_tr[num_feat_cols])
+        X_val.loc[:, num_feat_cols] = scaler.transform(X_val[num_feat_cols])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            model = XGBRegressor(
+                n_estimators=200, max_depth=7, learning_rate=0.1,
+                subsample=0.8, random_state=42, n_jobs=-1,
+            )
+            model.fit(X_tr, y_tr)
+
+        val_r2   = r2_score(y_val, model.predict(X_val))
+        train_r2 = r2_score(y_tr,  model.predict(X_tr))
+
+        # Evaluate on test curves via DTW decode
+        pipe = {
+            'model': model, 'reference_curve': reference_curve,
+            'fixed_length': fixed_length, 'feature_columns': feature_columns,
+            'feature_scaler': scaler, 'numeric_feature_cols': num_feat_cols,
+            'all_keys': all_keys, 'key_types': key_types,
+        }
+
+        te_preds, te_real = [], []
+        for c in te_curves:
+            y_pred = _predict_with_dtw(c['original_values'], c['activity'], c['attributes'], pipe)
+            te_preds.append(y_pred)
+            te_real.append(c['original_values'])
+
+        if te_preds:
+            y_te_all = np.concatenate(te_real)
+            yp_te_all = np.concatenate(te_preds)
+            denom = np.abs(y_te_all).sum()
+            test_r2   = r2_score(y_te_all, yp_te_all)
+            test_mae  = mean_absolute_error(y_te_all, yp_te_all)
+            test_rmse = float(np.sqrt(np.mean((y_te_all - yp_te_all) ** 2)))
+            test_wape = float(np.abs(y_te_all - yp_te_all).sum() / denom) if denom > 0 else np.nan
+        else:
+            test_r2 = test_mae = test_rmse = test_wape = np.nan
+
+        pipelines[target] = pipe
+        metrics[target] = {
+            'train_r2': train_r2, 'val_r2': val_r2,
+            'test_r2': test_r2,   'test_mae': test_mae,
+            'test_rmse': test_rmse, 'test_wape': test_wape,
+        }
+        report(
+            f"  {target[:50]:50s} | "
+            f"train R²={train_r2:.3f}  val R²={val_r2:.3f} | "
+            f"test R²={test_r2:.3f}  MAE={test_mae:.3f}"
+        )
+
+    if metrics:
+        rows_m = [{'target': t, 'train_R²': round(m['train_r2'], 4),
+                   'val_R²': round(m['val_r2'], 4), 'test_R²': round(m['test_r2'], 4),
+                   'test_MAE': round(m['test_mae'], 4)}
+                  for t, m in metrics.items()]
+        df_mtr = pd.DataFrame(rows_m).set_index('target').sort_values('test_R²', ascending=False)
+        print("\n── CurveModel (DBA+DTW) metrics ─────────────────────────")
+        print(df_mtr.to_string())
+        print("─────────────────────────────────────────────────────────\n")
+
+    return {
+        'pipelines':    pipelines,
+        'target_cols':  target_cols,
+        'activity_col': activity_col,
+        'attr_cols':    attr_cols,
+        'metrics':      metrics,
+        'df_train':     df_train,
+        'df_test':      df_test,
+    }
+
+
+def simulate_curve_model(curve_model):
+    """
+    Predict test targets segment by segment using the DBA+DTW pipeline.
+    For each activity segment in df_test, DTW-aligns the real raw curve to the
+    reference and decodes canonical predictions back to the raw timeline.
+    No lags, no AR — segments are fully independent.
+    """
+    pipelines    = curve_model['pipelines']
+    target_cols  = curve_model['target_cols']
+    activity_col = curve_model['activity_col']
+    attr_cols    = curve_model['attr_cols']
+    df_test      = curve_model['df_test']
+
+    result = pd.DataFrame(np.nan, index=df_test.index, columns=target_cols)
+
+    if activity_col and activity_col in df_test.columns:
+        seg_ids = (df_test[activity_col] != df_test[activity_col].shift()).cumsum()
+    else:
+        seg_ids = pd.Series(np.ones(len(df_test), dtype=int), index=df_test.index)
+
+    for seg_id, seg_df in df_test.groupby(seg_ids):
+        activity   = seg_df[activity_col].iloc[0] if activity_col else 'unknown'
+        attributes = {c: seg_df[c].iloc[0] for c in attr_cols if c in seg_df.columns}
+        for target in target_cols:
+            if target not in pipelines:
+                continue
+            raw_vals = seg_df[target].values.astype(float)
+            if np.all(np.isnan(raw_vals)) or len(raw_vals) < 2:
+                continue
+            y_pred = _predict_with_dtw(raw_vals, activity, attributes, pipelines[target])
+            result.loc[seg_df.index, target] = y_pred
+
+    return result
+
+
+def train_curve_model_exog(df_train, df_test, fixed_length=100):
+    """
+    DBA + DTW reference-curve model with exogenous features.
+
+    Same as train_curve_model but each numeric ef_* column is resampled to
+    fixed_length points and included as position-wise features alongside
+    position_idx, curve_length, activity, and attr_*.
+
+    This lets the model see e.g. temperature or humidity at each canonical
+    position within the segment, not just a scalar summary.
+    """
+    from tslearn.barycenters import dtw_barycenter_averaging
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split as _tts
+
+    target_cols  = [
+        c for c in df_train.columns
+        if c.endswith('_energy') and not c.startswith('ef')
+        and pd.api.types.is_numeric_dtype(df_train[c])
+    ]
+    activity_col = 'ef_activity_log' if 'ef_activity_log' in df_train.columns else None
+    attr_cols    = [c for c in df_train.columns if c.startswith('attr_')
+                    and not pd.api.types.is_numeric_dtype(df_train[c])]
+    exog_cols    = [c for c in df_train.columns
+                    if c.startswith('ef') and c != 'ef_activity_log'
+                    and pd.api.types.is_numeric_dtype(df_train[c])]
+
+    report(f"\n[CurveModelExog] Exogenous cols added: {exog_cols}")
+
+    def _extract_curves_exog(df):
+        """Extract curves with per-segment resampled exog arrays."""
+        if activity_col and activity_col in df.columns:
+            seg_ids = (df[activity_col] != df[activity_col].shift()).cumsum()
+        else:
+            seg_ids = pd.Series(np.ones(len(df), dtype=int), index=df.index)
+
+        curves = []
+        instance_id = 0
+        for seg_id, seg_df in df.groupby(seg_ids):
+            activity   = seg_df[activity_col].iloc[0] if activity_col else 'unknown'
+            attributes = {c: seg_df[c].iloc[0] for c in attr_cols}
+
+            # Resample each exog column to fixed_length
+            exog_resampled = {}
+            for ec in exog_cols:
+                vals = seg_df[ec].values.astype(float)
+                if len(vals) < 2:
+                    exog_resampled[ec] = np.full(fixed_length, np.nan)
+                else:
+                    exog_resampled[ec] = np.interp(
+                        np.linspace(0, 1, fixed_length),
+                        np.linspace(0, 1, len(vals)),
+                        vals
+                    )
+
+            for target in target_cols:
+                vals = seg_df[target].dropna().values.astype(float)
+                if len(vals) < 5:
+                    continue
+                curves.append({
+                    'instance_id':     instance_id,
+                    'activity':        activity,
+                    'target':          target,
+                    'original_values': vals,
+                    'original_length': len(vals),
+                    'attributes':      attributes,
+                    'exog_resampled':  exog_resampled,
+                })
+            instance_id += 1
+        return curves
+
+    train_curves = _extract_curves_exog(df_train)
+    test_curves  = _extract_curves_exog(df_test)
+
+    report(f"[CurveModelExog] Train curves: {len(train_curves)} | Test curves: {len(test_curves)}")
+
+    pipelines, metrics = {}, {}
+
+    for target in target_cols:
+        tr_curves = [c for c in train_curves if c['target'] == target]
+        te_curves = [c for c in test_curves  if c['target'] == target]
+
+        if len(tr_curves) < 3:
+            continue
+
+        # DBA barycenter from train curves only
+        resampled = np.array([
+            np.interp(np.linspace(0, 1, fixed_length),
+                      np.linspace(0, 1, len(c['original_values'])),
+                      c['original_values'])
+            for c in tr_curves
+        ])[:, :, np.newaxis]
+        reference_curve = dtw_barycenter_averaging(resampled, barycenter_size=fixed_length)[:, 0]
+
+        # DTW-align train curves to barycenter
+        for c in tr_curves:
+            c['aligned_values'] = _align_curve_dtw(c['original_values'], reference_curve)
+
+        # Infer attribute key types from train only
+        all_keys  = sorted({k for c in tr_curves for k in c['attributes'].keys()})
+        key_types = {}
+        for key in all_keys:
+            is_num = True
+            for c in tr_curves:
+                try:    float(c['attributes'].get(key, 'x'))
+                except: is_num = False; break
+            key_types[key] = 'numeric' if is_num else 'category'
+
+        # Build regression dataset — includes resampled exog at each position
+        rows = []
+        for c in tr_curves:
+            for pos in range(fixed_length):
+                row = {
+                    'position_idx': pos,
+                    'curve_length': c['original_length'],
+                    'activity':     c['activity'],
+                    'instance_id':  c['instance_id'],
+                    'y':            c['aligned_values'][pos],
+                }
+                for key in all_keys:
+                    val = c['attributes'].get(key, None)
+                    if key_types[key] == 'numeric':
+                        try:    row[key] = float(val) if val is not None else np.nan
+                        except: row[key] = np.nan
+                    else:
+                        row[key] = str(val) if val is not None else 'None'
+                for ec in exog_cols:
+                    row[ec] = c['exog_resampled'][ec][pos]
+                rows.append(row)
+
+        df_reg = pd.DataFrame(rows)
+        cat_cols_reg = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+        feature_base = ['position_idx', 'curve_length', 'activity'] + all_keys + exog_cols
+        X_all = pd.get_dummies(df_reg[feature_base], columns=cat_cols_reg, drop_first=True)
+        y_all = df_reg['y'].values
+        feature_columns = X_all.columns.tolist()
+
+        unique_ids = df_reg['instance_id'].unique()
+        tr_ids, val_ids = _tts(unique_ids, test_size=0.2, random_state=42)
+        tr_mask  = df_reg['instance_id'].isin(tr_ids)
+        val_mask = df_reg['instance_id'].isin(val_ids)
+        X_tr, X_val = X_all[tr_mask].copy(), X_all[val_mask].copy()
+        y_tr, y_val = y_all[tr_mask],         y_all[val_mask]
+
+        num_feat_cols = ['position_idx', 'curve_length'] + \
+                        [k for k in all_keys if key_types[k] == 'numeric'] + exog_cols
+        num_feat_cols = [c for c in num_feat_cols if c in X_tr.columns]
+        scaler = StandardScaler()
+        X_tr.loc[:, num_feat_cols]  = scaler.fit_transform(X_tr[num_feat_cols])
+        X_val.loc[:, num_feat_cols] = scaler.transform(X_val[num_feat_cols])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            model = XGBRegressor(
+                n_estimators=200, max_depth=7, learning_rate=0.1,
+                subsample=0.8, random_state=42, n_jobs=-1,
+            )
+            model.fit(X_tr, y_tr)
+
+        val_r2   = r2_score(y_val, model.predict(X_val))
+        train_r2 = r2_score(y_tr,  model.predict(X_tr))
+
+        pipe = {
+            'model': model, 'reference_curve': reference_curve,
+            'fixed_length': fixed_length, 'feature_columns': feature_columns,
+            'feature_scaler': scaler, 'numeric_feature_cols': num_feat_cols,
+            'all_keys': all_keys, 'key_types': key_types,
+            'exog_cols': exog_cols,
+        }
+
+        # Evaluate on test curves
+        te_preds, te_real = [], []
+        for c in te_curves:
+            y_pred = _predict_with_dtw_exog(
+                c['original_values'], c['activity'], c['attributes'],
+                c['exog_resampled'], pipe
+            )
+            te_preds.append(y_pred)
+            te_real.append(c['original_values'])
+
+        if te_preds:
+            y_te_all  = np.concatenate(te_real)
+            yp_te_all = np.concatenate(te_preds)
+            denom     = np.abs(y_te_all).sum()
+            test_r2   = r2_score(y_te_all, yp_te_all)
+            test_mae  = mean_absolute_error(y_te_all, yp_te_all)
+            test_rmse = float(np.sqrt(np.mean((y_te_all - yp_te_all) ** 2)))
+            test_wape = float(np.abs(y_te_all - yp_te_all).sum() / denom) if denom > 0 else np.nan
+        else:
+            test_r2 = test_mae = test_rmse = test_wape = np.nan
+
+        pipelines[target] = pipe
+        metrics[target] = {
+            'train_r2': train_r2, 'val_r2': val_r2,
+            'test_r2': test_r2,   'test_mae': test_mae,
+            'test_rmse': test_rmse, 'test_wape': test_wape,
+        }
+        report(
+            f"  {target[:50]:50s} | "
+            f"train R²={train_r2:.3f}  val R²={val_r2:.3f} | "
+            f"test R²={test_r2:.3f}  MAE={test_mae:.3f}"
+        )
+
+    if metrics:
+        rows_m = [{'target': t, 'train_R²': round(m['train_r2'], 4),
+                   'val_R²': round(m['val_r2'], 4), 'test_R²': round(m['test_r2'], 4),
+                   'test_MAE': round(m['test_mae'], 4)}
+                  for t, m in metrics.items()]
+        df_mtr = pd.DataFrame(rows_m).set_index('target').sort_values('test_R²', ascending=False)
+        print("\n── CurveModelExog (DBA+DTW+exog) metrics ────────────────")
+        print(df_mtr.to_string())
+        print("─────────────────────────────────────────────────────────\n")
+
+    return {
+        'pipelines':    pipelines,
+        'target_cols':  target_cols,
+        'activity_col': activity_col,
+        'attr_cols':    attr_cols,
+        'exog_cols':    exog_cols,
+        'metrics':      metrics,
+        'df_train':     df_train,
+        'df_test':      df_test,
+    }
+
+
+def _predict_with_dtw_exog(raw_values, activity, attributes, exog_resampled, pipeline):
+    """
+    Like _predict_with_dtw but includes resampled exog columns as features.
+    exog_resampled: dict {col: np.ndarray of length fixed_length}
+    """
+    from dtw import dtw as _dtw
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler')
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+    exog_cols            = pipeline.get('exog_cols', [])
+
+    rows_ref = []
+    for ref_pos in range(fixed_length):
+        row = {'position_idx': ref_pos, 'curve_length': len(raw_values), 'activity': activity}
+        for key in all_keys:
+            val = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:    row[key] = float(val) if val is not None else np.nan
+                except: row[key] = np.nan
+            else:
+                row[key] = str(val) if val is not None else 'None'
+        for ec in exog_cols:
+            arr = exog_resampled.get(ec, None)
+            row[ec] = float(arr[ref_pos]) if arr is not None and not np.isnan(arr[ref_pos]) else np.nan
+        rows_ref.append(row)
+
+    X_ref = pd.DataFrame(rows_ref)
+    cat_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_ref = pd.get_dummies(X_ref, columns=cat_cols, drop_first=True)
+    for col in feature_columns:
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
+    y_ref_pred = model.predict(X_ref)
+
+    alignment  = _dtw(raw_values, reference_curve, keep_internals=True)
+    buckets    = [[] for _ in range(len(raw_values))]
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+    return y_raw_pred
+
+
+def simulate_curve_model_exog(curve_model_exog):
+    """
+    Predict test targets segment by segment using the DBA+DTW+exog pipeline.
+    Exogenous variables are resampled to fixed_length for each segment at predict time.
+    """
+    pipelines    = curve_model_exog['pipelines']
+    target_cols  = curve_model_exog['target_cols']
+    activity_col = curve_model_exog['activity_col']
+    attr_cols    = curve_model_exog['attr_cols']
+    exog_cols    = curve_model_exog['exog_cols']
+    df_test      = curve_model_exog['df_test']
+
+    fixed_length = next(iter(pipelines.values()))['fixed_length'] if pipelines else 100
+
+    result = pd.DataFrame(np.nan, index=df_test.index, columns=target_cols)
+
+    if activity_col and activity_col in df_test.columns:
+        seg_ids = (df_test[activity_col] != df_test[activity_col].shift()).cumsum()
+    else:
+        seg_ids = pd.Series(np.ones(len(df_test), dtype=int), index=df_test.index)
+
+    for seg_id, seg_df in df_test.groupby(seg_ids):
+        activity   = seg_df[activity_col].iloc[0] if activity_col else 'unknown'
+        attributes = {c: seg_df[c].iloc[0] for c in attr_cols if c in seg_df.columns}
+
+        exog_resampled = {}
+        for ec in exog_cols:
+            if ec not in seg_df.columns:
+                exog_resampled[ec] = np.full(fixed_length, np.nan)
+                continue
+            vals = seg_df[ec].values.astype(float)
+            exog_resampled[ec] = np.interp(
+                np.linspace(0, 1, fixed_length),
+                np.linspace(0, 1, max(len(vals), 2)),
+                vals if len(vals) >= 2 else np.full(2, vals[0] if len(vals) == 1 else np.nan)
+            )
+
+        for target in target_cols:
+            if target not in pipelines:
+                continue
+            raw_vals = seg_df[target].values.astype(float)
+            if np.all(np.isnan(raw_vals)) or len(raw_vals) < 2:
+                continue
+            y_pred = _predict_with_dtw_exog(
+                raw_vals, activity, attributes, exog_resampled, pipelines[target]
+            )
+            result.loc[seg_df.index, target] = y_pred
+
+    return result
+
+
+def plot_scm_simulation(scm, sim_autoregressive,
+                        sim_one_step=None,
+                        scm_all=None, sim_all_autoregressive=None, sim_all_one_step=None,
+                        sim_curve=None, sim_curve_exog=None):
     """
     One figure per target variable.
 
-    Causal model: Real (blue), One-step (green dashed), Autoregressive (red dotted).
-    All-features model (optional): One-step (orange dashed), Autoregressive (purple dotted).
+    Required: sim_autoregressive (causal AR model).
+    Optional: sim_one_step, sim_all_autoregressive, sim_curve.
 
     Vertical dotted lines mark activity transitions with the activity name.
-    Followed by a side-by-side metrics table comparing all available modes.
+    Followed by a metrics table comparing all provided modes.
     """
-    target_cols  = [t for t in scm['target_cols'] if t in sim_one_step.columns]
+    target_cols  = [t for t in scm['target_cols'] if t in sim_autoregressive.columns]
     df_test      = scm['df_test']
     activity_col = 'ef_activity_log' if 'ef_activity_log' in df_test.columns else None
 
-    has_all = scm_all is not None and sim_all_one_step is not None and sim_all_autoregressive is not None
+    has_all = scm_all is not None and sim_all_autoregressive is not None
 
     if not target_cols:
         print("[plot_scm_simulation] No target columns found.")
@@ -2411,24 +3073,30 @@ def plot_scm_simulation(scm, sim_one_step, sim_autoregressive,
 
     # ── one figure per target ────────────────────────────────────────────────
     for target in target_cols:
-        real_vals    = df_test[target].values if target in df_test.columns else np.full(n, np.nan)
-        os_vals      = _get(sim_one_step,        target, n)
-        ar_vals      = _get(sim_autoregressive,  target, n)
-        all_os_vals  = _get(sim_all_one_step,    target, n)
-        all_ar_vals  = _get(sim_all_autoregressive, target, n)
+        real_vals   = df_test[target].values if target in df_test.columns else np.full(n, np.nan)
+        ar_vals     = _get(sim_autoregressive,      target, n)
+        os_vals     = _get(sim_one_step,            target, n)
+        all_ar_vals = _get(sim_all_autoregressive,  target, n)
+        cv_vals     = _get(sim_curve,               target, n)
+        cve_vals    = _get(sim_curve_exog,          target, n)
 
-        m_os     = _compute_metrics(real_vals, os_vals)
         m_ar     = _compute_metrics(real_vals, ar_vals)
-        m_all_os = _compute_metrics(real_vals, all_os_vals) if has_all else None
-        m_all_ar = _compute_metrics(real_vals, all_ar_vals) if has_all else None
+        m_os     = _compute_metrics(real_vals, os_vals)     if sim_one_step     is not None else None
+        m_all_ar = _compute_metrics(real_vals, all_ar_vals) if has_all          else None
+        m_cv     = _compute_metrics(real_vals, cv_vals)     if sim_curve        is not None else None
+        m_cve    = _compute_metrics(real_vals, cve_vals)    if sim_curve_exog   is not None else None
 
         fig, ax = plt.subplots(figsize=(16, 4))
-        ax.plot(x, real_vals, label='Real',                                      color='steelblue', linewidth=1,   alpha=0.9)
-        ax.plot(x, os_vals,   label=f'Causal One-step    {_mstr(m_os)}',         color='seagreen',  linewidth=1,   alpha=0.85, linestyle='--')
-        ax.plot(x, ar_vals,   label=f'Causal Autoregress {_mstr(m_ar)}',         color='tomato',    linewidth=1,   alpha=0.85, linestyle=':')
+        ax.plot(x, real_vals, label='Real',                                        color='steelblue',  linewidth=1,  alpha=0.9)
+        ax.plot(x, ar_vals,   label=f'Causal AR            {_mstr(m_ar)}',         color='tomato',     linewidth=1,  alpha=0.85, linestyle=':')
+        if sim_one_step is not None:
+            ax.plot(x, os_vals, label=f'Causal 1-step       {_mstr(m_os)}',        color='seagreen',   linewidth=1,  alpha=0.85, linestyle='--')
         if has_all:
-            ax.plot(x, all_os_vals, label=f'All One-step      {_mstr(m_all_os)}', color='darkorange', linewidth=1, alpha=0.85, linestyle='--')
-            ax.plot(x, all_ar_vals, label=f'All Autoregress   {_mstr(m_all_ar)}', color='purple',     linewidth=1, alpha=0.85, linestyle=':')
+            ax.plot(x, all_ar_vals, label=f'All-feat AR      {_mstr(m_all_ar)}',   color='purple',     linewidth=1,  alpha=0.85, linestyle=':')
+        if sim_curve is not None:
+            ax.plot(x, cv_vals,  label=f'Curve DBA+DTW     {_mstr(m_cv)}',         color='darkorchid', linewidth=1,  alpha=0.85, linestyle='-.')
+        if sim_curve_exog is not None:
+            ax.plot(x, cve_vals, label=f'Curve DBA+DTW+exog {_mstr(m_cve)}',       color='goldenrod',  linewidth=1,  alpha=0.85, linestyle='-.')
 
         ymin, ymax = ax.get_ylim()
         for pos, label in activity_starts:
@@ -2443,28 +3111,34 @@ def plot_scm_simulation(scm, sim_one_step, sim_autoregressive,
         plt.tight_layout()
         plt.show()
 
-    # ── side-by-side metrics table ───────────────────────────────────────────
+    # ── metrics table ────────────────────────────────────────────────────────
     rows = []
     for target in target_cols:
         real_all_vals = df_test[target].values if target in df_test.columns else np.full(n, np.nan)
-        m_os     = _compute_metrics(real_all_vals, _get(sim_one_step,           target, n))
-        m_ar     = _compute_metrics(real_all_vals, _get(sim_autoregressive,     target, n))
-        row = {
-            'target':         target,
-            'causal_os_R²':   m_os['R²'],  'causal_os_MAE':  m_os['MAE'],  'causal_os_RMSE':  m_os['RMSE'],  'causal_os_WAPE':  m_os['WAPE'],
-            'causal_ar_R²':   m_ar['R²'],  'causal_ar_MAE':  m_ar['MAE'],  'causal_ar_RMSE':  m_ar['RMSE'],  'causal_ar_WAPE':  m_ar['WAPE'],
-        }
+        m_ar = _compute_metrics(real_all_vals, _get(sim_autoregressive, target, n))
+        row  = {'target': target,
+                'causal_ar_R²': m_ar['R²'], 'causal_ar_MAE': m_ar['MAE'],
+                'causal_ar_RMSE': m_ar['RMSE'], 'causal_ar_WAPE': m_ar['WAPE']}
+        if sim_one_step is not None:
+            m_os = _compute_metrics(real_all_vals, _get(sim_one_step, target, n))
+            row.update({'causal_os_R²': m_os['R²'], 'causal_os_MAE': m_os['MAE'],
+                        'causal_os_RMSE': m_os['RMSE'], 'causal_os_WAPE': m_os['WAPE']})
         if has_all:
-            m_all_os = _compute_metrics(real_all_vals, _get(sim_all_one_step,       target, n))
             m_all_ar = _compute_metrics(real_all_vals, _get(sim_all_autoregressive, target, n))
-            row.update({
-                'all_os_R²':  m_all_os['R²'],  'all_os_MAE':  m_all_os['MAE'],  'all_os_RMSE':  m_all_os['RMSE'],  'all_os_WAPE':  m_all_os['WAPE'],
-                'all_ar_R²':  m_all_ar['R²'],  'all_ar_MAE':  m_all_ar['MAE'],  'all_ar_RMSE':  m_all_ar['RMSE'],  'all_ar_WAPE':  m_all_ar['WAPE'],
-            })
+            row.update({'all_ar_R²': m_all_ar['R²'], 'all_ar_MAE': m_all_ar['MAE'],
+                        'all_ar_RMSE': m_all_ar['RMSE'], 'all_ar_WAPE': m_all_ar['WAPE']})
+        if sim_curve is not None:
+            m_cv = _compute_metrics(real_all_vals, _get(sim_curve, target, n))
+            row.update({'cv_R²': m_cv['R²'], 'cv_MAE': m_cv['MAE'],
+                        'cv_RMSE': m_cv['RMSE'], 'cv_WAPE': m_cv['WAPE']})
+        if sim_curve_exog is not None:
+            m_cve = _compute_metrics(real_all_vals, _get(sim_curve_exog, target, n))
+            row.update({'cve_R²': m_cve['R²'], 'cve_MAE': m_cve['MAE'],
+                        'cve_RMSE': m_cve['RMSE'], 'cve_WAPE': m_cve['WAPE']})
         rows.append(row)
 
-    metrics_df = pd.DataFrame(rows).set_index('target').sort_values('causal_os_R²', ascending=False)
-    header = "── Causal (causal_os/ar_*) vs All-features (all_os/ar_*) — test set ─" if has_all else "── One-step (causal_os_*) vs Autoregressive (causal_ar_*) — test set ─"
+    metrics_df = pd.DataFrame(rows).set_index('target').sort_values('causal_ar_R²', ascending=False)
+    header = "── Simulation comparison — test set ─"
     print(f"\n{header}")
     print(metrics_df.to_string())
     print("─" * len(header) + "\n")
@@ -2593,21 +3267,38 @@ scm_all = train_scm(
     use_all_features=True,
 )
 
-#%% Step 3 — run both simulation modes and compare
+#%% Step 2c — train reference-curve model (no lags, no AR)
 
-sim_one_step       = simulate_scm(scm, mode='one_step')
-#sim_autoregressive = simulate_scm(scm, mode='autoregressive')
+curve_model = train_curve_model(df_train, df_test)
 
-sim_all_one_step       = simulate_scm(scm_all, mode='one_step')
-#sim_all_autoregressive = simulate_scm(scm_all, mode='autoregressive')
+#%% Step 3 — run simulation modes
+
+#sim_one_step       = simulate_scm(scm, mode='one_step')
+sim_autoregressive = simulate_scm(scm, mode='autoregressive')
+
+#sim_all_one_step       = simulate_scm(scm_all, mode='one_step')
+sim_all_autoregressive = simulate_scm(scm_all, mode='autoregressive')
+
+#%% Step 3c — simulate curve model
+
+sim_curve = simulate_curve_model(curve_model)
+
+#%% Step 2d — train reference-curve model with exogenous features
+
+curve_model_exog = train_curve_model_exog(df_train, df_test)
+
+#%% Step 3d — simulate curve model with exogenous features
+
+sim_curve_exog = simulate_curve_model_exog(curve_model_exog)
 
 #%% Step 4 — visuals and metrics comparison
 
 plot_scm_simulation(
-    scm, sim_one_step,# sim_autoregressive,
+    scm, sim_autoregressive,
     scm_all=scm_all,
-    sim_all_one_step=sim_all_one_step,
-    #sim_all_autoregressive=sim_all_autoregressive,
+    sim_all_autoregressive=sim_all_autoregressive,
+    sim_curve=sim_curve,
+    sim_curve_exog=sim_curve_exog,
 )
 
 # %%
