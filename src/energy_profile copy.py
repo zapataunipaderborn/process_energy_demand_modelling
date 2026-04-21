@@ -1562,22 +1562,22 @@ print(process_datasets.keys())
 process_datasets_to_model = process_datasets
 
 process_datasets_to_model_sensors = process_datasets_to_model.copy()
-# process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
-# process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['Erhitzer']
-# process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
-# process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
+process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
+process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['Erhitzer']
+process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
+process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
-# process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
+process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
+process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 # process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
 # process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
 # process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
 # process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
 
-processes_to_run = ['process_2']
+processes_to_run = ['process_3']
 # Filter the original dictionary
 process_datasets_to_model = {
     k: v for k, v in process_datasets.items() 
@@ -1647,12 +1647,12 @@ def visualize_all_sensor_profiles(process_datasets, process_name, max_points_per
 
 
 # Choose the process you want to visualize here.
-process_to_visualize_profiles = 'process_2'
+process_to_visualize_profiles = 'process_3'
 #visualize_all_sensor_profiles(process_datasets, process_to_visualize_profiles)
 
 #%%
 
-display(process_datasets['process_2'])
+display(process_datasets['process_3'])
 # %%
 
 
@@ -1859,36 +1859,56 @@ def run_causal_discovery(
 #%%
 
 
-df_proc = process_datasets['process_2'].get('expanded')
+df_proc = process_datasets['process_3'].get('expanded')
 
 
-display(df_proc.columns)
+
 
 display(df_proc)
 
 #%%
 
-df = df_proc
+display(df_proc.columns)
 
-columns = ['datetime_energy',
-           'ef_precipitation_energy', 'medium_power_kW_energy',
-       'ef_temperature_2m_energy', 'ef_global_tilted_irradiance_energy',
-       'status_name_energy', 'pro_volstrom_l/h_energy',
-       'ef_apparent_temperature_energy', 'dampfmenge_kg/h_nmb+cip_energy',
-       'cip_turm_f_energy', 'ef_wind_speed_10m_energy', 'pro_temp_out_energy',
-        
+columns = [
+       'datetime_energy', 
+       '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
+       '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
+       '(4)_frostschutz_%_energy', '(5)_vor_vent_hauptzuluft_temp_c_energy',
+       '(7)_zuluft_turmt_temp_c_energy', '(9)_abluft2_kon_g/kg_energy',
+       '(11)_wm_mas_kg/h_energy', '(12)_mpt_fb(mpt?)_kg/h_energy',
+       '(13)_lanzen_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
+       '(15)_filter_mas_kg/h_energy', '(16)_konditionierung_mas_kg/h_energy',
+       '(8)_abluft_vol_m3/h_energy', '(23)_f10_speise_temp_c_energy',
+       '(23)_f11_speise_temp_c_energy',
+       '(19)_zuluft_vor_entfeuchter_temp_c_energy', 'dampf_nmb_energy',
+       'nach_nt_(c)_energy', 'f10_speise_kg/h_energy',
+       'f11_speise_kg/h_energy', 'f10_speise_kg/m³_energy',
+       'f11_speise_kg/m³_energy', 'f10_speise_l/h_energy',
+       'f11_speise_l/h_energy', #'(6)_nach_recu_reg_temp_c_old_energy',
+       '(18)_leistung_turmF_lufterhitzer_kw_energy',
+       '(17)_leistung_turmF_luftentfeuchter_kw_energy',
+       '(6)_nach_recu_reg_temp_c_energy', 'id_original_energy',
+       '(10)_abluft_temp_c_energy', '(8)_abluft_mas_kg/h_energy',
+       'ef_temperature_2m_energy', 
        'ef_relative_humidity_2m_energy',
-       'pro_menge_kg_energy', 'pro_power_kW_energy',
-       'ef_wind_direction_100m_energy', 'cip_turm_g_energy',
-       #'timestamp_start_log', 'timestamp_end_log',
-       'activity_log',
+       'ef_apparent_temperature_energy', 
+       'ef_precipitation_energy',
+       'ef_wind_speed_10m_energy', 
+       'ef_wind_direction_100m_energy',
+       'ef_global_tilted_irradiance_energy',
+       '(21)_zuluft_turm_mas_kg/h_energy', '(31)_q_waerme_recu_kw_energy',
+       '(22)_t_waermereg_c_energy',
+       '(29)_q_lufterwearmung_von_T6_nach_T7_kw_energy',
+       '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw_energy',
+       '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw_energy',
+       '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw_energy',
+       'activity_energy', 
+       #'activity_log', 'timestamp_start_log',
+       #'timestamp_end_log', 'object_attributes_log',
        #'higher_level_activity_log', 'object_type_log', 'object_log',
-       #'case_id_log',
-       'object_attributes_log'
+       #'case_id_log'
        ]
-
-df = df[columns]
-display(df)
 
 
 
@@ -1921,21 +1941,8 @@ if categorical_cols:
 
 df = df_resampled.reset_index()
 
-df = df.rename(columns={'activity_log': 'ef_activity_log'})
+df = df.rename(columns={'activity_energy': 'ef_activity_log'})
 
-# Expand object_attributes_log dict → flat attr_* columns (one per attribute key).
-# Each attr_* column is categorical and will be treated as a forced exogenous
-# parent of all targets at all lags, just like ef_activity_log.
-if 'object_attributes_log' in df.columns:
-    _attr_expanded = df['object_attributes_log'].apply(
-        lambda x: x if isinstance(x, dict) else {}
-    )
-    _attr_df = pd.DataFrame(_attr_expanded.tolist(), index=df.index)
-    _attr_df.columns = [f'attr_{c}' for c in _attr_df.columns]
-    for c in _attr_df.columns:
-        _attr_df[c] = _attr_df[c].astype(str).replace('nan', np.nan)
-    df = pd.concat([df.drop(columns=['object_attributes_log']), _attr_df], axis=1)
-    report(f"[Data] Expanded object_attributes_log → {list(_attr_df.columns)}")
 
 df = df.drop(columns=['datetime_energy'], errors='ignore')
 
@@ -1955,7 +1962,7 @@ display(df)
 #%%
 
 # Plot each activity's curve for '(21)_zuluft_turm_mas_kg/h_energy' by activity step
-sensor_col = variable
+sensor_col = '(23)_f10_speise_temp_c_energy'
 
 activity_segments = (df['ef_activity_log'] != df['ef_activity_log'].shift()).cumsum()
 unique_segments = activity_segments.unique()
@@ -2004,7 +2011,7 @@ display(df_clean)
 
 #%%
 
-from xgboost import XGBRegressor
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 import warnings
 
@@ -2037,12 +2044,6 @@ def _build_lag_features(df, target_cols, exog_cols, tau_max, causal_links=None):
     else:
         needed = {(col, lag) for col in all_cols for lag in range(1, tau_max + 1)}
 
-    # ef_activity_log and attr_* columns are unconditional parents of every target
-    for col in all_cols:
-        if col == 'ef_activity_log' or col.startswith('attr_'):
-            for lag in range(1, tau_max + 1):
-                needed.add((col, lag))
-
     lagged = {}
     for col, lag in sorted(needed):
         key = f'{col}_lag{lag}'
@@ -2064,85 +2065,47 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
     """
     causal_links = causal_output['causal_links']
 
-    # Cast ef_activity_log and all attr_* columns to pandas Categorical.
-    # Categories are fit on train only and applied to test.
-    # XGBoost with enable_categorical=True treats these as unordered splits.
-    _cat_cols = (
-        ['ef_activity_log'] if 'ef_activity_log' in df_train.columns
-                               and not pd.api.types.is_numeric_dtype(df_train['ef_activity_log'])
-        else []
-    ) + [
-        c for c in df_train.columns
-        if c.startswith('attr_') and not pd.api.types.is_numeric_dtype(df_train[c])
+    df = pd.concat([df_train, df_test]) if df_test is not None else df_train
+
+    target_cols = [
+        c for c in df.columns
+        if c.endswith('_energy') and not c.startswith('ef')
+        and pd.api.types.is_numeric_dtype(df[c])
     ]
-    if _cat_cols:
-        df_train = df_train.copy()
-        if df_test is not None:
-            df_test = df_test.copy()
-        for _c in _cat_cols:
-            _cats = df_train[_c].astype('category').cat.categories
-            df_train[_c] = pd.Categorical(df_train[_c], categories=_cats)
-            if df_test is not None:
-                df_test[_c] = pd.Categorical(df_test[_c], categories=_cats)
-        report(f"[SCM] Categorical columns: {_cat_cols}")
+    exog_cols = [
+        c for c in df.columns
+        if c.startswith('ef') and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    report(f"\n[SCM] Targets: {len(target_cols)} | Exogenous: {len(exog_cols)}")
 
     if df_test is None:
         # Fallback: derive split internally
-        df_all = df_train
-        activity_col = 'ef_activity_log' if 'ef_activity_log' in df_all.columns else None
+        activity_col = 'ef_activity_log' if 'ef_activity_log' in df.columns else None
         if activity_col:
-            seg_ids = (df_all[activity_col] != df_all[activity_col].shift()).cumsum()
+            seg_ids = (df[activity_col] != df[activity_col].shift()).cumsum()
             unique_segs = seg_ids.unique()
             test_segs = unique_segs[-min(n_test_activities, max(1, len(unique_segs) // 5)):]
             test_mask = seg_ids.isin(test_segs)
         else:
-            cutoff = int(len(df_all) * 0.7)
-            test_mask = pd.Series([False] * cutoff + [True] * (len(df_all) - cutoff), index=df_all.index)
-        df_train = df_all[~test_mask].copy()
-        df_test  = df_all[test_mask].copy()
+            cutoff = int(len(df) * 0.7)
+            test_mask = pd.Series([False] * cutoff + [True] * (len(df) - cutoff), index=df.index)
+        df_train = df[~test_mask].copy()
+        df_test  = df[test_mask].copy()
 
-    target_cols = [
-        c for c in df_train.columns
-        if c.endswith('_energy') and not c.startswith('ef')
-        and pd.api.types.is_numeric_dtype(df_train[c])
-    ]
-    # Exogenous: numeric ef_* cols + ef_activity_log + all attr_* columns
-    exog_cols = [
-        c for c in df_train.columns
-        if (c.startswith('ef') and (pd.api.types.is_numeric_dtype(df_train[c]) or c == 'ef_activity_log'))
-        or c.startswith('attr_')
-    ]
-
-    report(f"\n[SCM] Targets: {len(target_cols)} | Exogenous: {len(exog_cols)}")
     report(f"[SCM] Train rows: {len(df_train)} | Test rows: {len(df_test)}")
 
-    # Build lag features on train only for fitting.
-    # For test evaluation, prepend the last tau_max train rows so the first test
-    # rows get valid lag values that look back into real training history.
-    train_combined, all_feature_cols, _ = _build_lag_features(
-        df_train, target_cols, exog_cols, tau_max, causal_links=causal_links
+    # Build lag features guided by causal links
+    combined, all_feature_cols, _ = _build_lag_features(
+        df, target_cols, exog_cols, tau_max, causal_links=causal_links
     )
-    _context = df_train[target_cols + exog_cols].tail(tau_max)
-    _df_test_with_context = pd.concat([_context, df_test[target_cols + exog_cols]])
-    test_combined_full, _, _ = _build_lag_features(
-        _df_test_with_context, target_cols, exog_cols, tau_max, causal_links=causal_links
-    )
-    # Drop the context rows — keep only the actual test rows
-    test_combined = test_combined_full[test_combined_full.index.isin(df_test.index)]
+    train_combined = combined[combined.index.isin(df_train.index)]
+    test_combined  = combined[combined.index.isin(df_test.index)]
 
-    # ef_activity_log and attr_* lag columns are forced for every target
-    _forced_bases = ['ef_activity_log'] + [c for c in exog_cols if c.startswith('attr_')]
-    activity_lag_cols = [
-        f'{base}_lag{lag}'
-        for base in _forced_bases
-        for lag in range(1, tau_max + 1)
-        if f'{base}_lag{lag}' in all_feature_cols
-    ]
-
-    models, metrics, target_feature_cols, cat_col_categories = {}, {}, {}, {}
+    models, metrics, target_feature_cols = {}, {}, {}
 
     for target in target_cols:
-        # Per-target features: causal parents + activity lags always included
+        # Per-target features: only the lag columns that are causal parents of this target
         parents = causal_links.get(target, [])
         if parents:
             t_feat_cols = [
@@ -2151,42 +2114,24 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
                 if f'{parent}_lag{lag}' in all_feature_cols
             ]
         else:
-            t_feat_cols = list(all_feature_cols)
+            t_feat_cols = all_feature_cols  # fallback: use everything
 
         if not t_feat_cols:
-            t_feat_cols = list(all_feature_cols)
+            t_feat_cols = all_feature_cols
 
-        # Always include activity lags — they are unconditional parents of every target
-        for c in activity_lag_cols:
-            if c not in t_feat_cols:
-                t_feat_cols.append(c)
-
-        X_train = train_combined[t_feat_cols].copy()
+        X_train = train_combined[t_feat_cols]
         y_train = train_combined[target]
-        X_test  = test_combined[t_feat_cols].copy() if len(test_combined) > 0 else pd.DataFrame(columns=t_feat_cols)
-        y_test  = test_combined[target] if len(test_combined) > 0 else pd.Series(dtype=float)
+        X_test  = test_combined[t_feat_cols]
+        y_test  = test_combined[target]
 
         if len(X_train) < 10 or y_train.std() == 0:
             continue
 
-        # Cast ef_activity_log and attr_* lag columns to category for XGBoost.
-        # Must be string first — shift() introduces float NaNs which break XGBoost.
-        cat_feat_cols = [c for c in t_feat_cols
-                         if c.startswith('ef_activity_log') or
-                         any(c.startswith(f'{base}_lag') for base in exog_cols if base.startswith('attr_'))]
-        for c in cat_feat_cols:
-            _cats = sorted(set(X_train[c].astype(str).tolist()) | {'nan'})
-            cat_col_categories[c] = _cats
-            X_train[c] = pd.Categorical(X_train[c].astype(str), categories=_cats)
-            if len(X_test) > 0:
-                X_test[c] = pd.Categorical(X_test[c].astype(str), categories=_cats)
-
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            model = XGBRegressor(
+            model = GradientBoostingRegressor(
                 n_estimators=200, max_depth=4, learning_rate=0.05,
-                subsample=0.8, random_state=42,
-                enable_categorical=True, tree_method='hist',
+                subsample=0.8, random_state=42
             )
             model.fit(X_train, y_train)
 
@@ -2240,7 +2185,6 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
     return {
         'models': models,
         'target_feature_cols': target_feature_cols,
-        'cat_col_categories': cat_col_categories,   # col → list of valid string categories
         'all_feature_cols': all_feature_cols,
         'target_cols': target_cols,
         'exog_cols': exog_cols,
@@ -2252,20 +2196,19 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
     }
 
 
-def simulate_scm(scm, mode='one_step'):
+def simulate_scm(scm):
     """
-    Predict targets over the test set.
+    Simulate the SCM per test activity.
 
-    mode='one_step'    — one-step-ahead: at each test step lags are built from
-                         real observed history (train tail + real test rows so far).
-                         No error compounding. This is the honest evaluation mode.
+    For each activity segment in df_test:
+      - warm-up buffer = last tau_max rows of the context preceding that segment
+        (from df_train if it is the first segment, else from the previous test rows)
+      - simulation horizon = max value of ef_activity_step for that segment
+        (i.e. the duration the activity label says it will last)
+      - exogenous vars (ef_*) are taken directly from the real test rows for that
+        segment, so the simulation is conditioned on known process conditions
 
-    mode='autoregressive' — lags are built from previously predicted targets.
-                            Errors compound over time but reflects true forecasting
-                            when you have no future ground truth for the targets.
-
-    In both modes exogenous variables (ef_*, ef_activity_log) always come from
-    real test values — they are known inputs, not predicted.
+    Returns a DataFrame aligned to df_test's index with simulated target columns.
     """
     models              = scm['models']
     target_feature_cols = scm['target_feature_cols']
@@ -2276,162 +2219,177 @@ def simulate_scm(scm, mode='one_step'):
     df_test             = scm['df_test']
 
     all_cols = target_cols + exog_cols
+    activity_col = 'ef_activity_log' if 'ef_activity_log' in df_test.columns else None
+    step_col     = 'ef_activity_step' if 'ef_activity_step' in df_test.columns else None
 
-    # Real history: train tail + test (used for one_step lags on target cols)
-    real_history = pd.concat([
-        df_train[all_cols].tail(tau_max),
-        df_test[all_cols]
-    ]).reset_index(drop=True)
-    n_warmup = tau_max  # index offset: real_history[n_warmup + i] == df_test row i
+    # Build activity segments for the test set
+    if activity_col:
+        seg_ids = (df_test[activity_col] != df_test[activity_col].shift()).cumsum()
+    else:
+        seg_ids = pd.Series(1, index=df_test.index)
 
-    # Autoregressive buffer seeded from train tail
-    ar_buffer = df_train[all_cols].tail(tau_max).copy().reset_index(drop=True)
+    # Full ordered context (train + test) for warm-up look-back
+    full_context = pd.concat([df_train, df_test])[all_cols]
 
-    cat_col_categories = scm['cat_col_categories']
+    sim_rows_all = {}  # index → simulated row dict
 
-    def _cast_activity(X, feat_cols):
-        for c in feat_cols:
-            if c in cat_col_categories:
-                X[c] = pd.Categorical(X[c].astype(str), categories=cat_col_categories[c])
-        return X
+    for seg_id, seg_idx in seg_ids.groupby(seg_ids).groups.items():
+        seg_df = df_test.loc[seg_idx]
 
-    sim_rows = []
-    for step in range(len(df_test)):
+        # Horizon: how many steps this activity lasts
+        if step_col and step_col in seg_df.columns:
+            horizon = int(seg_df[step_col].max())
+        else:
+            horizon = len(seg_df)
+        horizon = max(horizon, 1)
 
-        new_row = {}
+        # Warm-up: last tau_max rows of context before this segment
+        first_pos = full_context.index.get_loc(seg_idx[0]) if seg_idx[0] in full_context.index else 0
+        if hasattr(first_pos, '__len__'):  # slice / array result
+            first_pos = int(np.argmax(full_context.index == seg_idx[0]))
+        warmup_start = max(0, first_pos - tau_max)
+        buffer = full_context.iloc[warmup_start:first_pos][all_cols].copy().reset_index(drop=True)
+        if len(buffer) == 0:
+            buffer = df_train[all_cols].tail(tau_max).copy().reset_index(drop=True)
 
-        for target in target_cols:
-            if target not in models:
-                new_row[target] = ar_buffer[target].iloc[-1] if len(ar_buffer) > 0 else np.nan
-                continue
+        # Exogenous values for this segment (real values, step-aligned)
+        exog_seg = seg_df[exog_cols].reset_index(drop=True) if exog_cols else pd.DataFrame()
 
-            t_feat_cols = target_feature_cols[target]
+        sim_rows = []
+        for step in range(horizon):
             row_feats = {}
-
-            for feat in t_feat_cols:
-                # Parse "colname_lagN"
+            for col in all_cols:
                 for lag in range(1, tau_max + 1):
-                    suffix = f'_lag{lag}'
-                    if feat.endswith(suffix):
-                        col = feat[:-len(suffix)]
-                        break
+                    buf_idx = len(buffer) - lag
+                    row_feats[f'{col}_lag{lag}'] = buffer[col].iloc[buf_idx] if buf_idx >= 0 else np.nan
+
+            new_row = {}
+            for target in target_cols:
+                if target in models:
+                    t_feat_cols = target_feature_cols[target]
+                    X_step = pd.DataFrame([{k: row_feats.get(k, np.nan) for k in t_feat_cols}])
+                    new_row[target] = float(models[target].predict(X_step)[0])
                 else:
-                    row_feats[feat] = np.nan
-                    continue
+                    new_row[target] = buffer[target].iloc[-1]
 
-                is_exog = col in exog_cols or col == 'ef_activity_log'
+            for col in exog_cols:
+                new_row[col] = exog_seg[col].iloc[step] if step < len(exog_seg) else buffer[col].iloc[-1]
 
-                if mode == 'one_step' or is_exog:
-                    # Always use real values for exog; use real history for targets in one_step
-                    hist_idx = n_warmup + step - lag
-                    row_feats[feat] = real_history[col].iloc[hist_idx] if hist_idx >= 0 else np.nan
-                else:
-                    # Autoregressive / trajectory: use predicted buffer for target lags
-                    buf_idx = len(ar_buffer) - lag
-                    row_feats[feat] = ar_buffer[col].iloc[buf_idx] if buf_idx >= 0 else np.nan
+            sim_rows.append(new_row)
+            buffer = pd.concat([buffer, pd.DataFrame([new_row])], ignore_index=True)
 
-            X_step = pd.DataFrame([row_feats])
-            X_step = _cast_activity(X_step, t_feat_cols)
-            new_row[target] = float(models[target].predict(X_step)[0])
+        # Map simulated steps back to test index positions for this segment
+        for i, idx in enumerate(seg_idx[:horizon]):
+            sim_rows_all[idx] = sim_rows[i] if i < len(sim_rows) else sim_rows[-1]
 
-        # Exogenous cols always come from real test row
-        for col in exog_cols:
-            new_row[col] = df_test[col].iloc[step]
-
-        sim_rows.append(new_row)
-
-        # Update autoregressive buffer with predicted targets + real exog
-        if mode == 'autoregressive':
-            ar_buffer = pd.concat([ar_buffer, pd.DataFrame([new_row])], ignore_index=True)
-
-    return pd.DataFrame(sim_rows, index=df_test.index)
+    sim_df = pd.DataFrame([sim_rows_all.get(i, {}) for i in df_test.index], index=df_test.index)
+    return sim_df
 
 
-def _compute_metrics(real_vals, pred_vals):
-    valid = ~(np.isnan(real_vals) | np.isnan(pred_vals))
-    rv, pv = real_vals[valid], pred_vals[valid]
-    if valid.sum() > 1 and np.std(rv) > 0:
-        denom = np.abs(rv).sum()
-        return {
-            'R²':      round(r2_score(rv, pv),                                          4),
-            'MAE':     round(mean_absolute_error(rv, pv),                               4),
-            'RMSE':    round(float(np.sqrt(np.mean((rv - pv) ** 2))),                   4),
-            'WAPE':    round(float(np.abs(rv - pv).sum() / denom) if denom > 0 else np.nan, 4),
-            'n_steps': int(valid.sum()),
-        }
-    return {'R²': np.nan, 'MAE': np.nan, 'RMSE': np.nan, 'WAPE': np.nan, 'n_steps': int(valid.sum())}
-
-
-def plot_scm_simulation(scm, sim_one_step, sim_autoregressive):
+def plot_scm_simulation(scm, sim_df, n_cols=3):
     """
-    One figure per target variable with three lines: Real, One-step, Autoregressive.
-    Vertical dotted lines mark activity transitions with the activity name.
-    Followed by a side-by-side metrics table comparing both modes.
+    One figure per execution (segment) in the test set.
+    Each figure shows all target variables (up to n_cols per row) for that
+    single activity run: real vs simulated.
+
+    After all figures, prints an aggregated metrics table (MAE / R² per
+    target) over the full test set.
     """
-    target_cols  = [t for t in scm['target_cols'] if t in sim_one_step.columns]
+    target_cols  = [t for t in scm['target_cols'] if t in sim_df.columns]
     df_test      = scm['df_test']
     activity_col = 'ef_activity_log' if 'ef_activity_log' in df_test.columns else None
 
     if not target_cols:
-        print("[plot_scm_simulation] No target columns found.")
+        print("[plot_scm_simulation] No target columns found in sim_df.")
         return
 
-    x = np.arange(len(df_test))
-    activity_starts = []
+    # Each segment = one execution of one activity
     if activity_col:
         seg_ids = (df_test[activity_col] != df_test[activity_col].shift()).cumsum()
-        for _, seg_index in seg_ids.groupby(seg_ids).groups.items():
-            pos   = df_test.index.get_loc(seg_index[0])
-            label = df_test.loc[seg_index[0], activity_col]
-            activity_starts.append((pos, label))
+    else:
+        seg_ids = pd.Series(1, index=df_test.index)
 
-    def _mstr(m):
-        return f"R²={m['R²']:.3f}  MAE={m['MAE']:.3f}  RMSE={m['RMSE']:.3f}  WAPE={m['WAPE']:.3f}"
+    # Count executions per label for the "(exec k of N)" label
+    from collections import Counter
+    label_counts  = Counter(df_test.loc[list(grp)[0], activity_col] if activity_col else 'all'
+                            for grp in seg_ids.groupby(seg_ids).groups.values())
+    label_seen    = Counter()
 
-    # ── one figure per target ────────────────────────────────────────────────
-    for target in target_cols:
-        real_vals = df_test[target].values if target in df_test.columns else np.full(len(df_test), np.nan)
-        os_vals   = sim_one_step[target].values       if target in sim_one_step.columns       else np.full(len(df_test), np.nan)
-        ar_vals   = sim_autoregressive[target].values if target in sim_autoregressive.columns else np.full(len(df_test), np.nan)
+    n_targets = len(target_cols)
+    n_rows_per_fig = -(-n_targets // n_cols)   # ceil division
 
-        m_os = _compute_metrics(real_vals, os_vals)
-        m_ar = _compute_metrics(real_vals, ar_vals)
+    for seg_id, seg_index in seg_ids.groupby(seg_ids).groups.items():
+        idx   = list(seg_index)
+        label = df_test.loc[idx[0], activity_col] if activity_col else 'all'
+        label_seen[label] += 1
+        exec_k = label_seen[label]
+        exec_n = label_counts[label]
 
-        fig, ax = plt.subplots(figsize=(16, 4))
-        ax.plot(x, real_vals, label='Real',                           color='steelblue', linewidth=1,  alpha=0.9)
-        ax.plot(x, os_vals,   label=f'One-step       {_mstr(m_os)}', color='seagreen',  linewidth=1,  alpha=0.85, linestyle='--')
-        ax.plot(x, ar_vals,   label=f'Autoregressive {_mstr(m_ar)}', color='tomato',    linewidth=1,  alpha=0.85, linestyle=':')
+        real_seg = df_test.loc[idx].reset_index(drop=True)
+        sim_seg  = sim_df.loc[idx].reset_index(drop=True)
 
-        ymin, ymax = ax.get_ylim()
-        for pos, label in activity_starts:
-            ax.axvline(pos, color='gray', linewidth=0.5, alpha=0.5, linestyle=':')
-            ax.text(pos + 0.5, ymax, label, fontsize=5, rotation=90,
-                    va='top', ha='left', color='dimgray', clip_on=True)
+        fig, axes = plt.subplots(n_rows_per_fig, n_cols,
+                                 figsize=(5 * n_cols, 3 * n_rows_per_fig),
+                                 squeeze=False)
+        axes_flat = axes.flatten()
+        fig.suptitle(f'{label}  —  exec {exec_k} / {exec_n}  ({len(idx)} steps)',
+                     fontsize=10, fontweight='bold')
 
-        ax.set_title(target, fontsize=9)
-        ax.set_xlabel('Test step')
-        ax.legend(fontsize=6, loc='upper left')
-        ax.tick_params(labelsize=7)
+        for i, target in enumerate(target_cols):
+            ax = axes_flat[i]
+            real_vals = real_seg[target].values if target in real_seg.columns else np.full(len(real_seg), np.nan)
+            sim_vals  = sim_seg[target].values  if target in sim_seg.columns  else np.full(len(sim_seg),  np.nan)
+
+            ax.plot(real_vals, label='Real',      alpha=0.85, color='steelblue')
+            ax.plot(sim_vals,  label='Simulated', alpha=0.85, color='tomato', linestyle='--')
+
+            valid = ~(np.isnan(real_vals) | np.isnan(sim_vals))
+            if valid.sum() > 1 and np.std(real_vals[valid]) > 0:
+                rv, sv = real_vals[valid], sim_vals[valid]
+                r2   = r2_score(rv, sv)
+                mae  = mean_absolute_error(rv, sv)
+                rmse = np.sqrt(np.mean((rv - sv) ** 2))
+                denom = np.abs(rv).sum()
+                wape = np.abs(rv - sv).sum() / denom if denom > 0 else np.nan
+                metric_str = f"R²={r2:.2f}  MAE={mae:.2f}  RMSE={rmse:.2f}  WAPE={wape:.2f}"
+            else:
+                metric_str = ""
+
+            ax.set_title(f"{target[:35]}\n{metric_str}", fontsize=7)
+            ax.legend(fontsize=6)
+            ax.tick_params(labelsize=6)
+
+        for j in range(len(target_cols), len(axes_flat)):
+            axes_flat[j].set_visible(False)
+
         plt.tight_layout()
         plt.show()
 
-    # ── side-by-side metrics table ───────────────────────────────────────────
+    # ── aggregated simulation metrics over full test set ─────────────────────
     rows = []
     for target in target_cols:
         real_all = df_test[target].values if target in df_test.columns else np.full(len(df_test), np.nan)
-        m_os = _compute_metrics(real_all, sim_one_step[target].values       if target in sim_one_step.columns       else np.full(len(df_test), np.nan))
-        m_ar = _compute_metrics(real_all, sim_autoregressive[target].values if target in sim_autoregressive.columns else np.full(len(df_test), np.nan))
-        rows.append({
-            'target':  target,
-            'os_R²':   m_os['R²'],  'os_MAE':  m_os['MAE'],  'os_RMSE':  m_os['RMSE'],  'os_WAPE':  m_os['WAPE'],
-            'ar_R²':   m_ar['R²'],  'ar_MAE':  m_ar['MAE'],  'ar_RMSE':  m_ar['RMSE'],  'ar_WAPE':  m_ar['WAPE'],
-        })
+        sim_all  = sim_df[target].values  if target in sim_df.columns  else np.full(len(sim_df),  np.nan)
+        valid = ~(np.isnan(real_all) | np.isnan(sim_all))
+        rv, sv = real_all[valid], sim_all[valid]
+        if valid.sum() > 1 and np.std(rv) > 0:
+            denom = np.abs(rv).sum()
+            rows.append({
+                'target':  target,
+                'R²':      round(r2_score(rv, sv),              4),
+                'MAE':     round(mean_absolute_error(rv, sv),   4),
+                'RMSE':    round(float(np.sqrt(np.mean((rv - sv) ** 2))), 4),
+                'WAPE':    round(float(np.abs(rv - sv).sum() / denom) if denom > 0 else np.nan, 4),
+                'n_steps': int(valid.sum()),
+            })
+        else:
+            rows.append({'target': target, 'R²': np.nan, 'MAE': np.nan,
+                         'RMSE': np.nan, 'WAPE': np.nan, 'n_steps': int(valid.sum())})
 
-    metrics_df = pd.DataFrame(rows).set_index('target').sort_values('os_R²', ascending=False)
-    print("\n── One-step (os_*) vs Autoregressive (ar_*) — test set ─")
+    metrics_df = pd.DataFrame(rows).set_index('target').sort_values('R²', ascending=False)
+    print("\n── SCM simulation metrics (test set) ───────────────────")
     print(metrics_df.to_string())
     print("─────────────────────────────────────────────────────────\n")
-    display(metrics_df)
     return metrics_df
 
 #%% Step 0 — train / test split by activity segment
@@ -2440,39 +2398,37 @@ display(df_clean)
 
 df = df_clean.copy()
 
-# relevant_columns = [
-#         '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
-#        '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
-#     #    '(4)_frostschutz_%_energy', '(5)_vor_vent_hauptzuluft_temp_c_energy',
-#     #    '(7)_zuluft_turmt_temp_c_energy', '(9)_abluft2_kon_g/kg_energy',
-#     #    '(11)_wm_mas_kg/h_energy', '(12)_mpt_fb(mpt?)_kg/h_energy',
-#     #    '(13)_lanzen_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
-#     #    '(15)_filter_mas_kg/h_energy', '(16)_konditionierung_mas_kg/h_energy',
-#     #    '(8)_abluft_vol_m3/h_energy', '(23)_f10_speise_temp_c_energy',
-#        '(23)_f11_speise_temp_c_energy',
-#        '(19)_zuluft_vor_entfeuchter_temp_c_energy', 'dampf_nmb_energy',
-#        'nach_nt_(c)_energy', 'f10_speise_kg/h_energy',
-#     #    'f11_speise_kg/h_energy', 
-#         'f10_speise_kg/m³_energy',
-#     #    'f11_speise_kg/m³_energy', 'f10_speise_l/h_energy',
-#     #    'f11_speise_l/h_energy', '(18)_leistung_turmF_lufterhitzer_kw_energy',
-#     #    '(17)_leistung_turmF_luftentfeuchter_kw_energy',
-#     #    '(6)_nach_recu_reg_temp_c_energy', 
-#        #'id_original_energy',
-#        '(10)_abluft_temp_c_energy', '(8)_abluft_mas_kg/h_energy',
-#        'ef_temperature_2m_energy', 'ef_relative_humidity_2m_energy',
-#        'ef_apparent_temperature_energy', #'ef_precipitation_energy',
-#        #'ef_wind_speed_10m_energy', 'ef_wind_direction_100m_energy',
-#        #'ef_global_tilted_irradiance_energy',
-#        '(21)_zuluft_turm_mas_kg/h_energy', '(31)_q_waerme_recu_kw_energy',
-#        '(22)_t_waermereg_c_energy',
-#        '(29)_q_lufterwearmung_von_T6_nach_T7_kw_energy',
-#        '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw_energy',
-#        '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw_energy',
-#        '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw_energy',
-#        'ef_activity_log', 'ef_activity_step']
-
-relevant_columns = df.columns
+relevant_columns = [
+        '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
+       '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
+    #    '(4)_frostschutz_%_energy', '(5)_vor_vent_hauptzuluft_temp_c_energy',
+    #    '(7)_zuluft_turmt_temp_c_energy', '(9)_abluft2_kon_g/kg_energy',
+    #    '(11)_wm_mas_kg/h_energy', '(12)_mpt_fb(mpt?)_kg/h_energy',
+    #    '(13)_lanzen_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
+    #    '(15)_filter_mas_kg/h_energy', '(16)_konditionierung_mas_kg/h_energy',
+    #    '(8)_abluft_vol_m3/h_energy', '(23)_f10_speise_temp_c_energy',
+       '(23)_f11_speise_temp_c_energy',
+       '(19)_zuluft_vor_entfeuchter_temp_c_energy', 'dampf_nmb_energy',
+       'nach_nt_(c)_energy', 'f10_speise_kg/h_energy',
+    #    'f11_speise_kg/h_energy', 
+        'f10_speise_kg/m³_energy',
+    #    'f11_speise_kg/m³_energy', 'f10_speise_l/h_energy',
+    #    'f11_speise_l/h_energy', '(18)_leistung_turmF_lufterhitzer_kw_energy',
+    #    '(17)_leistung_turmF_luftentfeuchter_kw_energy',
+    #    '(6)_nach_recu_reg_temp_c_energy', 
+       #'id_original_energy',
+       '(10)_abluft_temp_c_energy', '(8)_abluft_mas_kg/h_energy',
+       'ef_temperature_2m_energy', 'ef_relative_humidity_2m_energy',
+       'ef_apparent_temperature_energy', #'ef_precipitation_energy',
+       #'ef_wind_speed_10m_energy', 'ef_wind_direction_100m_energy',
+       #'ef_global_tilted_irradiance_energy',
+       '(21)_zuluft_turm_mas_kg/h_energy', '(31)_q_waerme_recu_kw_energy',
+       '(22)_t_waermereg_c_energy',
+       '(29)_q_lufterwearmung_von_T6_nach_T7_kw_energy',
+       '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw_energy',
+       '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw_energy',
+       '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw_energy',
+       'ef_activity_log', 'ef_activity_step']
 
 df_relevant = df[relevant_columns].copy()
 
@@ -2498,17 +2454,6 @@ df_test  = df_in[_test_mask].copy()
 report(f"[Split] Train: {len(df_train)} rows | Test: {len(df_test)} rows | "
        f"Test activities: {df_test[_activity_col].nunique() if _activity_col else 'N/A'}")
 
-# Encode ef_activity_log as integer so it enters causal discovery as numeric.
-# Fit the mapping on train only, apply to both splits.
-# The original string column is kept as ef_activity_log; the encoded version
-# is added as ef_activity_code (still ef-prefixed → parent-only in discovery).
-if _activity_col and _activity_col in df_train.columns:
-    _activity_categories = df_train[_activity_col].astype('category').cat.categories
-    _activity_map = {v: i for i, v in enumerate(_activity_categories)}
-    df_train['ef_activity_code'] = df_train[_activity_col].map(_activity_map).fillna(-1).astype(int)
-    df_test['ef_activity_code']  = df_test[_activity_col].map(_activity_map).fillna(-1).astype(int)
-    report(f"[Split] Activity encoding: {dict(list(_activity_map.items())[:10])}")
-
 display(df_train)
 
 
@@ -2516,12 +2461,12 @@ display(df_train)
 
 pcmci_output = run_causal_discovery(
     dataset=df_train,
-    method='pc',
+    method='pcmci',
     model_suffix='enegy',
     tau_max=SCM_TAU_MAX,
-    pc_alpha=0.01,
-    alpha_level=0.01,
-    activity_col='ef_activity_code',
+    pc_alpha=0.05,
+    alpha_level=0.05,
+    activity_col='ef_activity_step',
 )
 
 #%% Step 1b — causal features per target variable
@@ -2546,13 +2491,14 @@ scm = train_scm(
     tau_max=SCM_TAU_MAX,
 )
 
-#%% Step 3 — run both simulation modes and compare
+#%% Step 3 — simulate forward per test activity
+# For each test activity the simulation runs for its full duration (ef_activity_step max).
+# Exogenous variables (ef_*) are taken from real test values; targets are predicted.
 
-sim_one_step       = simulate_scm(scm, mode='one_step')
-sim_autoregressive = simulate_scm(scm, mode='autoregressive')
+sim_df = simulate_scm(scm)
 
-#%% Step 4 — visuals and metrics comparison
+#%%
 
-plot_scm_simulation(scm, sim_one_step, sim_autoregressive)
+plot_scm_simulation(scm, sim_df)
 
 # %%

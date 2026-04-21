@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda run *)",
+      "Bash(python3 -c \"from tigramite.pcmci import PCMCI; import inspect; src = inspect.getsource\\(PCMCI.run_pc_stable\\); print\\(src[:4000]\\)\")"
+    ]
+  }
+}
