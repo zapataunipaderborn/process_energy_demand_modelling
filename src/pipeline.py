@@ -769,7 +769,10 @@ def _mean_trace_fitness(log_df, net, im, fm):
     try:
         replay = token_replay.apply(
             log_df, net, im, fm,
-            parameters={'consider_remaining_in_fitness': True}
+            parameters={
+                'consider_remaining_in_fitness': True,
+                'show_progress_bar': False,
+            }
         )
         scores = []
         for item in replay:
@@ -1264,31 +1267,67 @@ import pandas as pd
 from sim_extractor import extract_process
 from simulation import ProcessSimulation
 from sim_modeller import SimModeller
+import io
+from contextlib import redirect_stdout, redirect_stderr
+
+
+LOG_DIR = current_path.parent / 'logs'
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+RUN_LOG_FILE = LOG_DIR / f"pipeline_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+
+def _append_to_run_log(section_title, stdout_text='', stderr_text=''):
+    """Append captured execution output to the run log file."""
+    with open(RUN_LOG_FILE, 'a', encoding='utf-8') as _fh:
+        _fh.write(f"\n{'='*80}\n")
+        _fh.write(f"{section_title}\n")
+        _fh.write(f"{'='*80}\n")
+        if stdout_text:
+            _fh.write("[STDOUT]\n")
+            _fh.write(stdout_text)
+            if not stdout_text.endswith('\n'):
+                _fh.write('\n')
+        if stderr_text:
+            _fh.write("[STDERR]\n")
+            _fh.write(stderr_text)
+            if not stderr_text.endswith('\n'):
+                _fh.write('\n')
+
+
+def _run_with_logged_output(section_title, func, *args, **kwargs):
+    """Run a callable while redirecting stdout/stderr to the run log."""
+    _stdout_buf = io.StringIO()
+    _stderr_buf = io.StringIO()
+    try:
+        with redirect_stdout(_stdout_buf), redirect_stderr(_stderr_buf):
+            result = func(*args, **kwargs)
+    finally:
+        _append_to_run_log(
+            section_title,
+            _stdout_buf.getvalue(),
+            _stderr_buf.getvalue(),
+        )
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIMULATION MODE TOGGLE
-#   'statistical'      – sample durations/transitions from best-fit distributions
-#   'ml'               – use ML models (falls back to statistical when needed)
-#   'ml_duration_only' – use ML only for the duration median; std and
-#                        transition probabilities still come from data extraction
+# SIMULATION / MINING EXPERIMENT CONFIGURATION
+#
+# Single source of truth:
+#   1) Toggle families below (statistical / ml / petri_net)
+#   2) Choose enabled Petri-net miners in PETRI_NET_ALGORITHMS
+#   3) MODES_TO_COMPARE is built automatically from those settings
 # ─────────────────────────────────────────────────────────────────────────────
-SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
+ENABLE_STATISTICAL_MODE = True
+ENABLE_ML_DURATION_ONLY_MODE = False
+ENABLE_ML_FULL_MODE = False
+ENABLE_PETRI_NET_COMBINED_MODE = True
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PROCESS MINING ALGORITHM
-#   'inductive'  – pm4py Inductive Miner → guarantees a sound Petri net
-#   'heuristic'  – pm4py Heuristics Miner → better noise filtering
-#   'alpha'      – pm4py Alpha Miner → classic algorithm
-#   'ilp'        – pm4py ILP Miner → precise/sound, can be strict
-#   'manual'     – original manual extraction (no process mining)
-# ─────────────────────────────────────────────────────────────────────────────
-#MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
+# Base extractor algorithm for shared non-Petri statistics and as a fallback.
+# Supported: 'inductive', 'heuristic', 'alpha', 'ilp', 'manual'
 MINING_ALGORITHM = 'heuristic'
-#MINING_ALGORITHM = 'alpha'
-#MINING_ALGORITHM = 'ilp'
 
 # Petri-net miner variants to compare when mode names include the algorithm.
-PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
+PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
@@ -1307,7 +1346,7 @@ MINING_SEARCH_SPACE = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
+# ML MODEL CONFIGURATION (used only when ML modes are enabled below)
 #   model_types: list of models to train — best is selected per activity key
 #                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
 #   optimize_hyperparams: True  → Optuna hyper-parameter search
@@ -1415,40 +1454,27 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODES TO COMPARE
-#   We run BOTH modes on every process so results appear side by side.
+# MODES TO COMPARE (built from the toggles above)
 # ─────────────────────────────────────────────────────────────────────────────
-MODES_TO_COMPARE = [
-    'statistical',
-    'petri_net_alpha',
-    'petri_net_heuristic',
-    'petri_net_inductive',
-    'petri_net_combined',
-    'petri_net_ilp',
-    #'petri_net_statistical',
-    #'petri_net_statistical_memory',
-    #'ml_duration_only',
-    #'ml_duration_only_with_activity_past',
-    #'ml_duration_only_with_activity_past_point_estimate',
-    #'ml_global_model',
-]
+MODES_TO_COMPARE = []
 
-# Keep requested modes, but drop Petri-net variants that are not enabled.
-_filtered_modes = []
-for _mode_name in MODES_TO_COMPARE:
-    if _mode_name.startswith('petri_net_'):
-        _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
-        if _mode_alg == 'combined':
-            _filtered_modes.append(_mode_name)
-            continue
-        if _mode_alg not in PETRI_NET_ALGORITHMS:
-            print(
-                f"⚠️ Skipping unsupported mode '{_mode_name}' "
-                f"(enabled algorithms: {PETRI_NET_ALGORITHMS})"
-            )
-            continue
-    _filtered_modes.append(_mode_name)
-MODES_TO_COMPARE = _filtered_modes
+if ENABLE_STATISTICAL_MODE:
+    MODES_TO_COMPARE.append('statistical')
+
+if ENABLE_ML_DURATION_ONLY_MODE:
+    MODES_TO_COMPARE.append('ml_duration_only')
+
+if ENABLE_ML_FULL_MODE:
+    MODES_TO_COMPARE.append('ml')
+
+for _alg in PETRI_NET_ALGORITHMS:
+    MODES_TO_COMPARE.append(f'petri_net_{_alg}')
+
+if ENABLE_PETRI_NET_COMBINED_MODE:
+    MODES_TO_COMPARE.append('petri_net_combined')
+
+print(f"\n📌 MODES_TO_COMPARE: {MODES_TO_COMPARE}")
+print(f"📄 Detailed execution log: {RUN_LOG_FILE}")
 
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
@@ -1463,7 +1489,9 @@ for process in process_datasets_to_model.keys():
     production_plan = train_datasets[process]['production_plan']
 
     # ── Extract process statistics for non-Petri modes (shared baseline) ─────
-    activity_stats_df, raw_df, process_models = extract_process(
+    activity_stats_df, raw_df, process_models = _run_with_logged_output(
+        f"extract_process[{process}][{MINING_ALGORITHM}]",
+        extract_process,
         df_train,
         mining_algorithm=MINING_ALGORITHM,
         optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
@@ -1492,7 +1520,9 @@ for process in process_datasets_to_model.keys():
     for mode_alg in petri_mode_algorithms:
         if mode_alg in extraction_by_algorithm:
             continue
-        pm_activity_stats_df, pm_raw_df, pm_process_models = extract_process(
+        pm_activity_stats_df, pm_raw_df, pm_process_models = _run_with_logged_output(
+            f"extract_process[{process}][{mode_alg}]",
+            extract_process,
             df_train,
             mining_algorithm=mode_alg,
             optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
@@ -1549,7 +1579,12 @@ for process in process_datasets_to_model.keys():
             n_optuna_trials=ML_OPTUNA_TRIALS,
             train_transitions=False,   # only duration for ml_duration_only
         )
-        ml_models.train(raw_df, activity_stats_df)
+        _run_with_logged_output(
+            f"ml_train[{process}]",
+            ml_models.train,
+            raw_df,
+            activity_stats_df,
+        )
         print(ml_models.summary())
 
     # ── Loop over modes ───────────────────────────────────────────────────
@@ -1582,11 +1617,14 @@ for process in process_datasets_to_model.keys():
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
         mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
-        simulated_log_train = ProcessSimulation(
-            mode_activity_stats_df, production_plan,
-            mode=simulation_mode, ml_models=mode_ml,
-            process_models=mode_pm,
-        ).run()
+        simulated_log_train = _run_with_logged_output(
+            f"simulate_train[{process}][{sim_mode}]",
+            ProcessSimulation(
+                mode_activity_stats_df, production_plan,
+                mode=simulation_mode, ml_models=mode_ml,
+                process_models=mode_pm,
+            ).run,
+        )
 
         print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
 
@@ -1597,7 +1635,17 @@ for process in process_datasets_to_model.keys():
         print(f"\n  🔍 EVALUATION ON {split_label}  [{sim_mode}]")
         print("  " + "="*76)
 
-        eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train)
+        eval_train = _run_with_logged_output(
+            f"evaluate_train[{process}][{sim_mode}]",
+            comprehensive_simulation_evaluation,
+            simulated_log_train,
+            df_train,
+        )
+        print(
+            "  ✅ TRAIN results "
+            f"[{sim_mode}] score={eval_train.get('overall_score')} "
+            f"quality={eval_train.get('quality_assessment')}"
+        )
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
         #plot_simulation_comparison(simulated_log_train, df_train)
@@ -1625,20 +1673,33 @@ for process in process_datasets_to_model.keys():
         df_test = test_datasets[process]['event_log'] if test_datasets else None
         if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
             production_plan_test = test_datasets[process]['production_plan']
-            simulated_log_test = ProcessSimulation(
-                mode_activity_stats_df,
-                production_plan_test,
-                mode=simulation_mode,
-                ml_models=mode_ml,
-                process_models=mode_pm,
-            ).run()
+            simulated_log_test = _run_with_logged_output(
+                f"simulate_test[{process}][{sim_mode}]",
+                ProcessSimulation(
+                    mode_activity_stats_df,
+                    production_plan_test,
+                    mode=simulation_mode,
+                    ml_models=mode_ml,
+                    process_models=mode_pm,
+                ).run,
+            )
 
             print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
 
             print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
             print("  " + "="*76)
 
-            eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test)
+            eval_test = _run_with_logged_output(
+                f"evaluate_test[{process}][{sim_mode}]",
+                comprehensive_simulation_evaluation,
+                simulated_log_test,
+                df_test,
+            )
+            print(
+                "  ✅ TEST results "
+                f"[{sim_mode}] score={eval_test.get('overall_score')} "
+                f"quality={eval_test.get('quality_assessment')}"
+            )
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
             #plot_simulation_comparison(simulated_log_test, df_test)
@@ -1754,8 +1815,6 @@ else:
 
 # %% 
 
-# %% [markdown]
-# # Data fusion
 
 # %% 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1910,6 +1969,10 @@ if test_cols and 'mode' in evaluation_results_df.columns:
     print(latex_table)
 
 # %% 
+
+stop
+# %% [markdown]
+# # Data fusion
 
 # %% [markdown]
 # # Data fusion
