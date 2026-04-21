@@ -2053,16 +2053,18 @@ def _build_lag_features(df, target_cols, exog_cols, tau_max, causal_links=None):
     return combined, list(feat_df.columns), causal_links
 
 
-def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test_activities=SCM_N_TEST_ACTIVITIES):
+def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test_activities=SCM_N_TEST_ACTIVITIES, use_all_features=False):
     """
     Train one GradientBoostingRegressor per target variable (*_energy, not ef*).
 
-    df_train : training split (rows used for fitting)
-    df_test  : test split (rows used for evaluation / simulation); if None a
-               time-based fallback split is derived from df_train's parent df.
-    causal_output : dict returned by run_causal_discovery.
+    df_train         : training split (rows used for fitting)
+    df_test          : test split (rows used for evaluation / simulation); if None a
+                       time-based fallback split is derived from df_train's parent df.
+    causal_output    : dict returned by run_causal_discovery.
+    use_all_features : if True, ignore causal links and use ALL lagged variables as
+                       features for every target (the "all" baseline).
     """
-    causal_links = causal_output['causal_links']
+    causal_links = {} if use_all_features else causal_output['causal_links']
 
     # Cast ef_activity_log and all attr_* columns to pandas Categorical.
     # Categories are fit on train only and applied to test.
@@ -2119,13 +2121,15 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
     # Build lag features on train only for fitting.
     # For test evaluation, prepend the last tau_max train rows so the first test
     # rows get valid lag values that look back into real training history.
+    # When use_all_features=True, pass causal_links=None so all lags are built.
+    _links_for_features = None if use_all_features else causal_links
     train_combined, all_feature_cols, _ = _build_lag_features(
-        df_train, target_cols, exog_cols, tau_max, causal_links=causal_links
+        df_train, target_cols, exog_cols, tau_max, causal_links=_links_for_features
     )
     _context = df_train[target_cols + exog_cols].tail(tau_max)
     _df_test_with_context = pd.concat([_context, df_test[target_cols + exog_cols]])
     test_combined_full, _, _ = _build_lag_features(
-        _df_test_with_context, target_cols, exog_cols, tau_max, causal_links=causal_links
+        _df_test_with_context, target_cols, exog_cols, tau_max, causal_links=_links_for_features
     )
     # Drop the context rows — keep only the actual test rows
     test_combined = test_combined_full[test_combined_full.index.isin(df_test.index)]
@@ -2142,24 +2146,28 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
     models, metrics, target_feature_cols, cat_col_categories = {}, {}, {}, {}
 
     for target in target_cols:
-        # Per-target features: causal parents + activity lags always included
-        parents = causal_links.get(target, [])
-        if parents:
-            t_feat_cols = [
-                f'{parent}_lag{lag}'
-                for parent, lag in parents
-                if f'{parent}_lag{lag}' in all_feature_cols
-            ]
+        # Per-target features: causal parents + activity lags always included.
+        # When use_all_features=True, every lagged variable is a feature.
+        if use_all_features:
+            t_feat_cols = list(all_feature_cols)
         else:
-            t_feat_cols = list(all_feature_cols)
+            parents = causal_links.get(target, [])
+            if parents:
+                t_feat_cols = [
+                    f'{parent}_lag{lag}'
+                    for parent, lag in parents
+                    if f'{parent}_lag{lag}' in all_feature_cols
+                ]
+            else:
+                t_feat_cols = list(all_feature_cols)
 
-        if not t_feat_cols:
-            t_feat_cols = list(all_feature_cols)
+            if not t_feat_cols:
+                t_feat_cols = list(all_feature_cols)
 
-        # Always include activity lags — they are unconditional parents of every target
-        for c in activity_lag_cols:
-            if c not in t_feat_cols:
-                t_feat_cols.append(c)
+            # Always include activity lags — they are unconditional parents of every target
+            for c in activity_lag_cols:
+                if c not in t_feat_cols:
+                    t_feat_cols.append(c)
 
         X_train = train_combined[t_feat_cols].copy()
         y_train = train_combined[target]
@@ -2249,6 +2257,7 @@ def train_scm(df_train, causal_output, df_test=None, tau_max=SCM_TAU_MAX, n_test
         'df_train': df_train,
         'df_test': df_test,
         'metrics': metrics,
+        'feature_mode': 'all' if use_all_features else 'causal',
     }
 
 
@@ -2362,15 +2371,22 @@ def _compute_metrics(real_vals, pred_vals):
     return {'R²': np.nan, 'MAE': np.nan, 'RMSE': np.nan, 'WAPE': np.nan, 'n_steps': int(valid.sum())}
 
 
-def plot_scm_simulation(scm, sim_one_step, sim_autoregressive):
+def plot_scm_simulation(scm, sim_one_step, sim_autoregressive,
+                        scm_all=None, sim_all_one_step=None, sim_all_autoregressive=None):
     """
-    One figure per target variable with three lines: Real, One-step, Autoregressive.
+    One figure per target variable.
+
+    Causal model: Real (blue), One-step (green dashed), Autoregressive (red dotted).
+    All-features model (optional): One-step (orange dashed), Autoregressive (purple dotted).
+
     Vertical dotted lines mark activity transitions with the activity name.
-    Followed by a side-by-side metrics table comparing both modes.
+    Followed by a side-by-side metrics table comparing all available modes.
     """
     target_cols  = [t for t in scm['target_cols'] if t in sim_one_step.columns]
     df_test      = scm['df_test']
     activity_col = 'ef_activity_log' if 'ef_activity_log' in df_test.columns else None
+
+    has_all = scm_all is not None and sim_all_one_step is not None and sim_all_autoregressive is not None
 
     if not target_cols:
         print("[plot_scm_simulation] No target columns found.")
@@ -2388,19 +2404,31 @@ def plot_scm_simulation(scm, sim_one_step, sim_autoregressive):
     def _mstr(m):
         return f"R²={m['R²']:.3f}  MAE={m['MAE']:.3f}  RMSE={m['RMSE']:.3f}  WAPE={m['WAPE']:.3f}"
 
+    def _get(sim, target, n):
+        return sim[target].values if sim is not None and target in sim.columns else np.full(n, np.nan)
+
+    n = len(df_test)
+
     # ── one figure per target ────────────────────────────────────────────────
     for target in target_cols:
-        real_vals = df_test[target].values if target in df_test.columns else np.full(len(df_test), np.nan)
-        os_vals   = sim_one_step[target].values       if target in sim_one_step.columns       else np.full(len(df_test), np.nan)
-        ar_vals   = sim_autoregressive[target].values if target in sim_autoregressive.columns else np.full(len(df_test), np.nan)
+        real_vals    = df_test[target].values if target in df_test.columns else np.full(n, np.nan)
+        os_vals      = _get(sim_one_step,        target, n)
+        ar_vals      = _get(sim_autoregressive,  target, n)
+        all_os_vals  = _get(sim_all_one_step,    target, n)
+        all_ar_vals  = _get(sim_all_autoregressive, target, n)
 
-        m_os = _compute_metrics(real_vals, os_vals)
-        m_ar = _compute_metrics(real_vals, ar_vals)
+        m_os     = _compute_metrics(real_vals, os_vals)
+        m_ar     = _compute_metrics(real_vals, ar_vals)
+        m_all_os = _compute_metrics(real_vals, all_os_vals) if has_all else None
+        m_all_ar = _compute_metrics(real_vals, all_ar_vals) if has_all else None
 
         fig, ax = plt.subplots(figsize=(16, 4))
-        ax.plot(x, real_vals, label='Real',                           color='steelblue', linewidth=1,  alpha=0.9)
-        ax.plot(x, os_vals,   label=f'One-step       {_mstr(m_os)}', color='seagreen',  linewidth=1,  alpha=0.85, linestyle='--')
-        ax.plot(x, ar_vals,   label=f'Autoregressive {_mstr(m_ar)}', color='tomato',    linewidth=1,  alpha=0.85, linestyle=':')
+        ax.plot(x, real_vals, label='Real',                                      color='steelblue', linewidth=1,   alpha=0.9)
+        ax.plot(x, os_vals,   label=f'Causal One-step    {_mstr(m_os)}',         color='seagreen',  linewidth=1,   alpha=0.85, linestyle='--')
+        ax.plot(x, ar_vals,   label=f'Causal Autoregress {_mstr(m_ar)}',         color='tomato',    linewidth=1,   alpha=0.85, linestyle=':')
+        if has_all:
+            ax.plot(x, all_os_vals, label=f'All One-step      {_mstr(m_all_os)}', color='darkorange', linewidth=1, alpha=0.85, linestyle='--')
+            ax.plot(x, all_ar_vals, label=f'All Autoregress   {_mstr(m_all_ar)}', color='purple',     linewidth=1, alpha=0.85, linestyle=':')
 
         ymin, ymax = ax.get_ylim()
         for pos, label in activity_starts:
@@ -2418,19 +2446,28 @@ def plot_scm_simulation(scm, sim_one_step, sim_autoregressive):
     # ── side-by-side metrics table ───────────────────────────────────────────
     rows = []
     for target in target_cols:
-        real_all = df_test[target].values if target in df_test.columns else np.full(len(df_test), np.nan)
-        m_os = _compute_metrics(real_all, sim_one_step[target].values       if target in sim_one_step.columns       else np.full(len(df_test), np.nan))
-        m_ar = _compute_metrics(real_all, sim_autoregressive[target].values if target in sim_autoregressive.columns else np.full(len(df_test), np.nan))
-        rows.append({
-            'target':  target,
-            'os_R²':   m_os['R²'],  'os_MAE':  m_os['MAE'],  'os_RMSE':  m_os['RMSE'],  'os_WAPE':  m_os['WAPE'],
-            'ar_R²':   m_ar['R²'],  'ar_MAE':  m_ar['MAE'],  'ar_RMSE':  m_ar['RMSE'],  'ar_WAPE':  m_ar['WAPE'],
-        })
+        real_all_vals = df_test[target].values if target in df_test.columns else np.full(n, np.nan)
+        m_os     = _compute_metrics(real_all_vals, _get(sim_one_step,           target, n))
+        m_ar     = _compute_metrics(real_all_vals, _get(sim_autoregressive,     target, n))
+        row = {
+            'target':         target,
+            'causal_os_R²':   m_os['R²'],  'causal_os_MAE':  m_os['MAE'],  'causal_os_RMSE':  m_os['RMSE'],  'causal_os_WAPE':  m_os['WAPE'],
+            'causal_ar_R²':   m_ar['R²'],  'causal_ar_MAE':  m_ar['MAE'],  'causal_ar_RMSE':  m_ar['RMSE'],  'causal_ar_WAPE':  m_ar['WAPE'],
+        }
+        if has_all:
+            m_all_os = _compute_metrics(real_all_vals, _get(sim_all_one_step,       target, n))
+            m_all_ar = _compute_metrics(real_all_vals, _get(sim_all_autoregressive, target, n))
+            row.update({
+                'all_os_R²':  m_all_os['R²'],  'all_os_MAE':  m_all_os['MAE'],  'all_os_RMSE':  m_all_os['RMSE'],  'all_os_WAPE':  m_all_os['WAPE'],
+                'all_ar_R²':  m_all_ar['R²'],  'all_ar_MAE':  m_all_ar['MAE'],  'all_ar_RMSE':  m_all_ar['RMSE'],  'all_ar_WAPE':  m_all_ar['WAPE'],
+            })
+        rows.append(row)
 
-    metrics_df = pd.DataFrame(rows).set_index('target').sort_values('os_R²', ascending=False)
-    print("\n── One-step (os_*) vs Autoregressive (ar_*) — test set ─")
+    metrics_df = pd.DataFrame(rows).set_index('target').sort_values('causal_os_R²', ascending=False)
+    header = "── Causal (causal_os/ar_*) vs All-features (all_os/ar_*) — test set ─" if has_all else "── One-step (causal_os_*) vs Autoregressive (causal_ar_*) — test set ─"
+    print(f"\n{header}")
     print(metrics_df.to_string())
-    print("─────────────────────────────────────────────────────────\n")
+    print("─" * len(header) + "\n")
     display(metrics_df)
     return metrics_df
 
@@ -2546,13 +2583,31 @@ scm = train_scm(
     tau_max=SCM_TAU_MAX,
 )
 
+#%% Step 2b — train SCM with ALL features (baseline — no causal selection)
+
+scm_all = train_scm(
+    df_train,
+    causal_output=pcmci_output,
+    df_test=df_test,
+    tau_max=SCM_TAU_MAX,
+    use_all_features=True,
+)
+
 #%% Step 3 — run both simulation modes and compare
 
 sim_one_step       = simulate_scm(scm, mode='one_step')
-sim_autoregressive = simulate_scm(scm, mode='autoregressive')
+#sim_autoregressive = simulate_scm(scm, mode='autoregressive')
+
+sim_all_one_step       = simulate_scm(scm_all, mode='one_step')
+#sim_all_autoregressive = simulate_scm(scm_all, mode='autoregressive')
 
 #%% Step 4 — visuals and metrics comparison
 
-plot_scm_simulation(scm, sim_one_step, sim_autoregressive)
+plot_scm_simulation(
+    scm, sim_one_step,# sim_autoregressive,
+    scm_all=scm_all,
+    sim_all_one_step=sim_all_one_step,
+    #sim_all_autoregressive=sim_all_autoregressive,
+)
 
 # %%
