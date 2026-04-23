@@ -1769,7 +1769,24 @@ all_energy_pipelines = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODES TO COMPARE
-#   We run BOTH modes on every process so results appear side by side.
+#
+#   What each mode uses:
+#
+#   Mode                          Miner                  Duration source
+#   ─────────────────────────────────────────────────────────────────────
+#   statistical                   MINING_ALGORITHM        fitted distributions
+#   petri_net_alpha/heuristic/    that specific miner     fitted distributions
+#     inductive/ilp
+#   petri_net_energy_*            best of the above       fitted distributions
+#                                 (auto-selected by       + energy modifiers
+#                                 train score)
+#   ml / ml_duration_only         MINING_ALGORITHM        ML models (ML_MODEL_TYPES)
+#
+#   → MINING_ALGORITHM:  only affects 'statistical' and the ml* modes.
+#                        energy-aware modes ignore it — they auto-pick the
+#                        best miner from the petri_net_* results.
+#   → SIMULATION_MODE:   only affects ml* modes ('ml' or 'ml_duration_only').
+#                        statistical and petri_net_* modes do not use it.
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
     'statistical',
