@@ -1777,9 +1777,10 @@ all_energy_pipelines = {}
 #   statistical                   MINING_ALGORITHM        fitted distributions
 #   petri_net_alpha/heuristic/    that specific miner     fitted distributions
 #     inductive/ilp
-#   petri_net_energy_*            best of the above       fitted distributions
-#                                 (auto-selected by       + energy modifiers
-#                                 train score)
+#   petri_net_energy_*            best of the above       per-activity auto-selected:
+#                                 (auto-selected by         ML if val score beats
+#                                 train score)              statistical baseline,
+#                                                           else statistical
 #   ml / ml_duration_only         MINING_ALGORITHM        ML models (ML_MODEL_TYPES)
 #
 #   → MINING_ALGORITHM:  only affects 'statistical' and the ml* modes.
@@ -1787,6 +1788,11 @@ all_energy_pipelines = {}
 #                        best miner from the petri_net_* results.
 #   → SIMULATION_MODE:   only affects ml* modes ('ml' or 'ml_duration_only').
 #                        statistical and petri_net_* modes do not use it.
+#
+#   Energy-aware auto-selection (per activity, per modifier type):
+#     Duration  : ML kept only if val R² > 0  (> statistical baseline of predicting mean)
+#     Transition: ML kept only if val Acc > majority-class baseline accuracy
+#     petri_net_energy_aware = best duration choice + best transition choice independently
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
     'statistical',
@@ -1796,9 +1802,11 @@ MODES_TO_COMPARE = [
     'petri_net_combined',
     'petri_net_ilp',
     # ── energy-aware Petri-net variants ──────────────────────────────
-    'petri_net_energy_duration_aware',    # duration shifted by energy only
-    'petri_net_energy_transition_aware',  # transition weights biased by energy only
-    'petri_net_energy_aware',             # both duration + transitions
+    # Per activity: ML modifier used only if it beats the statistical baseline on validation.
+    # Otherwise the activity falls back to statistical (no modifier applied).
+    'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
+    'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
+    'petri_net_energy_aware',             # best duration + best transition independently per activity
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
     #'ml_duration_only',

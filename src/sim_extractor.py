@@ -1212,10 +1212,12 @@ def extract_energy_modifiers(
             )
 
             # --- Duration Model Selection ---
+            # Statistical baseline: R²=0 (predicting the mean, i.e. no energy effect).
+            # ML modifier is only kept if it beats R²>0 on the validation split.
             if mean_dur > 0:
                 best_dur_score = -float('inf')
-                best_dur_name = duration_models[0]
-                
+                best_dur_name = None  # None → statistical wins
+
                 for model_name in duration_models:
                     try:
                         mdl = get_regressor(model_name)
@@ -1227,24 +1229,39 @@ def extract_energy_modifiers(
                             best_dur_name = model_name
                     except Exception:
                         pass
-                
-                # Re-train best on ALL data
-                try:
-                    best_mdl = get_regressor(best_dur_name)
-                    best_mdl.fit(X, y_dur)
-                    best_mdl._mean_duration = mean_dur
-                    best_mdl._train_feature_mean = train_feature_mean
-                    energy_duration_modifiers[str(activity)] = best_mdl
-                    act_report['Duration Approach'] = best_dur_name
-                    print(f"  [{activity}] Duration -> {best_dur_name} (val R2: {best_dur_score:.3f})")
-                except Exception as exc:
-                    print(f"  [{activity}] Duration FAILED: {exc}")
+
+                # Statistical baseline R² = 0 (always predicts the mean).
+                # Keep ML only if it genuinely improves over the statistical baseline.
+                if best_dur_name is not None and best_dur_score > 0:
+                    try:
+                        best_mdl = get_regressor(best_dur_name)
+                        best_mdl.fit(X, y_dur)
+                        best_mdl._mean_duration = mean_dur
+                        best_mdl._train_feature_mean = train_feature_mean
+                        energy_duration_modifiers[str(activity)] = best_mdl
+                        act_report['Duration Approach'] = f'{best_dur_name} (R²={best_dur_score:.3f})'
+                        print(f"  [{activity}] Duration -> ML:{best_dur_name} "
+                              f"(val R²={best_dur_score:.3f}) > statistical (R²=0) ✓")
+                    except Exception as exc:
+                        print(f"  [{activity}] Duration FAILED: {exc}")
+                        act_report['Duration Approach'] = 'Statistical (ML fit failed)'
+                else:
+                    act_report['Duration Approach'] = (
+                        f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0)'
+                    )
+                    print(f"  [{activity}] Duration -> statistical "
+                          f"(best ML val R²={best_dur_score:.3f} ≤ 0, no improvement)")
 
             # --- Transition Model Selection ---
+            # Statistical baseline: majority-class accuracy (predict the most common next activity).
+            # ML modifier is only kept if it beats that baseline.
             if n_classes >= 2:
+                from collections import Counter
+                majority_class_acc = Counter(yt_val).most_common(1)[0][1] / len(yt_val)
+
                 best_tr_score = -float('inf')
-                best_tr_name = transition_models[0]
-                
+                best_tr_name = None  # None → statistical wins
+
                 for model_name in transition_models:
                     try:
                         clf = get_classifier(model_name)
@@ -1256,24 +1273,39 @@ def extract_energy_modifiers(
                             best_tr_name = model_name
                     except Exception:
                         pass
-                
-                # Re-train best on ALL data
-                try:
-                    best_clf = get_classifier(best_tr_name)
-                    best_clf.fit(X, y_tr)
-                    best_clf._train_feature_mean = train_feature_mean
-                    energy_transition_modifiers[str(activity)] = best_clf
-                    act_report['Transition Approach'] = best_tr_name
-                    print(f"  [{activity}] Transition -> {best_tr_name} (val Acc: {best_tr_score:.3f})")
-                except Exception as exc:
-                    print(f"  [{activity}] Transition FAILED: {exc}")
+
+                if best_tr_name is not None and best_tr_score > majority_class_acc:
+                    try:
+                        best_clf = get_classifier(best_tr_name)
+                        best_clf.fit(X, y_tr)
+                        best_clf._train_feature_mean = train_feature_mean
+                        energy_transition_modifiers[str(activity)] = best_clf
+                        act_report['Transition Approach'] = (
+                            f'{best_tr_name} (Acc={best_tr_score:.3f})'
+                        )
+                        print(f"  [{activity}] Transition -> ML:{best_tr_name} "
+                              f"(val Acc={best_tr_score:.3f}) > majority baseline "
+                              f"({majority_class_acc:.3f}) ✓")
+                    except Exception as exc:
+                        print(f"  [{activity}] Transition FAILED: {exc}")
+                        act_report['Transition Approach'] = 'Statistical (ML fit failed)'
+                else:
+                    act_report['Transition Approach'] = (
+                        f'Statistical (best ML Acc={best_tr_score:.3f} '
+                        f'≤ majority baseline {majority_class_acc:.3f})'
+                    )
+                    print(f"  [{activity}] Transition -> statistical "
+                          f"(best ML val Acc={best_tr_score:.3f} ≤ majority "
+                          f"baseline {majority_class_acc:.3f})")
             else:
-                act_report['Transition Approach'] = f'Statistical Base Method (1 class)'
+                act_report['Transition Approach'] = 'Statistical (1 class only)'
 
         model_choices_report[str(activity)] = act_report
 
-    print(f"\n  Duration modifiers  : {len(energy_duration_modifiers)} activities")
-    print(f"  Transition modifiers: {len(energy_transition_modifiers)} activities")
+    print(f"\n  Duration modifiers  : {len(energy_duration_modifiers)} activities use ML "
+          f"(rest fall back to statistical — no modifier applied)")
+    print(f"  Transition modifiers: {len(energy_transition_modifiers)} activities use ML "
+          f"(rest fall back to statistical — base PN weights unchanged)")
     
     return energy_duration_modifiers, energy_transition_modifiers, energy_state_columns, model_choices_report
 
