@@ -1114,6 +1114,18 @@ class StatisticalDurationBaseline:
         return self
 
 
+def _extract_feature_importance(model, feature_names: list) -> dict:
+    """Return a {feature: importance} dict for tree/linear models; empty dict otherwise."""
+    if hasattr(model, 'feature_importances_'):
+        return dict(zip(feature_names, model.feature_importances_.tolist()))
+    if hasattr(model, 'coef_'):
+        coefs = model.coef_
+        if coefs.ndim > 1:
+            coefs = np.abs(coefs).mean(axis=0)
+        return dict(zip(feature_names, np.abs(coefs).tolist()))
+    return {}
+
+
 def extract_energy_modifiers(
     df_expanded,
     sensors,
@@ -1268,14 +1280,18 @@ def extract_energy_modifiers(
 
                 # Statistical baseline R² = 0 (always predicts the mean).
                 # Keep ML only if it genuinely improves over the statistical baseline.
-                if best_dur_name is not None and best_dur_score > 0:
+                if best_dur_name is not None and best_dur_score > 0.05:
                     try:
                         best_mdl = get_regressor(best_dur_name)
                         best_mdl.fit(X, y_dur)
                         best_mdl._mean_duration = mean_dur
                         best_mdl._train_feature_mean = train_feature_mean
+                        best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                         energy_duration_modifiers[str(activity)] = best_mdl
                         act_report['Duration Approach'] = f'{best_dur_name} (R²={best_dur_score:.3f})'
+                        if best_mdl._feature_importance:
+                            top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
+                            act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                         print(f"  [{activity}] Duration -> ML:{best_dur_name} "
                               f"(val R²={best_dur_score:.3f}) > statistical (R²=0) ✓")
                     except Exception as exc:
@@ -1283,10 +1299,10 @@ def extract_energy_modifiers(
                         act_report['Duration Approach'] = 'Statistical (ML fit failed)'
                 else:
                     act_report['Duration Approach'] = (
-                        f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0)'
+                        f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0.05)'
                     )
                     print(f"  [{activity}] Duration -> statistical "
-                          f"(best ML val R²={best_dur_score:.3f} ≤ 0, no improvement)")
+                          f"(best ML val R²={best_dur_score:.3f} ≤ 0.05, no improvement)")
 
             # --- Transition Model Selection ---
             # Statistical baseline: majority-class accuracy (predict the most common next activity).
@@ -1315,10 +1331,14 @@ def extract_energy_modifiers(
                         best_clf = get_classifier(best_tr_name)
                         best_clf.fit(X, y_tr)
                         best_clf._train_feature_mean = train_feature_mean
+                        best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                         energy_transition_modifiers[str(activity)] = best_clf
                         act_report['Transition Approach'] = (
                             f'{best_tr_name} (Acc={best_tr_score:.3f})'
                         )
+                        if best_clf._feature_importance:
+                            top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
+                            act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                         print(f"  [{activity}] Transition -> ML:{best_tr_name} "
                               f"(val Acc={best_tr_score:.3f}) > majority baseline "
                               f"({majority_class_acc:.3f}) ✓")
@@ -1477,14 +1497,18 @@ def extract_energy_direct_models(
             except Exception:
                 pass
 
-        if best_dur_name is not None and best_dur_score > 0:
+        if best_dur_name is not None and best_dur_score > 0.05:
             try:
                 best_mdl = get_regressor(best_dur_name)
                 best_mdl.fit(X, y_dur)
                 best_mdl._mean_duration      = mean_dur
                 best_mdl._train_feature_mean = train_feature_mean
+                best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
                 act_report['Duration Approach'] = f'{best_dur_name} (R²={best_dur_score:.3f})'
+                if best_mdl._feature_importance:
+                    top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
+                    act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                 print(f"  [{activity}] Duration -> ML:{best_dur_name} "
                       f"(val R²={best_dur_score:.3f}) > statistical ✓")
             except Exception as exc:
@@ -1492,10 +1516,10 @@ def extract_energy_direct_models(
                 act_report['Duration Approach'] = 'Statistical (ML fit failed)'
         else:
             act_report['Duration Approach'] = (
-                f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0)'
+                f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0.05)'
             )
             print(f"  [{activity}] Duration -> statistical "
-                  f"(best ML val R²={best_dur_score:.3f} ≤ 0)")
+                  f"(best ML val R²={best_dur_score:.3f} ≤ 0.05)")
 
         # ── Transition: direct classifier for sampling ────────────────
         if n_classes >= 2:
@@ -1519,10 +1543,14 @@ def extract_energy_direct_models(
                     best_clf = get_classifier(best_tr_name)
                     best_clf.fit(X, y_tr)
                     best_clf._train_feature_mean = train_feature_mean
+                    best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                     transition_models_direct[str(activity)] = best_clf
                     act_report['Transition Approach'] = (
                         f'{best_tr_name} (Acc={best_tr_score:.3f})'
                     )
+                    if best_clf._feature_importance:
+                        top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
+                        act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
                           f"(val Acc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
                 except Exception as exc:

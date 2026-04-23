@@ -2630,6 +2630,59 @@ else:
 
 report("\n" + "█"*80 + "\n")
 
+# ── FEATURE IMPORTANCE SUMMARY ────────────────────────────────────────────────
+report("\n" + "="*80)
+report("ENERGY MODEL — FEATURE IMPORTANCE SUMMARY")
+report("="*80)
+report("(Only activities where an ML model beat the R²>0.05 threshold are shown)")
+
+_fi_records = []
+if 'energy_modifiers_by_process' in dir():
+    for _proc, _mods in energy_modifiers_by_process.items():
+        for _role, _mod_dict in [('Duration', _mods.get('duration', {})),
+                                  ('Transition', _mods.get('transition', {}))]:
+            for _act, _mdl in _mod_dict.items():
+                fi = getattr(_mdl, '_feature_importance', {})
+                if not fi:
+                    continue
+                # Top 3 features by importance
+                for rank, (feat, imp) in enumerate(
+                    sorted(fi.items(), key=lambda kv: -kv[1])[:3], start=1
+                ):
+                    _fi_records.append({
+                        'Process':   _proc,
+                        'Activity':  _act,
+                        'Role':      _role,
+                        'Rank':      rank,
+                        'Feature':   feat,
+                        'Importance': round(imp, 4),
+                    })
+
+if _fi_records:
+    _fi_df = pd.DataFrame(_fi_records)
+    _fi_pivot = _fi_df.pivot_table(
+        index=['Process', 'Activity', 'Role'],
+        columns='Rank',
+        values=['Feature', 'Importance'],
+        aggfunc='first',
+    )
+    # Flatten multi-level columns to e.g. "Feature_1", "Importance_1"
+    _fi_pivot.columns = [f'{col}_{rank}' for col, rank in _fi_pivot.columns]
+    _fi_pivot = _fi_pivot.reset_index()
+    # Reorder into readable triples: Feature_1, Imp_1, Feature_2, Imp_2 ...
+    _ordered = ['Process', 'Activity', 'Role']
+    for _r in [1, 2, 3]:
+        for _c in [f'Feature_{_r}', f'Importance_{_r}']:
+            if _c in _fi_pivot.columns:
+                _ordered.append(_c)
+    _fi_pivot = _fi_pivot[[c for c in _ordered if c in _fi_pivot.columns]]
+    report(_fi_pivot.to_string(index=False))
+    display(_fi_pivot)
+else:
+    report("  No ML models passed the R²>0.05 threshold — no feature importances to show.")
+
+report("\n" + "█"*80 + "\n")
+
 # ── POST-REPORT VISUALIZATIONS: GENERALIZATION GALLERY ───────────────────────
 # (Note: Placed at the very end to provide a final visual verification of curve fitting)
 if RUN_TEST_EVALUATION:

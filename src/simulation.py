@@ -1259,19 +1259,26 @@ class ProcessSimulation:
             max_steps        = max(max_case_length * 2, 50)
             step             = 0
 
-            # Seed energy state with training-time column means so modifiers
-            # can fire from step 1.  Using the mean of all activities gives
-            # a neutral starting point; individual activity-specific means
-            # are applied after the first activity fires and updates the state.
+            # Seed energy state from the training-time means of start activities
+            # for this object group.  This is more realistic than averaging all
+            # activities: the first fired transition will immediately update the
+            # state, so we want a seed that reflects what the process looks like
+            # at the beginning.  Falls back to the global mean if no start-activity
+            # modifier has a stored mean.
             if self.energy_state_columns:
-                # Collect training means across all fitted modifier objects
+                _start_acts = set(self._get_start_activities(
+                    object_name, object_type, higher_level_activity
+                ))
+                all_mods = {**self.energy_duration_modifiers, **self.energy_transition_modifiers}
+                # Prefer means from start-activity modifiers; fall back to all modifiers
+                _candidates = {k: m for k, m in all_mods.items() if k in _start_acts and hasattr(m, '_train_feature_mean')}
+                if not _candidates:
+                    _candidates = {k: m for k, m in all_mods.items() if hasattr(m, '_train_feature_mean')}
                 all_means: dict[str, list] = {c: [] for c in self.energy_state_columns}
-                for _mod in (list(self.energy_duration_modifiers.values()) +
-                             list(self.energy_transition_modifiers.values())):
-                    if hasattr(_mod, '_train_feature_mean'):
-                        for c, v in _mod._train_feature_mean.items():
-                            if c in all_means:
-                                all_means[c].append(v)
+                for _mod in _candidates.values():
+                    for c, v in _mod._train_feature_mean.items():
+                        if c in all_means:
+                            all_means[c].append(v)
                 seed_state = {
                     c: float(np.mean(vals)) if vals else 0.0
                     for c, vals in all_means.items()
@@ -1528,15 +1535,20 @@ class ProcessSimulation:
             max_steps        = max(max_case_length * 2, 50)
             step             = 0
 
-            # Seed energy state from training-time means (same as modifier method)
+            # Seed energy state from start-activity modifier means (same logic as modifier method)
             if self.energy_state_columns:
+                _start_acts = set(self._get_start_activities(
+                    object_name, object_type, higher_level_activity
+                ))
+                all_mods = {**self.energy_duration_modifiers, **self.energy_transition_modifiers}
+                _candidates = {k: m for k, m in all_mods.items() if k in _start_acts and hasattr(m, '_train_feature_mean')}
+                if not _candidates:
+                    _candidates = {k: m for k, m in all_mods.items() if hasattr(m, '_train_feature_mean')}
                 all_means = {c: [] for c in self.energy_state_columns}
-                for _mod in (list(self.energy_duration_modifiers.values()) +
-                             list(self.energy_transition_modifiers.values())):
-                    if hasattr(_mod, '_train_feature_mean'):
-                        for c, v in _mod._train_feature_mean.items():
-                            if c in all_means:
-                                all_means[c].append(v)
+                for _mod in _candidates.values():
+                    for c, v in _mod._train_feature_mean.items():
+                        if c in all_means:
+                            all_means[c].append(v)
                 seed_state = {
                     c: float(np.mean(vals)) if vals else 0.0
                     for c, vals in all_means.items()
