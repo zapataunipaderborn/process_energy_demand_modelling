@@ -1572,6 +1572,7 @@ process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produk
 process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
+processes_to_run = ['process_3']
 # Filter the original dictionary
 process_datasets_to_model = {
     k: v for k, v in process_datasets.items() 
