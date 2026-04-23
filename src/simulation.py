@@ -102,6 +102,9 @@ class ProcessSimulation:
             'petri_net_energy_aware',
             'petri_net_energy_duration_aware',
             'petri_net_energy_transition_aware',
+            'petri_net_energy_direct',
+            'petri_net_energy_direct_duration_only',
+            'petri_net_energy_direct_transition_only',
         )
         if self.mode in _ENERGY_MODES:
             if self.process_models is None or len(self.process_models) == 0:
@@ -1469,6 +1472,192 @@ class ProcessSimulation:
             print(f"  Completed {object_name} energy-aware PN with "
                   f"{activity_count} activities")
 
+    def _simulate_petri_net_energy_direct_for_case(
+        self, case_id, object_attributes, start_time,
+        enable_duration=True, enable_transitions=True,
+    ):
+        """
+        Simulate one case using the Petri net for structure, but with ML models
+        that *directly* predict duration and next-activity from the energy state
+        of the previous activity — no multiplicative correction, full prediction.
+
+        Duration:   energy_state → regressor → duration_minutes
+                    Falls back to statistical per-activity mean when no ML model.
+        Transition: energy_state → classifier → sample from predict_proba
+                    Falls back to base PN stochastic weights when no ML model.
+
+        Models come from ``self.energy_duration_modifiers`` /
+        ``self.energy_transition_modifiers`` which must have been populated by
+        ``extract_energy_direct_models`` (not the modifier variant).
+        """
+        current_sim_time = start_time.timestamp()
+        unique_objects = (
+            self.activity_stats[['object', 'object_type', 'higher_level_activity']]
+            .drop_duplicates()
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name             = str(obj_config['object']).strip()
+            object_type             = str(obj_config['object_type']).strip()
+            higher_level_activity   = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key   = (object_name, object_type, higher_level_activity)
+            model = self.process_models.get(key) if self.process_models else None
+
+            if model is None:
+                print(f"  ⚠️  No Petri net for {key} — falling back to statistical.")
+                self._simulate_statistical_for_object(
+                    case_id, object_attributes, current_sim_time,
+                    object_name, object_type, higher_level_activity
+                )
+                continue
+
+            net             = model['net']
+            im              = model['im']
+            fm              = model['fm']
+            stochastic_map  = model.get('stochastic_map', {})
+            max_case_length = model.get('max_case_length', 200)
+
+            marking          = copy.copy(im)
+            activity_count   = 0
+            activity_history = []
+            prev_activity    = None
+            max_steps        = max(max_case_length * 2, 50)
+            step             = 0
+
+            # Seed energy state from training-time means (same as modifier method)
+            if self.energy_state_columns:
+                all_means = {c: [] for c in self.energy_state_columns}
+                for _mod in (list(self.energy_duration_modifiers.values()) +
+                             list(self.energy_transition_modifiers.values())):
+                    if hasattr(_mod, '_train_feature_mean'):
+                        for c, v in _mod._train_feature_mean.items():
+                            if c in all_means:
+                                all_means[c].append(v)
+                seed_state = {
+                    c: float(np.mean(vals)) if vals else 0.0
+                    for c, vals in all_means.items()
+                }
+                current_energy_state = seed_state if seed_state else None
+            else:
+                current_energy_state = None
+
+            while marking != fm and step < max_steps:
+                step += 1
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    Deadlock after {activity_count} activities.")
+                    break
+
+                enabled_list = sorted(
+                    enabled,
+                    key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
+                )
+
+                # ── Transition sampling ───────────────────────────────
+                # If ML classifier exists for prev_activity AND enable_transitions:
+                #   sample next activity directly from predict_proba, then pick
+                #   the enabled transition whose label matches best.
+                # Else: use base PN stochastic weights.
+                chosen_transition = None
+                if (enable_transitions
+                        and current_energy_state is not None
+                        and prev_activity is not None
+                        and prev_activity in self.energy_transition_modifiers):
+                    clf = self.energy_transition_modifiers[prev_activity]
+                    energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
+                    try:
+                        proba_vec  = clf.predict_proba([energy_vec])[0]
+                        label_prob = dict(zip(clf.classes_, proba_vec))
+
+                        # Score each visible enabled transition by ML probability
+                        weights = []
+                        for t in enabled_list:
+                            if t.label is not None:
+                                weights.append(label_prob.get(str(t.label).strip(), 1e-6))
+                            else:
+                                # Silent transitions: use base PN weight
+                                weights.append(stochastic_map.get(t, 1e-6))
+
+                        total = sum(weights)
+                        if total > 0:
+                            probs = [w / total for w in weights]
+                            chosen_transition = np.random.choice(enabled_list, p=probs)
+                    except Exception as exc:
+                        if self.verbose:
+                            print(f"    WARNING: direct transition sampling failed: {exc}")
+
+                if chosen_transition is None:
+                    # Fallback: base PN stochastic weights
+                    weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
+                    total   = sum(weights)
+                    if total <= 0:
+                        chosen_transition = random.choice(enabled_list)
+                    else:
+                        probs = [w / total for w in weights]
+                        chosen_transition = np.random.choice(enabled_list, p=probs)
+
+                marking = self._fire_transition(marking, chosen_transition)
+
+                if chosen_transition.label is not None:
+                    chosen_label = str(chosen_transition.label).strip()
+                    activity_count += 1
+
+                    # ── Duration: direct ML prediction or statistical ──
+                    if (enable_duration
+                            and current_energy_state is not None
+                            and chosen_label in self.energy_duration_modifiers):
+                        mdl = self.energy_duration_modifiers[chosen_label]
+                        energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
+                        try:
+                            activity_duration = max(0.1, float(mdl.predict([energy_vec])[0]))
+                            if self.verbose:
+                                print(f"    [{chosen_label}] direct ML duration: "
+                                      f"{activity_duration:.1f} min")
+                        except Exception as exc:
+                            if self.verbose:
+                                print(f"    WARNING: direct duration prediction failed: {exc}")
+                            activity_duration = self._get_activity_duration(
+                                chosen_label, object_name, object_type,
+                                higher_level_activity, object_attributes,
+                                activity_history=activity_history,
+                                activity_index=activity_count,
+                                override_mode=self.base_simulation_mode,
+                            )
+                    else:
+                        activity_duration = self._get_activity_duration(
+                            chosen_label, object_name, object_type,
+                            higher_level_activity, object_attributes,
+                            activity_history=activity_history,
+                            activity_index=activity_count,
+                            override_mode=self.base_simulation_mode,
+                        )
+
+                    start_time_obj   = datetime.fromtimestamp(current_sim_time)
+                    current_sim_time += activity_duration * 60
+                    end_time_obj     = datetime.fromtimestamp(current_sim_time)
+
+                    self._log_event(
+                        case_id=case_id, activity=chosen_label,
+                        timestamp_start=start_time_obj, timestamp_end=end_time_obj,
+                        object_name=object_name, object_type=object_type,
+                        higher_level_activity=higher_level_activity,
+                        object_attributes=object_attributes,
+                    )
+
+                    activity_history.insert(0, (chosen_label, activity_duration))
+                    activity_history = activity_history[:2]
+                    prev_activity    = chosen_label
+
+            if step >= max_steps:
+                print(f"    WARNING: max steps ({max_steps}) reached.")
+
+            print(f"  Completed {object_name} energy-direct PN with "
+                  f"{activity_count} activities")
+
     def _simulate_process_for_case(self, case_id, object_attributes, start_time):
         """Simulate process for one case using probabilistic end transitions"""
         print(f"[DEBUG _simulate_process_for_case] self.mode = '{self.mode}'")
@@ -1493,13 +1682,26 @@ class ProcessSimulation:
             )
             return
 
-        # ── Energy-aware Petri net modes ──────────────────────────────
+        # ── Energy-aware Petri net modes (modifier approach) ─────────
         if self.mode in ('petri_net_energy_aware',
                          'petri_net_energy_duration_aware',
                          'petri_net_energy_transition_aware'):
             enable_dur = self.mode != 'petri_net_energy_transition_aware'
             enable_tr  = self.mode != 'petri_net_energy_duration_aware'
             self._simulate_petri_net_energy_aware_for_case(
+                case_id, object_attributes, start_time,
+                enable_duration=enable_dur,
+                enable_transitions=enable_tr,
+            )
+            return
+
+        # ── Energy-direct Petri net modes (full ML prediction) ───────
+        if self.mode in ('petri_net_energy_direct',
+                         'petri_net_energy_direct_duration_only',
+                         'petri_net_energy_direct_transition_only'):
+            enable_dur = self.mode != 'petri_net_energy_direct_transition_only'
+            enable_tr  = self.mode != 'petri_net_energy_direct_duration_only'
+            self._simulate_petri_net_energy_direct_for_case(
                 case_id, object_attributes, start_time,
                 enable_duration=enable_dur,
                 enable_transitions=enable_tr,

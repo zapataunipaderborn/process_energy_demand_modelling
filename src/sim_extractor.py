@@ -1310,6 +1310,204 @@ def extract_energy_modifiers(
     return energy_duration_modifiers, energy_transition_modifiers, energy_state_columns, model_choices_report
 
 
+def extract_energy_direct_models(
+    df_expanded,
+    sensors,
+    activity_col='activity_log',
+    duration_models=None,
+    transition_models=None,
+    min_samples=30,
+    timestamp_start_col='timestamp_start_log',
+    datetime_energy_col='datetime_energy',
+):
+    """
+    Train per-activity ML models that *directly* predict duration and next
+    activity from the energy-state vector of the *previous* activity.
+
+    Unlike ``extract_energy_modifiers`` (which learns a multiplicative
+    correction on top of a statistical baseline), these models are the full
+    prediction:
+
+      energy_state_of_prev_activity → duration_minutes   (regressor)
+      energy_state_of_prev_activity → next_activity      (classifier, used
+                                                           for direct sampling)
+
+    For each activity the best ML model is chosen by validation score and
+    kept only if it beats the statistical baseline:
+      - Duration  : kept when val R² > 0  (baseline = always predict mean)
+      - Transition: kept when val Acc > majority-class accuracy
+
+    Returns
+    -------
+    duration_models_direct   : dict[activity → fitted regressor]
+        Model predicts duration_minutes directly.  Has attribute
+        ``_mean_duration`` (fallback) and ``_train_feature_mean``.
+    transition_models_direct : dict[activity → fitted classifier]
+        Model predicts P(next_activity | energy_state) for direct sampling.
+        Has attribute ``_train_feature_mean``.
+    energy_state_columns     : list[str]   (3 × N features, ordered)
+    model_choices_report     : dict[activity → {Duration, Transition approach}]
+    """
+    print("\n" + "=" * 70)
+    print("ENERGY DIRECT MODEL EXTRACTION")
+    print("=" * 70)
+    print(f"  Sensors          : {sensors}")
+    print(f"  Duration models  : {duration_models}")
+    print(f"  Transition models: {transition_models}")
+
+    from xgboost import XGBRegressor
+    from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import r2_score, accuracy_score
+    from collections import Counter
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+
+    if duration_models is None:   duration_models   = ['xgboost']
+    if transition_models is None: transition_models = ['logistic']
+
+    def get_regressor(name):
+        if name == 'xgboost': return XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.1, subsample=0.8, verbosity=0, random_state=42)
+        if name == 'linear':  return LinearRegression()
+        if name == 'lasso':   return Lasso(alpha=0.1, random_state=42)
+        if name == 'mlp':     return MLPRegressor(hidden_layer_sizes=(50,), max_iter=500, random_state=42)
+        return XGBRegressor(n_estimators=100, random_state=42)
+
+    def get_classifier(name):
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42)
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
+        return LogisticRegression(max_iter=1000, random_state=42)
+
+    # Build records: each row = one activity instance with its energy state
+    # from the PREVIOUS activity (what's available before this activity fires)
+    # and the duration + next_activity of THIS activity.
+    df_recs = _build_energy_state_matrix_with_next(
+        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+    )
+
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+
+    if df_recs.empty:
+        print("  WARNING: no valid instances — returning empty models.")
+        return {}, {}, energy_state_columns, {}
+
+    print(f"  Total instances  : {len(df_recs)}")
+
+    duration_models_direct   = {}
+    transition_models_direct = {}
+    model_choices_report     = {}
+
+    for activity, grp in df_recs.groupby('activity'):
+        X       = grp[energy_state_columns].values
+        y_dur   = grp['duration'].values          # raw minutes — direct target
+        y_tr    = grp['next_activity'].values
+        n       = len(grp)
+        n_classes = len(set(y_tr))
+
+        train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+        mean_dur           = float(y_dur.mean())
+
+        act_report = {
+            'Duration Approach':   f'Statistical (n={n}<{min_samples})',
+            'Transition Approach': f'Statistical (n={n}<{min_samples})',
+        }
+
+        if n < min_samples:
+            model_choices_report[str(activity)] = act_report
+            continue
+
+        X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
+            X, y_dur, y_tr, test_size=0.2, random_state=42
+        )
+
+        # ── Duration: direct regression on minutes ────────────────────
+        best_dur_score = -float('inf')
+        best_dur_name  = None
+
+        for model_name in duration_models:
+            try:
+                mdl = get_regressor(model_name)
+                mdl.fit(X_tr, yd_tr)
+                score = r2_score(yd_val, mdl.predict(X_val))
+                if score > best_dur_score:
+                    best_dur_score = score
+                    best_dur_name  = model_name
+            except Exception:
+                pass
+
+        if best_dur_name is not None and best_dur_score > 0:
+            try:
+                best_mdl = get_regressor(best_dur_name)
+                best_mdl.fit(X, y_dur)
+                best_mdl._mean_duration      = mean_dur
+                best_mdl._train_feature_mean = train_feature_mean
+                duration_models_direct[str(activity)] = best_mdl
+                act_report['Duration Approach'] = f'{best_dur_name} (R²={best_dur_score:.3f})'
+                print(f"  [{activity}] Duration -> ML:{best_dur_name} "
+                      f"(val R²={best_dur_score:.3f}) > statistical ✓")
+            except Exception as exc:
+                print(f"  [{activity}] Duration FAILED: {exc}")
+                act_report['Duration Approach'] = 'Statistical (ML fit failed)'
+        else:
+            act_report['Duration Approach'] = (
+                f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0)'
+            )
+            print(f"  [{activity}] Duration -> statistical "
+                  f"(best ML val R²={best_dur_score:.3f} ≤ 0)")
+
+        # ── Transition: direct classifier for sampling ────────────────
+        if n_classes >= 2:
+            majority_acc   = Counter(yt_val).most_common(1)[0][1] / len(yt_val)
+            best_tr_score  = -float('inf')
+            best_tr_name   = None
+
+            for model_name in transition_models:
+                try:
+                    clf   = get_classifier(model_name)
+                    clf.fit(X_tr, yt_tr)
+                    score = accuracy_score(yt_val, clf.predict(X_val))
+                    if score > best_tr_score:
+                        best_tr_score = score
+                        best_tr_name  = model_name
+                except Exception:
+                    pass
+
+            if best_tr_name is not None and best_tr_score > majority_acc:
+                try:
+                    best_clf = get_classifier(best_tr_name)
+                    best_clf.fit(X, y_tr)
+                    best_clf._train_feature_mean = train_feature_mean
+                    transition_models_direct[str(activity)] = best_clf
+                    act_report['Transition Approach'] = (
+                        f'{best_tr_name} (Acc={best_tr_score:.3f})'
+                    )
+                    print(f"  [{activity}] Transition -> ML:{best_tr_name} "
+                          f"(val Acc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
+                except Exception as exc:
+                    print(f"  [{activity}] Transition FAILED: {exc}")
+                    act_report['Transition Approach'] = 'Statistical (ML fit failed)'
+            else:
+                act_report['Transition Approach'] = (
+                    f'Statistical (best ML Acc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
+                )
+                print(f"  [{activity}] Transition -> statistical "
+                      f"(best ML val Acc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+        else:
+            act_report['Transition Approach'] = 'Statistical (1 class only)'
+
+        model_choices_report[str(activity)] = act_report
+
+    print(f"\n  Duration direct models  : {len(duration_models_direct)} activities use ML")
+    print(f"  Transition direct models: {len(transition_models_direct)} activities use ML")
+
+    return duration_models_direct, transition_models_direct, energy_state_columns, model_choices_report
+
+
 def _build_energy_state_matrix_with_next(
     df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
 ):

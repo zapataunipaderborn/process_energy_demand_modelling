@@ -1567,9 +1567,14 @@ process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produk
 process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
-process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
-process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
-process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
+# process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
+# process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
+# process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
+
+
+# display(process_datasets_to_model_sensors['process_3']['expanded'])
+
+# %%
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
 processes_to_run = ['process_3']
@@ -1594,7 +1599,7 @@ from sim_modeller import SimModeller
 #   Both modifiers accept any estimator with .fit() and .predict()/.predict_proba().
 # ─────────────────────────────────────────────────────────────────────────────
 from sklearn.linear_model import Lasso, LogisticRegression
-from sim_extractor import extract_energy_modifiers
+from sim_extractor import extract_energy_modifiers, extract_energy_direct_models
 
 from xgboost import XGBRegressor
 
@@ -1793,6 +1798,11 @@ all_energy_pipelines = {}
 #     Duration  : ML kept only if val R² > 0  (> statistical baseline of predicting mean)
 #     Transition: ML kept only if val Acc > majority-class baseline accuracy
 #     petri_net_energy_aware = best duration choice + best transition choice independently
+#
+#   Energy-direct modes (new):
+#     energy_state → ML → duration_minutes directly   (not a correction factor)
+#     energy_state → ML → sample next activity directly from predict_proba
+#     Same ML-vs-statistical auto-selection applies per activity
 # ─────────────────────────────────────────────────────────────────────────────
 MODES_TO_COMPARE = [
     'statistical',
@@ -1802,11 +1812,14 @@ MODES_TO_COMPARE = [
     'petri_net_combined',
     'petri_net_ilp',
     # ── energy-aware Petri-net variants ──────────────────────────────
-    # Per activity: ML modifier used only if it beats the statistical baseline on validation.
-    # Otherwise the activity falls back to statistical (no modifier applied).
+    # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
     'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
     'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
     'petri_net_energy_aware',             # best duration + best transition independently per activity
+    # Direct approach: ML IS the prediction (energy_state → duration or next_activity directly)
+    'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
+    'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
+    'petri_net_energy_direct',                  # ML predicts both directly per activity
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
     #'ml_duration_only',
@@ -1817,9 +1830,19 @@ MODES_TO_COMPARE = [
 
 # Keep requested modes, but drop Petri-net variants that are not enabled.
 _ENERGY_AWARE_MODES = {
+    # Modifier approach: ML corrects a statistical base duration/PN weights
     'petri_net_energy_aware',
     'petri_net_energy_duration_aware',
     'petri_net_energy_transition_aware',
+    # Direct approach: ML is the full prediction (no statistical base)
+    'petri_net_energy_direct',
+    'petri_net_energy_direct_duration_only',
+    'petri_net_energy_direct_transition_only',
+}
+_ENERGY_DIRECT_MODES = {
+    'petri_net_energy_direct',
+    'petri_net_energy_direct_duration_only',
+    'petri_net_energy_direct_transition_only',
 }
 _filtered_modes = []
 for _mode_name in MODES_TO_COMPARE:
@@ -2178,6 +2201,9 @@ for process in process_datasets_to_model.keys():
                 if not _sensors:
                     print("⚠️  No sensors found for this process — skipping energy modifiers.")
                 else:
+                    # Initialise direct-model dicts so they're always defined in scope
+                    _energy_direct_dur_mods = {}
+                    _energy_direct_tr_mods  = {}
                     try:
                         _energy_dur_mods, _energy_tr_mods, _energy_state_cols, _model_choices_report = \
                             extract_energy_modifiers(
@@ -2205,6 +2231,28 @@ for process in process_datasets_to_model.keys():
                             report(_choices_df.to_string(index=False))
                             display(_choices_df)
 
+                        # ── Train direct ML models (if any direct modes requested) ──
+                        _direct_modes_requested = [
+                            m for m in _energy_modes_requested if m in _ENERGY_DIRECT_MODES
+                        ]
+                        if _direct_modes_requested:
+                            _energy_direct_dur_mods, _energy_direct_tr_mods, _, _direct_report = \
+                                extract_energy_direct_models(
+                                    df_expanded=_df_expanded_train,
+                                    sensors=_sensors,
+                                    duration_models=ENERGY_DURATION_MODELS,
+                                    transition_models=ENERGY_TRANSITION_MODELS,
+                                    min_samples=ENERGY_MIN_SAMPLES,
+                                )
+                            if _direct_report:
+                                report("\n" + "="*80)
+                                report(f"ENERGY DIRECT MODEL APPROACH TRACKING | Process: {process}")
+                                report("="*80)
+                                _direct_df = pd.DataFrame.from_dict(_direct_report, orient='index').reset_index()
+                                _direct_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
+                                _direct_df.insert(0, 'Dataset/Process', process)
+                                report(_direct_df.to_string(index=False))
+                                display(_direct_df)
 
                         # ── Train Dynamic ML Curve Predictors ──────────────────
                         # Only run this if we actually want to evaluate on Test results
@@ -2270,14 +2318,18 @@ for process in process_datasets_to_model.keys():
                     print("─"*80)
 
                     def _run_energy_sim(plan, stats_df, pm):
+                        # Direct modes use the direct ML models; modifier modes use the modifier models
+                        _is_direct = _energy_mode in _ENERGY_DIRECT_MODES
+                        _dur_mods  = _energy_direct_dur_mods if _is_direct else _energy_dur_mods
+                        _tr_mods   = _energy_direct_tr_mods  if _is_direct else _energy_tr_mods
                         return ProcessSimulation(
                             stats_df, plan,
                             mode=_energy_mode,
                             base_simulation_mode=SIMULATION_MODE,
                             ml_models=ml_models,
                             process_models=pm,
-                            energy_duration_modifiers=_energy_dur_mods,
-                            energy_transition_modifiers=_energy_tr_mods,
+                            energy_duration_modifiers=_dur_mods,
+                            energy_transition_modifiers=_tr_mods,
                             energy_state_columns=_energy_state_cols,
                             energy_pipelines=_energy_pipelines,
                             duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
@@ -2585,12 +2637,13 @@ if RUN_TEST_EVALUATION:
         exp_test = test_datasets[process].get('expanded')
         if exp_test is None: continue
         
+        _proc_sensor_config = process_datasets_to_model_sensors.get(process, {})
         for sensor in sensors:
             # We filter for the test curves for this specific process/sensor combo
-            test_curves, _ = split_curves(exp_test, sensor, 
-                                        process_datasets_to_model_sensors[process]['activities_to_model'],
-                                        process_datasets_to_model_sensors[process]['objects_to_model'],
-                                        test_size=0.0, verbose=0)
+            _activities = _proc_sensor_config.get('activities_to_model', exp_test['activity_log'].dropna().unique().tolist())
+            _objects    = _proc_sensor_config.get('objects_to_model',    exp_test['object_log'].dropna().unique().tolist())
+            test_curves, _ = split_curves(exp_test, sensor, _activities, _objects,
+                                          test_size=0.0, verbose=0)
             
             if test_curves:
                 display(Markdown("---"))
