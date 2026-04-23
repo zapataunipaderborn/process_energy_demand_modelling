@@ -1079,6 +1079,41 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
     return df_recs, energy_state_columns
 
 
+class StatisticalDurationBaseline:
+    """
+    Sklearn-compatible regressor that ignores the energy-state features and
+    instead samples from a fitted normal distribution (mean, std) of the
+    training durations.  Used as a named competitor in the model-selection
+    loop so the report can show its R² and it can win when ML adds no value.
+
+    For the modifier path the target is log(duration/mean_duration), so the
+    fitted distribution is on that log-ratio space.  For the direct path the
+    target is raw minutes; set ``log_ratio=False`` in that case.
+    """
+
+    def __init__(self, log_ratio=True):
+        self.log_ratio = log_ratio
+        self._mean = 0.0
+        self._std  = 1.0
+
+    def fit(self, X, y):
+        self._mean = float(np.mean(y))
+        self._std  = max(float(np.std(y)), 1e-6)
+        return self
+
+    def predict(self, X):
+        return np.random.normal(self._mean, self._std, size=len(X))
+
+    # sklearn needs these for get_params / set_params (e.g. cross_val_score)
+    def get_params(self, deep=True):
+        return {'log_ratio': self.log_ratio}
+
+    def set_params(self, **params):
+        for k, v in params.items():
+            setattr(self, k, v)
+        return self
+
+
 def extract_energy_modifiers(
     df_expanded,
     sensors,
@@ -1154,6 +1189,7 @@ def extract_energy_modifiers(
         if name == 'linear': return LinearRegression()
         if name == 'lasso': return Lasso(alpha=0.1, random_state=42)
         if name == 'mlp': return MLPRegressor(hidden_layer_sizes=(50,), max_iter=500, random_state=42)
+        if name == 'statistical': return StatisticalDurationBaseline(log_ratio=True)
         return XGBRegressor(n_estimators=100, random_state=42) # fallback
 
     def get_classifier(name):
@@ -1373,6 +1409,7 @@ def extract_energy_direct_models(
         if name == 'linear':  return LinearRegression()
         if name == 'lasso':   return Lasso(alpha=0.1, random_state=42)
         if name == 'mlp':     return MLPRegressor(hidden_layer_sizes=(50,), max_iter=500, random_state=42)
+        if name == 'statistical': return StatisticalDurationBaseline(log_ratio=False)
         return XGBRegressor(n_estimators=100, random_state=42)
 
     def get_classifier(name):

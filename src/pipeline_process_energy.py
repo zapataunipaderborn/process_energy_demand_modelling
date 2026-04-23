@@ -1605,7 +1605,7 @@ from xgboost import XGBRegressor
 
 # ── Duration modifier models ───────────────────────────────────────────────
 # List of sklearn-compatible regressor types to compete per activity
-ENERGY_DURATION_MODELS    = ['xgboost', 'linear', 'lasso', 'mlp']
+ENERGY_DURATION_MODELS    = ['xgboost', 'linear', 'lasso', 'mlp', 'statistical']
 
 # ── Transition modifier models ─────────────────────────────────────────────
 # List of classifier types to compete per activity
