@@ -2671,6 +2671,387 @@ def predict_raw_curve_instance_stats(raw_values, activity, attributes, pipeline)
 
 
 # =============================================================================
+# INSTANCE STATS (LEAK-FREE) — TWO-STAGE PIPELINE
+#
+# Fixes the data leakage in the Instance Stats approach: instead of computing
+# curve statistics (mean, std, min, max, start, end) from the actual test curve,
+# a first-stage model predicts those statistics from observable metadata only
+# (activity, curve_length, process attributes).  The predicted stats are then
+# fed into the existing DTW curve-shape model as if they were known.
+#
+# Stage 1 — Stats Predictor:
+#   Input : activity, curve_length, process attributes
+#   Output: predicted {curve_mean, curve_std, curve_min, curve_max,
+#                       curve_start, curve_end}
+#
+# Stage 2 — Curve Shape Model (identical to instance_stats):
+#   Input : position_idx, curve_length, predicted stats, activity, attributes
+#   Output: predicted energy curve
+# =============================================================================
+
+_STAT_TARGETS = ['curve_mean', 'curve_std', 'curve_min', 'curve_max',
+                 'curve_start', 'curve_end']
+
+
+def _build_stats_predictor_dataset(curves, all_keys, key_types):
+    """
+    Build a feature matrix where each row is one curve instance and the targets
+    are the six instance statistics.  Only metadata available before seeing the
+    curve is used as input.
+    """
+    rows, targets = [], []
+    for curve in curves:
+        stats = _instance_stats(curve['resampled_values'])
+        row = {
+            'curve_length': curve['original_length'],
+            'activity':     curve['activity'],
+        }
+        for key in all_keys:
+            value = curve['attributes'].get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows.append(row)
+        targets.append([stats[t] for t in _STAT_TARGETS])
+    return pd.DataFrame(rows), np.array(targets)
+
+
+def build_and_train_pipeline_istats_leakfree(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+):
+    """
+    Instance Stats (Leak-Free) — two-stage pipeline.
+
+    Stage 1 trains a multi-output regressor to predict the six curve statistics
+    from metadata only (no test-curve values used at inference time).
+    Stage 2 is identical to ``build_and_train_pipeline_instance_stats`` and uses
+    those predicted stats as features.  Returns the same pipeline dict as the
+    leaky version with ``'approach'`` set to ``'istats_leakfree'`` and an extra
+    ``'stats_predictor'`` key.
+    """
+    if verbose:
+        print("\n" + "=" * 80)
+        print("INSTANCE STATS (LEAK-FREE) — TWO-STAGE DTW PIPELINE")
+        print("=" * 80)
+
+    if models is None:
+        models = {
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    # ── Stage 0: DBA barycenter + DTW alignment (same as instance_stats) ─────
+    if verbose:
+        print(f"\n[0] Computing DBA barycenter from {len(train_curves)} train curves "
+              f"(fixed_length={fixed_length})...")
+
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values']
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    for i, curve in enumerate(train_curves):
+        if verbose and i % max(1, len(train_curves) // 10) == 0:
+            print(f"    Aligning curve {i + 1}/{len(train_curves)}...")
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    # ── Stage 1: train stats predictor ───────────────────────────────────────
+    if verbose:
+        print(f"\n[1] Training Stage 1 — stats predictor "
+              f"(targets: {_STAT_TARGETS})...")
+
+    X_sp, y_sp = _build_stats_predictor_dataset(train_curves, all_keys, key_types)
+
+    categorical_cols_sp = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_sp = pd.get_dummies(X_sp, columns=categorical_cols_sp, drop_first=True)
+    sp_feature_columns = X_sp.columns.tolist()
+
+    numeric_sp_cols = ['curve_length'] + [k for k in all_keys if key_types[k] == 'numeric']
+    numeric_sp_cols = [c for c in numeric_sp_cols if c in X_sp.columns]
+
+    sp_scaler = None
+    if numeric_sp_cols:
+        sp_scaler = StandardScaler()
+        X_sp = X_sp.copy()
+        X_sp.loc[:, numeric_sp_cols] = sp_scaler.fit_transform(X_sp[numeric_sp_cols])
+
+    unique_instances     = [c['instance_id'] for c in train_curves]
+    sp_train_idx, sp_val_idx = train_test_split(
+        range(len(train_curves)), test_size=val_size, random_state=random_state
+    )
+
+    X_sp_train, X_sp_val = X_sp.iloc[sp_train_idx], X_sp.iloc[sp_val_idx]
+    y_sp_train, y_sp_val = y_sp[sp_train_idx],       y_sp[sp_val_idx]
+
+    from sklearn.multioutput import MultiOutputRegressor
+
+    sp_results = {}
+    for name, model_class in models.items():
+        if name == 'Gradient Boosting':
+            base = model_class(n_estimators=100, max_depth=5, learning_rate=0.1,
+                               random_state=random_state)
+        elif name == 'Random Forest':
+            base = model_class(n_estimators=100, max_depth=10, random_state=random_state,
+                               n_jobs=-1)
+        else:
+            try:
+                base = model_class(random_state=random_state)
+            except TypeError:
+                base = model_class()
+
+        sp_model = MultiOutputRegressor(base)
+        sp_model.fit(X_sp_train, y_sp_train)
+        val_r2 = float(np.mean([
+            r2_score(y_sp_val[:, i], sp_model.predict(X_sp_val)[:, i])
+            for i in range(y_sp.shape[1])
+        ]))
+        sp_results[name] = {'model': sp_model, 'val_r2': val_r2}
+        if verbose:
+            print(f"     {name}  mean-val-R²={val_r2:.4f}")
+
+    best_sp_name  = max(sp_results, key=lambda k: sp_results[k]['val_r2'])
+    best_sp_model = sp_results[best_sp_name]['model']
+    if verbose:
+        print(f"  Best stats predictor: {best_sp_name}  "
+              f"(mean val R²={sp_results[best_sp_name]['val_r2']:.4f})")
+
+    # ── Stage 2: train curve-shape model (identical to instance_stats) ───────
+    if verbose:
+        print(f"\n[2] Training Stage 2 — curve shape model...")
+
+    df_reg = _build_feature_matrix_plus(
+        train_curves, all_keys, key_types, fixed_length,
+        value_key='resampled_values', include_target=True
+    )
+
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_all = df_reg[['position_idx', 'curve_length', 'curve_mean', 'curve_std',
+                     'curve_min', 'curve_max', 'curve_start', 'curve_end']].copy()
+    X_all = X_all.assign(activity=df_reg['activity'].values)
+    for key in all_keys:
+        X_all = X_all.assign(**{key: df_reg[key].values})
+    X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    y_all = df_reg['y'].copy()
+
+    train_inst_ids = {train_curves[i]['instance_id'] for i in sp_train_idx}
+    train_mask = df_reg['instance_id'].isin(train_inst_ids)
+    val_mask   = ~train_mask
+
+    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
+    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
+
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = (
+        ['position_idx', 'curve_length', 'curve_mean', 'curve_std',
+         'curve_min', 'curve_max', 'curve_start', 'curve_end']
+        + [k for k in all_keys if key_types[k] == 'numeric']
+    )
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
+            X_train[numeric_feature_cols]
+        )
+        X_val.loc[:, numeric_feature_cols] = feature_scaler.transform(
+            X_val[numeric_feature_cols]
+        )
+
+    all_results = {}
+    for name, model_class in models.items():
+        if verbose:
+            print(f"     Training {name}...")
+        if name == 'Gradient Boosting':
+            model = model_class(n_estimators=200, max_depth=7, learning_rate=0.1,
+                                subsample=0.8, random_state=random_state)
+        elif name == 'Random Forest':
+            model = model_class(n_estimators=200, max_depth=12, min_samples_split=5,
+                                random_state=random_state, n_jobs=-1)
+        else:
+            try:
+                model = model_class(random_state=random_state)
+            except TypeError:
+                model = model_class()
+
+        model.fit(X_train, y_train)
+        val_r2   = r2_score(y_val,   model.predict(X_val))
+        val_rmse = np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
+        train_r2   = r2_score(y_train, model.predict(X_train))
+        train_rmse = np.sqrt(mean_squared_error(y_train, model.predict(X_train)))
+        if verbose:
+            print(f"       Train R²={train_r2:.4f}  RMSE={train_rmse:.4f} | "
+                  f"Val R²={val_r2:.4f}  RMSE={val_rmse:.4f}")
+        all_results[name] = {
+            'model': model, 'train_r2': train_r2, 'val_r2': val_r2,
+            'train_rmse': train_rmse, 'val_rmse': val_rmse,
+        }
+
+    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_model = all_results[best_name]['model']
+    if verbose:
+        print(f"\n  Best curve model: {best_name}  "
+              f"(val R²={all_results[best_name]['val_r2']:.4f})")
+
+    return {
+        'approach':            'istats_leakfree',
+        'model':               best_model,
+        'model_name':          best_name,
+        'reference_curve':     reference_curve,
+        'fixed_length':        fixed_length,
+        'all_keys':            all_keys,
+        'key_types':           key_types,
+        'feature_columns':     feature_columns,
+        'feature_scaler':      feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'val_r2':              all_results[best_name]['val_r2'],
+        'all_results':         all_results,
+        # Stage 1
+        'stats_predictor':         best_sp_model,
+        'sp_feature_columns':      sp_feature_columns,
+        'sp_scaler':               sp_scaler,
+        'numeric_sp_cols':         numeric_sp_cols,
+        'sp_categorical_cols':     categorical_cols_sp,
+    }
+
+
+def predict_raw_curve_istats_leakfree(raw_values, activity, attributes, pipeline):
+    """
+    Predict using the leak-free two-stage Instance Stats pipeline.
+
+    Stage 1 predicts curve statistics from metadata (no test values used).
+    Stage 2 uses those predicted stats as features, identical to the leaky
+    version, and maps predictions back to raw time steps via DTW.
+    """
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler', None)
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+
+    stats_predictor    = pipeline['stats_predictor']
+    sp_feature_columns = pipeline['sp_feature_columns']
+    sp_scaler          = pipeline.get('sp_scaler', None)
+    numeric_sp_cols    = pipeline.get('numeric_sp_cols', [])
+    sp_categorical_cols = pipeline.get('sp_categorical_cols', [])
+
+    # ── Stage 1: predict curve stats from metadata only ──────────────────────
+    sp_row = {'curve_length': len(raw_values), 'activity': activity}
+    for key in all_keys:
+        value = attributes.get(key, None)
+        if key_types[key] == 'numeric':
+            try:
+                sp_row[key] = float(value) if value is not None else np.nan
+            except (ValueError, TypeError):
+                sp_row[key] = np.nan
+        else:
+            sp_row[key] = str(value) if value is not None else 'None'
+
+    X_sp = pd.DataFrame([sp_row])
+    X_sp = pd.get_dummies(X_sp, columns=sp_categorical_cols, drop_first=True)
+    for col in sp_feature_columns:
+        if col not in X_sp.columns:
+            X_sp[col] = 0
+    X_sp = X_sp[sp_feature_columns]
+
+    if sp_scaler is not None and numeric_sp_cols:
+        cols_to_scale = [c for c in numeric_sp_cols if c in X_sp.columns]
+        if cols_to_scale:
+            X_sp.loc[:, cols_to_scale] = sp_scaler.transform(X_sp[cols_to_scale])
+
+    predicted_stats_arr = stats_predictor.predict(X_sp)[0]
+    predicted_stats = dict(zip(_STAT_TARGETS, predicted_stats_arr))
+
+    # ── Stage 2: build feature rows using predicted stats ────────────────────
+    alignment = dtw(raw_values, reference_curve, keep_internals=True)
+
+    rows_ref = []
+    for pos in range(fixed_length):
+        row = {
+            'position_idx': pos,
+            'curve_length': len(raw_values),
+            'curve_mean':   predicted_stats['curve_mean'],
+            'curve_std':    predicted_stats['curve_std'],
+            'curve_min':    predicted_stats['curve_min'],
+            'curve_max':    predicted_stats['curve_max'],
+            'curve_start':  predicted_stats['curve_start'],
+            'curve_end':    predicted_stats['curve_end'],
+            'activity':     activity,
+        }
+        for key in all_keys:
+            value = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows_ref.append(row)
+
+    X_ref = pd.DataFrame(rows_ref)
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_ref = pd.get_dummies(X_ref, columns=categorical_cols, drop_first=True)
+    for col in feature_columns:
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
+    y_ref_pred = model.predict(X_ref)
+
+    # Map canonical predictions back to raw time steps via DTW warp path
+    buckets    = [[] for _ in range(len(raw_values))]
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            _ = nearest_qi
+            y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
 # APPROACH 3 — DTW-PHASE AWARE PIPELINE
 #
 # Same architecture as the baseline (DBA barycenter → DTW alignment → regression)
@@ -3720,8 +4101,407 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
 
 
 # =============================================================================
+# DTW + SEQ2SEQ  —  LSTM encoder-decoder over canonical DBA space
+# =============================================================================
+#
+# Same DBA barycenter + DTW alignment as the baseline, but the model is an
+# LSTM seq2seq that takes the full 100-step context vector as input and
+# outputs the full 100-step energy curve in one shot — capturing temporal
+# dependencies that a per-row regressor cannot.
+#
+# Training target:  DTW-aligned curve in canonical space (same as baseline).
+# Input sequence :  [phase, curve_length, activity_ohe…, attrs…]  (100 × F)
+# Output sequence:  aligned energy values                          (100,)
+#
+# Decode back to raw length: identical DTW path inversion as baseline.
+# =============================================================================
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+
+class _Seq2SeqLSTM(nn.Module):
+    """
+    Encoder-decoder LSTM.
+    Encoder: reads the 100-step input feature sequence.
+    Decoder: auto-regressively generates 100 output values conditioned on the
+             encoder hidden state. At each step it receives the previous
+             predicted value concatenated with the corresponding input features
+             (scheduled teacher forcing during training, own predictions at
+             inference).
+    """
+    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers  = num_layers
+        self.encoder = nn.LSTM(input_size, hidden_size, num_layers,
+                               batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        # decoder input = 1 (prev value) + input_size (context features at that step)
+        self.decoder = nn.LSTM(1 + input_size, hidden_size, num_layers,
+                               batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.out_proj = nn.Linear(hidden_size, 1)
+
+    def forward(self, x, targets=None, teacher_forcing_ratio=0.5):
+        """
+        x       : (B, T, F)
+        targets : (B, T)  — if None, pure auto-regressive
+        returns : (B, T)
+        """
+        B, T, _ = x.shape
+        _, (h, c) = self.encoder(x)
+
+        prev = torch.zeros(B, 1, 1, device=x.device)   # (B, 1, 1)
+        outputs = []
+        for t in range(T):
+            dec_in = torch.cat([prev, x[:, t:t+1, :]], dim=-1)  # (B,1,1+F)
+            out, (h, c) = self.decoder(dec_in, (h, c))
+            pred = self.out_proj(out)                             # (B,1,1)
+            outputs.append(pred)
+            if targets is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                prev = targets[:, t:t+1].unsqueeze(-1)
+            else:
+                prev = pred.detach()
+
+        return torch.cat(outputs, dim=1).squeeze(-1)             # (B, T)
+
+
+def _build_seq2seq_input(curves, all_keys, key_types, fixed_length,
+                          cat_columns, feature_columns, scaler,
+                          numeric_feature_cols, value_key='resampled_values',
+                          return_targets=True):
+    """
+    Build input tensor (N, fixed_length, F) and optional target (N, fixed_length)
+    from a list of curve dicts.  Uses the same feature set as the baseline.
+    """
+    X_list, y_list = [], []
+    for curve in curves:
+        rows = []
+        for pos in range(fixed_length):
+            row = {
+                'position_idx': pos,
+                'curve_length': curve['original_length'],
+                'activity':     curve['activity'],
+            }
+            for key in all_keys:
+                v = curve['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(v) if v is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(v) if v is not None else 'None'
+            rows.append(row)
+
+        df_c = pd.DataFrame(rows)
+        df_c = pd.get_dummies(df_c, columns=cat_columns, drop_first=True)
+        for col in feature_columns:
+            if col not in df_c.columns:
+                df_c[col] = 0
+        df_c = df_c[feature_columns]
+
+        if scaler is not None and numeric_feature_cols:
+            cols_to_scale = [c for c in numeric_feature_cols if c in df_c.columns]
+            if cols_to_scale:
+                df_c[cols_to_scale] = scaler.transform(df_c[cols_to_scale])
+
+        X_list.append(df_c.values.astype(np.float32))
+        if return_targets:
+            y_list.append(curve[value_key].astype(np.float32))
+
+    X = torch.tensor(np.array(X_list), dtype=torch.float32)   # (N, T, F)
+    if return_targets:
+        y = torch.tensor(np.array(y_list), dtype=torch.float32)  # (N, T)
+        return X, y
+    return X
+
+
+def build_and_train_pipeline_seq2seq(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    hidden_size=128,
+    num_layers=2,
+    dropout=0.1,
+    epochs=80,
+    batch_size=32,
+    lr=1e-3,
+    teacher_forcing_ratio=0.5,
+    patience=10,
+    verbose=1,
+):
+    """
+    DTW + Seq2Seq pipeline.
+
+    Stages
+    ------
+    2a. DBA barycenter — same as baseline
+    2b. DTW alignment  — same as baseline
+    2c. Feature matrix — same feature set as baseline (position, curve_length,
+                         activity, attrs), shaped as sequences
+    2d. LSTM encoder-decoder trained with teacher forcing
+    2e. Best epoch selected by val loss (MSE in canonical space)
+
+    Returns
+    -------
+    pipeline : dict  (drop-in compatible with predict_raw_curve_seq2seq)
+    """
+    from sklearn.model_selection import train_test_split as _tts
+
+    if verbose:
+        print("\n" + "=" * 80)
+        print("STEP 2 — BUILD + TRAIN SEQ2SEQ PIPELINE  (train curves only)")
+        print("=" * 80)
+
+    # ------------------------------------------------------------------
+    # 2a. DBA barycenter
+    # ------------------------------------------------------------------
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values']
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    if verbose:
+        print(f"    Barycenter length: {len(reference_curve)}")
+
+    # ------------------------------------------------------------------
+    # 2b. DTW-align train curves
+    # ------------------------------------------------------------------
+    for i, curve in enumerate(train_curves):
+        if verbose and i % max(1, len(train_curves) // 10) == 0:
+            print(f"    Aligning {i+1}/{len(train_curves)}...")
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+
+    # ------------------------------------------------------------------
+    # 2c. Feature setup (same as baseline — fit on train only)
+    # ------------------------------------------------------------------
+    all_keys, key_types = _infer_key_types(train_curves)
+    cat_columns = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+
+    # Build a dummy flat df just to determine feature columns + fit scaler
+    _df_ref = _build_feature_matrix(
+        train_curves, all_keys, key_types, fixed_length,
+        value_key='resampled_values', include_target=False
+    )
+    _df_ref = _df_ref.drop(columns=['instance_id'], errors='ignore')
+    _df_ohe = pd.get_dummies(_df_ref, columns=cat_columns, drop_first=True)
+    feature_columns = _df_ohe.columns.tolist()
+
+    numeric_feature_cols = ['position_idx', 'curve_length'] + [
+        k for k in all_keys if key_types[k] == 'numeric'
+    ]
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in _df_ohe.columns]
+
+    scaler = StandardScaler()
+    _df_ohe[numeric_feature_cols] = scaler.fit_transform(_df_ohe[numeric_feature_cols])
+
+    # ------------------------------------------------------------------
+    # 2d. Build tensors + val split by instance
+    # ------------------------------------------------------------------
+    unique_instances = list({c['instance_id'] for c in train_curves})
+    train_inst, val_inst = _tts(unique_instances, test_size=val_size,
+                                random_state=random_state)
+    tr_curves = [c for c in train_curves if c['instance_id'] in set(train_inst)]
+    vl_curves = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+
+    X_tr, y_tr = _build_seq2seq_input(tr_curves, all_keys, key_types, fixed_length,
+                                       cat_columns, feature_columns, scaler,
+                                       numeric_feature_cols)
+    X_vl, y_vl = _build_seq2seq_input(vl_curves, all_keys, key_types, fixed_length,
+                                       cat_columns, feature_columns, scaler,
+                                       numeric_feature_cols)
+
+    if verbose:
+        print(f"    Train: {len(tr_curves)} curves | Val: {len(vl_curves)} curves")
+
+    # Normalise targets with train statistics (avoids magnitude dominance)
+    y_mean = float(y_tr.mean())
+    y_std  = float(y_tr.std()) + 1e-8
+    y_tr_n = (y_tr - y_mean) / y_std
+    y_vl_n = (y_vl - y_mean) / y_std
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_size = X_tr.shape[-1]
+
+    model = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
+                         num_layers=num_layers, dropout=dropout).to(device)
+    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    loader = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
+
+    best_val_loss = float('inf')
+    best_state    = None
+    no_improve    = 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimiser.zero_grad()
+            pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
+            loss = criterion(pred, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
+            val_loss = criterion(val_pred, y_vl_n.to(device)).item()
+
+        if verbose and epoch % 10 == 0:
+            print(f"    Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve    = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                if verbose:
+                    print(f"    Early stopping at epoch {epoch}")
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    if verbose:
+        print(f"    Best val_loss={best_val_loss:.5f}")
+
+    return {
+        'approach':            'seq2seq',
+        'model':               model,
+        'reference_curve':     reference_curve,
+        'fixed_length':        fixed_length,
+        'all_keys':            all_keys,
+        'key_types':           key_types,
+        'cat_columns':         cat_columns,
+        'feature_columns':     feature_columns,
+        'scaler':              scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'y_mean':              y_mean,
+        'y_std':               y_std,
+        'device':              device,
+        'val_loss':            best_val_loss,
+    }
+
+
+def predict_raw_curve_seq2seq(raw_values, activity, attributes, pipeline):
+    """
+    Predict a single raw curve using the trained Seq2Seq pipeline.
+
+    1. Build 100-step feature sequence (same as baseline).
+    2. Run the LSTM decoder (no teacher forcing) → 100 canonical predictions.
+    3. DTW-decode back to raw length using the same path inversion as baseline.
+    """
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+    cat_columns          = pipeline['cat_columns']
+    feature_columns      = pipeline['feature_columns']
+    scaler               = pipeline['scaler']
+    numeric_feature_cols = pipeline['numeric_feature_cols']
+    y_mean               = pipeline['y_mean']
+    y_std                = pipeline['y_std']
+    device               = pipeline['device']
+
+    # Build feature sequence
+    rows = []
+    for pos in range(fixed_length):
+        row = {
+            'position_idx': pos,
+            'curve_length': len(raw_values),
+            'activity':     activity,
+        }
+        for key in all_keys:
+            v = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(v) if v is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(v) if v is not None else 'None'
+        rows.append(row)
+
+    df_seq = pd.DataFrame(rows)
+    df_seq = pd.get_dummies(df_seq, columns=cat_columns, drop_first=True)
+    for col in feature_columns:
+        if col not in df_seq.columns:
+            df_seq[col] = 0
+    df_seq = df_seq[feature_columns]
+
+    if scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
+        if cols_to_scale:
+            df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
+
+    X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)  # (1,T,F)
+
+    model.eval()
+    with torch.no_grad():
+        y_norm = model(X, targets=None, teacher_forcing_ratio=0.0)  # (1, T)
+
+    y_ref_pred = (y_norm.squeeze(0).cpu().numpy() * y_std + y_mean)  # (T,)
+
+    # DTW path decode — identical to baseline predict_raw_curve
+    alignment  = dtw(raw_values, reference_curve, keep_internals=True)
+    buckets    = [[] for _ in range(len(raw_values))]
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            _ = nearest_qi
+            y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
 # STEP 4 — EVALUATE ON RAW TEST CURVES
 # =============================================================================
+
+def _dispatch_predict(raw_values, curve, pipeline):
+    """Route prediction to the right function based on pipeline['approach']."""
+    approach = pipeline.get('approach', 'baseline')
+    act, attrs = curve['activity'], curve['attributes']
+    if approach == 'exog':
+        return predict_raw_curve_exog(raw_values, act, attrs, pipeline,
+                                      exog_values=curve.get('exog_values', {}))
+    if approach == 'instance_stats':
+        return predict_raw_curve_instance_stats(raw_values, act, attrs, pipeline)
+    if approach == 'dtw_phase':
+        return predict_raw_curve_dtw_phase(raw_values, act, attrs, pipeline)
+    if approach == 'basis_expansion':
+        return predict_raw_curve_basis(raw_values, act, attrs, pipeline)
+    if approach == 'seq2seq':
+        return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
+    return predict_raw_curve(raw_values, act, attrs, pipeline)
+
 
 def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1):
     """
@@ -3742,31 +4522,9 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
     per_curve_metrics = []
     all_true, all_pred = [], []
 
-    _approach = pipeline.get('approach', 'baseline')
-
     for curve in test_curves:
         raw_values = curve['original_values']
-        if _approach == 'exog':
-            y_pred = predict_raw_curve_exog(
-                raw_values, curve['activity'], curve['attributes'], pipeline,
-                exog_values=curve.get('exog_values', {}),
-            )
-        elif _approach == 'instance_stats':
-            y_pred = predict_raw_curve_instance_stats(
-                raw_values, curve['activity'], curve['attributes'], pipeline,
-            )
-        elif _approach == 'dtw_phase':
-            y_pred = predict_raw_curve_dtw_phase(
-                raw_values, curve['activity'], curve['attributes'], pipeline,
-            )
-        elif _approach == 'basis_expansion':
-            y_pred = predict_raw_curve_basis(
-                raw_values, curve['activity'], curve['attributes'], pipeline,
-            )
-        else:
-            y_pred = predict_raw_curve(
-                raw_values, curve['activity'], curve['attributes'], pipeline,
-            )
+        y_pred = _dispatch_predict(raw_values, curve, pipeline)
 
         mae  = mean_absolute_error(raw_values, y_pred)
         rmse = np.sqrt(mean_squared_error(raw_values, y_pred))
@@ -3831,9 +4589,7 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
 
         for ax, curve in zip(axes[:n_plot], test_curves[:n_plot]):
             raw_values = curve['original_values']
-            y_pred = predict_raw_curve(
-                raw_values, curve['activity'], curve['attributes'], pipeline
-            )
+            y_pred = _dispatch_predict(raw_values, curve, pipeline)
 
             r2_val   = r2_score(raw_values, y_pred)
             rmse_val = np.sqrt(mean_squared_error(raw_values, y_pred))

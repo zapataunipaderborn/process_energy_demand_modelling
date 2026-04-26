@@ -2561,3 +2561,878 @@ plt.suptitle(f'Causal-DTW vs Baseline — {_TARGET_SENSOR}',
 plt.tight_layout()
 plt.show()
 # %%
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTOREGRESSIVE STRUCTURAL EQUATION MODEL (AR-SEM)
+#
+# One model per endogenous sensor.  At each step the model predicts y[t] from:
+#   - own lagged predictions  y[t-1], y[t-2], ...
+#   - other endogenous sensors at their PCMCI-discovered lags (already
+#     predicted this step or previous steps, in topological order)
+#   - exogenous ef_* parents at their PCMCI-discovered lags (always known)
+#   - activity (one-hot), phase t/T, ref_val and ref_slope at that phase
+#
+# Training uses teacher forcing (real aligned values as lags).
+# Inference uses own predictions as lags, seeded by the DTW reference curve.
+# Sensors are simulated in topological order from the causal graph so that
+# when sensor A needs sensor B at lag 1, B has already been predicted.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# %%
+
+def build_sem_from_pcmci(pcmci_out, endogenous_cols, exogenous_cols):
+    """
+    Extract the full Structural Equation Model from PCMCI output.
+
+    For every endogenous sensor returns its causal parents split into:
+      - own lags            [(col, lag, strength)]  where col == target
+      - endogenous parents  [(col, lag, strength)]  other sensors
+      - exogenous parents   [(col, lag, strength)]  ef_* / activity etc.
+
+    Also returns a topological order for simulation (Kahn's algorithm on
+    the contemporaneous + lag-1 graph; for lags > 1 there is no ordering
+    issue so we only look at lag-1 links between endogenous sensors).
+
+    Parameters
+    ----------
+    pcmci_out       : dict   from run_pcmci_causal_discovery()
+    endogenous_cols : list   sensor columns to model (target variables)
+    exogenous_cols  : list   ef_* + context columns (parents only)
+
+    Returns
+    -------
+    sem   : dict  {target_col: {'own': [...], 'endo': [...], 'exo': [...]}}
+    order : list  topological order of endogenous_cols for simulation
+    """
+    all_vars = pcmci_out['all_vars']
+    graph    = pcmci_out['graph']        # (n_vars, n_vars, tau_max+1)
+    val_mat  = pcmci_out['results']['val_matrix']
+
+    sem = {}
+    for target in endogenous_cols:
+        if target not in all_vars:
+            sem[target] = {'own': [], 'endo': [], 'exo': []}
+            continue
+        j = all_vars.index(target)
+        own, endo, exo = [], [], []
+        for i, col in enumerate(all_vars):
+            for tau in range(1, graph.shape[2]):
+                if graph[i, j, tau]:
+                    entry = (col, tau, float(val_mat[i, j, tau]))
+                    if col == target:
+                        own.append(entry)
+                    elif col in endogenous_cols:
+                        endo.append(entry)
+                    else:
+                        exo.append(entry)
+        sem[target] = {'own': own, 'endo': endo, 'exo': exo}
+
+    # Topological sort (Kahn) on lag-1 endogenous links only
+    # Edge: B → A means "B at lag 1 causes A" → simulate B before A
+    in_deg = {c: 0 for c in endogenous_cols}
+    adj    = {c: [] for c in endogenous_cols}
+    for target, parents in sem.items():
+        for col, lag, _ in parents['endo']:
+            if lag == 1 and col in endogenous_cols:
+                adj[col].append(target)
+                in_deg[target] += 1
+
+    queue = [c for c in endogenous_cols if in_deg[c] == 0]
+    order = []
+    while queue:
+        node = queue.pop(0)
+        order.append(node)
+        for nb in adj[node]:
+            in_deg[nb] -= 1
+            if in_deg[nb] == 0:
+                queue.append(nb)
+    # Any remaining (cycle) just appended in original order
+    order += [c for c in endogenous_cols if c not in order]
+
+    return sem, order
+
+
+def _build_reference_curves(train_curves_dict, fixed_length=100):
+    """
+    Build DBA barycenter and slope per (sensor, activity).
+
+    Parameters
+    ----------
+    train_curves_dict : dict  {sensor: list[curve_dict]}
+    fixed_length      : int
+
+    Returns
+    -------
+    ref_curves : dict  {sensor: {activity: np.ndarray(fixed_length)}}
+    ref_slopes : dict  {sensor: {activity: np.ndarray(fixed_length)}}
+    """
+    ref_curves = {}
+    ref_slopes = {}
+
+    for sensor, curves in train_curves_dict.items():
+        ref_curves[sensor] = {}
+        ref_slopes[sensor] = {}
+
+        activities = sorted({c['activity'] for c in curves})
+        for act in activities:
+            act_curves = [c for c in curves if c['activity'] == act]
+            if not act_curves:
+                continue
+            resampled = np.array([
+                _resample(c['original_values'], fixed_length)
+                for c in act_curves
+            ])[:, :, np.newaxis]
+            bary = dtw_barycenter_averaging(resampled, barycenter_size=fixed_length)
+            ref  = bary[:, 0]
+            ref_curves[sensor][act] = ref
+            ref_slopes[sensor][act] = np.gradient(ref)
+
+        # Global fallback across all activities
+        if curves:
+            all_res = np.array([
+                _resample(c['original_values'], fixed_length) for c in curves
+            ])[:, :, np.newaxis]
+            bary_all = dtw_barycenter_averaging(all_res, barycenter_size=fixed_length)
+            ref_all  = bary_all[:, 0]
+            ref_curves[sensor]['__global__'] = ref_all
+            ref_slopes[sensor]['__global__'] = np.gradient(ref_all)
+
+    return ref_curves, ref_slopes
+
+
+def _get_ref(ref_dict, sensor, activity):
+    """Look up reference curve/slope with __global__ fallback."""
+    s = ref_dict.get(sensor, {})
+    return s.get(activity, s.get('__global__', np.zeros(100)))
+
+
+def _extract_curves_for_sensor(df_expanded, sensor, activities, objects,
+                                sem_entry, all_endo, fixed_length,
+                                test_size=0.20, random_state=42):
+    """
+    Extract train/test curve dicts for one sensor.
+
+    Each dict contains:
+        original_values, activity, instance_id, original_length, attributes,
+        own_lags   : {lag: np.ndarray}   aligned values shifted by lag
+        endo_vals  : {(col,lag): np.ndarray}
+        exo_vals   : {(col,lag): np.ndarray}
+    """
+    own_lags  = [lag for _, lag, _ in sem_entry['own']]
+    endo_pars = [(col, lag) for col, lag, _ in sem_entry['endo']]
+    exo_pars  = [(col, lag) for col, lag, _ in sem_entry['exo']]
+
+    # Columns to pull from df_expanded
+    extra_cols = (
+        [col for col, _ in endo_pars if col in df_expanded.columns] +
+        [col for col, _ in exo_pars  if col in df_expanded.columns]
+    )
+    extra_cols = list(dict.fromkeys(extra_cols))  # deduplicate, preserve order
+
+    keep = ['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log',
+            'datetime_energy', sensor, 'object_attributes_log'] + extra_cols
+    keep = [c for c in keep if c in df_expanded.columns]
+
+    df = df_expanded[keep].copy()
+    df = df[df['object_log'].isin(objects)]
+    df = df[df['activity_log'].isin(activities)]
+    df['datetime_energy'] = pd.to_datetime(df['datetime_energy'])
+    df = df.sort_values(['case_id_log', 'timestamp_start_log', 'datetime_energy'])
+    df['_iid'] = df.groupby(
+        ['case_id_log', 'object_log', 'activity_log', 'timestamp_start_log']
+    ).ngroup()
+
+    curves = []
+    for iid, grp in df.groupby('_iid'):
+        grp    = grp.sort_values('datetime_energy').reset_index(drop=True)
+        values = grp[sensor].dropna().values
+        if len(values) < 5:
+            continue
+        attrs = grp['object_attributes_log'].iloc[0] \
+            if 'object_attributes_log' in grp.columns else {}
+
+        entry = {
+            'instance_id':     iid,
+            'activity':        grp['activity_log'].iloc[0],
+            'original_values': values,
+            'original_length': len(values),
+            'attributes':      attrs,
+            'endo_vals':  {(c, l): grp[c].values for c, l in endo_pars
+                           if c in grp.columns},
+            'exo_vals':   {(c, l): grp[c].values for c, l in exo_pars
+                           if c in grp.columns},
+        }
+        curves.append(entry)
+
+    all_ids = list(range(len(curves)))
+    if test_size <= 0:
+        return curves, []
+    tr_ids, te_ids = train_test_split(all_ids, test_size=test_size,
+                                       random_state=random_state)
+    return [curves[i] for i in tr_ids], [curves[i] for i in te_ids]
+
+
+def build_and_train_ar_sem(
+    train_curves_dict,
+    sem,
+    ref_curves,
+    ref_slopes,
+    fixed_length=100,
+    max_own_lag=2,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    verbose=True,
+):
+    """
+    Train one autoregressive model per endogenous sensor.
+
+    Training uses teacher forcing: real DTW-aligned values are used as
+    lagged inputs.  The DTW reference curve (per sensor × activity) provides
+    phase features (ref_val, ref_slope at the current position).
+
+    Parameters
+    ----------
+    train_curves_dict : dict  {sensor: list[curve_dict]}  from _extract_curves_for_sensor
+    sem               : dict  from build_sem_from_pcmci
+    ref_curves        : dict  from _build_reference_curves
+    ref_slopes        : dict  from _build_reference_curves
+    fixed_length      : int
+    max_own_lag       : int   number of own autoregressive lags to include
+    val_size          : float
+    random_state      : int
+    models            : dict  {name: ModelClass}
+    verbose           : bool
+
+    Returns
+    -------
+    ar_pipelines : dict  {sensor: pipeline_dict}
+    """
+    if models is None:
+        models = {
+            'Linear Regression': LinearRegression,
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    ar_pipelines = {}
+
+    for sensor, train_curves in train_curves_dict.items():
+        if not train_curves:
+            continue
+
+        sem_s     = sem.get(sensor, {'own': [], 'endo': [], 'exo': []})
+        endo_pars = [(c, l) for c, l, _ in sem_s['endo']]
+        exo_pars  = [(c, l) for c, l, _ in sem_s['exo']]
+        own_lags  = list(range(1, max_own_lag + 1))
+
+        if verbose:
+            report(f"\n[AR-SEM] {sensor}")
+            report(f"  own lags   : {own_lags}")
+            report(f"  endo pars  : {endo_pars}")
+            report(f"  exo pars   : {[(c,l) for c,l in exo_pars]}")
+
+        # ── DTW-align train curves to per-activity barycenter ─────────────
+        for c in train_curves:
+            ref = _get_ref(ref_curves, sensor, c['activity'])
+            c['aligned'] = _dtw_align(c['original_values'], ref)
+
+        # ── Attribute key types ───────────────────────────────────────────
+        all_keys = sorted({k for c in train_curves for k in c['attributes'].keys()})
+        key_types = {}
+        for key in all_keys:
+            is_num = True
+            for c in train_curves:
+                if key in c['attributes']:
+                    try:
+                        float(c['attributes'][key])
+                    except (ValueError, TypeError):
+                        is_num = False
+                        break
+            key_types[key] = 'numeric' if is_num else 'category'
+
+        # ── Build feature matrix (teacher forcing) ────────────────────────
+        rows = []
+        for c in train_curves:
+            ref   = _get_ref(ref_curves, sensor, c['activity'])
+            slope = _get_ref(ref_slopes, sensor, c['activity'])
+            aligned = c['aligned']
+
+            # Resample endo/exo signals to fixed_length
+            endo_rs = {(col, lag): _resample(c['endo_vals'].get((col, lag),
+                        np.zeros(c['original_length'])), fixed_length)
+                       for col, lag in endo_pars}
+            exo_rs  = {(col, lag): _resample(c['exo_vals'].get((col, lag),
+                        np.zeros(c['original_length'])), fixed_length)
+                       for col, lag in exo_pars}
+
+            for pos in range(fixed_length):
+                phase = pos / max(fixed_length - 1, 1)
+                row = {
+                    'instance_id':  c['instance_id'],
+                    'activity':     c['activity'],
+                    'position_idx': pos,
+                    'phase':        phase,
+                    'curve_length': c['original_length'],
+                    'ref_val':      float(ref[pos]),
+                    'ref_slope':    float(slope[pos]),
+                    'y':            float(aligned[pos]),
+                }
+                # Own autoregressive lags (teacher forcing: use real aligned)
+                for lag in own_lags:
+                    src = max(0, pos - lag)
+                    row[f'own_lag{lag}'] = float(aligned[src])
+
+                # Endogenous parent lags
+                for col, lag in endo_pars:
+                    src = max(0, pos - lag)
+                    row[f'{col}__lag{lag}'] = float(endo_rs[(col, lag)][src])
+
+                # Exogenous parent lags
+                for col, lag in exo_pars:
+                    src = max(0, pos - lag)
+                    row[f'{col}__lag{lag}'] = float(exo_rs[(col, lag)][src])
+
+                # Scalar attributes
+                for key in all_keys:
+                    val = c['attributes'].get(key, None)
+                    if key_types[key] == 'numeric':
+                        try:
+                            row[key] = float(val) if val is not None else np.nan
+                        except (ValueError, TypeError):
+                            row[key] = np.nan
+                    else:
+                        row[key] = str(val) if val is not None else 'None'
+
+                rows.append(row)
+
+        df_reg = pd.DataFrame(rows)
+        cat_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+        X_all = df_reg.drop(columns=['instance_id', 'y'] + cat_cols)
+        for cc in cat_cols:
+            X_all[cc] = df_reg[cc].values
+        X_all = pd.get_dummies(X_all, columns=cat_cols, drop_first=True)
+        y_all = df_reg['y'].copy()
+
+        tr_inst, va_inst = train_test_split(
+            df_reg['instance_id'].unique(), test_size=val_size,
+            random_state=random_state
+        )
+        tr_mask = df_reg['instance_id'].isin(tr_inst)
+        va_mask = df_reg['instance_id'].isin(va_inst)
+        X_train, X_val = X_all[tr_mask].copy(), X_all[va_mask].copy()
+        y_train, y_val = y_all[tr_mask].copy(), y_all[va_mask].copy()
+
+        feat_cols = X_all.columns.tolist()
+        num_cols  = [c for c in feat_cols
+                     if c not in pd.get_dummies(
+                         pd.DataFrame({'activity': ['x']}),
+                         columns=['activity'], drop_first=True
+                     ).columns]
+        num_cols = [c for c in feat_cols
+                    if X_train[c].dtype in (float, np.float64, np.float32,
+                                             int, np.int64, np.int32)]
+
+        scaler = StandardScaler()
+        X_train.loc[:, num_cols] = scaler.fit_transform(X_train[num_cols])
+        X_val.loc[:,   num_cols] = scaler.transform(X_val[num_cols])
+
+        best_model, best_name, best_r2 = None, None, -np.inf
+        all_results = {}
+        for name, cls in models.items():
+            mdl = cls()
+            mdl.fit(X_train, y_train)
+            tr_r2 = float(r2_score(y_train, mdl.predict(X_train)))
+            va_r2 = float(r2_score(y_val,   mdl.predict(X_val)))
+            all_results[name] = {'train_r2': tr_r2, 'val_r2': va_r2}
+            if verbose:
+                report(f"    {name:25}  train R²={tr_r2:.4f}  val R²={va_r2:.4f}")
+            if va_r2 > best_r2:
+                best_r2, best_model, best_name = va_r2, mdl, name
+
+        report(f"  → best: {best_name}  val R²={best_r2:.4f}")
+
+        ar_pipelines[sensor] = {
+            'model':            best_model,
+            'model_name':       best_name,
+            'val_r2':           best_r2,
+            'all_results':      all_results,
+            'feature_columns':  feat_cols,
+            'scaler':           scaler,
+            'numeric_cols':     num_cols,
+            'all_keys':         all_keys,
+            'key_types':        key_types,
+            'own_lags':         own_lags,
+            'endo_pars':        endo_pars,
+            'exo_pars':         exo_pars,
+            'fixed_length':     fixed_length,
+            'approach':         'ar_sem',
+        }
+
+    return ar_pipelines
+
+
+def simulate_ar_sem(
+    activity,
+    T,
+    ef_signals,
+    endo_signals,
+    ar_pipelines,
+    ref_curves,
+    ref_slopes,
+    attributes=None,
+    sim_order=None,
+):
+    """
+    Run the full autoregressive simulation for one activity window.
+
+    At each step t (0..T-1):
+      1. For each sensor in sim_order:
+         a. Compute phase = t / (T-1)
+         b. Look up ref_val and ref_slope at that phase
+         c. Build feature row using:
+              - own predictions at lags 1,2,...  (seeded by ref_curve at t=0)
+              - other endogenous sensor predictions at their lags
+              - ef_* values at their lags (resampled to T)
+              - activity, phase, ref_val, ref_slope, attributes
+         d. Predict y_sensor[t]
+
+    Parameters
+    ----------
+    activity      : str
+    T             : int   number of time steps to simulate
+    ef_signals    : dict  {col: np.ndarray(T)}  exogenous signals, length T
+    endo_signals  : dict  {col: np.ndarray(T)}  used only for endo parents at lag>1
+                          (at inference pass zeros or best-guess; model will
+                           use its own predictions for lag-1 endo parents)
+    ar_pipelines  : dict  {sensor: pipeline_dict}
+    ref_curves    : dict  {sensor: {activity: np.ndarray(fixed_length)}}
+    ref_slopes    : dict  {sensor: {activity: np.ndarray(fixed_length)}}
+    attributes    : dict  scalar attributes (order properties etc.)
+    sim_order     : list  sensor simulation order (from build_sem_from_pcmci)
+
+    Returns
+    -------
+    predictions : dict  {sensor: np.ndarray(T)}
+    """
+    if attributes is None:
+        attributes = {}
+    if sim_order is None:
+        sim_order = list(ar_pipelines.keys())
+
+    sensors = [s for s in sim_order if s in ar_pipelines]
+    fixed_length = next(
+        (ar_pipelines[s]['fixed_length'] for s in sensors), 100
+    )
+
+    # Buffer: predictions[sensor][t] once computed
+    pred_buf = {s: np.full(T, np.nan) for s in sensors}
+
+    # Resample ef signals to T once
+    ef_rs = {col: _resample(sig, T) for col, sig in ef_signals.items()}
+    endo_rs = {col: _resample(sig, T) for col, sig in endo_signals.items()}
+
+    for t in range(T):
+        phase = t / max(T - 1, 1)
+        # Canonical position in reference space
+        ref_pos = int(round(phase * (fixed_length - 1)))
+        ref_pos = max(0, min(ref_pos, fixed_length - 1))
+
+        for sensor in sensors:
+            pip = ar_pipelines[sensor]
+            ref = _get_ref(ref_curves, sensor, activity)
+            slp = _get_ref(ref_slopes, sensor, activity)
+
+            row = {
+                'position_idx': ref_pos,
+                'phase':        phase,
+                'curve_length': T,
+                'ref_val':      float(ref[ref_pos]),
+                'ref_slope':    float(slp[ref_pos]),
+            }
+
+            # Own autoregressive lags — seed with reference curve when t < lag
+            for lag in pip['own_lags']:
+                if t - lag >= 0 and not np.isnan(pred_buf[sensor][t - lag]):
+                    row[f'own_lag{lag}'] = float(pred_buf[sensor][t - lag])
+                else:
+                    # Warm-start: use reference curve value at that position
+                    seed_pos = max(0, ref_pos - lag)
+                    row[f'own_lag{lag}'] = float(ref[seed_pos])
+
+            # Endogenous parent lags
+            for col, lag in pip['endo_pars']:
+                src_t = t - lag
+                if col in pred_buf and src_t >= 0 and not np.isnan(pred_buf[col][src_t]):
+                    row[f'{col}__lag{lag}'] = float(pred_buf[col][src_t])
+                elif col in endo_rs and src_t >= 0:
+                    row[f'{col}__lag{lag}'] = float(endo_rs[col][src_t])
+                else:
+                    row[f'{col}__lag{lag}'] = 0.0
+
+            # Exogenous parent lags
+            for col, lag in pip['exo_pars']:
+                src_t = t - lag
+                if col in ef_rs and src_t >= 0:
+                    row[f'{col}__lag{lag}'] = float(ef_rs[col][src_t])
+                else:
+                    row[f'{col}__lag{lag}'] = 0.0
+
+            # Scalar attributes
+            all_keys  = pip['all_keys']
+            key_types = pip['key_types']
+            for key in all_keys:
+                val = attributes.get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(val) if val is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(val) if val is not None else 'None'
+
+            # Activity one-hot + align columns
+            row['activity'] = activity
+            X = pd.DataFrame([row])
+            cat_cols = ['activity'] + [k for k in all_keys
+                                        if key_types[k] == 'category']
+            X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+            for fc in pip['feature_columns']:
+                if fc not in X.columns:
+                    X[fc] = 0
+            X = X[pip['feature_columns']]
+
+            num_cols = pip['numeric_cols']
+            sc_cols  = [c for c in num_cols if c in X.columns]
+            if sc_cols:
+                X.loc[:, sc_cols] = pip['scaler'].transform(X[sc_cols])
+
+            pred_buf[sensor][t] = float(pip['model'].predict(X)[0])
+
+    return pred_buf
+
+
+def evaluate_ar_sem(test_curves_dict, ar_pipelines, ref_curves, ref_slopes,
+                    sim_order=None):
+    """
+    Evaluate AR-SEM on test curves.  For each test curve we run
+    simulate_ar_sem using the ef_* and endo signals from that curve instance
+    and compare predictions to the real aligned values.
+
+    Returns
+    -------
+    metrics_df : pd.DataFrame   per-curve metrics (sensor, activity, R², MAE…)
+    agg        : dict           aggregate per sensor
+    """
+    records = []
+
+    sensors = list(test_curves_dict.keys())
+    if sim_order is None:
+        sim_order = sensors
+
+    # Collect all instance_ids across sensors
+    all_ids = {c['instance_id']
+               for s in sensors
+               for c in test_curves_dict.get(s, [])}
+
+    for iid in all_ids:
+        # Find matching curve for each sensor (same instance_id)
+        instance = {}
+        for s in sensors:
+            for c in test_curves_dict.get(s, []):
+                if c['instance_id'] == iid:
+                    instance[s] = c
+                    break
+        if not instance:
+            continue
+
+        # Use first available curve to get activity / T / attributes
+        ref_c  = next(iter(instance.values()))
+        act    = ref_c['activity']
+        T      = ref_c['original_length']
+        attrs  = ref_c['attributes']
+
+        # Build ef_signals and endo_signals for this instance
+        ef_signals   = {}
+        endo_signals = {}
+
+        for s, c in instance.items():
+            pip = ar_pipelines.get(s, {})
+            for col, lag in pip.get('exo_pars', []):
+                if (col, lag) in c.get('exo_vals', {}) and col not in ef_signals:
+                    ef_signals[col] = c['exo_vals'][(col, lag)]
+            for col, lag in pip.get('endo_pars', []):
+                if col in instance and col not in endo_signals:
+                    other_c = instance[col]
+                    endo_signals[col] = other_c['original_values']
+
+        preds = simulate_ar_sem(
+            activity=act, T=T,
+            ef_signals=ef_signals,
+            endo_signals=endo_signals,
+            ar_pipelines=ar_pipelines,
+            ref_curves=ref_curves,
+            ref_slopes=ref_slopes,
+            attributes=attrs,
+            sim_order=sim_order,
+        )
+
+        for s, c in instance.items():
+            real = c['original_values']
+            pred = _resample(preds[s], len(real))
+            mae  = float(mean_absolute_error(real, pred))
+            rmse = float(np.sqrt(mean_squared_error(real, pred)))
+            r2   = float(r2_score(real, pred))
+            denom = np.sum(np.abs(real))
+            wape = float(np.sum(np.abs(real - pred)) / denom * 100) \
+                   if denom > 0 else np.nan
+            records.append({
+                'sensor':      s,
+                'activity':    act,
+                'instance_id': iid,
+                'n_points':    len(real),
+                'MAE':  mae, 'RMSE': rmse, 'WAPE (%)': wape, 'R2': r2,
+            })
+
+    metrics_df = pd.DataFrame(records)
+    agg = {}
+    for s in sensors:
+        sub = metrics_df[metrics_df['sensor'] == s]
+        if sub.empty:
+            continue
+        agg[s] = {
+            'MAE':  sub['MAE'].mean(),
+            'RMSE': sub['RMSE'].mean(),
+            'R2':   sub['R2'].mean(),
+        }
+    return metrics_df, agg
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RUN — build SEM, train AR models, simulate, compare vs baseline + causal-DTW
+# ──────────────────────────────────────────────────────────────────────────────
+
+# %%
+
+# Endogenous sensors: _energy columns that do NOT start with ef_
+_df_exp3 = process_datasets['process_3']['expanded']
+
+_endo_cols = [
+    c for c in _df_exp3.columns
+    if c.endswith('_energy')
+    and not c.startswith('ef_')
+    and pd.api.types.is_numeric_dtype(_df_exp3[c])
+    and c != 'datetime_energy'
+    and c != 'id_original_energy'
+]
+
+_exo_cols = [
+    c for c in _df_exp3.columns
+    if c.startswith('ef_')
+    and pd.api.types.is_numeric_dtype(_df_exp3[c])
+]
+
+report(f"\nEndogenous sensors : {len(_endo_cols)}")
+report(f"Exogenous (ef_*)   : {_exo_cols}")
+
+# %%
+
+# Build SEM from existing pcmci_output
+# (pcmci_output was computed above on the same df with these columns)
+_sem, _sim_order = build_sem_from_pcmci(pcmci_output, _endo_cols, _exo_cols)
+
+report("\nSimulation order (topological):")
+report(_sim_order)
+report("\nSEM summary:")
+for s, entry in _sem.items():
+    n_own  = len(entry['own'])
+    n_endo = len(entry['endo'])
+    n_exo  = len(entry['exo'])
+    if n_own + n_endo + n_exo > 0:
+        report(f"  {s[:50]:50}  own={n_own}  endo={n_endo}  exo={n_exo}")
+
+# %%
+
+# Extract train/test curves for every endogenous sensor
+_activities_ar = _df_exp3['activity_log'].dropna().unique().tolist() \
+    if 'activity_log' in _df_exp3.columns else []
+_objects_ar    = _df_exp3['object_log'].dropna().unique().tolist() \
+    if 'object_log' in _df_exp3.columns else []
+
+_train_curves_dict = {}
+_test_curves_dict  = {}
+
+for _s in _endo_cols:
+    _sem_s = _sem.get(_s, {'own': [], 'endo': [], 'exo': []})
+    _tr, _te = _extract_curves_for_sensor(
+        _df_exp3, _s, _activities_ar, _objects_ar,
+        _sem_s, _endo_cols,
+        fixed_length=100,
+        test_size=0.20,
+        random_state=42,
+    )
+    if _tr:
+        _train_curves_dict[_s] = _tr
+        _test_curves_dict[_s]  = _te
+
+report(f"\nSensors with training data: {list(_train_curves_dict.keys())}")
+
+# %%
+
+# Build reference curves (DBA per sensor × activity)
+_ref_curves, _ref_slopes = _build_reference_curves(
+    _train_curves_dict, fixed_length=100
+)
+
+# %%
+
+# Train AR-SEM models
+_AR_MODELS = {
+    'Linear Regression': LinearRegression,
+    'Gradient Boosting': GradientBoostingRegressor,
+}
+
+_ar_pipelines = build_and_train_ar_sem(
+    _train_curves_dict,
+    sem=_sem,
+    ref_curves=_ref_curves,
+    ref_slopes=_ref_slopes,
+    fixed_length=100,
+    max_own_lag=2,
+    val_size=0.2,
+    models=_AR_MODELS,
+    verbose=True,
+)
+
+# %%
+
+# Evaluate AR-SEM on test curves
+_metrics_ar, _agg_ar = evaluate_ar_sem(
+    _test_curves_dict,
+    _ar_pipelines,
+    _ref_curves,
+    _ref_slopes,
+    sim_order=_sim_order,
+)
+
+display(Markdown("## AR-SEM Evaluation — TEST set"))
+display(_metrics_ar.groupby(['sensor', 'activity'])[['MAE', 'RMSE', 'WAPE (%)', 'R2']]
+        .mean().round(4))
+
+# %%
+
+# Compare AR-SEM vs Baseline DTW per sensor (sensors that appear in both)
+_baseline_r2 = {}
+for _s, _ep in _ar_pipelines.items():
+    # Use the baseline pipeline trained per-sensor if available, else skip
+    pass   # baseline trained below for _TARGET_SENSOR only — extend if needed
+
+# Quick comparison table: AR-SEM agg R² vs val_r2 from training
+display(Markdown("## AR-SEM val R² per sensor"))
+_ar_summary = pd.DataFrame([
+    {'Sensor': s, 'Best model': p['model_name'], 'Val R²': round(p['val_r2'], 4)}
+    for s, p in _ar_pipelines.items()
+]).sort_values('Val R²', ascending=False)
+display(_ar_summary)
+
+# %%
+
+# ΔR² vs Baseline: train a quick baseline for every AR sensor and compare
+from sim_extractor import build_and_train_pipeline, predict_raw_curve
+from sim_extractor import evaluate_pipeline_on_test as _eval_base_fn
+
+_compare_rows_ar = []
+
+for _s in list(_ar_pipelines.keys()):
+    _tr_b = [
+        {k: v for k, v in c.items()
+         if k not in ('endo_vals', 'exo_vals')}
+        for c in _train_curves_dict[_s]
+    ]
+    _te_b = [
+        {k: v for k, v in c.items()
+         if k not in ('endo_vals', 'exo_vals')}
+        for c in _test_curves_dict[_s]
+    ]
+    if not _tr_b or not _te_b:
+        continue
+
+    _ep_b = build_and_train_pipeline(
+        _tr_b, variable=_s, fixed_length=100, val_size=0.2,
+        models={'Gradient Boosting': GradientBoostingRegressor},
+        verbose=False,
+    )
+    _mdf_b, _agg_b = _eval_base_fn(_te_b, _ep_b, max_plot_curves=0, verbose=False)
+
+    _ar_r2   = _agg_ar.get(_s, {}).get('R2', np.nan)
+    _base_r2 = _agg_b.get('R2', np.nan)
+    _compare_rows_ar.append({
+        'Sensor':        _s[:55],
+        'AR-SEM  R²':   round(_ar_r2,   4),
+        'Baseline R²':  round(_base_r2, 4),
+        'ΔR²':          round(_ar_r2 - _base_r2, 4),
+    })
+
+_compare_ar_df = pd.DataFrame(_compare_rows_ar).sort_values('ΔR²', ascending=False)
+display(Markdown("## AR-SEM vs Baseline DTW — TEST R²"))
+display(_compare_ar_df)
+
+# %%
+
+# ΔR² bar chart
+if not _compare_ar_df.empty:
+    fig, ax = plt.subplots(figsize=(max(8, len(_compare_ar_df) * 0.6), 5))
+    colors = ['#2ecc71' if v >= 0 else '#e74c3c'
+              for v in _compare_ar_df['ΔR²']]
+    ax.barh(_compare_ar_df['Sensor'], _compare_ar_df['ΔR²'],
+            color=colors, edgecolor='black', linewidth=0.5)
+    ax.axvline(0, color='black', linewidth=0.8, linestyle='--')
+    ax.set_title('ΔR² AR-SEM vs Baseline DTW (green = AR-SEM better)',
+                 fontsize=11, fontweight='bold')
+    ax.set_xlabel('ΔR²')
+    plt.tight_layout()
+    plt.show()
+
+# %%
+
+# Overlay plot: AR-SEM vs real for a few test curves of _TARGET_SENSOR
+if _TARGET_SENSOR in _ar_pipelines and _TARGET_SENSOR in _test_curves_dict:
+    _te_ar = _test_curves_dict[_TARGET_SENSOR][:6]
+    fig, axes = plt.subplots(2, 3, figsize=(14, 6))
+    axes = axes.flatten()
+
+    for ax, c in zip(axes, _te_ar):
+        real = c['original_values']
+        T    = len(real)
+
+        _ef_s  = {col: c['exo_vals'][(col, lag)]
+                  for col, lag in _ar_pipelines[_TARGET_SENSOR]['exo_pars']
+                  if (col, lag) in c.get('exo_vals', {})}
+        _en_s  = {col: _test_curves_dict[col][0]['original_values']
+                  for col, lag in _ar_pipelines[_TARGET_SENSOR]['endo_pars']
+                  if col in _test_curves_dict}
+
+        _preds_ar = simulate_ar_sem(
+            activity=c['activity'], T=T,
+            ef_signals=_ef_s, endo_signals=_en_s,
+            ar_pipelines=_ar_pipelines,
+            ref_curves=_ref_curves, ref_slopes=_ref_slopes,
+            attributes=c['attributes'],
+            sim_order=_sim_order,
+        )
+        y_ar = _resample(_preds_ar[_TARGET_SENSOR], T)
+
+        ax.plot(real, label='Real',    color='black',   linewidth=1.5)
+        ax.plot(y_ar, label='AR-SEM', color='#3498db', linewidth=1.2,
+                linestyle='--')
+        ax.set_title(f"{c['activity']} | id={c['instance_id']}", fontsize=8)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes[len(_te_ar):]:
+        ax.set_visible(False)
+
+    plt.suptitle(f'AR-SEM simulation — {_TARGET_SENSOR}',
+                 fontsize=11, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+# %%

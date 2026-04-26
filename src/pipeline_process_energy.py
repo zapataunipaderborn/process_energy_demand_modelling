@@ -2523,18 +2523,22 @@ if RUN_CURVE_ONLY_EVALUATION:
         split_curves,
         build_and_train_pipeline,            predict_raw_curve,
         build_and_train_pipeline_instance_stats, predict_raw_curve_instance_stats,
+        build_and_train_pipeline_istats_leakfree, predict_raw_curve_istats_leakfree,
         build_and_train_pipeline_dtw_phase,  predict_raw_curve_dtw_phase,
         build_and_train_pipeline_basis,      predict_raw_curve_basis,
         build_and_train_pipeline_exog,       predict_raw_curve_exog,
+        build_and_train_pipeline_seq2seq,    predict_raw_curve_seq2seq,
     )
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import GradientBoostingRegressor
 
-    all_energy_pipelines           = {}   # baseline
-    all_energy_pipelines_instance_stats = {}   # Instance Stats
-    all_energy_pipelines_dtw_phase = {}   # Approach 3
-    all_energy_pipelines_basis     = {}   # Approach 2
-    all_energy_pipelines_exog      = {}   # DTW + External Factors
+    all_energy_pipelines                  = {}   # baseline
+    all_energy_pipelines_instance_stats  = {}   # Instance Stats (leaky)
+    all_energy_pipelines_istats_leakfree = {}   # Instance Stats (leak-free)
+    all_energy_pipelines_dtw_phase       = {}   # Approach 3
+    all_energy_pipelines_basis           = {}   # Approach 2
+    all_energy_pipelines_exog            = {}   # DTW + External Factors
+    all_energy_pipelines_seq2seq         = {}   # DTW + Seq2Seq
 
     _CURVE_MODELS = {
         'Linear Regression': LinearRegression,
@@ -2583,11 +2587,13 @@ if RUN_CURVE_ONLY_EVALUATION:
         print(f"  External factors : {_ef_cols}")
         print(f"{'='*60}")
 
-        _pipelines_baseline       = {}
-        _pipelines_instance_stats = {}
-        _pipelines_dtw_phase      = {}
-        _pipelines_basis          = {}
-        _pipelines_exog           = {}
+        _pipelines_baseline            = {}
+        _pipelines_instance_stats      = {}
+        _pipelines_istats_leakfree     = {}
+        _pipelines_dtw_phase           = {}
+        _pipelines_basis               = {}
+        _pipelines_exog                = {}
+        _pipelines_seq2seq             = {}
 
         for _sensor in _sensors:
             # Split with exog columns so curves carry the ef_ time series
@@ -2646,6 +2652,28 @@ if RUN_CURVE_ONLY_EVALUATION:
                 'reference_curve': _ep_istats['reference_curve'],
                 'predict_fn':      _make_pred_istats(_ep_istats),
                 'full_pipeline':   _ep_istats,
+            }
+
+            # ── Instance Stats (Leak-Free) — two-stage ───────────────────
+            print(f"  [{_sensor}] Training Instance Stats Leak-Free (two-stage)...")
+            _ep_lf = build_and_train_pipeline_istats_leakfree(
+                _train_curves,
+                variable=_sensor,
+                fixed_length=100,
+                val_size=0.2,
+                models=_CURVE_MODELS,
+                optimize_hyperparams=False,
+                verbose=False,
+            )
+            print(f"    Best model: {_ep_lf['model_name']}  val R²={_ep_lf['val_r2']:.4f}")
+
+            def _make_pred_lf(ep):
+                return lambda rv, act, attrs: predict_raw_curve_istats_leakfree(rv, act, attrs, pipeline=ep)
+
+            _pipelines_istats_leakfree[_sensor] = {
+                'reference_curve': _ep_lf['reference_curve'],
+                'predict_fn':      _make_pred_lf(_ep_lf),
+                'full_pipeline':   _ep_lf,
             }
 
             # ── Approach 3 — DTW-phase ───────────────────────────────────
@@ -2720,11 +2748,41 @@ if RUN_CURVE_ONLY_EVALUATION:
             else:
                 print(f"  [{_sensor}] No ef_ columns found — skipping DTW+Exog.")
 
-        all_energy_pipelines[_proc]                = _pipelines_baseline
-        all_energy_pipelines_instance_stats[_proc] = _pipelines_instance_stats
-        all_energy_pipelines_dtw_phase[_proc]      = _pipelines_dtw_phase
-        all_energy_pipelines_basis[_proc]          = _pipelines_basis
-        all_energy_pipelines_exog[_proc]           = _pipelines_exog
+            # ── DTW + Seq2Seq ────────────────────────────────────────────
+            print(f"  [{_sensor}] Training DTW + Seq2Seq (LSTM encoder-decoder)...")
+            _ep_seq2seq = build_and_train_pipeline_seq2seq(
+                _train_curves,
+                variable=_sensor,
+                fixed_length=100,
+                val_size=0.2,
+                hidden_size=128,
+                num_layers=2,
+                dropout=0.1,
+                epochs=80,
+                batch_size=32,
+                lr=1e-3,
+                teacher_forcing_ratio=0.5,
+                patience=10,
+                verbose=False,
+            )
+            print(f"    val_loss={_ep_seq2seq['val_loss']:.5f}")
+
+            def _make_pred_seq2seq(ep):
+                return lambda rv, act, attrs: predict_raw_curve_seq2seq(rv, act, attrs, pipeline=ep)
+
+            _pipelines_seq2seq[_sensor] = {
+                'reference_curve': _ep_seq2seq['reference_curve'],
+                'predict_fn':      _make_pred_seq2seq(_ep_seq2seq),
+                'full_pipeline':   _ep_seq2seq,
+            }
+
+        all_energy_pipelines[_proc]                   = _pipelines_baseline
+        all_energy_pipelines_instance_stats[_proc]   = _pipelines_instance_stats
+        all_energy_pipelines_istats_leakfree[_proc]  = _pipelines_istats_leakfree
+        all_energy_pipelines_dtw_phase[_proc]        = _pipelines_dtw_phase
+        all_energy_pipelines_basis[_proc]            = _pipelines_basis
+        all_energy_pipelines_exog[_proc]             = _pipelines_exog
+        all_energy_pipelines_seq2seq[_proc]          = _pipelines_seq2seq
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2802,11 +2860,13 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown(f"## Split: {_split_label}"))
 
         for _approach_label, _pipelines in [
-            ('Baseline (DTW + pos)',      all_energy_pipelines),
-            ('Instance Stats',            all_energy_pipelines_instance_stats),
-            ('Approach 2 (B-spline)',     all_energy_pipelines_basis),
-            ('Approach 3 (DTW-phase)',    all_energy_pipelines_dtw_phase),
-            ('DTW + Ext. Factors',        all_energy_pipelines_exog),
+            ('Baseline (DTW + pos)',        all_energy_pipelines),
+            ('Instance Stats (leaky)',      all_energy_pipelines_instance_stats),
+            ('Instance Stats (leak-free)',  all_energy_pipelines_istats_leakfree),
+            ('Approach 2 (B-spline)',       all_energy_pipelines_basis),
+            ('Approach 3 (DTW-phase)',      all_energy_pipelines_dtw_phase),
+            ('DTW + Ext. Factors',          all_energy_pipelines_exog),
+            ('DTW + Seq2Seq',               all_energy_pipelines_seq2seq),
         ]:
             if not _pipelines:
                 continue
@@ -2883,6 +2943,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 ('Approach 2 (B-spline)', 'Approach 2 (B-spline)'),
                 ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
                 ('DTW + Ext. Factors',     'DTW + Ext. Factors'),
+                ('DTW + Seq2Seq',          'DTW + Seq2Seq'),
             ]:
                 _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
                     index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
