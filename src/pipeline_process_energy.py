@@ -2525,6 +2525,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         build_and_train_pipeline_instance_stats, predict_raw_curve_instance_stats,
         build_and_train_pipeline_dtw_phase,  predict_raw_curve_dtw_phase,
         build_and_train_pipeline_basis,      predict_raw_curve_basis,
+        build_and_train_pipeline_exog,       predict_raw_curve_exog,
     )
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import GradientBoostingRegressor
@@ -2533,6 +2534,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_instance_stats = {}   # Instance Stats
     all_energy_pipelines_dtw_phase = {}   # Approach 3
     all_energy_pipelines_basis     = {}   # Approach 2
+    all_energy_pipelines_exog      = {}   # DTW + External Factors
 
     _CURVE_MODELS = {
         'Linear Regression': LinearRegression,
@@ -2567,18 +2569,28 @@ if RUN_CURVE_ONLY_EVALUATION:
         if not _objects and 'object_log' in _df_train_exp.columns:
             _objects = _df_train_exp['object_log'].dropna().unique().tolist()
 
+        # Detect ef_* columns — external factors are always predictors of every curve
+        _ef_cols = [
+            c for c in _df_train_exp.columns
+            if c.startswith('ef_')
+            and _df_train_exp[c].dtype in ('float64', 'float32', 'int64', 'int32')
+        ]
+
         print(f"\n{'='*60}")
         print(f"CURVE-ONLY TRAINING — {_proc.upper()}")
-        print(f"  Sensors   : {_sensors}")
-        print(f"  Activities: {_activities}")
+        print(f"  Sensors          : {_sensors}")
+        print(f"  Activities       : {_activities}")
+        print(f"  External factors : {_ef_cols}")
         print(f"{'='*60}")
 
-        _pipelines_baseline  = {}
+        _pipelines_baseline       = {}
         _pipelines_instance_stats = {}
-        _pipelines_dtw_phase = {}
-        _pipelines_basis     = {}
+        _pipelines_dtw_phase      = {}
+        _pipelines_basis          = {}
+        _pipelines_exog           = {}
 
         for _sensor in _sensors:
+            # Split with exog columns so curves carry the ef_ time series
             _train_curves, _ = split_curves(
                 _df_train_exp,
                 variable=_sensor,
@@ -2586,6 +2598,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 objects=_objects,
                 test_size=0.0,
                 verbose=0,
+                exog_columns=_ef_cols,
             )
             if not _train_curves:
                 print(f"  [{_sensor}] No curves found — skipping.")
@@ -2680,10 +2693,38 @@ if RUN_CURVE_ONLY_EVALUATION:
                 'full_pipeline':   _ep_basis,
             }
 
-        all_energy_pipelines[_proc]           = _pipelines_baseline
+            # ── DTW + External Factors ───────────────────────────────────
+            if _ef_cols:
+                print(f"  [{_sensor}] Training DTW + External Factors ({len(_ef_cols)} ef_ signals)...")
+                _ep_exog = build_and_train_pipeline_exog(
+                    _train_curves,
+                    variable=_sensor,
+                    fixed_length=100,
+                    val_size=0.2,
+                    models=_CURVE_MODELS,
+                    optimize_hyperparams=False,
+                    verbose=False,
+                )
+                print(f"    Best model: {_ep_exog['model_name']}  val R²={_ep_exog['val_r2']:.4f}")
+
+                def _make_pred_exog(ep):
+                    return lambda rv, act, attrs, exog=None: predict_raw_curve_exog(
+                        rv, act, attrs, pipeline=ep, exog_values=exog or {}
+                    )
+
+                _pipelines_exog[_sensor] = {
+                    'reference_curve': _ep_exog['reference_curve'],
+                    'predict_fn':      _make_pred_exog(_ep_exog),
+                    'full_pipeline':   _ep_exog,
+                }
+            else:
+                print(f"  [{_sensor}] No ef_ columns found — skipping DTW+Exog.")
+
+        all_energy_pipelines[_proc]                = _pipelines_baseline
         all_energy_pipelines_instance_stats[_proc] = _pipelines_instance_stats
-        all_energy_pipelines_dtw_phase[_proc] = _pipelines_dtw_phase
-        all_energy_pipelines_basis[_proc]     = _pipelines_basis
+        all_energy_pipelines_dtw_phase[_proc]      = _pipelines_dtw_phase
+        all_energy_pipelines_basis[_proc]          = _pipelines_basis
+        all_energy_pipelines_exog[_proc]           = _pipelines_exog
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2710,8 +2751,11 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
             _objs = _df['object_log'].dropna().unique().tolist()
 
         for _sensor, _ep in _sensors.items():
+            _fp = _ep.get('full_pipeline', {})
+            _exog_cols_eval = _fp.get('exog_cols', []) if _fp.get('approach') == 'exog' else None
             _curves, _ = split_curves(_df, _sensor, _acts, _objs,
-                                      test_size=0.0, verbose=0)
+                                      test_size=0.0, verbose=0,
+                                      exog_columns=_exog_cols_eval)
             if not _curves:
                 continue
             show_plots = (split_label == 'TEST')
@@ -2759,9 +2803,10 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
         for _approach_label, _pipelines in [
             ('Baseline (DTW + pos)',      all_energy_pipelines),
-            ('Instance Stats',              all_energy_pipelines_instance_stats),
+            ('Instance Stats',            all_energy_pipelines_instance_stats),
             ('Approach 2 (B-spline)',     all_energy_pipelines_basis),
             ('Approach 3 (DTW-phase)',    all_energy_pipelines_dtw_phase),
+            ('DTW + Ext. Factors',        all_energy_pipelines_exog),
         ]:
             if not _pipelines:
                 continue
@@ -2834,9 +2879,10 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
             )
             for _delta_label, _delta_appr in [
-                ('Instance Stats',              'Instance Stats'),
-                ('Approach 2 (B-spline)',      'Approach 2 (B-spline)'),
-                ('Approach 3 (DTW-phase)',     'Approach 3 (DTW-phase)'),
+                ('Instance Stats',         'Instance Stats'),
+                ('Approach 2 (B-spline)', 'Approach 2 (B-spline)'),
+                ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
+                ('DTW + Ext. Factors',     'DTW + Ext. Factors'),
             ]:
                 _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
                     index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'

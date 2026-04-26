@@ -1693,7 +1693,8 @@ import matplotlib.pyplot as plt
 REFERENCE_LENGTH = 100
 
 def split_curves(df_expanded, variable, activities, objects,
-                 test_size=0.15, random_state=42, verbose=1):
+                 test_size=0.15, random_state=42, verbose=1,
+                 exog_columns=None):
     """
     Extract all activity curves and split into train/test sets.
 
@@ -1710,6 +1711,9 @@ def split_curves(df_expanded, variable, activities, objects,
     test_size    : float         — fraction for test (default 0.15)
     random_state : int
     verbose      : int           — 0 = silent, 1 = full output
+    exog_columns : list[str] | None
+        Optional list of external-factor columns (e.g. 'ef_temp_energy') whose
+        raw time series should be stored per curve for use by exog-aware pipelines.
 
     Returns
     -------
@@ -1717,15 +1721,21 @@ def split_curves(df_expanded, variable, activities, objects,
     test_curves  : list[dict]
         Each dict: 'instance_id', 'activity', 'original_values' (np.ndarray),
                    'original_length', 'attributes'
+        When exog_columns is not None, each dict also contains:
+            'exog_values': {col: np.ndarray}  — one array per exog column,
+                           same length as original_values
     """
     if verbose:
         print("=" * 80)
         print("STEP 1 — RAW TRAIN/TEST SPLIT (before any preprocessing)")
         print("=" * 80)
 
+    exog_cols_present = [c for c in (exog_columns or []) if c in df_expanded.columns]
+
     df = df_expanded.copy()
-    df = df[['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log',
-             'datetime_energy', variable, 'object_attributes_log']]
+    keep_cols = ['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log',
+                 'datetime_energy', variable, 'object_attributes_log'] + exog_cols_present
+    df = df[keep_cols]
     df = df[df['object_log'].isin(objects)]
     df = df[df['activity_log'].isin(activities)]
     df['timestamp_start'] = pd.to_datetime(df['timestamp_start_log'])
@@ -1748,13 +1758,18 @@ def split_curves(df_expanded, variable, activities, objects,
                 group['object_attributes_log'].iloc[0]
                 if not group['object_attributes_log'].empty else {}
             )
-            curves_data.append({
+            entry = {
                 'instance_id':     instance_id,
                 'activity':        group['activity_log'].iloc[0],
                 'original_values': values,
                 'original_length': len(values),
                 'attributes':      attributes,
-            })
+            }
+            if exog_cols_present:
+                entry['exog_values'] = {
+                    col: group[col].values for col in exog_cols_present
+                }
+            curves_data.append(entry)
 
     if verbose:
         print(f"Total curves extracted : {len(curves_data)}")
@@ -3402,6 +3417,309 @@ def predict_raw_curve_basis(raw_values, activity, attributes, pipeline):
 
 
 # =============================================================================
+# EXTERNAL FACTORS (EXOG) — DTW PIPELINE WITH ef_* TIME-SERIES PREDICTORS
+#
+# Every existing approach predicts from (position, activity, scalar attributes).
+# This variant additionally uses external-factor curves (columns whose name
+# starts with 'ef_') as positional features: for each canonical position the
+# model sees the resampled value of every ef_ signal at that moment in time.
+#
+# Training:  ef_ arrays stored in the curve dict (from split_curves with
+#            exog_columns=...) are resampled to fixed_length and appended as
+#            extra feature columns alongside position_idx.
+# Inference: caller passes exog_values={col: np.ndarray} with the actual
+#            external-factor readings for the target activity window; they are
+#            resampled to fixed_length before building the feature matrix, then
+#            the DTW decode maps predictions back to raw length as usual.
+# =============================================================================
+
+
+def _resample_signal(arr, target_length):
+    """Resample 1-D array to target_length via linear interpolation."""
+    arr = np.asarray(arr, dtype=float)
+    if len(arr) == target_length:
+        return arr
+    if len(arr) < 2:
+        return np.full(target_length, arr[0] if len(arr) == 1 else np.nan)
+    return np.interp(
+        np.linspace(0, 1, target_length),
+        np.linspace(0, 1, len(arr)),
+        arr,
+    )
+
+
+def build_and_train_pipeline_exog(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+):
+    """
+    DTW baseline enriched with ef_* external-factor time series as features.
+
+    Requires that each curve dict in train_curves contains 'exog_values' (set
+    by split_curves with exog_columns=...).  Curves that lack the key are still
+    included but their exog features are filled with NaN.
+
+    Returns a pipeline dict identical to build_and_train_pipeline but with the
+    additional keys:
+        'exog_cols'  — list[str]  ordered exog column names used at train time
+        'approach'   — 'exog'
+    """
+    if verbose:
+        print("\n" + "=" * 80)
+        print("STEP 2 — BUILD + TRAIN PIPELINE (DTW + External Factors)")
+        print("=" * 80)
+
+    if models is None:
+        models = {
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    # Collect all exog column names present across train curves
+    exog_cols = sorted({
+        col
+        for c in train_curves
+        for col in c.get('exog_values', {}).keys()
+    })
+
+    if verbose:
+        print(f"  External-factor columns: {exog_cols}")
+
+    # ── DBA barycenter ────────────────────────────────────────────────────────
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values'],
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    # ── DTW-align train curves ────────────────────────────────────────────────
+    for curve in train_curves:
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+        # resample exog signals to fixed_length
+        curve['_exog_resampled'] = {
+            col: _resample_signal(curve['exog_values'][col], fixed_length)
+            for col in exog_cols
+            if col in curve.get('exog_values', {})
+        }
+
+    # ── Attribute key types (train only) ─────────────────────────────────────
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    # ── Feature matrix ────────────────────────────────────────────────────────
+    rows = []
+    for curve in train_curves:
+        exog_rs = curve.get('_exog_resampled', {})
+        for position_idx in range(fixed_length):
+            row = {
+                'instance_id':  curve['instance_id'],
+                'activity':     curve['activity'],
+                'position_idx': position_idx,
+                'curve_length': curve['original_length'],
+                'y':            curve['resampled_values'][position_idx],
+            }
+            for key in all_keys:
+                value = curve['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(value) if value is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(value) if value is not None else 'None'
+            for col in exog_cols:
+                row[col] = float(exog_rs[col][position_idx]) if col in exog_rs else np.nan
+            rows.append(row)
+
+    df_reg = pd.DataFrame(rows)
+
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_all = df_reg[['position_idx', 'curve_length']].copy()
+    X_all = X_all.assign(activity=df_reg['activity'].values)
+    for key in all_keys:
+        X_all = X_all.assign(**{key: df_reg[key].values})
+    for col in exog_cols:
+        X_all[col] = df_reg[col].values
+    X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    y_all = df_reg['y'].copy()
+
+    unique_instances     = df_reg['instance_id'].unique()
+    train_inst, val_inst = train_test_split(
+        unique_instances, test_size=val_size, random_state=random_state
+    )
+    train_mask = df_reg['instance_id'].isin(train_inst)
+    val_mask   = df_reg['instance_id'].isin(val_inst)
+
+    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
+    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
+
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = ['position_idx', 'curve_length'] + \
+        [k for k in all_keys if key_types[k] == 'numeric'] + exog_cols
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
+            X_train[numeric_feature_cols]
+        )
+        X_val.loc[:, numeric_feature_cols] = feature_scaler.transform(
+            X_val[numeric_feature_cols]
+        )
+
+    # ── Train models ──────────────────────────────────────────────────────────
+    all_results = {}
+    best_model, best_name, best_val_r2 = None, None, -np.inf
+
+    for name, model_class in models.items():
+        if verbose:
+            print(f"\n  Training {name}...")
+        model = model_class()
+        model.fit(X_train, y_train)
+
+        train_r2 = float(r2_score(y_train, model.predict(X_train)))
+        val_r2   = float(r2_score(y_val,   model.predict(X_val)))
+        if verbose:
+            print(f"    train R²={train_r2:.4f}  val R²={val_r2:.4f}")
+
+        all_results[name] = {'train_r2': train_r2, 'val_r2': val_r2}
+        if val_r2 > best_val_r2:
+            best_val_r2  = val_r2
+            best_model   = model
+            best_name    = name
+
+    if verbose:
+        print(f"\n  Best model: {best_name}  val R²={best_val_r2:.4f}")
+
+    return {
+        'model':               best_model,
+        'model_name':          best_name,
+        'reference_curve':     reference_curve,
+        'fixed_length':        fixed_length,
+        'all_keys':            all_keys,
+        'key_types':           key_types,
+        'feature_columns':     feature_columns,
+        'feature_scaler':      feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'val_r2':              best_val_r2,
+        'all_results':         all_results,
+        'exog_cols':           exog_cols,
+        'approach':            'exog',
+    }
+
+
+def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
+                            exog_values=None):
+    """
+    Predict for a single raw curve using the external-factors pipeline.
+
+    Parameters
+    ----------
+    raw_values  : np.ndarray
+    activity    : str
+    attributes  : dict
+    pipeline    : dict  — from build_and_train_pipeline_exog()
+    exog_values : dict | None
+        {col: np.ndarray} — raw ef_* time series for this activity window,
+        same length as raw_values (will be resampled internally).
+        Missing columns are filled with 0.
+    """
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler', None)
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+    exog_cols            = pipeline.get('exog_cols', [])
+
+    if exog_values is None:
+        exog_values = {}
+
+    # Resample each exog signal to fixed_length
+    exog_rs = {
+        col: _resample_signal(exog_values[col], fixed_length)
+        if col in exog_values
+        else np.zeros(fixed_length)
+        for col in exog_cols
+    }
+
+    rows_ref = []
+    for ref_pos in range(fixed_length):
+        row = {
+            'position_idx': ref_pos,
+            'curve_length': len(raw_values),
+            'activity':     activity,
+        }
+        for key in all_keys:
+            value = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        for col in exog_cols:
+            row[col] = float(exog_rs[col][ref_pos])
+        rows_ref.append(row)
+
+    X_ref = pd.DataFrame(rows_ref)
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_ref = pd.get_dummies(X_ref, columns=categorical_cols, drop_first=True)
+
+    for col in feature_columns:
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
+    y_ref_pred = model.predict(X_ref)
+
+    # DTW decode canonical → raw length
+    alignment = dtw(raw_values, reference_curve, keep_internals=True)
+    buckets   = [[] for _ in range(len(raw_values))]
+
+    for qi, ri in zip(alignment.index1, alignment.index2):
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred  = np.empty(len(raw_values), dtype=float)
+    path_pairs  = list(zip(alignment.index1, alignment.index2))
+
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+            continue
+        nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+        _ = nearest_qi
+        y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
 # STEP 4 — EVALUATE ON RAW TEST CURVES
 # =============================================================================
 
@@ -3424,11 +3742,31 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
     per_curve_metrics = []
     all_true, all_pred = [], []
 
+    _approach = pipeline.get('approach', 'baseline')
+
     for curve in test_curves:
         raw_values = curve['original_values']
-        y_pred = predict_raw_curve(
-            raw_values, curve['activity'], curve['attributes'], pipeline
-        )
+        if _approach == 'exog':
+            y_pred = predict_raw_curve_exog(
+                raw_values, curve['activity'], curve['attributes'], pipeline,
+                exog_values=curve.get('exog_values', {}),
+            )
+        elif _approach == 'instance_stats':
+            y_pred = predict_raw_curve_instance_stats(
+                raw_values, curve['activity'], curve['attributes'], pipeline,
+            )
+        elif _approach == 'dtw_phase':
+            y_pred = predict_raw_curve_dtw_phase(
+                raw_values, curve['activity'], curve['attributes'], pipeline,
+            )
+        elif _approach == 'basis_expansion':
+            y_pred = predict_raw_curve_basis(
+                raw_values, curve['activity'], curve['attributes'], pipeline,
+            )
+        else:
+            y_pred = predict_raw_curve(
+                raw_values, curve['activity'], curve['attributes'], pipeline,
+            )
 
         mae  = mean_absolute_error(raw_values, y_pred)
         rmse = np.sqrt(mean_squared_error(raw_values, y_pred))
