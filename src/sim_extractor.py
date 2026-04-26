@@ -2275,6 +2275,752 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
 
 
 # =============================================================================
+# APPROACH 3 — DTW-PHASE AWARE PIPELINE
+#
+# Same architecture as the baseline (DBA barycenter → DTW alignment → regression)
+# but the feature matrix is enriched with phase-aware descriptors computed from
+# the DTW-aligned curve at each position:
+#
+#   • local_slope      — finite-difference derivative, tells the model whether
+#                        we are in a rising / falling transient or plateau
+#   • local_curvature  — second derivative, distinguishes ramp from inflection
+#   • phase_norm       — position / (fixed_length - 1), replaces the raw int
+#                        index with a [0, 1] normalised phase coordinate
+#   • ref_value        — the DBA barycenter value at this position, giving the
+#                        model a shape prior from the training prototype
+#   • ref_slope        — slope of the barycenter at this position
+#
+# At prediction time the same descriptors are derived from the DBA barycenter
+# (the only aligned curve available without touching test data), so the model
+# sees the same feature space it was trained on.
+# =============================================================================
+
+def _phase_features_from_curve(aligned_curve):
+    """
+    Compute per-position phase descriptors for a DTW-aligned curve.
+
+    Returns a dict of 1-D arrays, each of length len(aligned_curve).
+    """
+    v = np.asarray(aligned_curve, dtype=float)
+    n = len(v)
+
+    slope = np.gradient(v)
+    curvature = np.gradient(slope)
+    phase_norm = np.linspace(0.0, 1.0, n)
+
+    return {
+        'phase_norm':     phase_norm,
+        'local_slope':    slope,
+        'local_curvature': curvature,
+        'ref_value':      v,
+        'ref_slope':      slope,   # for reference row: ref_value IS the curve
+    }
+
+
+def _build_feature_matrix_dtw_phase(
+    curves, all_keys, key_types, fixed_length,
+    reference_curve, value_key='resampled_values', include_target=True
+):
+    """
+    Like _build_feature_matrix but adds phase-aware features derived from the
+    DTW-aligned curve and the DBA reference curve.
+    """
+    ref_feats = _phase_features_from_curve(reference_curve)
+
+    rows = []
+    for curve in curves:
+        aligned = np.asarray(curve[value_key], dtype=float)
+        curve_feats = _phase_features_from_curve(aligned)
+
+        for pos in range(fixed_length):
+            row = {
+                'instance_id':      curve['instance_id'],
+                'activity':         curve['activity'],
+                'position_idx':     pos,
+                'curve_length':     curve['original_length'],
+                'phase_norm':       curve_feats['phase_norm'][pos],
+                'local_slope':      curve_feats['local_slope'][pos],
+                'local_curvature':  curve_feats['local_curvature'][pos],
+                'ref_value':        ref_feats['ref_value'][pos],
+                'ref_slope':        ref_feats['ref_slope'][pos],
+            }
+            if include_target:
+                row['y'] = aligned[pos]
+
+            for key in all_keys:
+                value = curve['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(value) if value is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(value) if value is not None else 'None'
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_and_train_pipeline_dtw_phase(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+):
+    """
+    Approach 3 — DTW-phase-aware pipeline.
+
+    Identical flow to build_and_train_pipeline() but the regression features are
+    enriched with phase descriptors (slope, curvature, normalised phase, reference
+    curve value/slope) so the model understands *where in the process phase* each
+    prediction sits, not just its raw integer index.
+
+    Returns the same pipeline dict as build_and_train_pipeline(), with an extra
+    key ``'approach'`` set to ``'dtw_phase'``.
+    """
+    if verbose:
+        print("\n" + "=" * 80)
+        print("APPROACH 3 — DTW-PHASE AWARE PIPELINE  (train curves only)")
+        print("=" * 80)
+
+    if models is None:
+        models = {
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    # 2a. DBA barycenter — identical to baseline
+    if verbose:
+        print(f"\n[2a] Computing DBA barycenter from {len(train_curves)} train curves "
+              f"(fixed_length={fixed_length})...")
+
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values']
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    if verbose:
+        print(f"    Barycenter length: {len(reference_curve)} points")
+
+    # 2b. DTW-align train curves to barycenter
+    if verbose:
+        print(f"\n[2b] Aligning {len(train_curves)} train curves to DBA barycenter...")
+
+    for i, curve in enumerate(train_curves):
+        if verbose and i % max(1, len(train_curves) // 10) == 0:
+            print(f"    Curve {i + 1}/{len(train_curves)}...")
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+
+    # 2c. Attribute types + phase-enriched feature matrix
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    if verbose:
+        print(f"\n[2c] Attribute columns: {key_types}")
+        print("     Phase features: phase_norm, local_slope, local_curvature, "
+              "ref_value, ref_slope")
+
+    df_reg = _build_feature_matrix_dtw_phase(
+        train_curves, all_keys, key_types, fixed_length,
+        reference_curve, value_key='resampled_values', include_target=True
+    )
+
+    if verbose:
+        print(f"     Regression dataset: {len(df_reg)} rows "
+              f"({len(train_curves)} curves x {fixed_length} positions)")
+
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_all = df_reg.drop(columns=['instance_id', 'y'], errors='ignore').copy()
+    X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    y_all = df_reg['y'].copy()
+
+    unique_instances     = df_reg['instance_id'].unique()
+    train_inst, val_inst = train_test_split(
+        unique_instances, test_size=val_size, random_state=random_state
+    )
+    train_mask = df_reg['instance_id'].isin(train_inst)
+    val_mask   = df_reg['instance_id'].isin(val_inst)
+
+    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
+    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
+
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = (
+        ['position_idx', 'curve_length', 'phase_norm',
+         'local_slope', 'local_curvature', 'ref_value', 'ref_slope']
+        + [k for k in all_keys if key_types[k] == 'numeric']
+    )
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
+            X_train[numeric_feature_cols]
+        )
+        X_val.loc[:, numeric_feature_cols] = feature_scaler.transform(
+            X_val[numeric_feature_cols]
+        )
+
+    if verbose:
+        print(f"\n     Train: {len(train_inst)} curves / {len(X_train)} points")
+        print(f"     Val  : {len(val_inst)} curves / {len(X_val)} points")
+
+    # 2d. Train models
+    all_results = {}
+
+    for name, model_class in models.items():
+        if verbose:
+            print(f"\n[2d] Training — {name}...")
+
+        if optimize_hyperparams:
+            if not verbose:
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def objective(trial, name=name, model_class=model_class):
+                if name == 'Gradient Boosting':
+                    params = {
+                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
+                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
+                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
+                        'random_state':  random_state,
+                    }
+                elif name == 'Random Forest':
+                    params = {
+                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
+                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
+                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+                        'random_state':      random_state,
+                        'n_jobs':            -1,
+                    }
+                else:
+                    params = {}
+                m = model_class(**params)
+                m.fit(X_train, y_train)
+                return r2_score(y_val, m.predict(X_val))
+
+            sampler = optuna.samplers.TPESampler(seed=random_state)
+            study = optuna.create_study(direction='maximize', sampler=sampler)
+            study.optimize(objective, n_trials=n_trials)
+            best_params = study.best_params
+            if name in ('Gradient Boosting', 'Random Forest'):
+                best_params['random_state'] = random_state
+            if name == 'Random Forest':
+                best_params['n_jobs'] = -1
+            if verbose:
+                print(f"     Best params: {best_params}")
+            model = model_class(**best_params)
+        else:
+            if name == 'Gradient Boosting':
+                model = model_class(
+                    n_estimators=200, max_depth=7, learning_rate=0.1,
+                    subsample=0.8, random_state=random_state
+                )
+            elif name == 'Random Forest':
+                model = model_class(
+                    n_estimators=200, max_depth=12, min_samples_split=5,
+                    random_state=random_state, n_jobs=-1
+                )
+            else:
+                try:
+                    model = model_class(random_state=random_state)
+                except TypeError:
+                    model = model_class()
+
+        model.fit(X_train, y_train)
+
+        train_pred = model.predict(X_train)
+        val_pred   = model.predict(X_val)
+        train_r2   = r2_score(y_train, train_pred)
+        val_r2     = r2_score(y_val,   val_pred)
+        train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
+        val_rmse   = np.sqrt(mean_squared_error(y_val,   val_pred))
+
+        if verbose:
+            print(f"     Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}")
+            print(f"     Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+
+        all_results[name] = {
+            'model':      model,
+            'train_r2':   train_r2,
+            'val_r2':     val_r2,
+            'train_rmse': train_rmse,
+            'val_rmse':   val_rmse,
+        }
+
+    # 2e. Best model by val R2
+    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_model = all_results[best_name]['model']
+
+    if verbose:
+        print(f"\n Best model : {best_name}  "
+              f"(val R2={all_results[best_name]['val_r2']:.4f})")
+
+    pipeline = {
+        'approach':        'dtw_phase',
+        'model':           best_model,
+        'model_name':      best_name,
+        'reference_curve': reference_curve,
+        'fixed_length':    fixed_length,
+        'all_keys':        all_keys,
+        'key_types':       key_types,
+        'feature_columns': feature_columns,
+        'feature_scaler':  feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'val_r2':          all_results[best_name]['val_r2'],
+        'all_results':     all_results,
+    }
+
+    return pipeline
+
+
+def predict_raw_curve_dtw_phase(raw_values, activity, attributes, pipeline):
+    """
+    Predict for a single raw curve using the DTW-phase-aware pipeline.
+
+    At inference the phase descriptors are derived from the DBA reference curve
+    (the training prototype) evaluated at each of the fixed_length canonical
+    positions — not from the test curve itself, which would be data leakage.
+    The DTW warp path maps canonical predictions back to raw time steps exactly
+    as in the baseline predict_raw_curve().
+    """
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler', None)
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+
+    ref_feats = _phase_features_from_curve(reference_curve)
+
+    rows_ref = []
+    for pos in range(fixed_length):
+        row = {
+            'position_idx':     pos,
+            'curve_length':     len(raw_values),
+            'activity':         activity,
+            'phase_norm':       ref_feats['phase_norm'][pos],
+            'local_slope':      ref_feats['local_slope'][pos],
+            'local_curvature':  ref_feats['local_curvature'][pos],
+            'ref_value':        ref_feats['ref_value'][pos],
+            'ref_slope':        ref_feats['ref_slope'][pos],
+        }
+        for key in all_keys:
+            value = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows_ref.append(row)
+
+    X_ref = pd.DataFrame(rows_ref)
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_ref = pd.get_dummies(X_ref, columns=categorical_cols, drop_first=True)
+
+    for col in feature_columns:
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
+    y_ref_pred = model.predict(X_ref)
+
+    # Map canonical predictions back to raw time steps via DTW warp path
+    alignment = dtw(raw_values, reference_curve, keep_internals=True)
+    buckets = [[] for _ in range(len(raw_values))]
+
+    for qi, ri in zip(alignment.index1, alignment.index2):
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+            continue
+        nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+        _ = nearest_qi
+        y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
+# APPROACH 2 — BASIS EXPANSION (B-SPLINE)
+#
+# Instead of predicting each time step independently, the model learns to
+# predict the K coefficients of a B-spline basis expansion of the curve.
+# The basis functions enforce smoothness by construction and the output
+# generalises to any output length by evaluating the spline at new knots.
+#
+#   Train:
+#     1. Resample every curve to fixed_length (no DTW needed).
+#     2. Fit a B-spline basis B of shape (fixed_length × K).
+#     3. Project each curve onto the basis: c = pinv(B) @ curve  →  shape (K,).
+#     4. Build a multi-output regression dataset (activity, attrs) → c_vector.
+#     5. Train a MultiOutputRegressor over the candidate models; pick best by
+#        validation R² averaged across all K outputs.
+#
+#   Predict:
+#     1. Predict c_vector for the given (activity, attrs).
+#     2. Evaluate B_new @ c_vector at any desired output length.
+#        No DTW needed at inference — the spline handles variable lengths.
+#
+# Why it is better than the baseline:
+#   • The model outputs K~20 smooth coefficients, not 100 independent scalars.
+#   • Temporal continuity is guaranteed by the basis (no point-level noise).
+#   • Inference is O(K) matrix-vector multiply — faster than DTW at test time.
+# =============================================================================
+
+from scipy.interpolate import BSpline, make_interp_spline
+from sklearn.multioutput import MultiOutputRegressor
+
+
+def _make_bspline_basis(fixed_length, n_basis):
+    """
+    Build a B-spline design matrix of shape (fixed_length, n_basis).
+
+    Uses uniform knots on [0, 1] with degree 3 (cubic splines).
+    Returns (B, t_train) where t_train is the evaluation grid.
+    """
+    t = np.linspace(0, 1, fixed_length)
+    degree = 3
+    n_interior = n_basis - degree - 1
+    n_interior = max(n_interior, 0)
+    interior_knots = np.linspace(0, 1, n_interior + 2)[1:-1]
+    knots = np.concatenate([
+        np.zeros(degree + 1),
+        interior_knots,
+        np.ones(degree + 1),
+    ])
+
+    B = np.zeros((fixed_length, n_basis))
+    for j in range(n_basis):
+        coeffs = np.zeros(n_basis)
+        coeffs[j] = 1.0
+        try:
+            spl = BSpline(knots, coeffs, degree)
+            B[:, j] = spl(t)
+        except Exception:
+            pass
+
+    return B, t, knots, degree
+
+
+def build_and_train_pipeline_basis(
+    train_curves,
+    variable,
+    fixed_length=100,
+    n_basis=20,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+):
+    """
+    Approach 2 — B-spline basis expansion pipeline.
+
+    Returns the same pipeline dict shape as build_and_train_pipeline(), with
+    extra keys ``'approach'``, ``'B'`` (basis matrix), ``'knots'``,
+    ``'degree'``, ``'n_basis'``.
+    """
+    if verbose:
+        print("\n" + "=" * 80)
+        print("APPROACH 2 — B-SPLINE BASIS EXPANSION  (train curves only)")
+        print(f"  fixed_length={fixed_length}  n_basis={n_basis}")
+        print("=" * 80)
+
+    if models is None:
+        models = {
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    # 1. Resample all train curves to fixed_length
+    resampled = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values']
+        )
+        for c in train_curves
+    ])  # shape (N, fixed_length)
+
+    # 2. Build B-spline basis
+    B, t_train, knots, degree = _make_bspline_basis(fixed_length, n_basis)
+    B_pinv = np.linalg.pinv(B)  # shape (n_basis, fixed_length)
+
+    if verbose:
+        print(f"\n  B-spline basis: {n_basis} basis functions, degree {degree}")
+        print(f"  Basis matrix B shape: {B.shape}")
+
+    # 3. Project each curve → coefficients
+    coeffs = resampled @ B_pinv.T   # shape (N, n_basis)
+
+    # 4. Build feature matrix (one row per curve, not per time step)
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    rows = []
+    for i, curve in enumerate(train_curves):
+        row = {
+            'instance_id':  curve['instance_id'],
+            'activity':     curve['activity'],
+            'curve_length': curve['original_length'],
+        }
+        for key in all_keys:
+            value = curve['attributes'].get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows.append(row)
+
+    df_feat = pd.DataFrame(rows)
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_all = df_feat.drop(columns=['instance_id'], errors='ignore').copy()
+    X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    feature_columns = X_all.columns.tolist()
+    Y_all = coeffs   # shape (N, n_basis)
+
+    # Val split by instance
+    unique_instances     = df_feat['instance_id'].values
+    train_inst, val_inst = train_test_split(
+        np.arange(len(unique_instances)), test_size=val_size, random_state=random_state
+    )
+
+    X_train, X_val = X_all.iloc[train_inst].copy(), X_all.iloc[val_inst].copy()
+    Y_train, Y_val = Y_all[train_inst],              Y_all[val_inst]
+
+    numeric_feature_cols = ['curve_length'] + [k for k in all_keys if key_types[k] == 'numeric']
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
+            X_train[numeric_feature_cols]
+        )
+        X_val.loc[:, numeric_feature_cols] = feature_scaler.transform(
+            X_val[numeric_feature_cols]
+        )
+
+    if verbose:
+        print(f"\n  Train: {len(train_inst)} curves  |  Val: {len(val_inst)} curves")
+
+    # 5. Train models (MultiOutputRegressor wraps single-output estimators)
+    all_results = {}
+
+    for name, model_class in models.items():
+        if verbose:
+            print(f"\n  Training — {name}...")
+
+        if optimize_hyperparams:
+            if not verbose:
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def objective(trial, name=name, model_class=model_class):
+                if name == 'Gradient Boosting':
+                    params = {
+                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
+                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
+                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
+                        'random_state':  random_state,
+                    }
+                elif name == 'Random Forest':
+                    params = {
+                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
+                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
+                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+                        'random_state':      random_state,
+                        'n_jobs':            -1,
+                    }
+                else:
+                    params = {}
+                base = model_class(**params)
+                m = MultiOutputRegressor(base, n_jobs=-1)
+                m.fit(X_train, Y_train)
+                Y_pred = m.predict(X_val)
+                return float(np.mean([r2_score(Y_val[:, k], Y_pred[:, k])
+                                      for k in range(n_basis)]))
+
+            sampler = optuna.samplers.TPESampler(seed=random_state)
+            study = optuna.create_study(direction='maximize', sampler=sampler)
+            study.optimize(objective, n_trials=n_trials)
+            best_params = study.best_params
+            if name in ('Gradient Boosting', 'Random Forest'):
+                best_params['random_state'] = random_state
+            if name == 'Random Forest':
+                best_params['n_jobs'] = -1
+            base_model = model_class(**best_params)
+        else:
+            if name == 'Gradient Boosting':
+                base_model = model_class(
+                    n_estimators=200, max_depth=7, learning_rate=0.1,
+                    subsample=0.8, random_state=random_state
+                )
+            elif name == 'Random Forest':
+                base_model = model_class(
+                    n_estimators=200, max_depth=12, min_samples_split=5,
+                    random_state=random_state, n_jobs=-1
+                )
+            else:
+                try:
+                    base_model = model_class(random_state=random_state)
+                except TypeError:
+                    base_model = model_class()
+
+        model = MultiOutputRegressor(base_model, n_jobs=-1)
+        model.fit(X_train, Y_train)
+
+        Y_train_pred = model.predict(X_train)
+        Y_val_pred   = model.predict(X_val)
+
+        train_r2   = float(np.mean([r2_score(Y_train[:, k], Y_train_pred[:, k])
+                                    for k in range(n_basis)]))
+        val_r2     = float(np.mean([r2_score(Y_val[:, k], Y_val_pred[:, k])
+                                    for k in range(n_basis)]))
+        train_rmse = float(np.mean([np.sqrt(mean_squared_error(Y_train[:, k], Y_train_pred[:, k]))
+                                    for k in range(n_basis)]))
+        val_rmse   = float(np.mean([np.sqrt(mean_squared_error(Y_val[:, k], Y_val_pred[:, k]))
+                                    for k in range(n_basis)]))
+
+        if verbose:
+            print(f"    Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}  (avg over {n_basis} basis)")
+            print(f"    Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+
+        all_results[name] = {
+            'model':      model,
+            'train_r2':   train_r2,
+            'val_r2':     val_r2,
+            'train_rmse': train_rmse,
+            'val_rmse':   val_rmse,
+        }
+
+    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_model = all_results[best_name]['model']
+
+    if verbose:
+        print(f"\n  Best model: {best_name}  (val R2={all_results[best_name]['val_r2']:.4f})")
+
+    pipeline = {
+        'approach':        'basis_expansion',
+        'model':           best_model,
+        'model_name':      best_name,
+        'reference_curve': np.mean(resampled, axis=0),  # mean curve as reference visual
+        'fixed_length':    fixed_length,
+        'n_basis':         n_basis,
+        'B':               B,
+        'B_pinv':          B_pinv,
+        'knots':           knots,
+        'degree':          degree,
+        'all_keys':        all_keys,
+        'key_types':       key_types,
+        'feature_columns': feature_columns,
+        'feature_scaler':  feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'val_r2':          all_results[best_name]['val_r2'],
+        'all_results':     all_results,
+    }
+
+    return pipeline
+
+
+def predict_raw_curve_basis(raw_values, activity, attributes, pipeline):
+    """
+    Predict for a single raw curve using the B-spline basis pipeline.
+
+    Predicts coefficient vector c, then reconstructs the curve at the desired
+    output length by evaluating the spline at len(raw_values) evenly-spaced
+    points — no DTW needed at inference.
+    """
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler', None)
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+    n_basis              = pipeline['n_basis']
+    knots                = pipeline['knots']
+    degree               = pipeline['degree']
+    fixed_length         = pipeline['fixed_length']
+
+    row = {
+        'curve_length': len(raw_values),
+        'activity':     activity,
+    }
+    for key in all_keys:
+        value = attributes.get(key, None)
+        if key_types[key] == 'numeric':
+            try:
+                row[key] = float(value) if value is not None else np.nan
+            except (ValueError, TypeError):
+                row[key] = np.nan
+        else:
+            row[key] = str(value) if value is not None else 'None'
+
+    X = pd.DataFrame([row])
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+    for col in feature_columns:
+        if col not in X.columns:
+            X[col] = 0
+    X = X[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X.columns]
+        if cols_to_scale:
+            X.loc[:, cols_to_scale] = feature_scaler.transform(X[cols_to_scale])
+
+    c_pred = model.predict(X)[0]   # shape (n_basis,)
+
+    # Reconstruct at output length by evaluating basis at len(raw_values) points
+    t_out = np.linspace(0, 1, len(raw_values))
+    B_out = np.zeros((len(raw_values), n_basis))
+    for j in range(n_basis):
+        coeffs = np.zeros(n_basis)
+        coeffs[j] = 1.0
+        try:
+            spl = BSpline(knots, coeffs, degree)
+            B_out[:, j] = spl(t_out)
+        except Exception:
+            pass
+
+    return B_out @ c_pred
+
+
+# =============================================================================
 # STEP 4 — EVALUATE ON RAW TEST CURVES
 # =============================================================================
 

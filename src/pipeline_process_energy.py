@@ -1562,9 +1562,9 @@ process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
 process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
+process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
 # process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
@@ -1577,7 +1577,7 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 # %%
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
-# processes_to_run = ['process_3']
+processes_to_run = ['process_2']
 # Filter the original dictionary
 process_datasets_to_model = {
     k: v for k, v in process_datasets.items() 
@@ -1682,6 +1682,16 @@ TEMPORAL_SPLIT     = True
 TRAIN_RATIO        = 0.80
 RUN_TEST_EVALUATION = True # Fast mode: skip heavy test-set simulation & curve extraction
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CURVE-ONLY EVALUATION MODE
+#   True  → after energy pipelines are trained, run a full curve-quality
+#            evaluation (MAE / RMSE / WAPE / R²) per activity and sensor,
+#            with plots, WITHOUT running any process simulation.
+#            Use this to benchmark curve models in isolation before picking
+#            one of the improved approaches (seq2seq, basis expansion, DTW).
+#   False → skip this block (default when running full pipeline).
+# ─────────────────────────────────────────────────────────────────────────────
+RUN_CURVE_ONLY_EVALUATION = True
 
 
 def _split_process_datasets(datasets, train_ratio=0.80):
@@ -1866,7 +1876,10 @@ MODES_TO_COMPARE = _filtered_modes
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
 
-for process in process_datasets_to_model.keys():
+if RUN_CURVE_ONLY_EVALUATION:
+    print("RUN_CURVE_ONLY_EVALUATION=True — skipping process modelling loop.")
+
+for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION else []:
     print("\n" + "="*80)
     print(f"ANALYZING {process.upper()}")
     print("="*80)
@@ -2420,64 +2433,65 @@ for process in process_datasets_to_model.keys():
             _plot_results_heatmap(_train_cols, f"Training Quality: {process}", local_df=_proc_df)
 
 
-# Convert the results list into a DataFrame
-evaluation_results_df = pd.DataFrame(evaluation_results_list)
+if not RUN_CURVE_ONLY_EVALUATION:
+    # Convert the results list into a DataFrame
+    evaluation_results_df = pd.DataFrame(evaluation_results_list)
 
-# Reorder columns to place key columns first
-priority_cols = ['process', 'mode', 'split']
-for prefix in ['train', 'test']:
-    for col_name in ['overall_score', 'quality_assessment']:
-        full = f"{prefix}_{col_name}"
-        if full in evaluation_results_df.columns:
-            priority_cols.append(full)
-remaining_cols = [c for c in evaluation_results_df.columns if c not in priority_cols]
-evaluation_results_df = evaluation_results_df[priority_cols + remaining_cols]
-
-# print the DataFrame
-print("\n" + "="*80)
-print("AGGREGATED EVALUATION RESULTS — MODE COMPARISON")
-print("="*80)
-
-evaluation_results_df.to_parquet(
-    "evaluation_results.parquet",
-    engine="pyarrow",
-    index=False
-)
-evaluation_results_df
-
-# ── Per-process breakdown: show modes sorted by test_overall_score ────────
-report("\n" + "="*80)
-report("PER-PROCESS RESULTS — MODES SORTED BY test_overall_score")
-report("="*80)
-
-sort_col = 'test_overall_score'
-if sort_col in evaluation_results_df.columns:
-    # Columns to display (key columns only for readability)
-    display_cols = ['process', 'mode', 'split']
-    for prefix in ['test', 'train']:
+    # Reorder columns to place key columns first
+    priority_cols = ['process', 'mode', 'split']
+    for prefix in ['train', 'test']:
         for col_name in ['overall_score', 'quality_assessment']:
             full = f"{prefix}_{col_name}"
             if full in evaluation_results_df.columns:
-                display_cols.append(full)
-    # Add all test_ metric columns for full visibility
-    test_metric_cols = [c for c in evaluation_results_df.columns
-                        if c.startswith('test_') and c not in display_cols]
-    display_cols.extend(test_metric_cols)
-    display_cols = [c for c in display_cols if c in evaluation_results_df.columns]
+                priority_cols.append(full)
+    remaining_cols = [c for c in evaluation_results_df.columns if c not in priority_cols]
+    evaluation_results_df = evaluation_results_df[priority_cols + remaining_cols]
 
-    for process_name, grp in evaluation_results_df.groupby('process'):
-        report(f"\n{'─'*80}")
-        report(f"  PROCESS: {process_name}")
-        report(f"{'─'*80}")
-        sorted_grp = grp.sort_values(sort_col, ascending=False)
-        # Pretty-print with pandas
-        with pd.option_context('display.max_columns', None,
-                               'display.width', 200,
-                               'display.max_colwidth', 30):
-            report(sorted_grp[display_cols].to_string(index=False))
-else:
-    report(f"  Column '{sort_col}' not found — skipping per-process ranking.")
-    print(f"  Available columns: {list(evaluation_results_df.columns)}")
+    # print the DataFrame
+    print("\n" + "="*80)
+    print("AGGREGATED EVALUATION RESULTS — MODE COMPARISON")
+    print("="*80)
+
+    evaluation_results_df.to_parquet(
+        "evaluation_results.parquet",
+        engine="pyarrow",
+        index=False
+    )
+    evaluation_results_df
+
+    # ── Per-process breakdown: show modes sorted by test_overall_score ────────
+    report("\n" + "="*80)
+    report("PER-PROCESS RESULTS — MODES SORTED BY test_overall_score")
+    report("="*80)
+
+    sort_col = 'test_overall_score'
+    if sort_col in evaluation_results_df.columns:
+        # Columns to display (key columns only for readability)
+        display_cols = ['process', 'mode', 'split']
+        for prefix in ['test', 'train']:
+            for col_name in ['overall_score', 'quality_assessment']:
+                full = f"{prefix}_{col_name}"
+                if full in evaluation_results_df.columns:
+                    display_cols.append(full)
+        # Add all test_ metric columns for full visibility
+        test_metric_cols = [c for c in evaluation_results_df.columns
+                            if c.startswith('test_') and c not in display_cols]
+        display_cols.extend(test_metric_cols)
+        display_cols = [c for c in display_cols if c in evaluation_results_df.columns]
+
+        for process_name, grp in evaluation_results_df.groupby('process'):
+            report(f"\n{'─'*80}")
+            report(f"  PROCESS: {process_name}")
+            report(f"{'─'*80}")
+            sorted_grp = grp.sort_values(sort_col, ascending=False)
+            # Pretty-print with pandas
+            with pd.option_context('display.max_columns', None,
+                                   'display.width', 200,
+                                   'display.max_colwidth', 30):
+                report(sorted_grp[display_cols].to_string(index=False))
+    else:
+        report(f"  Column '{sort_col}' not found — skipping per-process ranking.")
+        print(f"  Available columns: {list(evaluation_results_df.columns)}")
 
 # %% 
 
@@ -2488,7 +2502,7 @@ else:
 # ── FINAL SUMMARY ─────────────────────────────────────────────────────────────
 # All modeling and per-process evaluations are complete.
 
-if RUN_TEST_EVALUATION:
+if RUN_TEST_EVALUATION and not RUN_CURVE_ONLY_EVALUATION:
     # Final consolidated summary of TEST set performance across ALL processes
     # (Focuses strictly on the core metrics to maintain clarity)
     _final_test_cols = [f"test_{b}" for b in CORE_METRIC_BASES if f"test_{b}" in evaluation_results_df.columns]
@@ -2500,7 +2514,330 @@ if RUN_TEST_EVALUATION:
 
 
 
-# %% 
+# %%
+# ── CURVE-ONLY: train ALL approaches without process modelling ────────────────
+# Trains baseline, Approach 2 (B-spline basis), and Approach 3 (DTW-phase)
+# side by side so results can be compared in the evaluation cell below.
+if RUN_CURVE_ONLY_EVALUATION:
+    from sim_extractor import (
+        split_curves,
+        build_and_train_pipeline,            predict_raw_curve,
+        build_and_train_pipeline_dtw_phase,  predict_raw_curve_dtw_phase,
+        build_and_train_pipeline_basis,      predict_raw_curve_basis,
+    )
+    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import GradientBoostingRegressor
+
+    all_energy_pipelines           = {}   # baseline
+    all_energy_pipelines_dtw_phase = {}   # Approach 3
+    all_energy_pipelines_basis     = {}   # Approach 2
+
+    _CURVE_MODELS = {
+        'Linear Regression': LinearRegression,
+        'Gradient Boosting': GradientBoostingRegressor,
+    }
+
+    for _proc in process_datasets_to_model.keys():
+        _proc_cfg   = process_datasets_to_model_sensors.get(_proc, {}) \
+                      if 'process_datasets_to_model_sensors' in dir() else {}
+        _sensors    = _proc_cfg.get('sensors_to_model', [])
+        _activities = _proc_cfg.get('activities_to_model', [])
+        _objects    = _proc_cfg.get('objects_to_model', [])
+
+        _df_train_exp = train_datasets[_proc].get('expanded')
+        if _df_train_exp is None or _df_train_exp.empty:
+            print(f"  Skipping {_proc}: no expanded data.")
+            continue
+
+        if not _sensors:
+            _sensors = [
+                c for c in _df_train_exp.columns
+                if c.endswith('_energy')
+                and not c.endswith('_log')
+                and _df_train_exp[c].dtype in ('float64', 'float32', 'int64', 'int32')
+            ]
+        if not _sensors:
+            print(f"  Skipping {_proc}: no sensor columns found.")
+            continue
+
+        if not _activities and 'activity_log' in _df_train_exp.columns:
+            _activities = _df_train_exp['activity_log'].dropna().unique().tolist()
+        if not _objects and 'object_log' in _df_train_exp.columns:
+            _objects = _df_train_exp['object_log'].dropna().unique().tolist()
+
+        print(f"\n{'='*60}")
+        print(f"CURVE-ONLY TRAINING — {_proc.upper()}")
+        print(f"  Sensors   : {_sensors}")
+        print(f"  Activities: {_activities}")
+        print(f"{'='*60}")
+
+        _pipelines_baseline  = {}
+        _pipelines_dtw_phase = {}
+        _pipelines_basis     = {}
+
+        for _sensor in _sensors:
+            _train_curves, _ = split_curves(
+                _df_train_exp,
+                variable=_sensor,
+                activities=_activities,
+                objects=_objects,
+                test_size=0.0,
+                verbose=0,
+            )
+            if not _train_curves:
+                print(f"  [{_sensor}] No curves found — skipping.")
+                continue
+
+            # ── Baseline ────────────────────────────────────────────────────
+            print(f"  [{_sensor}] Training baseline (DTW + position index)...")
+            _ep_base = build_and_train_pipeline(
+                _train_curves,
+                variable=_sensor,
+                fixed_length=100,
+                val_size=0.2,
+                models=_CURVE_MODELS,
+                optimize_hyperparams=False,
+                verbose=False,
+            )
+            print(f"    Best model: {_ep_base['model_name']}  val R²={_ep_base['val_r2']:.4f}")
+
+            def _make_pred_base(ep):
+                return lambda rv, act, attrs: predict_raw_curve(rv, act, attrs, pipeline=ep)
+
+            _pipelines_baseline[_sensor] = {
+                'reference_curve': _ep_base['reference_curve'],
+                'predict_fn':      _make_pred_base(_ep_base),
+                'full_pipeline':   _ep_base,
+            }
+
+            # ── Approach 3 — DTW-phase ───────────────────────────────────
+            print(f"  [{_sensor}] Training Approach 3 (DTW + phase features)...")
+            _ep_phase = build_and_train_pipeline_dtw_phase(
+                _train_curves,
+                variable=_sensor,
+                fixed_length=100,
+                val_size=0.2,
+                models=_CURVE_MODELS,
+                optimize_hyperparams=False,
+                verbose=False,
+            )
+            print(f"    Best model: {_ep_phase['model_name']}  val R²={_ep_phase['val_r2']:.4f}")
+
+            def _make_pred_phase(ep):
+                return lambda rv, act, attrs: predict_raw_curve_dtw_phase(rv, act, attrs, pipeline=ep)
+
+            _pipelines_dtw_phase[_sensor] = {
+                'reference_curve': _ep_phase['reference_curve'],
+                'predict_fn':      _make_pred_phase(_ep_phase),
+                'full_pipeline':   _ep_phase,
+            }
+
+            # ── Approach 2 — B-spline basis expansion ───────────────────
+            print(f"  [{_sensor}] Training Approach 2 (B-spline basis expansion)...")
+            _ep_basis = build_and_train_pipeline_basis(
+                _train_curves,
+                variable=_sensor,
+                fixed_length=100,
+                n_basis=20,
+                val_size=0.2,
+                models=_CURVE_MODELS,
+                optimize_hyperparams=False,
+                verbose=False,
+            )
+            print(f"    Best model: {_ep_basis['model_name']}  val R²={_ep_basis['val_r2']:.4f}")
+
+            def _make_pred_basis(ep):
+                return lambda rv, act, attrs: predict_raw_curve_basis(rv, act, attrs, pipeline=ep)
+
+            _pipelines_basis[_sensor] = {
+                'reference_curve': _ep_basis['reference_curve'],
+                'predict_fn':      _make_pred_basis(_ep_basis),
+                'full_pipeline':   _ep_basis,
+            }
+
+        all_energy_pipelines[_proc]           = _pipelines_baseline
+        all_energy_pipelines_dtw_phase[_proc] = _pipelines_dtw_phase
+        all_energy_pipelines_basis[_proc]     = _pipelines_basis
+
+# %%
+# ══════════════════════════════════════════════════════════════════════════════
+# CURVE-ONLY EVALUATION — BASELINE vs APPROACH 2 (B-spline) vs APPROACH 3 (DTW-phase)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_curve_eval(pipelines_dict, approach_label, split_label,
+                    df_lookup, activities, objects):
+    """
+    Evaluate every (process, sensor) in pipelines_dict against curves from
+    df_lookup.  Returns a list of per-curve metric dicts.
+    """
+    from sim_extractor import evaluate_pipeline_on_test, split_curves
+    records = []
+    for _proc, _sensors in pipelines_dict.items():
+        _df = df_lookup.get(_proc, {}).get('expanded')
+        if _df is None or _df.empty:
+            continue
+        _acts = activities.get(_proc, [])
+        _objs = objects.get(_proc, [])
+        if not _acts and 'activity_log' in _df.columns:
+            _acts = _df['activity_log'].dropna().unique().tolist()
+        if not _objs and 'object_log' in _df.columns:
+            _objs = _df['object_log'].dropna().unique().tolist()
+
+        for _sensor, _ep in _sensors.items():
+            _curves, _ = split_curves(_df, _sensor, _acts, _objs,
+                                      test_size=0.0, verbose=0)
+            if not _curves:
+                continue
+            show_plots = (split_label == 'TEST')
+            _metrics_df, _agg = evaluate_pipeline_on_test(
+                _curves, _ep['full_pipeline'],
+                max_plot_curves=6 if show_plots else 0,
+                verbose=1 if show_plots else 0,
+            )
+            for _, _r in _metrics_df.iterrows():
+                records.append({
+                    'Approach': approach_label,
+                    'Process':  _proc,
+                    'Sensor':   _sensor,
+                    'Split':    split_label,
+                    'Activity': _r['activity'],
+                    'N':        _r['n_points'],
+                    'MAE':      _r['MAE'],
+                    'RMSE':     _r['RMSE'],
+                    'WAPE':     _r['WAPE (%)'],
+                    'R2':       _r['R2'],
+                })
+    return records
+
+
+if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_pipelines:
+    from sim_extractor import evaluate_pipeline_on_test, split_curves
+
+    display(Markdown("---"))
+    display(Markdown("# Curve-Only Evaluation — Baseline vs Approach 2 (B-spline) vs Approach 3 (DTW-phase)"))
+
+    _proc_cfg_lookup = {
+        _p: process_datasets_to_model_sensors.get(_p, {})
+        for _p in process_datasets_to_model.keys()
+    } if 'process_datasets_to_model_sensors' in dir() else {}
+    _activities_map = {p: c.get('activities_to_model', []) for p, c in _proc_cfg_lookup.items()}
+    _objects_map    = {p: c.get('objects_to_model',    []) for p, c in _proc_cfg_lookup.items()}
+
+    _all_records = []
+
+    # ── Evaluate both approaches on TRAIN and TEST ───────────────────────────
+    for _split_label, _df_src in [('TRAIN', train_datasets),
+                                   ('TEST',  test_datasets if TEMPORAL_SPLIT else train_datasets)]:
+
+        display(Markdown(f"## Split: {_split_label}"))
+
+        for _approach_label, _pipelines in [
+            ('Baseline (DTW + pos)',   all_energy_pipelines),
+            ('Approach 2 (B-spline)',  all_energy_pipelines_basis),
+            ('Approach 3 (DTW-phase)', all_energy_pipelines_dtw_phase),
+        ]:
+            if not _pipelines:
+                continue
+            display(Markdown(f"### {_approach_label}"))
+            _recs = _run_curve_eval(
+                _pipelines, _approach_label, _split_label,
+                _df_src, _activities_map, _objects_map,
+            )
+            _all_records.extend(_recs)
+
+    # ── Side-by-side comparison table ───────────────────────────────────────
+    if _all_records:
+        _all_df = pd.DataFrame(_all_records)
+
+        display(Markdown("---"))
+        display(Markdown("## Summary — Baseline vs Approach 3 (TEST set)"))
+
+        _test_df = _all_df[_all_df['Split'] == 'TEST']
+        if not _test_df.empty:
+            _compare = (
+                _test_df
+                .groupby(['Approach', 'Process', 'Sensor'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+                .mean()
+                .round(4)
+            )
+            display(_compare)
+            report("\nCURVE MODEL COMPARISON (TEST SET)")
+            report(_compare.to_string())
+
+            # ── Per-activity table ───────────────────────────────────────────
+            display(Markdown("### Per-activity breakdown (TEST)"))
+            _act_compare = (
+                _test_df
+                .groupby(['Approach', 'Process', 'Sensor', 'Activity'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+                .mean()
+                .round(4)
+            )
+            display(_act_compare)
+
+            # ── R² heatmap — one subplot per approach ────────────────────────
+            _approaches = _test_df['Approach'].unique()
+            fig_h, axes_h = plt.subplots(
+                1, len(_approaches),
+                figsize=(max(8, _test_df['Activity'].nunique() * 1.4) * len(_approaches),
+                         max(3, _test_df[['Process', 'Sensor']].drop_duplicates().shape[0] * 1.2))
+            )
+            if len(_approaches) == 1:
+                axes_h = [axes_h]
+
+            for ax_h, _appr in zip(axes_h, _approaches):
+                _sub = _test_df[_test_df['Approach'] == _appr]
+                _ph = _sub.pivot_table(
+                    index=['Process', 'Sensor'], columns='Activity',
+                    values='R2', aggfunc='mean'
+                )
+                sns.heatmap(
+                    _ph, annot=True, fmt='.3f', cmap='RdYlGn',
+                    vmin=0, vmax=1, linewidths=0.5, ax=ax_h,
+                    cbar_kws={'label': 'R²'}
+                )
+                ax_h.set_title(f'R² — {_appr}', fontsize=11, fontweight='bold')
+                ax_h.set_xticklabels(ax_h.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+
+            plt.suptitle('Curve R² per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
+            plt.tight_layout()
+            plt.show()
+
+            # ── Delta heatmaps: each new approach minus baseline ─────────────
+            _base_pivot = _test_df[_test_df['Approach'] == 'Baseline (DTW + pos)'].pivot_table(
+                index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
+            )
+            for _delta_label, _delta_appr in [
+                ('Approach 2 (B-spline)',  'Approach 2 (B-spline)'),
+                ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
+            ]:
+                _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
+                    index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
+                )
+                if _base_pivot.empty or _new_pivot.empty:
+                    continue
+                _delta = (_new_pivot - _base_pivot).reindex_like(_base_pivot)
+                fig_d, ax_d = plt.subplots(figsize=(max(8, len(_base_pivot.columns) * 1.4),
+                                                     max(3, len(_base_pivot) * 1.2)))
+                sns.heatmap(
+                    _delta, annot=True, fmt='.3f', cmap='RdYlGn',
+                    center=0, linewidths=0.5, ax=ax_d,
+                    cbar_kws={'label': f'ΔR² ({_delta_label} − Baseline)'}
+                )
+                ax_d.set_title(
+                    f'ΔR² {_delta_label} vs Baseline — green = {_delta_label} better',
+                    fontsize=11, fontweight='bold'
+                )
+                ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+                plt.tight_layout()
+                plt.show()
+
+elif RUN_CURVE_ONLY_EVALUATION:
+    display(Markdown(
+        "> **Curve-Only Evaluation skipped** — `all_energy_pipelines` is empty. "
+        "Make sure the energy pipeline training block ran successfully."
+    ))
+
+# %%
 # ── STANDALONE PROFILE EVALUATION (TRAIN & TEST) ──────────────────────────────
 from sim_extractor import evaluate_pipeline_on_test, split_curves
 profile_summary_records = []
@@ -2586,10 +2923,9 @@ report("█   FINAL ENERGY PERFORMANCE REPORT (SIMULATION QUALITY)             �
 report("█"*80)
 
 energy_metrics_summary = []
+records = []
 if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
     energy_cols = [c for c in evaluation_results_df.columns if c.startswith('test_energy_')]
-    
-    records = []
     for _, row in evaluation_results_df.iterrows():
         proc = row['process']
         mode = row['mode']
