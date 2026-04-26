@@ -2275,6 +2275,387 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
 
 
 # =============================================================================
+# INSTANCE STATS — DTW PIPELINE WITH INSTANCE-LEVEL CURVE STATISTICS
+#
+# The baseline predicts f(position, activity, curve_length) → value.
+# For a given activity it learns a single average curve shape and cannot
+# distinguish one instance from another.
+#
+# This variant keeps the exact same DBA + DTW alignment flow but enriches
+# the feature row for each position with statistics computed from the
+# DTW-aligned curve of that specific instance:
+#
+#   • curve_mean, curve_std  — overall level and spread of this run
+#   • curve_min, curve_max   — range, useful for scaling context
+#   • curve_start, curve_end — boundary values that constrain the shape
+#
+# At train time these come from the DTW-aligned training curve (already
+# computed in step 2b — no extra cost).
+# At test time the raw curve is DTW-aligned to the reference BEFORE features
+# are built, so the model sees the same space it was trained on.
+# =============================================================================
+
+def _instance_stats(aligned_curve):
+    """Compute per-instance summary statistics from a DTW-aligned curve."""
+    v = np.asarray(aligned_curve, dtype=float)
+    return {
+        'curve_mean':  float(np.mean(v)),
+        'curve_std':   float(np.std(v)),
+        'curve_min':   float(np.min(v)),
+        'curve_max':   float(np.max(v)),
+        'curve_start': float(v[0]),
+        'curve_end':   float(v[-1]),
+    }
+
+
+def _build_feature_matrix_plus(curves, all_keys, key_types, fixed_length,
+                                value_key='resampled_values', include_target=True):
+    """
+    Like _build_feature_matrix but adds instance-level curve statistics.
+    """
+    rows = []
+    for curve in curves:
+        stats = _instance_stats(curve[value_key])
+        for position_idx in range(fixed_length):
+            row = {
+                'instance_id':  curve['instance_id'],
+                'activity':     curve['activity'],
+                'position_idx': position_idx,
+                'curve_length': curve['original_length'],
+                'curve_mean':   stats['curve_mean'],
+                'curve_std':    stats['curve_std'],
+                'curve_min':    stats['curve_min'],
+                'curve_max':    stats['curve_max'],
+                'curve_start':  stats['curve_start'],
+                'curve_end':    stats['curve_end'],
+            }
+            if include_target:
+                row['y'] = curve[value_key][position_idx]
+
+            for key in all_keys:
+                value = curve['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(value) if value is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(value) if value is not None else 'None'
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_and_train_pipeline_instance_stats(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+):
+    """
+    Instance Stats — DTW pipeline enriched with instance-level curve statistics.
+
+    Same flow as build_and_train_pipeline(); only _build_feature_matrix_plus
+    is used instead of _build_feature_matrix.  Returns the same pipeline dict
+    with ``'approach'`` set to ``'instance_stats'``.
+    """
+    if verbose:
+        print("\n" + "=" * 80)
+        print("INSTANCE STATS — DTW + INSTANCE CURVE STATISTICS  (train curves only)")
+        print("=" * 80)
+
+    if models is None:
+        models = {
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    # 2a. DBA barycenter
+    if verbose:
+        print(f"\n[2a] Computing DBA barycenter from {len(train_curves)} train curves "
+              f"(fixed_length={fixed_length})...")
+
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values']
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    if verbose:
+        print(f"    Barycenter length: {len(reference_curve)} points")
+
+    # 2b. DTW-align train curves
+    if verbose:
+        print(f"\n[2b] Aligning {len(train_curves)} train curves to DBA barycenter...")
+
+    for i, curve in enumerate(train_curves):
+        if verbose and i % max(1, len(train_curves) // 10) == 0:
+            print(f"    Curve {i + 1}/{len(train_curves)}...")
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+
+    # 2c. Feature matrix with instance statistics
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    if verbose:
+        print(f"\n[2c] Attribute columns : {key_types}")
+        print("     Extra features     : curve_mean, curve_std, curve_min, "
+              "curve_max, curve_start, curve_end")
+
+    df_reg = _build_feature_matrix_plus(
+        train_curves, all_keys, key_types, fixed_length,
+        value_key='resampled_values', include_target=True
+    )
+
+    if verbose:
+        print(f"     Regression dataset: {len(df_reg)} rows "
+              f"({len(train_curves)} curves x {fixed_length} positions)")
+
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_all = df_reg[['position_idx', 'curve_length', 'curve_mean', 'curve_std',
+                     'curve_min', 'curve_max', 'curve_start', 'curve_end']].copy()
+    X_all = X_all.assign(activity=df_reg['activity'].values)
+    for key in all_keys:
+        X_all = X_all.assign(**{key: df_reg[key].values})
+    X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    y_all = df_reg['y'].copy()
+
+    unique_instances     = df_reg['instance_id'].unique()
+    train_inst, val_inst = train_test_split(
+        unique_instances, test_size=val_size, random_state=random_state
+    )
+    train_mask = df_reg['instance_id'].isin(train_inst)
+    val_mask   = df_reg['instance_id'].isin(val_inst)
+
+    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
+    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
+
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = (
+        ['position_idx', 'curve_length', 'curve_mean', 'curve_std',
+         'curve_min', 'curve_max', 'curve_start', 'curve_end']
+        + [k for k in all_keys if key_types[k] == 'numeric']
+    )
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
+            X_train[numeric_feature_cols]
+        )
+        X_val.loc[:, numeric_feature_cols] = feature_scaler.transform(
+            X_val[numeric_feature_cols]
+        )
+
+    if verbose:
+        print(f"\n     Train: {len(train_inst)} curves / {len(X_train)} points")
+        print(f"     Val  : {len(val_inst)} curves / {len(X_val)} points")
+
+    all_results = {}
+
+    for name, model_class in models.items():
+        if verbose:
+            print(f"\n[2d] Training — {name}...")
+
+        if optimize_hyperparams:
+            if not verbose:
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def objective(trial, name=name, model_class=model_class):
+                if name == 'Gradient Boosting':
+                    params = {
+                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
+                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
+                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
+                        'random_state':  random_state,
+                    }
+                elif name == 'Random Forest':
+                    params = {
+                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
+                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
+                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+                        'random_state':      random_state,
+                        'n_jobs':            -1,
+                    }
+                else:
+                    params = {}
+                m = model_class(**params)
+                m.fit(X_train, y_train)
+                return r2_score(y_val, m.predict(X_val))
+
+            sampler = optuna.samplers.TPESampler(seed=random_state)
+            study = optuna.create_study(direction='maximize', sampler=sampler)
+            study.optimize(objective, n_trials=n_trials)
+            best_params = study.best_params
+            if name in ('Gradient Boosting', 'Random Forest'):
+                best_params['random_state'] = random_state
+            if name == 'Random Forest':
+                best_params['n_jobs'] = -1
+            if verbose:
+                print(f"     Best params: {best_params}")
+            model = model_class(**best_params)
+        else:
+            if name == 'Gradient Boosting':
+                model = model_class(
+                    n_estimators=200, max_depth=7, learning_rate=0.1,
+                    subsample=0.8, random_state=random_state
+                )
+            elif name == 'Random Forest':
+                model = model_class(
+                    n_estimators=200, max_depth=12, min_samples_split=5,
+                    random_state=random_state, n_jobs=-1
+                )
+            else:
+                try:
+                    model = model_class(random_state=random_state)
+                except TypeError:
+                    model = model_class()
+
+        model.fit(X_train, y_train)
+
+        train_pred = model.predict(X_train)
+        val_pred   = model.predict(X_val)
+        train_r2   = r2_score(y_train, train_pred)
+        val_r2     = r2_score(y_val,   val_pred)
+        train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
+        val_rmse   = np.sqrt(mean_squared_error(y_val,   val_pred))
+
+        if verbose:
+            print(f"     Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}")
+            print(f"     Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+
+        all_results[name] = {
+            'model':      model,
+            'train_r2':   train_r2,
+            'val_r2':     val_r2,
+            'train_rmse': train_rmse,
+            'val_rmse':   val_rmse,
+        }
+
+    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_model = all_results[best_name]['model']
+
+    if verbose:
+        print(f"\n Best model : {best_name}  "
+              f"(val R2={all_results[best_name]['val_r2']:.4f})")
+
+    pipeline = {
+        'approach':        'instance_stats',
+        'model':           best_model,
+        'model_name':      best_name,
+        'reference_curve': reference_curve,
+        'fixed_length':    fixed_length,
+        'all_keys':        all_keys,
+        'key_types':       key_types,
+        'feature_columns': feature_columns,
+        'feature_scaler':  feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'val_r2':          all_results[best_name]['val_r2'],
+        'all_results':     all_results,
+    }
+
+    return pipeline
+
+
+def predict_raw_curve_instance_stats(raw_values, activity, attributes, pipeline):
+    """
+    Predict using the Instance Stats pipeline.
+
+    The raw test curve is DTW-aligned to the reference curve first, then
+    instance statistics are computed from that aligned version and used as
+    features alongside position_idx.  The canonical predictions are mapped
+    back to raw time steps via the same DTW warp path.
+    """
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler', None)
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+
+    # Align test curve to reference to get the canonical-space version
+    alignment     = dtw(raw_values, reference_curve, keep_internals=True)
+    aligned_test  = _align_curve_with_dtw(raw_values, reference_curve)
+    stats         = _instance_stats(aligned_test)
+
+    rows_ref = []
+    for pos in range(fixed_length):
+        row = {
+            'position_idx': pos,
+            'curve_length': len(raw_values),
+            'curve_mean':   stats['curve_mean'],
+            'curve_std':    stats['curve_std'],
+            'curve_min':    stats['curve_min'],
+            'curve_max':    stats['curve_max'],
+            'curve_start':  stats['curve_start'],
+            'curve_end':    stats['curve_end'],
+            'activity':     activity,
+        }
+        for key in all_keys:
+            value = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows_ref.append(row)
+
+    X_ref = pd.DataFrame(rows_ref)
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_ref = pd.get_dummies(X_ref, columns=categorical_cols, drop_first=True)
+
+    for col in feature_columns:
+        if col not in X_ref.columns:
+            X_ref[col] = 0
+    X_ref = X_ref[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
+        if cols_to_scale:
+            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
+
+    y_ref_pred = model.predict(X_ref)
+
+    # Map canonical predictions back to raw time steps
+    buckets    = [[] for _ in range(len(raw_values))]
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            _ = nearest_qi
+            y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
 # APPROACH 3 — DTW-PHASE AWARE PIPELINE
 #
 # Same architecture as the baseline (DBA barycenter → DTW alignment → regression)

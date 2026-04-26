@@ -2522,6 +2522,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     from sim_extractor import (
         split_curves,
         build_and_train_pipeline,            predict_raw_curve,
+        build_and_train_pipeline_instance_stats, predict_raw_curve_instance_stats,
         build_and_train_pipeline_dtw_phase,  predict_raw_curve_dtw_phase,
         build_and_train_pipeline_basis,      predict_raw_curve_basis,
     )
@@ -2529,6 +2530,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     from sklearn.ensemble import GradientBoostingRegressor
 
     all_energy_pipelines           = {}   # baseline
+    all_energy_pipelines_instance_stats = {}   # Instance Stats
     all_energy_pipelines_dtw_phase = {}   # Approach 3
     all_energy_pipelines_basis     = {}   # Approach 2
 
@@ -2572,6 +2574,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         print(f"{'='*60}")
 
         _pipelines_baseline  = {}
+        _pipelines_instance_stats = {}
         _pipelines_dtw_phase = {}
         _pipelines_basis     = {}
 
@@ -2608,6 +2611,28 @@ if RUN_CURVE_ONLY_EVALUATION:
                 'reference_curve': _ep_base['reference_curve'],
                 'predict_fn':      _make_pred_base(_ep_base),
                 'full_pipeline':   _ep_base,
+            }
+
+            # ── Instance Stats — DTW + instance curve statistics ─────────
+            print(f"  [{_sensor}] Training Instance Stats (DTW + curve stats)...")
+            _ep_istats = build_and_train_pipeline_instance_stats(
+                _train_curves,
+                variable=_sensor,
+                fixed_length=100,
+                val_size=0.2,
+                models=_CURVE_MODELS,
+                optimize_hyperparams=False,
+                verbose=False,
+            )
+            print(f"    Best model: {_ep_istats['model_name']}  val R²={_ep_istats['val_r2']:.4f}")
+
+            def _make_pred_istats(ep):
+                return lambda rv, act, attrs: predict_raw_curve_instance_stats(rv, act, attrs, pipeline=ep)
+
+            _pipelines_instance_stats[_sensor] = {
+                'reference_curve': _ep_istats['reference_curve'],
+                'predict_fn':      _make_pred_istats(_ep_istats),
+                'full_pipeline':   _ep_istats,
             }
 
             # ── Approach 3 — DTW-phase ───────────────────────────────────
@@ -2656,6 +2681,7 @@ if RUN_CURVE_ONLY_EVALUATION:
             }
 
         all_energy_pipelines[_proc]           = _pipelines_baseline
+        all_energy_pipelines_instance_stats[_proc] = _pipelines_instance_stats
         all_energy_pipelines_dtw_phase[_proc] = _pipelines_dtw_phase
         all_energy_pipelines_basis[_proc]     = _pipelines_basis
 
@@ -2732,9 +2758,10 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown(f"## Split: {_split_label}"))
 
         for _approach_label, _pipelines in [
-            ('Baseline (DTW + pos)',   all_energy_pipelines),
-            ('Approach 2 (B-spline)',  all_energy_pipelines_basis),
-            ('Approach 3 (DTW-phase)', all_energy_pipelines_dtw_phase),
+            ('Baseline (DTW + pos)',      all_energy_pipelines),
+            ('Instance Stats',              all_energy_pipelines_instance_stats),
+            ('Approach 2 (B-spline)',     all_energy_pipelines_basis),
+            ('Approach 3 (DTW-phase)',    all_energy_pipelines_dtw_phase),
         ]:
             if not _pipelines:
                 continue
@@ -2807,8 +2834,9 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
             )
             for _delta_label, _delta_appr in [
-                ('Approach 2 (B-spline)',  'Approach 2 (B-spline)'),
-                ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
+                ('Instance Stats',              'Instance Stats'),
+                ('Approach 2 (B-spline)',      'Approach 2 (B-spline)'),
+                ('Approach 3 (DTW-phase)',     'Approach 3 (DTW-phase)'),
             ]:
                 _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
                     index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
