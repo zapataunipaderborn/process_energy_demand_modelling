@@ -1562,9 +1562,9 @@ process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
 process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
+process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
 # process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
@@ -1577,7 +1577,7 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 # %%
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
-# processes_to_run = ['process_2']
+processes_to_run = ['process_2']
 # Filter the original dictionary
 process_datasets_to_model = {
     k: v for k, v in process_datasets.items() 
@@ -2549,6 +2549,19 @@ if RUN_CURVE_ONLY_EVALUATION:
         'Gradient Boosting': GradientBoostingRegressor,
     }
 
+    # ── Toggle approaches — comment out any you want to skip ─────────────────
+    _RUN_APPROACHES = [
+        'baseline',
+        # 'instance_stats',
+        # 'istats_leakfree',
+        # 'dtw_phase',
+        # 'basis',
+        # 'exog',
+        'seq2seq',
+        'seq2seq_only',
+        'seq2seq_exog',
+    ]
+
     for _proc in process_datasets_to_model.keys():
         _proc_cfg   = process_datasets_to_model_sensors.get(_proc, {}) \
                       if 'process_datasets_to_model_sensors' in dir() else {}
@@ -2617,120 +2630,9 @@ if RUN_CURVE_ONLY_EVALUATION:
                 continue
 
             # ── Baseline ────────────────────────────────────────────────────
-            print(f"  [{_sensor}] Training baseline (DTW + position index)...")
-            _ep_base = build_and_train_pipeline(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                val_size=0.2,
-                models=_CURVE_MODELS,
-                optimize_hyperparams=False,
-                verbose=False,
-            )
-            print(f"    Best model: {_ep_base['model_name']}  val R²={_ep_base['val_r2']:.4f}")
-
-            def _make_pred_base(ep):
-                return lambda rv, act, attrs: predict_raw_curve(rv, act, attrs, pipeline=ep)
-
-            _pipelines_baseline[_sensor] = {
-                'reference_curve': _ep_base['reference_curve'],
-                'predict_fn':      _make_pred_base(_ep_base),
-                'full_pipeline':   _ep_base,
-            }
-
-            # ── Instance Stats — DTW + instance curve statistics ─────────
-            print(f"  [{_sensor}] Training Instance Stats (DTW + curve stats)...")
-            _ep_istats = build_and_train_pipeline_instance_stats(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                val_size=0.2,
-                models=_CURVE_MODELS,
-                optimize_hyperparams=False,
-                verbose=False,
-            )
-            print(f"    Best model: {_ep_istats['model_name']}  val R²={_ep_istats['val_r2']:.4f}")
-
-            def _make_pred_istats(ep):
-                return lambda rv, act, attrs: predict_raw_curve_instance_stats(rv, act, attrs, pipeline=ep)
-
-            _pipelines_instance_stats[_sensor] = {
-                'reference_curve': _ep_istats['reference_curve'],
-                'predict_fn':      _make_pred_istats(_ep_istats),
-                'full_pipeline':   _ep_istats,
-            }
-
-            # ── Instance Stats (Leak-Free) — two-stage ───────────────────
-            print(f"  [{_sensor}] Training Instance Stats Leak-Free (two-stage)...")
-            _ep_lf = build_and_train_pipeline_istats_leakfree(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                val_size=0.2,
-                models=_CURVE_MODELS,
-                optimize_hyperparams=False,
-                verbose=False,
-            )
-            print(f"    Best model: {_ep_lf['model_name']}  val R²={_ep_lf['val_r2']:.4f}")
-
-            def _make_pred_lf(ep):
-                return lambda rv, act, attrs: predict_raw_curve_istats_leakfree(rv, act, attrs, pipeline=ep)
-
-            _pipelines_istats_leakfree[_sensor] = {
-                'reference_curve': _ep_lf['reference_curve'],
-                'predict_fn':      _make_pred_lf(_ep_lf),
-                'full_pipeline':   _ep_lf,
-            }
-
-            # ── Approach 3 — DTW-phase ───────────────────────────────────
-            print(f"  [{_sensor}] Training Approach 3 (DTW + phase features)...")
-            _ep_phase = build_and_train_pipeline_dtw_phase(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                val_size=0.2,
-                models=_CURVE_MODELS,
-                optimize_hyperparams=False,
-                verbose=False,
-            )
-            print(f"    Best model: {_ep_phase['model_name']}  val R²={_ep_phase['val_r2']:.4f}")
-
-            def _make_pred_phase(ep):
-                return lambda rv, act, attrs: predict_raw_curve_dtw_phase(rv, act, attrs, pipeline=ep)
-
-            _pipelines_dtw_phase[_sensor] = {
-                'reference_curve': _ep_phase['reference_curve'],
-                'predict_fn':      _make_pred_phase(_ep_phase),
-                'full_pipeline':   _ep_phase,
-            }
-
-            # ── Approach 2 — B-spline basis expansion ───────────────────
-            print(f"  [{_sensor}] Training Approach 2 (B-spline basis expansion)...")
-            _ep_basis = build_and_train_pipeline_basis(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                n_basis=20,
-                val_size=0.2,
-                models=_CURVE_MODELS,
-                optimize_hyperparams=False,
-                verbose=False,
-            )
-            print(f"    Best model: {_ep_basis['model_name']}  val R²={_ep_basis['val_r2']:.4f}")
-
-            def _make_pred_basis(ep):
-                return lambda rv, act, attrs: predict_raw_curve_basis(rv, act, attrs, pipeline=ep)
-
-            _pipelines_basis[_sensor] = {
-                'reference_curve': _ep_basis['reference_curve'],
-                'predict_fn':      _make_pred_basis(_ep_basis),
-                'full_pipeline':   _ep_basis,
-            }
-
-            # ── DTW + External Factors ───────────────────────────────────
-            if _ef_cols:
-                print(f"  [{_sensor}] Training DTW + External Factors ({len(_ef_cols)} ef_ signals)...")
-                _ep_exog = build_and_train_pipeline_exog(
+            if 'baseline' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training baseline (DTW + position index)...")
+                _ep_base = build_and_train_pipeline(
                     _train_curves,
                     variable=_sensor,
                     fixed_length=100,
@@ -2739,81 +2641,142 @@ if RUN_CURVE_ONLY_EVALUATION:
                     optimize_hyperparams=False,
                     verbose=False,
                 )
-                print(f"    Best model: {_ep_exog['model_name']}  val R²={_ep_exog['val_r2']:.4f}")
+                print(f"    Best model: {_ep_base['model_name']}  val R²={_ep_base['val_r2']:.4f}")
 
-                def _make_pred_exog(ep):
-                    return lambda rv, act, attrs, exog=None: predict_raw_curve_exog(
-                        rv, act, attrs, pipeline=ep, exog_values=exog or {}
-                    )
+                def _make_pred_base(ep):
+                    return lambda rv, act, attrs: predict_raw_curve(rv, act, attrs, pipeline=ep)
 
-                _pipelines_exog[_sensor] = {
-                    'reference_curve': _ep_exog['reference_curve'],
-                    'predict_fn':      _make_pred_exog(_ep_exog),
-                    'full_pipeline':   _ep_exog,
+                _pipelines_baseline[_sensor] = {
+                    'reference_curve': _ep_base['reference_curve'],
+                    'predict_fn':      _make_pred_base(_ep_base),
+                    'full_pipeline':   _ep_base,
                 }
-            else:
-                print(f"  [{_sensor}] No ef_ columns found — skipping DTW+Exog.")
+
+            # ── Instance Stats — DTW + instance curve statistics ─────────
+            if 'instance_stats' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training Instance Stats (DTW + curve stats)...")
+                _ep_istats = build_and_train_pipeline_instance_stats(
+                    _train_curves,
+                    variable=_sensor,
+                    fixed_length=100,
+                    val_size=0.2,
+                    models=_CURVE_MODELS,
+                    optimize_hyperparams=False,
+                    verbose=False,
+                )
+                print(f"    Best model: {_ep_istats['model_name']}  val R²={_ep_istats['val_r2']:.4f}")
+
+                def _make_pred_istats(ep):
+                    return lambda rv, act, attrs: predict_raw_curve_instance_stats(rv, act, attrs, pipeline=ep)
+
+                _pipelines_instance_stats[_sensor] = {
+                    'reference_curve': _ep_istats['reference_curve'],
+                    'predict_fn':      _make_pred_istats(_ep_istats),
+                    'full_pipeline':   _ep_istats,
+                }
+
+            # ── Instance Stats (Leak-Free) — two-stage ───────────────────
+            if 'istats_leakfree' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training Instance Stats Leak-Free (two-stage)...")
+                _ep_lf = build_and_train_pipeline_istats_leakfree(
+                    _train_curves,
+                    variable=_sensor,
+                    fixed_length=100,
+                    val_size=0.2,
+                    models=_CURVE_MODELS,
+                    optimize_hyperparams=False,
+                    verbose=False,
+                )
+                print(f"    Best model: {_ep_lf['model_name']}  val R²={_ep_lf['val_r2']:.4f}")
+
+                def _make_pred_lf(ep):
+                    return lambda rv, act, attrs: predict_raw_curve_istats_leakfree(rv, act, attrs, pipeline=ep)
+
+                _pipelines_istats_leakfree[_sensor] = {
+                    'reference_curve': _ep_lf['reference_curve'],
+                    'predict_fn':      _make_pred_lf(_ep_lf),
+                    'full_pipeline':   _ep_lf,
+                }
+
+            # ── Approach 3 — DTW-phase ───────────────────────────────────
+            if 'dtw_phase' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training Approach 3 (DTW + phase features)...")
+                _ep_phase = build_and_train_pipeline_dtw_phase(
+                    _train_curves,
+                    variable=_sensor,
+                    fixed_length=100,
+                    val_size=0.2,
+                    models=_CURVE_MODELS,
+                    optimize_hyperparams=False,
+                    verbose=False,
+                )
+                print(f"    Best model: {_ep_phase['model_name']}  val R²={_ep_phase['val_r2']:.4f}")
+
+                def _make_pred_phase(ep):
+                    return lambda rv, act, attrs: predict_raw_curve_dtw_phase(rv, act, attrs, pipeline=ep)
+
+                _pipelines_dtw_phase[_sensor] = {
+                    'reference_curve': _ep_phase['reference_curve'],
+                    'predict_fn':      _make_pred_phase(_ep_phase),
+                    'full_pipeline':   _ep_phase,
+                }
+
+            # ── Approach 2 — B-spline basis expansion ───────────────────
+            if 'basis' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training Approach 2 (B-spline basis expansion)...")
+                _ep_basis = build_and_train_pipeline_basis(
+                    _train_curves,
+                    variable=_sensor,
+                    fixed_length=100,
+                    n_basis=20,
+                    val_size=0.2,
+                    models=_CURVE_MODELS,
+                    optimize_hyperparams=False,
+                    verbose=False,
+                )
+                print(f"    Best model: {_ep_basis['model_name']}  val R²={_ep_basis['val_r2']:.4f}")
+
+                def _make_pred_basis(ep):
+                    return lambda rv, act, attrs: predict_raw_curve_basis(rv, act, attrs, pipeline=ep)
+
+                _pipelines_basis[_sensor] = {
+                    'reference_curve': _ep_basis['reference_curve'],
+                    'predict_fn':      _make_pred_basis(_ep_basis),
+                    'full_pipeline':   _ep_basis,
+                }
+
+            # ── DTW + External Factors ───────────────────────────────────
+            if 'exog' in _RUN_APPROACHES:
+                if _ef_cols:
+                    print(f"  [{_sensor}] Training DTW + External Factors ({len(_ef_cols)} ef_ signals)...")
+                    _ep_exog = build_and_train_pipeline_exog(
+                        _train_curves,
+                        variable=_sensor,
+                        fixed_length=100,
+                        val_size=0.2,
+                        models=_CURVE_MODELS,
+                        optimize_hyperparams=False,
+                        verbose=False,
+                    )
+                    print(f"    Best model: {_ep_exog['model_name']}  val R²={_ep_exog['val_r2']:.4f}")
+
+                    def _make_pred_exog(ep):
+                        return lambda rv, act, attrs, exog=None: predict_raw_curve_exog(
+                            rv, act, attrs, pipeline=ep, exog_values=exog or {}
+                        )
+
+                    _pipelines_exog[_sensor] = {
+                        'reference_curve': _ep_exog['reference_curve'],
+                        'predict_fn':      _make_pred_exog(_ep_exog),
+                        'full_pipeline':   _ep_exog,
+                    }
+                else:
+                    print(f"  [{_sensor}] No ef_ columns found — skipping DTW+Exog.")
 
             # ── DTW + Seq2Seq ────────────────────────────────────────────
-            print(f"  [{_sensor}] Training DTW + Seq2Seq (LSTM encoder-decoder)...")
-            _ep_seq2seq = build_and_train_pipeline_seq2seq(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                val_size=0.2,
-                hidden_size=128,
-                num_layers=2,
-                dropout=0.1,
-                epochs=80,
-                batch_size=32,
-                lr=1e-3,
-                teacher_forcing_ratio=0.5,
-                patience=10,
-                verbose=False,
-            )
-            print(f"    val_loss={_ep_seq2seq['val_loss']:.5f}")
-
-            def _make_pred_seq2seq(ep):
-                return lambda rv, act, attrs: predict_raw_curve_seq2seq(rv, act, attrs, pipeline=ep)
-
-            _pipelines_seq2seq[_sensor] = {
-                'reference_curve': _ep_seq2seq['reference_curve'],
-                'predict_fn':      _make_pred_seq2seq(_ep_seq2seq),
-                'full_pipeline':   _ep_seq2seq,
-            }
-
-            # ── Seq2Seq only (no DTW) ────────────────────────────────────
-            print(f"  [{_sensor}] Training Seq2Seq only (no DTW)...")
-            _ep_seq2seq_only = build_and_train_pipeline_seq2seq_only(
-                _train_curves,
-                variable=_sensor,
-                fixed_length=100,
-                val_size=0.2,
-                hidden_size=128,
-                num_layers=2,
-                dropout=0.1,
-                epochs=80,
-                batch_size=32,
-                lr=1e-3,
-                teacher_forcing_ratio=0.5,
-                patience=10,
-                verbose=False,
-            )
-            print(f"    val_loss={_ep_seq2seq_only['val_loss']:.5f}")
-
-            def _make_pred_seq2seq_only(ep):
-                return lambda rv, act, attrs: predict_raw_curve_seq2seq_only(rv, act, attrs, pipeline=ep)
-
-            _pipelines_seq2seq_only[_sensor] = {
-                'reference_curve': None,
-                'predict_fn':      _make_pred_seq2seq_only(_ep_seq2seq_only),
-                'full_pipeline':   _ep_seq2seq_only,
-            }
-
-            # ── DTW + Seq2Seq + External Factors ─────────────────────────
-            if _ef_cols:
-                print(f"  [{_sensor}] Training DTW + Seq2Seq + Ext. Factors ({len(_ef_cols)} ef_ signals)...")
-                _ep_seq2seq_exog = build_and_train_pipeline_seq2seq_exog(
+            if 'seq2seq' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training DTW + Seq2Seq (LSTM encoder-decoder)...")
+                _ep_seq2seq = build_and_train_pipeline_seq2seq(
                     _train_curves,
                     variable=_sensor,
                     fixed_length=100,
@@ -2828,20 +2791,79 @@ if RUN_CURVE_ONLY_EVALUATION:
                     patience=10,
                     verbose=False,
                 )
-                print(f"    val_loss={_ep_seq2seq_exog['val_loss']:.5f}")
+                print(f"    val_loss={_ep_seq2seq['val_loss']:.5f}")
 
-                def _make_pred_seq2seq_exog(ep):
-                    return lambda rv, act, attrs, exog=None: predict_raw_curve_seq2seq_exog(
-                        rv, act, attrs, pipeline=ep, exog_values=exog or {}
-                    )
+                def _make_pred_seq2seq(ep):
+                    return lambda rv, act, attrs: predict_raw_curve_seq2seq(rv, act, attrs, pipeline=ep)
 
-                _pipelines_seq2seq_exog[_sensor] = {
-                    'reference_curve': _ep_seq2seq_exog['reference_curve'],
-                    'predict_fn':      _make_pred_seq2seq_exog(_ep_seq2seq_exog),
-                    'full_pipeline':   _ep_seq2seq_exog,
+                _pipelines_seq2seq[_sensor] = {
+                    'reference_curve': _ep_seq2seq['reference_curve'],
+                    'predict_fn':      _make_pred_seq2seq(_ep_seq2seq),
+                    'full_pipeline':   _ep_seq2seq,
                 }
-            else:
-                print(f"  [{_sensor}] No ef_ columns — skipping DTW+Seq2Seq+Exog.")
+
+            # ── Seq2Seq only (no DTW) ────────────────────────────────────
+            if 'seq2seq_only' in _RUN_APPROACHES:
+                print(f"  [{_sensor}] Training Seq2Seq only (no DTW)...")
+                _ep_seq2seq_only = build_and_train_pipeline_seq2seq_only(
+                    _train_curves,
+                    variable=_sensor,
+                    fixed_length=100,
+                    val_size=0.2,
+                    hidden_size=128,
+                    num_layers=2,
+                    dropout=0.1,
+                    epochs=80,
+                    batch_size=32,
+                    lr=1e-3,
+                    teacher_forcing_ratio=0.5,
+                    patience=10,
+                    verbose=False,
+                )
+                print(f"    val_loss={_ep_seq2seq_only['val_loss']:.5f}")
+
+                def _make_pred_seq2seq_only(ep):
+                    return lambda rv, act, attrs: predict_raw_curve_seq2seq_only(rv, act, attrs, pipeline=ep)
+
+                _pipelines_seq2seq_only[_sensor] = {
+                    'reference_curve': None,
+                    'predict_fn':      _make_pred_seq2seq_only(_ep_seq2seq_only),
+                    'full_pipeline':   _ep_seq2seq_only,
+                }
+
+            # ── DTW + Seq2Seq + External Factors ─────────────────────────
+            if 'seq2seq_exog' in _RUN_APPROACHES:
+                if _ef_cols:
+                    print(f"  [{_sensor}] Training DTW + Seq2Seq + Ext. Factors ({len(_ef_cols)} ef_ signals)...")
+                    _ep_seq2seq_exog = build_and_train_pipeline_seq2seq_exog(
+                        _train_curves,
+                        variable=_sensor,
+                        fixed_length=100,
+                        val_size=0.2,
+                        hidden_size=128,
+                        num_layers=2,
+                        dropout=0.1,
+                        epochs=80,
+                        batch_size=32,
+                        lr=1e-3,
+                        teacher_forcing_ratio=0.5,
+                        patience=10,
+                        verbose=False,
+                    )
+                    print(f"    val_loss={_ep_seq2seq_exog['val_loss']:.5f}")
+
+                    def _make_pred_seq2seq_exog(ep):
+                        return lambda rv, act, attrs, exog=None: predict_raw_curve_seq2seq_exog(
+                            rv, act, attrs, pipeline=ep, exog_values=exog or {}
+                        )
+
+                    _pipelines_seq2seq_exog[_sensor] = {
+                        'reference_curve': _ep_seq2seq_exog['reference_curve'],
+                        'predict_fn':      _make_pred_seq2seq_exog(_ep_seq2seq_exog),
+                        'full_pipeline':   _ep_seq2seq_exog,
+                    }
+                else:
+                    print(f"  [{_sensor}] No ef_ columns — skipping DTW+Seq2Seq+Exog.")
 
         all_energy_pipelines[_proc]                   = _pipelines_baseline
         all_energy_pipelines_instance_stats[_proc]   = _pipelines_instance_stats
@@ -3260,5 +3282,59 @@ if RUN_TEST_EVALUATION:
                     max_plot_curves=6, 
                     verbose=1 
                 )
+
+# %%
+# ══════════════════════════════════════════════════════════════════════════════
+# RESULTS EXPORT — parquet table + HTML notebook snapshot
+# ══════════════════════════════════════════════════════════════════════════════
+import os
+import datetime
+import subprocess
+
+_run_ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+_results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+_run_dir  = os.path.join(_results_root, _run_ts)
+os.makedirs(_run_dir, exist_ok=True)
+
+# ── Curve-only evaluation results ────────────────────────────────────────────
+if 'all_energy_pipelines' in dir() and '_all_records' in dir() and _all_records:
+    _results_df = pd.DataFrame(_all_records)
+    _parquet_path = os.path.join(_run_dir, 'curve_eval_results.parquet')
+    _results_df.to_parquet(_parquet_path, index=False)
+    print(f"Saved results  → {_parquet_path}")
+    print(_results_df.groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'R2']].mean().round(4).to_string())
+else:
+    print("No curve evaluation results found — skipping parquet export.")
+
+# ── Profile summary results (if available) ───────────────────────────────────
+if 'profile_summary_df' in dir() and not profile_summary_df.empty:
+    _profile_path = os.path.join(_run_dir, 'profile_summary.parquet')
+    profile_summary_df.to_parquet(_profile_path, index=False)
+    print(f"Saved profile  → {_profile_path}")
+
+# ── Approaches that were run ──────────────────────────────────────────────────
+_meta = {
+    'run_timestamp': [_run_ts],
+    'approaches':    [str(_RUN_APPROACHES) if '_RUN_APPROACHES' in dir() else 'unknown'],
+}
+pd.DataFrame(_meta).to_parquet(os.path.join(_run_dir, 'run_meta.parquet'), index=False)
+
+# ── HTML export of this notebook ─────────────────────────────────────────────
+_this_file = os.path.abspath(__file__)
+_html_path = os.path.join(_run_dir, 'notebook.html')
+
+try:
+    _nb_result = subprocess.run(
+        ['jupyter', 'nbconvert', '--to', 'html', '--output', _html_path, _this_file],
+        capture_output=True, text=True, timeout=120,
+    )
+    if _nb_result.returncode == 0:
+        print(f"Saved HTML     → {_html_path}")
+    else:
+        print(f"nbconvert warning: {_nb_result.stderr.strip()[:300]}")
+except Exception as _e:
+    print(f"HTML export skipped: {_e}")
+
+print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
 
 # %%
