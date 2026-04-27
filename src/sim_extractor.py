@@ -1752,7 +1752,9 @@ def split_curves(df_expanded, variable, activities, objects,
     curves_data = []
     for instance_id, group in df.groupby('activity_instance_id'):
         group  = group.sort_values('datetime_energy').reset_index(drop=True)
-        values = group[variable].dropna().values
+        values = np.asarray(group[variable].dropna().values).squeeze()
+        if values.ndim != 1:
+            continue
         if len(values) >= 5:
             attributes = (
                 group['object_attributes_log'].iloc[0]
@@ -4482,6 +4484,553 @@ def predict_raw_curve_seq2seq(raw_values, activity, attributes, pipeline):
 
 
 # =============================================================================
+# SEQ2SEQ ONLY  —  no DBA, no DTW alignment, no DTW decode
+# =============================================================================
+# Target: raw curve linearly resampled to fixed_length.
+# Input : same positional feature sequence (phase, curve_length, activity, attrs).
+# Decode: linear resample of the 100 predictions back to raw length.
+# =============================================================================
+
+def build_and_train_pipeline_seq2seq_only(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    hidden_size=128,
+    num_layers=2,
+    dropout=0.1,
+    epochs=80,
+    batch_size=32,
+    lr=1e-3,
+    teacher_forcing_ratio=0.5,
+    patience=10,
+    verbose=1,
+):
+    """
+    Pure Seq2Seq pipeline — no DTW anywhere.
+
+    Target  : raw curve linearly resampled to fixed_length (no DBA, no alignment).
+    Input   : [phase, curve_length, activity_ohe, attrs] sequence (fixed_length × F).
+    Decode  : linear resample of fixed_length predictions back to raw length.
+    """
+    from sklearn.model_selection import train_test_split as _tts
+
+    if verbose:
+        print("\n" + "=" * 80)
+        print("STEP 2 — BUILD + TRAIN SEQ2SEQ-ONLY PIPELINE  (no DTW)")
+        print("=" * 80)
+
+    # Resample each curve to fixed_length as training target (no DTW)
+    for curve in train_curves:
+        curve['resampled_values'] = np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(curve['original_values'])),
+            curve['original_values'],
+        ).astype(np.float32)
+
+    # Feature setup — same as baseline, fit on train only
+    all_keys, key_types = _infer_key_types(train_curves)
+    cat_columns = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+
+    _df_ref = _build_feature_matrix(
+        train_curves, all_keys, key_types, fixed_length,
+        value_key='resampled_values', include_target=False,
+    )
+    _df_ref = _df_ref.drop(columns=['instance_id'], errors='ignore')
+    _df_ohe = pd.get_dummies(_df_ref, columns=cat_columns, drop_first=True)
+    feature_columns = _df_ohe.columns.tolist()
+
+    numeric_feature_cols = ['position_idx', 'curve_length'] + [
+        k for k in all_keys if key_types[k] == 'numeric'
+    ]
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in _df_ohe.columns]
+
+    scaler = StandardScaler()
+    _df_ohe[numeric_feature_cols] = scaler.fit_transform(_df_ohe[numeric_feature_cols])
+
+    # Val split by instance
+    unique_instances = list({c['instance_id'] for c in train_curves})
+    train_inst, val_inst = _tts(unique_instances, test_size=val_size, random_state=random_state)
+    tr_curves = [c for c in train_curves if c['instance_id'] in set(train_inst)]
+    vl_curves = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+
+    X_tr, y_tr = _build_seq2seq_input(tr_curves, all_keys, key_types, fixed_length,
+                                       cat_columns, feature_columns, scaler,
+                                       numeric_feature_cols)
+    X_vl, y_vl = _build_seq2seq_input(vl_curves, all_keys, key_types, fixed_length,
+                                       cat_columns, feature_columns, scaler,
+                                       numeric_feature_cols)
+
+    if verbose:
+        print(f"    Train: {len(tr_curves)} curves | Val: {len(vl_curves)} curves")
+
+    y_mean = float(y_tr.mean())
+    y_std  = float(y_tr.std()) + 1e-8
+    y_tr_n = (y_tr - y_mean) / y_std
+    y_vl_n = (y_vl - y_mean) / y_std
+
+    device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_size = X_tr.shape[-1]
+    model      = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
+                               num_layers=num_layers, dropout=dropout).to(device)
+    optimiser  = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion  = nn.MSELoss()
+    loader     = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
+
+    best_val_loss, best_state, no_improve = float('inf'), None, 0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimiser.zero_grad()
+            pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
+            loss = criterion(pred, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
+            val_loss = criterion(val_pred, y_vl_n.to(device)).item()
+
+        if verbose and epoch % 10 == 0:
+            print(f"    Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve    = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                if verbose:
+                    print(f"    Early stopping at epoch {epoch}")
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    if verbose:
+        print(f"    Best val_loss={best_val_loss:.5f}")
+
+    return {
+        'approach':             'seq2seq_only',
+        'model':                model,
+        'fixed_length':         fixed_length,
+        'all_keys':             all_keys,
+        'key_types':            key_types,
+        'cat_columns':          cat_columns,
+        'feature_columns':      feature_columns,
+        'scaler':               scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'y_mean':               y_mean,
+        'y_std':                y_std,
+        'device':               device,
+        'val_loss':             best_val_loss,
+    }
+
+
+def predict_raw_curve_seq2seq_only(raw_values, activity, attributes, pipeline):
+    """
+    Predict using the pure Seq2Seq pipeline (no DTW).
+    Builds feature sequence → LSTM decoder → linear resample to raw length.
+    """
+    fixed_length         = pipeline['fixed_length']
+    model                = pipeline['model']
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+    cat_columns          = pipeline['cat_columns']
+    feature_columns      = pipeline['feature_columns']
+    scaler               = pipeline['scaler']
+    numeric_feature_cols = pipeline['numeric_feature_cols']
+    y_mean               = pipeline['y_mean']
+    y_std                = pipeline['y_std']
+    device               = pipeline['device']
+
+    rows = []
+    for pos in range(fixed_length):
+        row = {'position_idx': pos, 'curve_length': len(raw_values), 'activity': activity}
+        for key in all_keys:
+            v = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(v) if v is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(v) if v is not None else 'None'
+        rows.append(row)
+
+    df_seq = pd.DataFrame(rows)
+    df_seq = pd.get_dummies(df_seq, columns=cat_columns, drop_first=True)
+    for col in feature_columns:
+        if col not in df_seq.columns:
+            df_seq[col] = 0
+    df_seq = df_seq[feature_columns]
+
+    if scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
+        if cols_to_scale:
+            df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
+
+    X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
+    model.eval()
+    with torch.no_grad():
+        y_norm = model(X, targets=None, teacher_forcing_ratio=0.0)
+
+    y_canonical = y_norm.squeeze(0).cpu().numpy() * y_std + y_mean  # (fixed_length,)
+
+    # Linear resample back to raw length — no DTW
+    y_raw_pred = np.interp(
+        np.linspace(0, 1, len(raw_values)),
+        np.linspace(0, 1, fixed_length),
+        y_canonical,
+    )
+    return y_raw_pred
+
+
+# =============================================================================
+# DTW + SEQ2SEQ + EXT. FACTORS  —  same as DTW+Seq2Seq but ef_* appended to input
+# =============================================================================
+# Each position's feature vector gains one value per ef_ column (resampled to
+# fixed_length).  Everything else — DBA, DTW alignment, DTW decode — is identical
+# to the standard DTW+Seq2Seq pipeline.
+# =============================================================================
+
+def _build_seq2seq_exog_input(curves, all_keys, key_types, fixed_length,
+                               cat_columns, feature_columns, scaler,
+                               numeric_feature_cols, exog_cols,
+                               value_key='resampled_values', return_targets=True):
+    """
+    Like _build_seq2seq_input but appends resampled ef_* values to each position.
+    exog_cols : list of ef_ column names in order.
+    """
+    X_list, y_list = [], []
+    for curve in curves:
+        # Resample each exog signal to fixed_length
+        exog_rs = {}
+        for col in exog_cols:
+            raw_sig = np.asarray(curve.get('exog_values', {}).get(col, []), dtype=float)
+            if len(raw_sig) < 2:
+                exog_rs[col] = np.zeros(fixed_length, dtype=np.float32)
+            else:
+                exog_rs[col] = np.interp(
+                    np.linspace(0, 1, fixed_length),
+                    np.linspace(0, 1, len(raw_sig)),
+                    raw_sig,
+                ).astype(np.float32)
+
+        rows = []
+        for pos in range(fixed_length):
+            row = {
+                'position_idx': pos,
+                'curve_length': curve['original_length'],
+                'activity':     curve['activity'],
+            }
+            for key in all_keys:
+                v = curve['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(v) if v is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(v) if v is not None else 'None'
+            for col in exog_cols:
+                row[col] = float(exog_rs[col][pos])
+            rows.append(row)
+
+        df_c = pd.DataFrame(rows)
+        df_c = pd.get_dummies(df_c, columns=cat_columns, drop_first=True)
+        for col in feature_columns:
+            if col not in df_c.columns:
+                df_c[col] = 0
+        df_c = df_c[feature_columns]
+
+        if scaler is not None and numeric_feature_cols:
+            cols_to_scale = [c for c in numeric_feature_cols if c in df_c.columns]
+            if cols_to_scale:
+                df_c[cols_to_scale] = scaler.transform(df_c[cols_to_scale])
+
+        X_list.append(df_c.values.astype(np.float32))
+        if return_targets:
+            y_list.append(curve[value_key].astype(np.float32))
+
+    X = torch.tensor(np.array(X_list), dtype=torch.float32)
+    if return_targets:
+        y = torch.tensor(np.array(y_list), dtype=torch.float32)
+        return X, y
+    return X
+
+
+def build_and_train_pipeline_seq2seq_exog(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    hidden_size=128,
+    num_layers=2,
+    dropout=0.1,
+    epochs=80,
+    batch_size=32,
+    lr=1e-3,
+    teacher_forcing_ratio=0.5,
+    patience=10,
+    verbose=1,
+):
+    """
+    DTW + Seq2Seq + External Factors pipeline.
+
+    Identical to build_and_train_pipeline_seq2seq except each position's input
+    vector is extended with resampled ef_* values read from curve['exog_values'].
+    DBA barycenter, DTW alignment and DTW decode are all unchanged.
+    """
+    from sklearn.model_selection import train_test_split as _tts
+
+    if verbose:
+        print("\n" + "=" * 80)
+        print("STEP 2 — BUILD + TRAIN DTW + SEQ2SEQ + EXT. FACTORS PIPELINE")
+        print("=" * 80)
+
+    # Detect exog cols from the first curve that has them
+    exog_cols = []
+    for c in train_curves:
+        ev = c.get('exog_values', {})
+        if ev:
+            exog_cols = sorted(ev.keys())
+            break
+
+    if verbose:
+        print(f"    External factor columns: {exog_cols}")
+
+    # DBA barycenter
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values'],
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    if verbose:
+        print(f"    Barycenter length: {len(reference_curve)}")
+
+    # DTW-align train curves
+    for i, curve in enumerate(train_curves):
+        if verbose and i % max(1, len(train_curves) // 10) == 0:
+            print(f"    Aligning {i+1}/{len(train_curves)}...")
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+
+    # Feature setup — base features + exog cols, fit scaler on train only
+    all_keys, key_types = _infer_key_types(train_curves)
+    cat_columns = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+
+    _df_ref = _build_feature_matrix(
+        train_curves, all_keys, key_types, fixed_length,
+        value_key='resampled_values', include_target=False,
+    )
+    _df_ref = _df_ref.drop(columns=['instance_id'], errors='ignore')
+    _df_ohe = pd.get_dummies(_df_ref, columns=cat_columns, drop_first=True)
+    # Add exog columns (filled with zeros for scaler fitting — values added per-curve at train time)
+    for col in exog_cols:
+        _df_ohe[col] = 0.0
+    feature_columns = _df_ohe.columns.tolist()
+
+    numeric_feature_cols = ['position_idx', 'curve_length'] + [
+        k for k in all_keys if key_types[k] == 'numeric'
+    ] + exog_cols
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in _df_ohe.columns]
+
+    scaler = StandardScaler()
+    _df_ohe[numeric_feature_cols] = scaler.fit_transform(_df_ohe[numeric_feature_cols])
+
+    # Val split by instance
+    unique_instances = list({c['instance_id'] for c in train_curves})
+    train_inst, val_inst = _tts(unique_instances, test_size=val_size, random_state=random_state)
+    tr_curves = [c for c in train_curves if c['instance_id'] in set(train_inst)]
+    vl_curves = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+
+    X_tr, y_tr = _build_seq2seq_exog_input(tr_curves, all_keys, key_types, fixed_length,
+                                            cat_columns, feature_columns, scaler,
+                                            numeric_feature_cols, exog_cols)
+    X_vl, y_vl = _build_seq2seq_exog_input(vl_curves, all_keys, key_types, fixed_length,
+                                            cat_columns, feature_columns, scaler,
+                                            numeric_feature_cols, exog_cols)
+
+    if verbose:
+        print(f"    Train: {len(tr_curves)} curves | Val: {len(vl_curves)} curves | Input size: {X_tr.shape[-1]}")
+
+    y_mean = float(y_tr.mean())
+    y_std  = float(y_tr.std()) + 1e-8
+    y_tr_n = (y_tr - y_mean) / y_std
+    y_vl_n = (y_vl - y_mean) / y_std
+
+    device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    input_size = X_tr.shape[-1]
+    model      = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
+                               num_layers=num_layers, dropout=dropout).to(device)
+    optimiser  = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion  = nn.MSELoss()
+    loader     = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
+
+    best_val_loss, best_state, no_improve = float('inf'), None, 0
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimiser.zero_grad()
+            pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
+            loss = criterion(pred, yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimiser.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
+            val_loss = criterion(val_pred, y_vl_n.to(device)).item()
+
+        if verbose and epoch % 10 == 0:
+            print(f"    Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve    = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                if verbose:
+                    print(f"    Early stopping at epoch {epoch}")
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    if verbose:
+        print(f"    Best val_loss={best_val_loss:.5f}")
+
+    return {
+        'approach':             'seq2seq_exog',
+        'model':                model,
+        'reference_curve':      reference_curve,
+        'fixed_length':         fixed_length,
+        'all_keys':             all_keys,
+        'key_types':            key_types,
+        'cat_columns':          cat_columns,
+        'feature_columns':      feature_columns,
+        'scaler':               scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'exog_cols':            exog_cols,
+        'y_mean':               y_mean,
+        'y_std':                y_std,
+        'device':               device,
+        'val_loss':             best_val_loss,
+    }
+
+
+def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
+                                    exog_values=None):
+    """
+    Predict using DTW + Seq2Seq + External Factors.
+    exog_values : dict {col: np.ndarray} of raw-length ef_ signals (or empty).
+    """
+    reference_curve      = pipeline['reference_curve']
+    fixed_length         = len(reference_curve)
+    model                = pipeline['model']
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+    cat_columns          = pipeline['cat_columns']
+    feature_columns      = pipeline['feature_columns']
+    scaler               = pipeline['scaler']
+    numeric_feature_cols = pipeline['numeric_feature_cols']
+    exog_cols            = pipeline.get('exog_cols', [])
+    y_mean               = pipeline['y_mean']
+    y_std                = pipeline['y_std']
+    device               = pipeline['device']
+
+    if exog_values is None:
+        exog_values = {}
+
+    # Resample ef_ signals to fixed_length
+    exog_rs = {}
+    for col in exog_cols:
+        raw_sig = np.asarray(exog_values.get(col, []), dtype=float)
+        if len(raw_sig) < 2:
+            exog_rs[col] = np.zeros(fixed_length, dtype=np.float32)
+        else:
+            exog_rs[col] = np.interp(
+                np.linspace(0, 1, fixed_length),
+                np.linspace(0, 1, len(raw_sig)),
+                raw_sig,
+            ).astype(np.float32)
+
+    rows = []
+    for pos in range(fixed_length):
+        row = {'position_idx': pos, 'curve_length': len(raw_values), 'activity': activity}
+        for key in all_keys:
+            v = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(v) if v is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(v) if v is not None else 'None'
+        for col in exog_cols:
+            row[col] = float(exog_rs[col][pos])
+        rows.append(row)
+
+    df_seq = pd.DataFrame(rows)
+    df_seq = pd.get_dummies(df_seq, columns=cat_columns, drop_first=True)
+    for col in feature_columns:
+        if col not in df_seq.columns:
+            df_seq[col] = 0
+    df_seq = df_seq[feature_columns]
+
+    if scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
+        if cols_to_scale:
+            df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
+
+    X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
+    model.eval()
+    with torch.no_grad():
+        y_norm = model(X, targets=None, teacher_forcing_ratio=0.0)
+
+    y_ref_pred = y_norm.squeeze(0).cpu().numpy() * y_std + y_mean
+
+    # DTW decode — same as baseline
+    alignment  = dtw(raw_values, reference_curve, keep_internals=True)
+    buckets    = [[] for _ in range(len(raw_values))]
+    path_pairs = list(zip(alignment.index1, alignment.index2))
+
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_ref_pred[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            _ = nearest_qi
+            y_raw_pred[qi] = float(y_ref_pred[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
 # STEP 4 — EVALUATE ON RAW TEST CURVES
 # =============================================================================
 
@@ -4500,6 +5049,11 @@ def _dispatch_predict(raw_values, curve, pipeline):
         return predict_raw_curve_basis(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq':
         return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
+    if approach == 'seq2seq_only':
+        return predict_raw_curve_seq2seq_only(raw_values, act, attrs, pipeline)
+    if approach == 'seq2seq_exog':
+        return predict_raw_curve_seq2seq_exog(raw_values, act, attrs, pipeline,
+                                              exog_values=curve.get('exog_values', {}))
     return predict_raw_curve(raw_values, act, attrs, pipeline)
 
 
