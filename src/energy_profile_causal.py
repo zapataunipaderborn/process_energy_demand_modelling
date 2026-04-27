@@ -86,6 +86,21 @@ from tigramite import plotting as tp
 from tigramite.pcmci import PCMCI
 from tigramite.independence_tests.parcorr import ParCorr
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.spatial.distance import jensenshannon
+from collections import Counter
+import pm4py
+import tempfile
+import os
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import pm4py
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+
 
 pio.renderers.default='notebook'
 pd.options.mode.chained_assignment = None
@@ -972,20 +987,7 @@ process_datasets['process_4'] = {
 # %%
 # Functions
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from scipy.spatial.distance import jensenshannon
-from collections import Counter
-import pm4py
-import tempfile
-import os
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import pm4py
-from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+
 
 try:
     from pm4py.algo.evaluation.generalization import algorithm as pm4py_generalization

@@ -12,6 +12,20 @@ os.environ["TQDM_DISABLE"] = "1"
 import logging
 import sys
 import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.spatial.distance import jensenshannon
+from collections import Counter
+import pm4py
+import tempfile
+import os
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import pm4py
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 
 # --- LOGGING AND REDIRECTION SETUP ---
 # Silence pm4py internal logs and TBR replay messages
@@ -19,53 +33,31 @@ logging.getLogger("pm4py").setLevel(logging.ERROR)
 # Silence other potential noise
 logging.getLogger("fsspec").setLevel(logging.ERROR)
 
-LOG_FILE = "pipeline_execution.log"
-
-# Configure logging
-logging.basicConfig(
-    filename=LOG_FILE,
-    filemode='w',  # Overwrite each run
-    level=logging.INFO, # <-- MUST BE INFO. DEBUG causes Numba/Matplotlib to flood bytecode logs
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-# Capture all library warnings (pm4py, pandas, etc.)
-logging.captureWarnings(True)
-
-# Save original stdout for notebook reports
+# Log file is set up after the config block so it goes straight into the run folder.
+# Placeholder so references to LOG_FILE later don't break before setup runs.
+LOG_FILE = None
 _original_stdout = sys.stdout
 
 def report(*args, **kwargs):
-    """
-    Prints to both the original notebook console and the log file.
-    Use this for high-level metrics and summaries.
-    """
-    # Print to the 'real' console/notebook
     print(*args, file=_original_stdout, flush=True, **kwargs)
-    # Log the report content to the file as well
     logging.info("[REPORT] " + " ".join(map(str, args)))
 
 class StreamToLogger:
     """Redirects stdout/stderr to logging."""
     def __init__(self, logger_func):
         self.logger_func = logger_func
-        self.buffer = ""
     def write(self, data):
         for line in data.splitlines():
             if line.strip():
                 self.logger_func(line.strip())
     def flush(self):
         pass
-
-# Redirect all standard prints and errors to the log file
-sys.stdout = StreamToLogger(logging.info)
-sys.stderr = StreamToLogger(logging.error)
+RANDOM_SEED = 42
 
 import random
 import itertools
 import os
 from datetime import datetime, timedelta
-RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 import simpy
 import seaborn as sns
@@ -88,6 +80,248 @@ from IPython.display import display, Markdown
 # Force pm4py to hide progress bars
 from pm4py.util import constants
 constants.SHOW_PROGRESS_BAR = False
+
+# %%
+import pandas as pd
+from sim_extractor import extract_process
+from simulation import ProcessSimulation
+from sim_modeller import SimModeller
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENERGY MODIFIER CONFIGURATION
+#   Runs after the energy modelling section (predict_raw_curve etc).
+#   Configure which sklearn estimator to use for each modifier.
+#   Both modifiers accept any estimator with .fit() and .predict()/.predict_proba().
+# ─────────────────────────────────────────────────────────────────────────────
+from sklearn.linear_model import Lasso, LogisticRegression
+from sim_extractor import extract_energy_modifiers, extract_energy_direct_models
+
+from xgboost import XGBRegressor
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODES TO COMPARE
+#
+#   What each mode uses:
+#
+#   Mode                          Miner                  Duration source
+#   ─────────────────────────────────────────────────────────────────────
+#   statistical                   MINING_ALGORITHM        fitted distributions
+#   petri_net_alpha/heuristic/    that specific miner     fitted distributions
+#     inductive/ilp
+#   petri_net_energy_*            best of the above       per-activity auto-selected:
+#                                 (auto-selected by         ML if val score beats
+#                                 train score)              statistical baseline,
+#                                                           else statistical
+#   ml / ml_duration_only         MINING_ALGORITHM        ML models (ML_MODEL_TYPES)
+#
+#   → MINING_ALGORITHM:  only affects 'statistical' and the ml* modes.
+#                        energy-aware modes ignore it — they auto-pick the
+#                        best miner from the petri_net_* results.
+#   → SIMULATION_MODE:   only affects ml* modes ('ml' or 'ml_duration_only').
+#                        statistical and petri_net_* modes do not use it.
+#
+#   Energy-aware auto-selection (per activity, per modifier type):
+#     Duration  : ML kept only if val R² > 0  (> statistical baseline of predicting mean)
+#     Transition: ML kept only if val Acc > majority-class baseline accuracy
+#     petri_net_energy_aware = best duration choice + best transition choice independently
+#
+#   Energy-direct modes (new):
+#     energy_state → ML → duration_minutes directly   (not a correction factor)
+#     energy_state → ML → sample next activity directly from predict_proba
+#     Same ML-vs-statistical auto-selection applies per activity
+# ─────────────────────────────────────────────────────────────────────────────
+MODES_TO_COMPARE = [
+    'statistical',
+    'petri_net_alpha',
+    'petri_net_heuristic',
+    'petri_net_inductive',
+    'petri_net_combined',
+    'petri_net_ilp',
+    # ── energy-aware Petri-net variants ──────────────────────────────
+    # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
+    'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
+    'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
+    'petri_net_energy_aware',             # best duration + best transition independently per activity
+    # Direct approach: ML IS the prediction (energy_state → duration or next_activity directly)
+    'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
+    'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
+    'petri_net_energy_direct',                  # ML predicts both directly per activity
+    #'petri_net_statistical',
+    #'petri_net_statistical_memory',
+    #'ml_duration_only',
+    #'ml_duration_only_with_activity_past',
+    #'ml_duration_only_with_activity_past_point_estimate',
+    #'ml_global_model',
+]
+
+# Keep requested modes, but drop Petri-net variants that are not enabled.
+_ENERGY_AWARE_MODES = {
+    # Modifier approach: ML corrects a statistical base duration/PN weights
+    'petri_net_energy_aware',
+    'petri_net_energy_duration_aware',
+    'petri_net_energy_transition_aware',
+    # Direct approach: ML is the full prediction (no statistical base)
+    'petri_net_energy_direct',
+    'petri_net_energy_direct_duration_only',
+    'petri_net_energy_direct_transition_only',
+}
+_ENERGY_DIRECT_MODES = {
+    'petri_net_energy_direct',
+    'petri_net_energy_direct_duration_only',
+    'petri_net_energy_direct_transition_only',
+}
+
+# ── Duration modifier models ───────────────────────────────────────────────
+# List of sklearn-compatible regressor types to compete per activity
+ENERGY_DURATION_MODELS    = ['xgboost', 'linear', 'lasso', 'mlp', 'statistical']
+
+# ── Transition modifier models ─────────────────────────────────────────────
+# List of classifier types to compete per activity
+ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
+
+ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
+ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
+ENERGY_MIN_SAMPLES         = 1           # STRICT: skip ML (use statistical) if n_samples < 30
+
+# Will be populated per process after energy modelling:
+energy_modifiers_by_process = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIMULATION MODE TOGGLE
+#   'statistical'      – sample durations/transitions from best-fit distributions
+#   'ml'               – use ML models (falls back to statistical when needed)
+#   'ml_duration_only' – use ML only for the duration median; std and
+#                        transition probabilities still come from data extraction
+# ─────────────────────────────────────────────────────────────────────────────
+SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCESS MINING ALGORITHM
+#   'inductive'  – pm4py Inductive Miner → guarantees a sound Petri net
+#   'heuristic'  – pm4py Heuristics Miner → better noise filtering
+#   'alpha'      – pm4py Alpha Miner → classic algorithm
+#   'ilp'        – pm4py ILP Miner → precise/sound, can be strict
+#   'manual'     – original manual extraction (no process mining)
+# ─────────────────────────────────────────────────────────────────────────────
+#MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
+MINING_ALGORITHM = 'heuristic'
+#MINING_ALGORITHM = 'alpha'
+#MINING_ALGORITHM = 'ilp'
+
+# Petri-net miner variants to compare when mode names include the algorithm.
+PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
+#   Runs local per-group search during extraction and keeps best model.
+# ─────────────────────────────────────────────────────────────────────────────
+OPTIMIZE_MINING_HYPERPARAMS = False
+MINING_SEARCH_SPACE = {
+    'inductive_noise_thresholds': [0.05, 0.10, 0.20, 0.30, 0.40],
+    'heuristic_params_grid': [
+        {'dependency_threshold': 0.30, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.50, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.70, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.50, 'and_threshold': 0.50, 'loop_two_threshold': 0.50},
+        {'dependency_threshold': 0.50, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
+    ],
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
+#   model_types: list of models to train — best is selected per activity key
+#                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
+#   optimize_hyperparams: True  → Optuna hyper-parameter search
+#                         False → use default model parameters
+#   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
+# ─────────────────────────────────────────────────────────────────────────────
+ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
+ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
+ML_OPTIMIZE_HYPERPARAMS = False    # ← set True to enable Optuna tuning
+ML_OPTUNA_TRIALS        = 20
+
+
+# %%
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION  —  edit everything here, nothing else needs to change
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Train / test split ────────────────────────────────────────────────────────
+TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
+TRAIN_RATIO         = 0.80    # fraction of cases used for training
+
+# ── Pipeline execution flags ──────────────────────────────────────────────────
+RUN_TEST_EVALUATION      = True   # evaluate on held-out test set
+RUN_CURVE_ONLY_EVALUATION = True  # run curve-quality benchmark (MAE/RMSE/R²)
+
+# ── Approaches to train — comment out any you want to skip ───────────────────
+#    'baseline'        DTW + position index (sklearn regressor)
+#    'instance_stats'  DTW + per-curve stats  (leaky — known invalid)
+#    'istats_leakfree' DTW + two-stage leak-free stats
+#    'dtw_phase'       DTW + phase features
+#    'basis'           DTW + B-spline basis expansion
+#    'exog'            DTW + external factors (ef_* columns)
+#    'seq2seq'         DTW + LSTM encoder-decoder
+#    'seq2seq_only'    LSTM encoder-decoder, no DTW
+#    'seq2seq_exog'    DTW + LSTM encoder-decoder + external factors
+APPROACHES = [
+    'baseline',
+    # 'instance_stats',
+    # 'istats_leakfree',
+    # 'dtw_phase',
+    # 'basis',
+    # 'exog',
+    # 'seq2seq',
+    # 'seq2seq_only',
+    # 'seq2seq_exog',
+]
+
+# ── Seq2Seq hyperparameters ───────────────────────────────────────────────────
+SEQ2SEQ_HIDDEN_SIZE          = 128
+SEQ2SEQ_NUM_LAYERS           = 2
+SEQ2SEQ_DROPOUT              = 0.1
+SEQ2SEQ_EPOCHS               = 80
+SEQ2SEQ_BATCH_SIZE           = 32
+SEQ2SEQ_LR                   = 1e-3
+SEQ2SEQ_TEACHER_FORCING      = 0.5
+SEQ2SEQ_PATIENCE             = 10
+
+# ── Results export ────────────────────────────────────────────────────────────
+EXPORT_RESULTS = True   # save parquet + HTML to results/<timestamp>/
+
+# ── Run folder + live log (created immediately so log captures everything) ───
+import datetime as _dt
+_run_ts       = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+_results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
+_run_dir      = os.path.join(_results_root, _run_ts)
+_plots_dir    = os.path.join(_run_dir, 'plots')
+os.makedirs(_plots_dir, exist_ok=True)
+os.makedirs(os.path.join(_run_dir, 'curves'), exist_ok=True)
+
+LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
+
+# Wire logging directly to the run folder log file, flushing after every record
+_log_handler = logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8')
+_log_handler.setLevel(logging.INFO)
+_log_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+_log_handler.stream.reconfigure(line_buffering=True)   # flush every line
+
+_root_logger = logging.getLogger()
+_root_logger.handlers.clear()   # drop any handlers basicConfig may have added
+_root_logger.addHandler(_log_handler)
+_root_logger.setLevel(logging.INFO)
+
+logging.getLogger("pm4py").setLevel(logging.ERROR)
+logging.getLogger("fsspec").setLevel(logging.ERROR)
+logging.captureWarnings(True)
+
+# Redirect all prints to the live log (original stdout still used by report())
+sys.stdout = StreamToLogger(logging.info)
+sys.stderr = StreamToLogger(logging.error)
+
+logging.info(f"Run started — output folder: {_run_dir}")
+logging.info(f"Approaches: {APPROACHES}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -966,20 +1200,7 @@ process_datasets['process_4'] = {
 # %%
 # Functions
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from scipy.spatial.distance import jensenshannon
-from collections import Counter
-import pm4py
-import tempfile
-import os
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import pm4py
-from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+
 
 try:
     from pm4py.algo.evaluation.generalization import algorithm as pm4py_generalization
@@ -1578,6 +1799,9 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
 processes_to_run = ['process_2']
+
+
+
 # Filter the original dictionary
 process_datasets_to_model = {
     k: v for k, v in process_datasets.items() 
@@ -1586,113 +1810,7 @@ process_datasets_to_model = {
 # The rest of your configuration will now only see process_3
 process_datasets_to_model_sensors = process_datasets_to_model.copy()
 
-# %%
-import pandas as pd
-from sim_extractor import extract_process
-from simulation import ProcessSimulation
-from sim_modeller import SimModeller
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ENERGY MODIFIER CONFIGURATION
-#   Runs after the energy modelling section (predict_raw_curve etc).
-#   Configure which sklearn estimator to use for each modifier.
-#   Both modifiers accept any estimator with .fit() and .predict()/.predict_proba().
-# ─────────────────────────────────────────────────────────────────────────────
-from sklearn.linear_model import Lasso, LogisticRegression
-from sim_extractor import extract_energy_modifiers, extract_energy_direct_models
-
-from xgboost import XGBRegressor
-
-# ── Duration modifier models ───────────────────────────────────────────────
-# List of sklearn-compatible regressor types to compete per activity
-ENERGY_DURATION_MODELS    = ['xgboost', 'linear', 'lasso', 'mlp', 'statistical']
-
-# ── Transition modifier models ─────────────────────────────────────────────
-# List of classifier types to compete per activity
-ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
-
-ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
-ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_SAMPLES         = 1           # STRICT: skip ML (use statistical) if n_samples < 30
-
-# Will be populated per process after energy modelling:
-energy_modifiers_by_process = {}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIMULATION MODE TOGGLE
-#   'statistical'      – sample durations/transitions from best-fit distributions
-#   'ml'               – use ML models (falls back to statistical when needed)
-#   'ml_duration_only' – use ML only for the duration median; std and
-#                        transition probabilities still come from data extraction
-# ─────────────────────────────────────────────────────────────────────────────
-SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PROCESS MINING ALGORITHM
-#   'inductive'  – pm4py Inductive Miner → guarantees a sound Petri net
-#   'heuristic'  – pm4py Heuristics Miner → better noise filtering
-#   'alpha'      – pm4py Alpha Miner → classic algorithm
-#   'ilp'        – pm4py ILP Miner → precise/sound, can be strict
-#   'manual'     – original manual extraction (no process mining)
-# ─────────────────────────────────────────────────────────────────────────────
-#MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
-MINING_ALGORITHM = 'heuristic'
-#MINING_ALGORITHM = 'alpha'
-#MINING_ALGORITHM = 'ilp'
-
-# Petri-net miner variants to compare when mode names include the algorithm.
-PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
-#   Runs local per-group search during extraction and keeps best model.
-# ─────────────────────────────────────────────────────────────────────────────
-OPTIMIZE_MINING_HYPERPARAMS = False
-MINING_SEARCH_SPACE = {
-    'inductive_noise_thresholds': [0.05, 0.10, 0.20, 0.30, 0.40],
-    'heuristic_params_grid': [
-        {'dependency_threshold': 0.30, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
-        {'dependency_threshold': 0.50, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
-        {'dependency_threshold': 0.70, 'and_threshold': 0.65, 'loop_two_threshold': 0.50},
-        {'dependency_threshold': 0.50, 'and_threshold': 0.50, 'loop_two_threshold': 0.50},
-        {'dependency_threshold': 0.50, 'and_threshold': 0.80, 'loop_two_threshold': 0.50},
-    ],
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
-#   model_types: list of models to train — best is selected per activity key
-#                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
-#   optimize_hyperparams: True  → Optuna hyper-parameter search
-#                         False → use default model parameters
-#   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
-# ─────────────────────────────────────────────────────────────────────────────
-ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
-ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
-ML_OPTIMIZE_HYPERPARAMS = False    # ← set True to enable Optuna tuning
-ML_OPTUNA_TRIALS        = 20
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEMPORAL TRAIN / TEST SPLIT (at the pipeline level, BEFORE extraction)
-#   TEMPORAL_SPLIT : True  → split all data by case start time (no leakage)
-#                    False → use all data (no split, single evaluation)
-#   TRAIN_RATIO    : fraction of cases used for training (e.g. 0.80 = 80%)
-# ─────────────────────────────────────────────────────────────────────────────
-TEMPORAL_SPLIT     = True
-TRAIN_RATIO        = 0.80
-RUN_TEST_EVALUATION = True # Fast mode: skip heavy test-set simulation & curve extraction
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CURVE-ONLY EVALUATION MODE
-#   True  → after energy pipelines are trained, run a full curve-quality
-#            evaluation (MAE / RMSE / WAPE / R²) per activity and sensor,
-#            with plots, WITHOUT running any process simulation.
-#            Use this to benchmark curve models in isolation before picking
-#            one of the improved approaches (seq2seq, basis expansion, DTW).
-#   False → skip this block (default when running full pipeline).
-# ─────────────────────────────────────────────────────────────────────────────
-RUN_CURVE_ONLY_EVALUATION = True
-
+##ä sim code
 
 def _split_process_datasets(datasets, train_ratio=0.80):
     """
@@ -1780,80 +1898,8 @@ else:
 
 all_energy_pipelines = {}
 
+### models to compare
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODES TO COMPARE
-#
-#   What each mode uses:
-#
-#   Mode                          Miner                  Duration source
-#   ─────────────────────────────────────────────────────────────────────
-#   statistical                   MINING_ALGORITHM        fitted distributions
-#   petri_net_alpha/heuristic/    that specific miner     fitted distributions
-#     inductive/ilp
-#   petri_net_energy_*            best of the above       per-activity auto-selected:
-#                                 (auto-selected by         ML if val score beats
-#                                 train score)              statistical baseline,
-#                                                           else statistical
-#   ml / ml_duration_only         MINING_ALGORITHM        ML models (ML_MODEL_TYPES)
-#
-#   → MINING_ALGORITHM:  only affects 'statistical' and the ml* modes.
-#                        energy-aware modes ignore it — they auto-pick the
-#                        best miner from the petri_net_* results.
-#   → SIMULATION_MODE:   only affects ml* modes ('ml' or 'ml_duration_only').
-#                        statistical and petri_net_* modes do not use it.
-#
-#   Energy-aware auto-selection (per activity, per modifier type):
-#     Duration  : ML kept only if val R² > 0  (> statistical baseline of predicting mean)
-#     Transition: ML kept only if val Acc > majority-class baseline accuracy
-#     petri_net_energy_aware = best duration choice + best transition choice independently
-#
-#   Energy-direct modes (new):
-#     energy_state → ML → duration_minutes directly   (not a correction factor)
-#     energy_state → ML → sample next activity directly from predict_proba
-#     Same ML-vs-statistical auto-selection applies per activity
-# ─────────────────────────────────────────────────────────────────────────────
-MODES_TO_COMPARE = [
-    'statistical',
-    'petri_net_alpha',
-    'petri_net_heuristic',
-    'petri_net_inductive',
-    'petri_net_combined',
-    'petri_net_ilp',
-    # ── energy-aware Petri-net variants ──────────────────────────────
-    # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
-    'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
-    'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
-    'petri_net_energy_aware',             # best duration + best transition independently per activity
-    # Direct approach: ML IS the prediction (energy_state → duration or next_activity directly)
-    'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
-    'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
-    'petri_net_energy_direct',                  # ML predicts both directly per activity
-    #'petri_net_statistical',
-    #'petri_net_statistical_memory',
-    #'ml_duration_only',
-    #'ml_duration_only_with_activity_past',
-    #'ml_duration_only_with_activity_past_point_estimate',
-    #'ml_global_model',
-]
-
-# Keep requested modes, but drop Petri-net variants that are not enabled.
-_ENERGY_AWARE_MODES = {
-    # Modifier approach: ML corrects a statistical base duration/PN weights
-    'petri_net_energy_aware',
-    'petri_net_energy_duration_aware',
-    'petri_net_energy_transition_aware',
-    # Direct approach: ML is the full prediction (no statistical base)
-    'petri_net_energy_direct',
-    'petri_net_energy_direct_duration_only',
-    'petri_net_energy_direct_transition_only',
-}
-_ENERGY_DIRECT_MODES = {
-    'petri_net_energy_direct',
-    'petri_net_energy_direct_duration_only',
-    'petri_net_energy_direct_transition_only',
-}
 _filtered_modes = []
 for _mode_name in MODES_TO_COMPARE:
     if _mode_name in _ENERGY_AWARE_MODES:
@@ -2549,19 +2595,6 @@ if RUN_CURVE_ONLY_EVALUATION:
         'Gradient Boosting': GradientBoostingRegressor,
     }
 
-    # ── Toggle approaches — comment out any you want to skip ─────────────────
-    _RUN_APPROACHES = [
-        'baseline',
-        # 'instance_stats',
-        # 'istats_leakfree',
-        # 'dtw_phase',
-        # 'basis',
-        # 'exog',
-        'seq2seq',
-        'seq2seq_only',
-        'seq2seq_exog',
-    ]
-
     for _proc in process_datasets_to_model.keys():
         _proc_cfg   = process_datasets_to_model_sensors.get(_proc, {}) \
                       if 'process_datasets_to_model_sensors' in dir() else {}
@@ -2630,7 +2663,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 continue
 
             # ── Baseline ────────────────────────────────────────────────────
-            if 'baseline' in _RUN_APPROACHES:
+            if 'baseline' in APPROACHES:
                 print(f"  [{_sensor}] Training baseline (DTW + position index)...")
                 _ep_base = build_and_train_pipeline(
                     _train_curves,
@@ -2653,7 +2686,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── Instance Stats — DTW + instance curve statistics ─────────
-            if 'instance_stats' in _RUN_APPROACHES:
+            if 'instance_stats' in APPROACHES:
                 print(f"  [{_sensor}] Training Instance Stats (DTW + curve stats)...")
                 _ep_istats = build_and_train_pipeline_instance_stats(
                     _train_curves,
@@ -2676,7 +2709,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── Instance Stats (Leak-Free) — two-stage ───────────────────
-            if 'istats_leakfree' in _RUN_APPROACHES:
+            if 'istats_leakfree' in APPROACHES:
                 print(f"  [{_sensor}] Training Instance Stats Leak-Free (two-stage)...")
                 _ep_lf = build_and_train_pipeline_istats_leakfree(
                     _train_curves,
@@ -2699,7 +2732,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── Approach 3 — DTW-phase ───────────────────────────────────
-            if 'dtw_phase' in _RUN_APPROACHES:
+            if 'dtw_phase' in APPROACHES:
                 print(f"  [{_sensor}] Training Approach 3 (DTW + phase features)...")
                 _ep_phase = build_and_train_pipeline_dtw_phase(
                     _train_curves,
@@ -2722,7 +2755,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── Approach 2 — B-spline basis expansion ───────────────────
-            if 'basis' in _RUN_APPROACHES:
+            if 'basis' in APPROACHES:
                 print(f"  [{_sensor}] Training Approach 2 (B-spline basis expansion)...")
                 _ep_basis = build_and_train_pipeline_basis(
                     _train_curves,
@@ -2746,7 +2779,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── DTW + External Factors ───────────────────────────────────
-            if 'exog' in _RUN_APPROACHES:
+            if 'exog' in APPROACHES:
                 if _ef_cols:
                     print(f"  [{_sensor}] Training DTW + External Factors ({len(_ef_cols)} ef_ signals)...")
                     _ep_exog = build_and_train_pipeline_exog(
@@ -2774,21 +2807,21 @@ if RUN_CURVE_ONLY_EVALUATION:
                     print(f"  [{_sensor}] No ef_ columns found — skipping DTW+Exog.")
 
             # ── DTW + Seq2Seq ────────────────────────────────────────────
-            if 'seq2seq' in _RUN_APPROACHES:
+            if 'seq2seq' in APPROACHES:
                 print(f"  [{_sensor}] Training DTW + Seq2Seq (LSTM encoder-decoder)...")
                 _ep_seq2seq = build_and_train_pipeline_seq2seq(
                     _train_curves,
                     variable=_sensor,
                     fixed_length=100,
                     val_size=0.2,
-                    hidden_size=128,
-                    num_layers=2,
-                    dropout=0.1,
-                    epochs=80,
-                    batch_size=32,
-                    lr=1e-3,
-                    teacher_forcing_ratio=0.5,
-                    patience=10,
+                    hidden_size=SEQ2SEQ_HIDDEN_SIZE,
+                    num_layers=SEQ2SEQ_NUM_LAYERS,
+                    dropout=SEQ2SEQ_DROPOUT,
+                    epochs=SEQ2SEQ_EPOCHS,
+                    batch_size=SEQ2SEQ_BATCH_SIZE,
+                    lr=SEQ2SEQ_LR,
+                    teacher_forcing_ratio=SEQ2SEQ_TEACHER_FORCING,
+                    patience=SEQ2SEQ_PATIENCE,
                     verbose=False,
                 )
                 print(f"    val_loss={_ep_seq2seq['val_loss']:.5f}")
@@ -2803,21 +2836,21 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── Seq2Seq only (no DTW) ────────────────────────────────────
-            if 'seq2seq_only' in _RUN_APPROACHES:
+            if 'seq2seq_only' in APPROACHES:
                 print(f"  [{_sensor}] Training Seq2Seq only (no DTW)...")
                 _ep_seq2seq_only = build_and_train_pipeline_seq2seq_only(
                     _train_curves,
                     variable=_sensor,
                     fixed_length=100,
                     val_size=0.2,
-                    hidden_size=128,
-                    num_layers=2,
-                    dropout=0.1,
-                    epochs=80,
-                    batch_size=32,
-                    lr=1e-3,
-                    teacher_forcing_ratio=0.5,
-                    patience=10,
+                    hidden_size=SEQ2SEQ_HIDDEN_SIZE,
+                    num_layers=SEQ2SEQ_NUM_LAYERS,
+                    dropout=SEQ2SEQ_DROPOUT,
+                    epochs=SEQ2SEQ_EPOCHS,
+                    batch_size=SEQ2SEQ_BATCH_SIZE,
+                    lr=SEQ2SEQ_LR,
+                    teacher_forcing_ratio=SEQ2SEQ_TEACHER_FORCING,
+                    patience=SEQ2SEQ_PATIENCE,
                     verbose=False,
                 )
                 print(f"    val_loss={_ep_seq2seq_only['val_loss']:.5f}")
@@ -2832,7 +2865,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 }
 
             # ── DTW + Seq2Seq + External Factors ─────────────────────────
-            if 'seq2seq_exog' in _RUN_APPROACHES:
+            if 'seq2seq_exog' in APPROACHES:
                 if _ef_cols:
                     print(f"  [{_sensor}] Training DTW + Seq2Seq + Ext. Factors ({len(_ef_cols)} ef_ signals)...")
                     _ep_seq2seq_exog = build_and_train_pipeline_seq2seq_exog(
@@ -2865,6 +2898,15 @@ if RUN_CURVE_ONLY_EVALUATION:
                 else:
                     print(f"  [{_sensor}] No ef_ columns — skipping DTW+Seq2Seq+Exog.")
 
+            # Stamp variable_name into every full_pipeline dict for this sensor
+            for _pd in [_pipelines_baseline, _pipelines_instance_stats,
+                        _pipelines_istats_leakfree, _pipelines_dtw_phase,
+                        _pipelines_basis, _pipelines_exog,
+                        _pipelines_seq2seq, _pipelines_seq2seq_only,
+                        _pipelines_seq2seq_exog]:
+                if _sensor in _pd:
+                    _pd[_sensor]['full_pipeline']['variable_name'] = _sensor
+
         all_energy_pipelines[_proc]                   = _pipelines_baseline
         all_energy_pipelines_instance_stats[_proc]   = _pipelines_instance_stats
         all_energy_pipelines_istats_leakfree[_proc]  = _pipelines_istats_leakfree
@@ -2881,7 +2923,7 @@ if RUN_CURVE_ONLY_EVALUATION:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_curve_eval(pipelines_dict, approach_label, split_label,
-                    df_lookup, activities, objects):
+                    df_lookup, activities, objects, save_dir=None):
     """
     Evaluate every (process, sensor) in pipelines_dict against curves from
     df_lookup.  Returns a list of per-curve metric dicts.
@@ -2903,17 +2945,25 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
 
         for _sensor, _ep in _sensors.items():
             _fp = _ep.get('full_pipeline', {})
-            _exog_cols_eval = _fp.get('exog_cols', []) if _fp.get('approach') == 'exog' else None
+            _exog_cols_eval = _fp.get('exog_cols', []) if _fp.get('approach') in ('exog', 'seq2seq_exog') else None
             _curves, _ = split_curves(_df, _sensor, _acts, _objs,
                                       test_size=0.0, verbose=0,
                                       exog_columns=_exog_cols_eval)
             if not _curves:
                 continue
             show_plots = (split_label == 'TEST')
+            # Build a per-approach, per-sensor sub-folder so filenames don't collide
+            _curve_save = None
+            if save_dir and show_plots:
+                _curve_save = os.path.join(
+                    save_dir,
+                    approach_label.replace(' ', '_').replace('/', '-'),
+                )
             _metrics_df, _agg = evaluate_pipeline_on_test(
                 _curves, _ep['full_pipeline'],
                 max_plot_curves=6 if show_plots else 0,
                 verbose=1 if show_plots else 0,
+                save_dir=_curve_save,
             )
             for _, _r in _metrics_df.iterrows():
                 records.append({
@@ -2935,6 +2985,14 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
     import importlib, sim_extractor as _se
     importlib.reload(_se)
     from sim_extractor import evaluate_pipeline_on_test, split_curves
+
+    # _run_dir and _plots_dir are already created at startup
+    _plot_counter = [0]   # mutable counter usable inside nested scopes
+
+    def _savefig(name):
+        _plot_counter[0] += 1
+        _p = os.path.join(_plots_dir, f"{_plot_counter[0]:02d}_{name}.png")
+        plt.savefig(_p, dpi=150, bbox_inches='tight')
 
     display(Markdown("---"))
     display(Markdown("# Curve-Only Evaluation — Baseline vs Approach 2 (B-spline) vs Approach 3 (DTW-phase)"))
@@ -2971,6 +3029,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _recs = _run_curve_eval(
                 _pipelines, _approach_label, _split_label,
                 _df_src, _activities_map, _objects_map,
+                save_dir=os.path.join(_run_dir, 'curves') if EXPORT_RESULTS else None,
             )
             _all_records.extend(_recs)
 
@@ -2978,8 +3037,29 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
     if _all_records:
         _all_df = pd.DataFrame(_all_records)
 
+        # ── Master summary table: Process × Sensor × Approach, TRAIN and TEST ─
         display(Markdown("---"))
-        display(Markdown("## Summary — Baseline vs Approach 3 (TEST set)"))
+        display(Markdown("## Model Summary — Train & Test metrics per Process / Sensor / Approach"))
+        _summary = (
+            _all_df
+            .groupby(['Process', 'Sensor', 'Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+            .mean()
+            .round(4)
+        )
+        # Unstack Split so TRAIN / TEST appear as column groups side by side
+        _summary_wide = _summary.unstack('Split')
+        # Flatten multi-level column names: MAE_TRAIN, MAE_TEST, …
+        _summary_wide.columns = [f'{m}_{s}' for m, s in _summary_wide.columns]
+        # Reorder: all TRAIN cols first, then TEST
+        _train_cols = [c for c in _summary_wide.columns if c.endswith('_TRAIN')]
+        _test_cols  = [c for c in _summary_wide.columns if c.endswith('_TEST')]
+        _summary_wide = _summary_wide[_train_cols + _test_cols]
+        display(_summary_wide)
+        report("\nMODEL SUMMARY (TRAIN & TEST)")
+        report(_summary_wide.to_string())
+
+        display(Markdown("---"))
+        display(Markdown("## Detailed comparison — TEST set"))
 
         _test_df = _all_df[_all_df['Split'] == 'TEST']
         if not _test_df.empty:
@@ -3029,6 +3109,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
             plt.suptitle('Curve R² per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
             plt.tight_layout()
+            if EXPORT_RESULTS and '_run_dir' in dir():
+                _savefig('r2_heatmap_all_approaches')
             plt.show()
 
             # ── Delta heatmaps: each new approach minus baseline ─────────────
@@ -3063,6 +3145,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 )
                 ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
                 plt.tight_layout()
+                if EXPORT_RESULTS and '_run_dir' in dir():
+                    _savefig(f'delta_r2_{_delta_label.replace(" ", "_").replace("/", "-")}')
                 plt.show()
 
 elif RUN_CURVE_ONLY_EVALUATION:
@@ -3087,62 +3171,47 @@ if 'process_datasets_to_model_sensors' in dir():
         for sensor in sensors_to_model:
             if process not in all_energy_pipelines or sensor not in all_energy_pipelines[process]:
                 continue
-            
-            pipeline = all_energy_pipelines[process][sensor]['full_pipeline']
-            
-            # Evaluate on TRAIN (60%)
-            df_train_exp = train_datasets[process].get('expanded')
-            if df_train_exp is not None:
-                # We use verbose=0 because we just want the metrics here
-                train_curves, _ = split_curves(df_train_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
-                _, tr_agg = evaluate_pipeline_on_test(train_curves, pipeline, verbose=0)
-                tr_agg.update({'process': process, 'sensor': sensor, 'split': 'TRAIN'})
-                profile_summary_records.append(tr_agg)
-                
-            # Evaluate on TEST (40%) - Guarded for speed
-            if RUN_TEST_EVALUATION:
-                df_test_exp = test_datasets[process].get('expanded')
-                if df_test_exp is not None and not df_test_exp.empty:
-                    test_curves, _ = split_curves(df_test_exp, sensor, activities_to_model, objects_to_model, test_size=0.0, verbose=0)
-                    if test_curves:
-                        metrics_df, ts_agg = evaluate_pipeline_on_test(test_curves, pipeline, verbose=0)
-                        
-                        # Get per-activity averages to show 'Subprocess' granularity
-                        if not metrics_df.empty:
-                            activity_metrics = metrics_df.groupby('activity')[['MAE', 'RMSE', 'WAPE (%)', 'R2']].mean().reset_index()
-                            for _, act_row in activity_metrics.iterrows():
-                                summary_rec = {
-                                    'Dataset': process,
-                                    'Subprocess': act_row['activity'],
-                                    'Sensor': sensor,
-                                    'MAE': act_row['MAE'],
-                                    'RMSE': act_row['RMSE'],
-                                    'WAPE': act_row['WAPE (%)'],
-                                    'R2': act_row['R2']
-                                }
-                                profile_summary_records.append(summary_rec)
 
+            pipeline = all_energy_pipelines[process][sensor]['full_pipeline']
+
+            for split_label, df_exp in [
+                ('TRAIN', train_datasets[process].get('expanded')),
+                ('TEST',  test_datasets[process].get('expanded') if RUN_TEST_EVALUATION else None),
+            ]:
+                if df_exp is None or df_exp.empty:
+                    continue
+                _sc, _ = split_curves(df_exp, sensor, activities_to_model, objects_to_model,
+                                      test_size=0.0, verbose=0)
+                if not _sc:
+                    continue
+                _mdf, _ = evaluate_pipeline_on_test(_sc, pipeline, max_plot_curves=0, verbose=0)
+                if _mdf.empty:
+                    continue
+                for _, _row in _mdf.iterrows():
+                    profile_summary_records.append({
+                        'Process':   process,
+                        'Sensor':    sensor,
+                        'Activity':  _row['activity'],
+                        'Split':     split_label,
+                        'MAE':       _row['MAE'],
+                        'RMSE':      _row['RMSE'],
+                        'WAPE':      _row['WAPE (%)'],
+                        'R2':        _row['R2'],
+                    })
 
 if profile_summary_records:
     profile_summary_df = pd.DataFrame(profile_summary_records)
     report("\n" + "="*80)
-    report("DETAILED ENERGY PROFILE METRICS PER DATASET & SUBPROCESS (TEST SET)")
+    report("DETAILED ENERGY PROFILE METRICS PER PROCESS / SENSOR / ACTIVITY")
     report("="*80)
-    
-    # Pivot for clean display: Dataset, Subprocess, Sensor as index
-    pivot_cols = ['MAE', 'RMSE', 'WAPE', 'R2']
-    available_metrics = [c for c in pivot_cols if c in profile_summary_df.columns]
-    summary_pivot = profile_summary_df.pivot_table(
-        index=['Dataset', 'Subprocess', 'Sensor'], 
-        values=available_metrics
+    _psummary = (
+        profile_summary_df
+        .groupby(['Process', 'Sensor', 'Activity', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+        .mean()
+        .round(4)
     )
-    
-    # Reorder columns as requested
-    final_cols = [c for c in ['MAE', 'RMSE', 'WAPE', 'R2'] if c in summary_pivot.columns]
-    summary_pivot = summary_pivot[final_cols]
-    
-    report(summary_pivot.round(4).to_string())
-    display(summary_pivot.round(4))
+    report(_psummary.to_string())
+    display(_psummary)
 
 # ── SIMULATION CURVE VISUALS (SIMULATED VS REAL) ───────────────────────────
 # We look for simulated logs in evaluation_results_list that have 'simulated_energy_curves'
@@ -3258,83 +3327,98 @@ report("\n" + "█"*80 + "\n")
 # ── POST-REPORT VISUALIZATIONS: GENERALIZATION GALLERY ───────────────────────
 # (Note: Placed at the very end to provide a final visual verification of curve fitting)
 if RUN_TEST_EVALUATION:
+    _gallery_dir = os.path.join(_run_dir, 'curves') if (EXPORT_RESULTS and '_run_dir' in dir()) else None
+
     for process, sensors in all_energy_pipelines.items():
         exp_test = test_datasets[process].get('expanded')
         if exp_test is None: continue
-        
+
         _proc_sensor_config = process_datasets_to_model_sensors.get(process, {})
         for sensor in sensors:
-            # We filter for the test curves for this specific process/sensor combo
             _activities = _proc_sensor_config.get('activities_to_model', exp_test['activity_log'].dropna().unique().tolist())
             _objects    = _proc_sensor_config.get('objects_to_model',    exp_test['object_log'].dropna().unique().tolist())
             test_curves, _ = split_curves(exp_test, sensor, _activities, _objects,
                                           test_size=0.0, verbose=0)
-            
+
             if test_curves:
                 display(Markdown("---"))
-                display(Markdown(f"## 🎨 Generalization Gallery: {sensor.upper()}"))
-                display(Markdown(f"*Visual verification of ML curve prediction vs Real ground-truth (Test Set)*"))
-                
-                # evaluate_pipeline_on_test uses a 3x2 grid by default for max_plot_curves=6
+                display(Markdown(f"## Generalization Gallery: {sensor.upper()}"))
+                display(Markdown(f"*Predicted vs real curves — Test Set — {process}*"))
                 evaluate_pipeline_on_test(
-                    test_curves, 
-                    all_energy_pipelines[process][sensor]['full_pipeline'], 
-                    max_plot_curves=6, 
-                    verbose=1 
+                    test_curves,
+                    all_energy_pipelines[process][sensor]['full_pipeline'],
+                    max_plot_curves=6,
+                    verbose=1,
+                    save_dir=_gallery_dir,
                 )
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
 # RESULTS EXPORT — parquet table + HTML notebook snapshot
 # ══════════════════════════════════════════════════════════════════════════════
-import os
-import datetime
 import subprocess
 
-_run_ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-_results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
-_run_dir  = os.path.join(_results_root, _run_ts)
-os.makedirs(_run_dir, exist_ok=True)
-
-# ── Curve-only evaluation results ────────────────────────────────────────────
-if 'all_energy_pipelines' in dir() and '_all_records' in dir() and _all_records:
-    _results_df = pd.DataFrame(_all_records)
-    _parquet_path = os.path.join(_run_dir, 'curve_eval_results.parquet')
-    _results_df.to_parquet(_parquet_path, index=False)
-    print(f"Saved results  → {_parquet_path}")
-    print(_results_df.groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'R2']].mean().round(4).to_string())
+if not EXPORT_RESULTS:
+    print("EXPORT_RESULTS=False — skipping export.")
 else:
-    print("No curve evaluation results found — skipping parquet export.")
+    # _run_dir is created at startup — just flush the log before saving anything
+    _log_handler.flush()
 
-# ── Profile summary results (if available) ───────────────────────────────────
-if 'profile_summary_df' in dir() and not profile_summary_df.empty:
-    _profile_path = os.path.join(_run_dir, 'profile_summary.parquet')
-    profile_summary_df.to_parquet(_profile_path, index=False)
-    print(f"Saved profile  → {_profile_path}")
+    # ── Curve-only evaluation results ────────────────────────────────────────
+    _export_df = None
+    for _cname in ('_all_df', '_all_records'):
+        _cval = globals().get(_cname)
+        if _cval is not None:
+            _export_df = pd.DataFrame(_cval) if isinstance(_cval, list) else _cval
+            if not _export_df.empty:
+                break
+            _export_df = None
 
-# ── Approaches that were run ──────────────────────────────────────────────────
-_meta = {
-    'run_timestamp': [_run_ts],
-    'approaches':    [str(_RUN_APPROACHES) if '_RUN_APPROACHES' in dir() else 'unknown'],
-}
-pd.DataFrame(_meta).to_parquet(os.path.join(_run_dir, 'run_meta.parquet'), index=False)
+    if _export_df is not None and not _export_df.empty:
+        _parquet_path = os.path.join(_run_dir, 'curve_eval_results.parquet')
+        _export_df.to_parquet(_parquet_path, index=False)
+        print(f"Saved results  → {_parquet_path}")
 
-# ── HTML export of this notebook ─────────────────────────────────────────────
-_this_file = os.path.abspath(__file__)
-_html_path = os.path.join(_run_dir, 'notebook.html')
-
-try:
-    _nb_result = subprocess.run(
-        ['jupyter', 'nbconvert', '--to', 'html', '--output', _html_path, _this_file],
-        capture_output=True, text=True, timeout=120,
-    )
-    if _nb_result.returncode == 0:
-        print(f"Saved HTML     → {_html_path}")
+        _sw = globals().get('_summary_wide')
+        if _sw is not None and not _sw.empty:
+            _sw_path = os.path.join(_run_dir, 'summary_train_test.parquet')
+            _sw.reset_index().to_parquet(_sw_path, index=False)
+            print(f"Saved summary  → {_sw_path}")
     else:
-        print(f"nbconvert warning: {_nb_result.stderr.strip()[:300]}")
-except Exception as _e:
-    print(f"HTML export skipped: {_e}")
+        print("No curve evaluation results found — skipping parquet export.")
 
-print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
+    # ── Profile summary ───────────────────────────────────────────────────────
+    _psdf = globals().get('profile_summary_df')
+    if _psdf is not None and not _psdf.empty:
+        _profile_path = os.path.join(_run_dir, 'profile_summary.parquet')
+        _psdf.to_parquet(_profile_path, index=False)
+        print(f"Saved profile  → {_profile_path}")
+    else:
+        print("No profile summary found — skipping profile parquet.")
+
+    # ── Run metadata ─────────────────────────────────────────────────────────
+    pd.DataFrame({
+        'run_timestamp': [_run_ts],
+        'approaches':    [str(APPROACHES)],
+    }).to_parquet(os.path.join(_run_dir, 'run_meta.parquet'), index=False)
+
+    # ── HTML export of this notebook ─────────────────────────────────────────
+    _this_file = os.path.abspath(__file__)
+    _html_path = os.path.join(_run_dir, 'notebook.html')
+    try:
+        _nb_result = subprocess.run(
+            ['jupyter', 'nbconvert', '--to', 'html', '--output', _html_path, _this_file],
+            capture_output=True, text=True, timeout=120,
+        )
+        if _nb_result.returncode == 0:
+            print(f"Saved HTML     → {_html_path}")
+        else:
+            print(f"nbconvert warning: {_nb_result.stderr.strip()[:300]}")
+    except Exception as _e:
+        print(f"HTML export skipped: {_e}")
+
+    print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
+    print(f"  plots/curves/  → {os.path.join(_run_dir, 'curves')}")
+    print(f"  plots/         → {os.path.join(_run_dir, 'plots')}")
 
 # %%

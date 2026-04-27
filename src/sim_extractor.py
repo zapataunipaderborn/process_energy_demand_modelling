@@ -5057,7 +5057,7 @@ def _dispatch_predict(raw_values, curve, pipeline):
     return predict_raw_curve(raw_values, act, attrs, pipeline)
 
 
-def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1):
+def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1, save_dir=None):
     """
     Evaluate the trained pipeline on completely unseen, raw test curves.
     Ground truth = raw_values (never warped, never seen during training).
@@ -5171,8 +5171,17 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
             fontsize=14, fontweight='bold', y=1.02
         )
         plt.tight_layout()
-        plt.show()  # Ensure plots are displayed in the notebook
-
+        if save_dir is not None:
+            import os as _os
+            _os.makedirs(save_dir, exist_ok=True)
+            _sensor_slug = (
+                pipeline.get('variable_name', 'sensor')
+                .replace('/', '-').replace(' ', '_')[:80]
+            )
+            _approach = pipeline.get('approach', 'baseline')
+            _save_path = _os.path.join(save_dir, f"{_approach}__{_sensor_slug}.png")
+            plt.savefig(_save_path, dpi=150, bbox_inches='tight')
+        plt.show()
 
     return metrics_df, agg_metrics
 
