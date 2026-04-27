@@ -4,3 +4,4 @@ __pycache__/
 *.parquet
 *pipeline_execution.log
 results/*
+nohup.out
