@@ -5099,6 +5099,139 @@ def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1):
     return sensor, activity, obj, pipeline
 
 
+def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_cols,
+                             fixed_length=100, val_size=0.2):
+    """
+    Top-level picklable worker for RUN_CURVE_ONLY_EVALUATION parallel training.
+    Trains all sklearn-based approaches for one (sensor, activity, object) combo.
+    Seq2seq approaches are excluded — they use PyTorch and must stay sequential.
+
+    Returns dict keyed by approach name, each value is the raw pipeline dict,
+    plus 'sensor'/'activity'/'object' keys for reassembly.
+    """
+    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import GradientBoostingRegressor
+
+    _SKLEARN_APPROACHES = {'baseline', 'instance_stats', 'istats_leakfree',
+                           'dtw_phase', 'basis', 'exog'}
+    _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
+
+    curves, _ = split_curves(
+        df_train,
+        variable=sensor,
+        activities=[activity],
+        objects=[obj],
+        test_size=0.0,
+        verbose=0,
+        exog_columns=ef_cols,
+    )
+    if len(curves) < 5:
+        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
+
+    models = {
+        'Linear Regression': LinearRegression,
+        'Gradient Boosting': GradientBoostingRegressor,
+    }
+    result = {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': False}
+
+    if 'baseline' in _active:
+        result['baseline'] = build_and_train_pipeline(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    if 'instance_stats' in _active:
+        result['instance_stats'] = build_and_train_pipeline_instance_stats(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    if 'istats_leakfree' in _active:
+        result['istats_leakfree'] = build_and_train_pipeline_istats_leakfree(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    if 'dtw_phase' in _active:
+        result['dtw_phase'] = build_and_train_pipeline_dtw_phase(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    if 'basis' in _active:
+        result['basis'] = build_and_train_pipeline_basis(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    if 'exog' in _active and ef_cols:
+        result['exog'] = build_and_train_pipeline_exog(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    return result
+
+
+def _train_seq2seq_worker(sensor, df_train, approaches, ef_cols,
+                          hidden_size=128, num_layers=2, dropout=0.1,
+                          epochs=80, batch_size=32, lr=1e-3,
+                          teacher_forcing_ratio=0.5, patience=10,
+                          fixed_length=100, val_size=0.2):
+    """
+    Top-level picklable worker for parallel seq2seq training.
+    Trains all seq2seq variants for one sensor (all activities combined).
+    Returns dict with sensor + results keyed by approach name.
+    """
+    import torch
+    torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
+    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_exog'}
+    _active = [a for a in approaches if a in _SEQ2SEQ]
+    if not _active:
+        return {'sensor': sensor, 'skipped': True}
+
+    curves, _ = split_curves(
+        df_train,
+        variable=sensor,
+        test_size=0.0,
+        verbose=0,
+        exog_columns=ef_cols,
+    )
+    if not curves:
+        return {'sensor': sensor, 'skipped': True}
+
+    result = {'sensor': sensor, 'skipped': False}
+
+    if 'seq2seq' in _active:
+        result['seq2seq'] = build_and_train_pipeline_seq2seq(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
+            dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
+            teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
+            verbose=False,
+        )
+
+    if 'seq2seq_only' in _active:
+        result['seq2seq_only'] = build_and_train_pipeline_seq2seq_only(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
+            dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
+            teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
+            verbose=False,
+        )
+
+    if 'seq2seq_exog' in _active and ef_cols:
+        result['seq2seq_exog'] = build_and_train_pipeline_seq2seq_exog(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
+            dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
+            teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
+            verbose=False,
+        )
+
+    return result
+
+
 def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1, save_dir=None):
     """
     Evaluate the trained pipeline on completely unseen, raw test curves.
