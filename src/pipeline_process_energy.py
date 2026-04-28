@@ -3421,4 +3421,4 @@ else:
     print(f"  plots/curves/  → {os.path.join(_run_dir, 'curves')}")
     print(f"  plots/         → {os.path.join(_run_dir, 'plots')}")
 
-# %%
+# %%%
