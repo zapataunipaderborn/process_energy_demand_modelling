@@ -2314,6 +2314,8 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                                 display(_direct_df)
 
                         # ── Train Dynamic ML Curve Predictors ──────────────────
+                        # One pipeline per (sensor, activity, object) so each barycenter
+                        # and model is fit on a homogeneous set of curves.
                         # Only run this if we actually want to evaluate on Test results
                         # as this DTW-based training is the slowest part of the pipeline.
                         if RUN_TEST_EVALUATION:
@@ -2322,45 +2324,51 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                             from sklearn.ensemble import GradientBoostingRegressor
 
                             _energy_pipelines = {}
-                            
+
                             _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
                             _activities_list = _config.get('activities_to_model', _df_expanded_train['activity_log'].dropna().unique().tolist())
-                            _objects_list = _config.get('objects_to_model', _df_expanded_train['object_log'].dropna().unique().tolist())
-                            
+                            _objects_list    = _config.get('objects_to_model',    _df_expanded_train['object_log'].dropna().unique().tolist())
+
+                            def _make_predict_fn(ep_bound):
+                                return lambda raw_values, activity, object_attributes: predict_raw_curve(
+                                    raw_values, activity, object_attributes, pipeline=ep_bound
+                                )
+
                             for _sensor in _sensors:
-                                print(f"\n  ℹ️ Training dynamic ML curve for sensor: {_sensor}")
-                                _train_curves, _ = split_curves(
-                                    _df_expanded_train,
-                                    variable=_sensor,
-                                    activities=_activities_list,
-                                    objects=_objects_list,
-                                    test_size=0.0, # All data into train since we do global temporal split
-                                    verbose=0,
-                                )
-                                _ep_pipeline = build_and_train_pipeline(
-                                    _train_curves,
-                                    variable=_sensor,
-                                    fixed_length=100,
-                                    val_size=0.2, # Validation internally handles R2 evaluation
-                                    models={
-                                        'Linear Regression': LinearRegression,
-                                        'Gradient Boosting': GradientBoostingRegressor,
-                                    },
-                                    optimize_hyperparams=False,
-                                    verbose=VERBOSE_EVAL
-                                )
-                                
-                                def _make_predict_fn(ep_bound):
-                                    return lambda raw_values, activity, object_attributes: predict_raw_curve(
-                                        raw_values, activity, object_attributes, pipeline=ep_bound
-                                    )
-                                    
-                                _energy_pipelines[_sensor] = {
-                                    'reference_curve': _ep_pipeline['reference_curve'],
-                                    'predict_fn': _make_predict_fn(_ep_pipeline),
-                                    'full_pipeline': _ep_pipeline 
-                                }
-                                
+                                _energy_pipelines[_sensor] = {}
+                                for _activity in _activities_list:
+                                    _energy_pipelines[_sensor][_activity] = {}
+                                    for _object in _objects_list:
+                                        print(f"\n  ℹ️ Training pipeline: sensor={_sensor} | activity={_activity} | object={_object}")
+                                        _train_curves, _ = split_curves(
+                                            _df_expanded_train,
+                                            variable=_sensor,
+                                            activities=[_activity],
+                                            objects=[_object],
+                                            test_size=0.0,
+                                            verbose=0,
+                                        )
+                                        if len(_train_curves) < 5:
+                                            print(f"    ⚠️  Only {len(_train_curves)} curves — skipping (too few samples).")
+                                            continue
+                                        _ep_pipeline = build_and_train_pipeline(
+                                            _train_curves,
+                                            variable=_sensor,
+                                            fixed_length=100,
+                                            val_size=0.2,
+                                            models={
+                                                'Linear Regression': LinearRegression,
+                                                'Gradient Boosting': GradientBoostingRegressor,
+                                            },
+                                            optimize_hyperparams=False,
+                                            verbose=VERBOSE_EVAL
+                                        )
+                                        _energy_pipelines[_sensor][_activity][_object] = {
+                                            'reference_curve': _ep_pipeline['reference_curve'],
+                                            'predict_fn':      _make_predict_fn(_ep_pipeline),
+                                            'full_pipeline':   _ep_pipeline,
+                                        }
+
                             all_energy_pipelines[process] = _energy_pipelines
                         else:
                             _energy_pipelines = {}
@@ -3165,39 +3173,41 @@ profile_summary_records = []
 if 'process_datasets_to_model_sensors' in dir():
     for process, config in process_datasets_to_model_sensors.items():
         sensors_to_model = config.get('sensors_to_model', [])
-        activities_to_model = config.get('activities_to_model', [])
-        objects_to_model = config.get('objects_to_model', [])
 
         for sensor in sensors_to_model:
             if process not in all_energy_pipelines or sensor not in all_energy_pipelines[process]:
                 continue
 
-            pipeline = all_energy_pipelines[process][sensor]['full_pipeline']
+            # Iterate every (activity, object) sub-pipeline
+            for _activity, _obj_map in all_energy_pipelines[process][sensor].items():
+                for _object, _ep in _obj_map.items():
+                    pipeline = _ep['full_pipeline']
 
-            for split_label, df_exp in [
-                ('TRAIN', train_datasets[process].get('expanded')),
-                ('TEST',  test_datasets[process].get('expanded') if RUN_TEST_EVALUATION else None),
-            ]:
-                if df_exp is None or df_exp.empty:
-                    continue
-                _sc, _ = split_curves(df_exp, sensor, activities_to_model, objects_to_model,
-                                      test_size=0.0, verbose=0)
-                if not _sc:
-                    continue
-                _mdf, _ = evaluate_pipeline_on_test(_sc, pipeline, max_plot_curves=0, verbose=0)
-                if _mdf.empty:
-                    continue
-                for _, _row in _mdf.iterrows():
-                    profile_summary_records.append({
-                        'Process':   process,
-                        'Sensor':    sensor,
-                        'Activity':  _row['activity'],
-                        'Split':     split_label,
-                        'MAE':       _row['MAE'],
-                        'RMSE':      _row['RMSE'],
-                        'WAPE':      _row['WAPE (%)'],
-                        'R2':        _row['R2'],
-                    })
+                    for split_label, df_exp in [
+                        ('TRAIN', train_datasets[process].get('expanded')),
+                        ('TEST',  test_datasets[process].get('expanded') if RUN_TEST_EVALUATION else None),
+                    ]:
+                        if df_exp is None or df_exp.empty:
+                            continue
+                        _sc, _ = split_curves(df_exp, sensor, [_activity], [_object],
+                                              test_size=0.0, verbose=0)
+                        if not _sc:
+                            continue
+                        _mdf, _ = evaluate_pipeline_on_test(_sc, pipeline, max_plot_curves=0, verbose=0)
+                        if _mdf.empty:
+                            continue
+                        for _, _row in _mdf.iterrows():
+                            profile_summary_records.append({
+                                'Process':   process,
+                                'Sensor':    sensor,
+                                'Activity':  _activity,
+                                'Object':    _object,
+                                'Split':     split_label,
+                                'MAE':       _row['MAE'],
+                                'RMSE':      _row['RMSE'],
+                                'WAPE':      _row['WAPE (%)'],
+                                'R2':        _row['R2'],
+                            })
 
 if profile_summary_records:
     profile_summary_df = pd.DataFrame(profile_summary_records)
@@ -3206,7 +3216,7 @@ if profile_summary_records:
     report("="*80)
     _psummary = (
         profile_summary_df
-        .groupby(['Process', 'Sensor', 'Activity', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+        .groupby(['Process', 'Sensor', 'Activity', 'Object', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
         .mean()
         .round(4)
     )
@@ -3333,24 +3343,23 @@ if RUN_TEST_EVALUATION:
         exp_test = test_datasets[process].get('expanded')
         if exp_test is None: continue
 
-        _proc_sensor_config = process_datasets_to_model_sensors.get(process, {})
-        for sensor in sensors:
-            _activities = _proc_sensor_config.get('activities_to_model', exp_test['activity_log'].dropna().unique().tolist())
-            _objects    = _proc_sensor_config.get('objects_to_model',    exp_test['object_log'].dropna().unique().tolist())
-            test_curves, _ = split_curves(exp_test, sensor, _activities, _objects,
-                                          test_size=0.0, verbose=0)
-
-            if test_curves:
-                display(Markdown("---"))
-                display(Markdown(f"## Generalization Gallery: {sensor.upper()}"))
-                display(Markdown(f"*Predicted vs real curves — Test Set — {process}*"))
-                evaluate_pipeline_on_test(
-                    test_curves,
-                    all_energy_pipelines[process][sensor]['full_pipeline'],
-                    max_plot_curves=6,
-                    verbose=1,
-                    save_dir=_gallery_dir,
-                )
+        for sensor, act_map in sensors.items():
+            for _activity, obj_map in act_map.items():
+                for _object, _ep in obj_map.items():
+                    test_curves, _ = split_curves(exp_test, sensor, [_activity], [_object],
+                                                  test_size=0.0, verbose=0)
+                    if not test_curves:
+                        continue
+                    display(Markdown("---"))
+                    display(Markdown(f"## Generalization Gallery: {sensor.upper()} | {_activity} | {_object}"))
+                    display(Markdown(f"*Predicted vs real curves — Test Set — {process}*"))
+                    evaluate_pipeline_on_test(
+                        test_curves,
+                        _ep['full_pipeline'],
+                        max_plot_curves=6,
+                        verbose=1,
+                        save_dir=_gallery_dir,
+                    )
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════

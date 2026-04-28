@@ -1414,18 +1414,24 @@ class ProcessSimulation:
 
 
                 # ── Update energy state ────────────────────────────────
-                # When energy_pipelines is populated: predict a new curve
-                # for the just-fired activity and update the state.
-                # When empty: the state was seeded with training means before
-                # the loop and stays unchanged — no per-step overwrite needed.
+                # energy_pipelines is keyed [sensor][activity][object].
+                # Fall back to the first available object pipeline when the
+                # exact object is not found (handles unseen objects at test time).
                 if self.energy_pipelines and chosen_label is not None:
                     new_energy_state = {}
-                    for sensor, ep in self.energy_pipelines.items():
+                    for sensor, act_map in self.energy_pipelines.items():
                         try:
+                            obj_map = act_map.get(chosen_label, {})
+                            ep = obj_map.get(object_name) or (
+                                next(iter(obj_map.values())) if obj_map else None
+                            )
+                            if ep is None:
+                                continue
                             ref_curve  = ep.get('reference_curve')
                             if ref_curve is None:
                                 raise ValueError(
-                                    f"energy_pipelines['{sensor}'] has no 'reference_curve'."
+                                    f"energy_pipelines['{sensor}']['{chosen_label}']['{object_name}'] "
+                                    f"has no 'reference_curve'."
                                 )
                             predict_fn = ep.get('predict_fn')
                             curve = (predict_fn(
@@ -1434,7 +1440,7 @@ class ProcessSimulation:
                                          object_attributes=object_attributes,
                                      ) if predict_fn is not None
                                      else np.asarray(ref_curve, dtype=float))
-                            
+
                             # Log the full curve for evaluation later
                             if self.events and self.events[-1]['activity'] == chosen_label:
                                 if 'simulated_energy_curves' not in self.events[-1]:
@@ -1446,7 +1452,7 @@ class ProcessSimulation:
                         except Exception as exc:
                             raise ValueError(
                                 f"Energy pipeline prediction failed for sensor '{sensor}', "
-                                f"activity '{chosen_label}': {exc}"
+                                f"activity '{chosen_label}', object '{object_name}': {exc}"
                             ) from exc
 
                     # Validate — raise if any expected column is missing
