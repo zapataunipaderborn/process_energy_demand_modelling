@@ -320,6 +320,9 @@ logging.captureWarnings(True)
 sys.stdout = StreamToLogger(logging.info)
 sys.stderr = StreamToLogger(logging.error)
 
+import time as _time
+_pipeline_start = _time.perf_counter()
+
 logging.info(f"Run started — output folder: {_run_dir}")
 logging.info(f"Approaches: {APPROACHES}")
 
@@ -2348,19 +2351,18 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
 
                             # ProcessPoolExecutor works from Jupyter notebooks; joblib/loky does not
                             # reliably spawn from an interactive kernel on Linux.
-                            _ctx = concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers)
-                            _futures = {
-                                _ctx.submit(_train_energy_pipeline_worker, s, a, o, _df_expanded_train, 1): (s, a, o)
-                                for s, a, o in _combos
-                            }
                             _results = []
-                            for _fut in concurrent.futures.as_completed(_futures):
-                                try:
-                                    _results.append(_fut.result())
-                                except Exception as _e:
-                                    s, a, o = _futures[_fut]
-                                    print(f"    ⚠️  Worker failed {s}|{a}|{o}: {_e}")
-                            _ctx.shutdown(wait=False)
+                            with concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers) as _ctx:
+                                _futures = {
+                                    _ctx.submit(_train_energy_pipeline_worker, s, a, o, _df_expanded_train, 1): (s, a, o)
+                                    for s, a, o in _combos
+                                }
+                                for _fut in concurrent.futures.as_completed(_futures):
+                                    try:
+                                        _results.append(_fut.result())
+                                    except Exception as _e:
+                                        s, a, o = _futures[_fut]
+                                        print(f"    ⚠️  Worker failed {s}|{a}|{o}: {_e}")
 
                             for _sensor, _activity, _object, _ep_pipeline in _results:
                                 if _ep_pipeline is None:
@@ -2676,6 +2678,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         if _sklearn_approaches and _combos:
             print(f"\n  Parallel sklearn training: {len(_combos)} combos × {len(_sklearn_approaches)} approaches "
                   f"across {_n_workers} workers...")
+            _sklearn_t0 = _time.perf_counter()
             with concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers) as _pool:
                 _futs = {
                     _pool.submit(_train_curve_only_worker,
@@ -2689,6 +2692,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                     except Exception as _we:
                         _ws, _wa, _wo = _futs[_fut]
                         print(f"  ⚠️  Worker failed {_ws}|{_wa}|{_wo}: {_we}")
+            print(f"  sklearn training done in {_time.perf_counter() - _sklearn_t0:.1f}s")
 
             # Reassemble into per-sensor dicts keyed [sensor][activity][object]
             for _r in _worker_results:
@@ -2733,63 +2737,68 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'full_pipeline':   _r['exog'],
                     }
 
-        # ── Seq2seq approaches — one worker per sensor (PyTorch, CPU fork-safe) ──
-        if _seq2seq_approaches and _sensors:
+        # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
+        if _seq2seq_approaches and _combos:
             from sim_extractor import _train_seq2seq_worker
-            _s2s_n_workers = min(len(_sensors), _os.cpu_count() or 4)
-            print(f"\n  Parallel seq2seq training: {len(_sensors)} sensors × "
+            _s2s_n_workers = min(len(_combos), _os.cpu_count() or 4)
+            print(f"\n  Parallel seq2seq training: {len(_combos)} combos × "
                   f"{len(_seq2seq_approaches)} approaches across {_s2s_n_workers} workers...")
+            _s2s_t0 = _time.perf_counter()
             with concurrent.futures.ProcessPoolExecutor(max_workers=_s2s_n_workers) as _s2s_pool:
                 _s2s_futs = {
                     _s2s_pool.submit(
                         _train_seq2seq_worker,
-                        _s, _df_train_exp, _seq2seq_approaches, _ef_cols,
+                        _s, _a, _o, _df_train_exp, _seq2seq_approaches, _ef_cols,
                         SEQ2SEQ_HIDDEN_SIZE, SEQ2SEQ_NUM_LAYERS, SEQ2SEQ_DROPOUT,
                         SEQ2SEQ_EPOCHS, SEQ2SEQ_BATCH_SIZE, SEQ2SEQ_LR,
                         SEQ2SEQ_TEACHER_FORCING, SEQ2SEQ_PATIENCE,
-                    ): _s
-                    for _s in _sensors
+                    ): (_s, _a, _o, _time.perf_counter())
+                    for _s, _a, _o in _combos
                 }
                 _s2s_results = []
                 for _s2s_fut in concurrent.futures.as_completed(_s2s_futs):
-                    _s = _s2s_futs[_s2s_fut]
+                    _s, _a, _o, _s_t0 = _s2s_futs[_s2s_fut]
                     try:
-                        _s2s_results.append(_s2s_fut.result())
+                        _res = _s2s_fut.result()
+                        _res['_elapsed'] = _time.perf_counter() - _s_t0
+                        _s2s_results.append(_res)
                     except Exception as _s2s_e:
-                        print(f"  ⚠️  Seq2seq worker failed [{_s}]: {_s2s_e}")
+                        print(f"  ⚠️  Seq2seq worker failed [{_s}|{_a}|{_o}]: {_s2s_e}")
+            print(f"  seq2seq training done in {_time.perf_counter() - _s2s_t0:.1f}s")
 
             for _r2 in _s2s_results:
-                _s = _r2['sensor']
+                _s, _a, _o = _r2['sensor'], _r2['activity'], _r2['object']
                 if _r2.get('skipped'):
-                    print(f"  [{_s}] No curves — seq2seq skipped.")
+                    print(f"  ⚠️  Skipped {_s}|{_a}|{_o} — seq2seq (too few curves).")
                     continue
+                _s_elapsed = _r2.get('_elapsed', 0)
                 if 'seq2seq' in _r2:
                     _ep = _r2['seq2seq']
                     _ep['variable_name'] = _s
-                    _pipelines_seq2seq[_s] = {
+                    _pipelines_seq2seq.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': _ep['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq(rv, act, attrs, pipeline=ep))(_ep),
                         'full_pipeline':   _ep,
                     }
-                    print(f"  [{_s}] seq2seq val_loss={_ep['val_loss']:.5f}")
+                    print(f"  [{_s}|{_a}|{_o}] seq2seq       val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
                 if 'seq2seq_only' in _r2:
                     _ep = _r2['seq2seq_only']
                     _ep['variable_name'] = _s
-                    _pipelines_seq2seq_only[_s] = {
+                    _pipelines_seq2seq_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': None,
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq_only(rv, act, attrs, pipeline=ep))(_ep),
                         'full_pipeline':   _ep,
                     }
-                    print(f"  [{_s}] seq2seq_only val_loss={_ep['val_loss']:.5f}")
+                    print(f"  [{_s}|{_a}|{_o}] seq2seq_only  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
                 if 'seq2seq_exog' in _r2:
                     _ep = _r2['seq2seq_exog']
                     _ep['variable_name'] = _s
-                    _pipelines_seq2seq_exog[_s] = {
+                    _pipelines_seq2seq_exog.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': _ep['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_seq2seq_exog(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_ep),
                         'full_pipeline':   _ep,
                     }
-                    print(f"  [{_s}] seq2seq_exog val_loss={_ep['val_loss']:.5f}")
+                    print(f"  [{_s}|{_a}|{_o}] seq2seq_exog  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
 
         all_energy_pipelines[_proc]                   = _pipelines_baseline
         all_energy_pipelines_instance_stats[_proc]   = _pipelines_instance_stats
@@ -2828,17 +2837,12 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
             _objs = _df['object_log'].dropna().unique().tolist()
 
         for _sensor, _sensor_val in _sensors.items():
-            # Support both nested [sensor][activity][object]→ep (sklearn)
-            # and flat [sensor]→ep (seq2seq) structures.
-            if isinstance(_sensor_val, dict) and 'full_pipeline' in _sensor_val:
-                _leaf_eps = [(_acts, _objs, _sensor_val)]  # flat seq2seq style
-            else:
-                # nested: {activity: {object: ep}}
-                _leaf_eps = [
-                    ([_a], [_o], _ep)
-                    for _a, _obj_map in _sensor_val.items()
-                    for _o, _ep in _obj_map.items()
-                ]
+            # nested: {activity: {object: ep}}
+            _leaf_eps = [
+                ([_a], [_o], _ep)
+                for _a, _obj_map in _sensor_val.items()
+                for _o, _ep in _obj_map.items()
+            ]
 
             for _leaf_acts, _leaf_objs, _ep in _leaf_eps:
                 _fp = _ep.get('full_pipeline', {})
@@ -3317,5 +3321,12 @@ else:
     print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
     print(f"  plots/curves/  → {os.path.join(_run_dir, 'curves')}")
     print(f"  plots/         → {os.path.join(_run_dir, 'plots')}")
+
+    _total_elapsed = _time.perf_counter() - _pipeline_start
+    _h, _rem = divmod(int(_total_elapsed), 3600)
+    _m, _s   = divmod(_rem, 60)
+    print(f"\n{'='*60}")
+    print(f"  Pipeline finished in {_h:02d}h {_m:02d}m {_s:02d}s  ({_total_elapsed:.1f}s total)")
+    print(f"{'='*60}")
 
 # %%

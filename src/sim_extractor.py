@@ -2071,6 +2071,8 @@ def build_and_train_pipeline(
 
     feature_scaler = None
     if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
         feature_scaler = StandardScaler()
         X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
             X_train[numeric_feature_cols]
@@ -2264,6 +2266,7 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
     if feature_scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
         if cols_to_scale:
+            X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
             X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
 
     y_ref_pred = model.predict(X_ref)
@@ -2472,6 +2475,8 @@ def build_and_train_pipeline_instance_stats(
 
     feature_scaler = None
     if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
         feature_scaler = StandardScaler()
         X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
             X_train[numeric_feature_cols]
@@ -2650,6 +2655,7 @@ def predict_raw_curve_instance_stats(raw_values, activity, attributes, pipeline)
     if feature_scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
         if cols_to_scale:
+            X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
             X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
 
     y_ref_pred = model.predict(X_ref)
@@ -2879,6 +2885,8 @@ def build_and_train_pipeline_istats_leakfree(
 
     feature_scaler = None
     if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
         feature_scaler = StandardScaler()
         X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
             X_train[numeric_feature_cols]
@@ -2989,6 +2997,7 @@ def predict_raw_curve_istats_leakfree(raw_values, activity, attributes, pipeline
     if sp_scaler is not None and numeric_sp_cols:
         cols_to_scale = [c for c in numeric_sp_cols if c in X_sp.columns]
         if cols_to_scale:
+            X_sp[cols_to_scale] = X_sp[cols_to_scale].astype('float64')
             X_sp.loc[:, cols_to_scale] = sp_scaler.transform(X_sp[cols_to_scale])
 
     predicted_stats_arr = stats_predictor.predict(X_sp)[0]
@@ -3032,6 +3041,7 @@ def predict_raw_curve_istats_leakfree(raw_values, activity, attributes, pipeline
     if feature_scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
         if cols_to_scale:
+            X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
             X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
 
     y_ref_pred = model.predict(X_ref)
@@ -3251,6 +3261,8 @@ def build_and_train_pipeline_dtw_phase(
 
     feature_scaler = None
     if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
         feature_scaler = StandardScaler()
         X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
             X_train[numeric_feature_cols]
@@ -3428,6 +3440,7 @@ def predict_raw_curve_dtw_phase(raw_values, activity, attributes, pipeline):
     if feature_scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
         if cols_to_scale:
+            X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
             X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
 
     y_ref_pred = model.predict(X_ref)
@@ -3611,6 +3624,8 @@ def build_and_train_pipeline_basis(
 
     feature_scaler = None
     if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
         feature_scaler = StandardScaler()
         X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
             X_train[numeric_feature_cols]
@@ -3785,6 +3800,7 @@ def predict_raw_curve_basis(raw_values, activity, attributes, pipeline):
     if feature_scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in X.columns]
         if cols_to_scale:
+            X[cols_to_scale] = X[cols_to_scale].astype('float64')
             X.loc[:, cols_to_scale] = feature_scaler.transform(X[cols_to_scale])
 
     c_pred = model.predict(X)[0]   # shape (n_basis,)
@@ -3964,6 +3980,8 @@ def build_and_train_pipeline_exog(
 
     feature_scaler = None
     if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
         feature_scaler = StandardScaler()
         X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(
             X_train[numeric_feature_cols]
@@ -4082,6 +4100,7 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
     if feature_scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
         if cols_to_scale:
+            X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
             X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
 
     y_ref_pred = model.predict(X_ref)
@@ -4212,6 +4231,7 @@ def _build_seq2seq_input(curves, all_keys, key_types, fixed_length,
         if scaler is not None and numeric_feature_cols:
             cols_to_scale = [c for c in numeric_feature_cols if c in df_c.columns]
             if cols_to_scale:
+                df_c[cols_to_scale] = df_c[cols_to_scale].astype('float64')
                 df_c[cols_to_scale] = scaler.transform(df_c[cols_to_scale])
 
         X_list.append(df_c.values.astype(np.float32))
@@ -4458,6 +4478,7 @@ def predict_raw_curve_seq2seq(raw_values, activity, attributes, pipeline):
     if scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
         if cols_to_scale:
+            df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
 
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)  # (1,T,F)
@@ -4679,6 +4700,7 @@ def predict_raw_curve_seq2seq_only(raw_values, activity, attributes, pipeline):
     if scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
         if cols_to_scale:
+            df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
 
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
@@ -4758,6 +4780,7 @@ def _build_seq2seq_exog_input(curves, all_keys, key_types, fixed_length,
         if scaler is not None and numeric_feature_cols:
             cols_to_scale = [c for c in numeric_feature_cols if c in df_c.columns]
             if cols_to_scale:
+                df_c[cols_to_scale] = df_c[cols_to_scale].astype('float64')
                 df_c[cols_to_scale] = scaler.transform(df_c[cols_to_scale])
 
         X_list.append(df_c.values.astype(np.float32))
@@ -5007,6 +5030,7 @@ def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
     if scaler is not None and numeric_feature_cols:
         cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
         if cols_to_scale:
+            df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
 
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
@@ -5173,34 +5197,38 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     return result
 
 
-def _train_seq2seq_worker(sensor, df_train, approaches, ef_cols,
+def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                           hidden_size=128, num_layers=2, dropout=0.1,
                           epochs=80, batch_size=32, lr=1e-3,
                           teacher_forcing_ratio=0.5, patience=10,
                           fixed_length=100, val_size=0.2):
     """
     Top-level picklable worker for parallel seq2seq training.
-    Trains all seq2seq variants for one sensor (all activities combined).
-    Returns dict with sensor + results keyed by approach name.
+    Trains all seq2seq variants for one (sensor, activity, object) combo —
+    identical scoping to _train_curve_only_worker so each model sees only
+    homogeneous curves from that single combo.
+    Returns dict with sensor/activity/object + results keyed by approach name.
     """
     import torch
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
     _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_exog'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
-        return {'sensor': sensor, 'skipped': True}
+        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
 
     curves, _ = split_curves(
         df_train,
         variable=sensor,
+        activities=[activity],
+        objects=[obj],
         test_size=0.0,
         verbose=0,
         exog_columns=ef_cols,
     )
-    if not curves:
-        return {'sensor': sensor, 'skipped': True}
+    if len(curves) < 5:
+        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
 
-    result = {'sensor': sensor, 'skipped': False}
+    result = {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': False}
 
     if 'seq2seq' in _active:
         result['seq2seq'] = build_and_train_pipeline_seq2seq(
@@ -5258,7 +5286,8 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
         mae  = mean_absolute_error(raw_values, y_pred)
         rmse = np.sqrt(mean_squared_error(raw_values, y_pred))
         r2   = r2_score(raw_values, y_pred)
-        wape = np.sum(np.abs(raw_values - y_pred)) / np.sum(np.abs(raw_values)) * 100
+        _denom = np.sum(np.abs(raw_values))
+        wape = np.sum(np.abs(raw_values - y_pred)) / _denom * 100 if _denom != 0 else np.nan
 
         per_curve_metrics.append({
             'instance_id': curve['instance_id'],
