@@ -1784,7 +1784,7 @@ process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_senso
 
 process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
 process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
 # process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
@@ -2319,10 +2319,8 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                         # Only run this if we actually want to evaluate on Test results
                         # as this DTW-based training is the slowest part of the pipeline.
                         if RUN_TEST_EVALUATION:
-                            from sim_extractor import split_curves, build_and_train_pipeline, predict_raw_curve
-                            from sklearn.linear_model import LinearRegression
-                            from sklearn.ensemble import GradientBoostingRegressor
-                            from joblib import Parallel, delayed
+                            from sim_extractor import predict_raw_curve, _train_energy_pipeline_worker
+                            import concurrent.futures, os
 
                             _energy_pipelines = {}
 
@@ -2335,43 +2333,30 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                                     raw_values, activity, object_attributes, pipeline=ep_bound
                                 )
 
-                            def _train_one(sensor, activity, obj, df_train):
-                                curves, _ = split_curves(
-                                    df_train,
-                                    variable=sensor,
-                                    activities=[activity],
-                                    objects=[obj],
-                                    test_size=0.0,
-                                    verbose=0,
-                                )
-                                if len(curves) < 5:
-                                    return sensor, activity, obj, None
-                                pipeline = build_and_train_pipeline(
-                                    curves,
-                                    variable=sensor,
-                                    fixed_length=100,
-                                    val_size=0.2,
-                                    models={
-                                        'Linear Regression': LinearRegression,
-                                        'Gradient Boosting': GradientBoostingRegressor,
-                                    },
-                                    optimize_hyperparams=False,
-                                    verbose=0,
-                                )
-                                return sensor, activity, obj, pipeline
-
                             _combos = [
                                 (s, a, o)
                                 for s in _sensors
                                 for a in _activities_list
                                 for o in _objects_list
                             ]
-                            print(f"\n  ℹ️ Training {len(_combos)} pipelines in parallel (n_jobs=-1)...")
+                            _n_workers = min(len(_combos), os.cpu_count() or 4)
+                            print(f"\n  ℹ️ Training {len(_combos)} pipelines across {_n_workers} workers...")
 
-                            _results = Parallel(n_jobs=-1, backend='loky')(
-                                delayed(_train_one)(s, a, o, _df_expanded_train)
+                            # ProcessPoolExecutor works from Jupyter notebooks; joblib/loky does not
+                            # reliably spawn from an interactive kernel on Linux.
+                            _ctx = concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers)
+                            _futures = {
+                                _ctx.submit(_train_energy_pipeline_worker, s, a, o, _df_expanded_train, 1): (s, a, o)
                                 for s, a, o in _combos
-                            )
+                            }
+                            _results = []
+                            for _fut in concurrent.futures.as_completed(_futures):
+                                try:
+                                    _results.append(_fut.result())
+                                except Exception as _e:
+                                    s, a, o = _futures[_fut]
+                                    print(f"    ⚠️  Worker failed {s}|{a}|{o}: {_e}")
+                            _ctx.shutdown(wait=False)
 
                             for _sensor, _activity, _object, _ep_pipeline in _results:
                                 if _ep_pipeline is None:

@@ -1936,6 +1936,7 @@ def build_and_train_pipeline(
     optimize_hyperparams=False,
     n_trials=50,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     Build the full preprocessing + training pipeline using ONLY train curves.
@@ -2110,7 +2111,7 @@ def build_and_train_pipeline(
                         'max_depth':         trial.suggest_int('max_depth', 5, 20),
                         'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
                         'random_state':      random_state,
-                        'n_jobs':            -1,
+                        'n_jobs':            n_jobs,
                     }
                 else:
                     params = {}
@@ -2125,7 +2126,7 @@ def build_and_train_pipeline(
             if name in ('Gradient Boosting', 'Random Forest'):
                 best_params['random_state'] = random_state
             if name == 'Random Forest':
-                best_params['n_jobs'] = -1
+                best_params['n_jobs'] = n_jobs
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -2139,7 +2140,7 @@ def build_and_train_pipeline(
             elif name == 'Random Forest':
                 model = model_class(
                     n_estimators=200, max_depth=12, min_samples_split=5,
-                    random_state=random_state, n_jobs=-1
+                    random_state=random_state, n_jobs=n_jobs
                 )
             else:
                 try:
@@ -2373,6 +2374,7 @@ def build_and_train_pipeline_instance_stats(
     optimize_hyperparams=False,
     n_trials=50,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     Instance Stats — DTW pipeline enriched with instance-level curve statistics.
@@ -2507,7 +2509,7 @@ def build_and_train_pipeline_instance_stats(
                         'max_depth':         trial.suggest_int('max_depth', 5, 20),
                         'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
                         'random_state':      random_state,
-                        'n_jobs':            -1,
+                        'n_jobs':            n_jobs,
                     }
                 else:
                     params = {}
@@ -2522,7 +2524,7 @@ def build_and_train_pipeline_instance_stats(
             if name in ('Gradient Boosting', 'Random Forest'):
                 best_params['random_state'] = random_state
             if name == 'Random Forest':
-                best_params['n_jobs'] = -1
+                best_params['n_jobs'] = n_jobs
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -2535,7 +2537,7 @@ def build_and_train_pipeline_instance_stats(
             elif name == 'Random Forest':
                 model = model_class(
                     n_estimators=200, max_depth=12, min_samples_split=5,
-                    random_state=random_state, n_jobs=-1
+                    random_state=random_state, n_jobs=n_jobs
                 )
             else:
                 try:
@@ -2732,6 +2734,7 @@ def build_and_train_pipeline_istats_leakfree(
     optimize_hyperparams=False,
     n_trials=50,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     Instance Stats (Leak-Free) — two-stage pipeline.
@@ -2817,7 +2820,7 @@ def build_and_train_pipeline_istats_leakfree(
                                random_state=random_state)
         elif name == 'Random Forest':
             base = model_class(n_estimators=100, max_depth=10, random_state=random_state,
-                               n_jobs=-1)
+                               n_jobs=n_jobs)
         else:
             try:
                 base = model_class(random_state=random_state)
@@ -2893,7 +2896,7 @@ def build_and_train_pipeline_istats_leakfree(
                                 subsample=0.8, random_state=random_state)
         elif name == 'Random Forest':
             model = model_class(n_estimators=200, max_depth=12, min_samples_split=5,
-                                random_state=random_state, n_jobs=-1)
+                                random_state=random_state, n_jobs=n_jobs)
         else:
             try:
                 model = model_class(random_state=random_state)
@@ -3150,6 +3153,7 @@ def build_and_train_pipeline_dtw_phase(
     optimize_hyperparams=False,
     n_trials=50,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     Approach 3 — DTW-phase-aware pipeline.
@@ -3285,7 +3289,7 @@ def build_and_train_pipeline_dtw_phase(
                         'max_depth':         trial.suggest_int('max_depth', 5, 20),
                         'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
                         'random_state':      random_state,
-                        'n_jobs':            -1,
+                        'n_jobs':            n_jobs,
                     }
                 else:
                     params = {}
@@ -3300,7 +3304,7 @@ def build_and_train_pipeline_dtw_phase(
             if name in ('Gradient Boosting', 'Random Forest'):
                 best_params['random_state'] = random_state
             if name == 'Random Forest':
-                best_params['n_jobs'] = -1
+                best_params['n_jobs'] = n_jobs
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -3313,7 +3317,7 @@ def build_and_train_pipeline_dtw_phase(
             elif name == 'Random Forest':
                 model = model_class(
                     n_estimators=200, max_depth=12, min_samples_split=5,
-                    random_state=random_state, n_jobs=-1
+                    random_state=random_state, n_jobs=n_jobs
                 )
             else:
                 try:
@@ -3523,6 +3527,7 @@ def build_and_train_pipeline_basis(
     optimize_hyperparams=False,
     n_trials=50,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     Approach 2 — B-spline basis expansion pipeline.
@@ -3648,7 +3653,7 @@ def build_and_train_pipeline_basis(
                 else:
                     params = {}
                 base = model_class(**params)
-                m = MultiOutputRegressor(base, n_jobs=-1)
+                m = MultiOutputRegressor(base, n_jobs=n_jobs)
                 m.fit(X_train, Y_train)
                 Y_pred = m.predict(X_val)
                 return float(np.mean([r2_score(Y_val[:, k], Y_pred[:, k])
@@ -3661,7 +3666,7 @@ def build_and_train_pipeline_basis(
             if name in ('Gradient Boosting', 'Random Forest'):
                 best_params['random_state'] = random_state
             if name == 'Random Forest':
-                best_params['n_jobs'] = -1
+                best_params['n_jobs'] = n_jobs
             base_model = model_class(**best_params)
         else:
             if name == 'Gradient Boosting':
@@ -3672,7 +3677,7 @@ def build_and_train_pipeline_basis(
             elif name == 'Random Forest':
                 base_model = model_class(
                     n_estimators=200, max_depth=12, min_samples_split=5,
-                    random_state=random_state, n_jobs=-1
+                    random_state=random_state, n_jobs=n_jobs
                 )
             else:
                 try:
@@ -3680,7 +3685,7 @@ def build_and_train_pipeline_basis(
                 except TypeError:
                     base_model = model_class()
 
-        model = MultiOutputRegressor(base_model, n_jobs=-1)
+        model = MultiOutputRegressor(base_model, n_jobs=n_jobs)
         model.fit(X_train, Y_train)
 
         Y_train_pred = model.predict(X_train)
@@ -3841,6 +3846,7 @@ def build_and_train_pipeline_exog(
     optimize_hyperparams=False,
     n_trials=50,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     DTW baseline enriched with ef_* external-factor time series as features.
@@ -4780,6 +4786,7 @@ def build_and_train_pipeline_seq2seq_exog(
     teacher_forcing_ratio=0.5,
     patience=10,
     verbose=1,
+    n_jobs=-1,
 ):
     """
     DTW + Seq2Seq + External Factors pipeline.
@@ -5055,6 +5062,41 @@ def _dispatch_predict(raw_values, curve, pipeline):
         return predict_raw_curve_seq2seq_exog(raw_values, act, attrs, pipeline,
                                               exog_values=curve.get('exog_values', {}))
     return predict_raw_curve(raw_values, act, attrs, pipeline)
+
+
+def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1):
+    """
+    Top-level (picklable) worker for parallel pipeline training.
+    Trains one pipeline for a single (sensor, activity, object) combination.
+    Must be a module-level function so joblib/loky can pickle it.
+    """
+    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import GradientBoostingRegressor
+
+    curves, _ = split_curves(
+        df_train,
+        variable=sensor,
+        activities=[activity],
+        objects=[obj],
+        test_size=0.0,
+        verbose=0,
+    )
+    if len(curves) < 5:
+        return sensor, activity, obj, None
+    pipeline = build_and_train_pipeline(
+        curves,
+        variable=sensor,
+        fixed_length=100,
+        val_size=0.2,
+        models={
+            'Linear Regression': LinearRegression,
+            'Gradient Boosting': GradientBoostingRegressor,
+        },
+        optimize_hyperparams=False,
+        verbose=0,
+        n_jobs=n_jobs,
+    )
+    return sensor, activity, obj, pipeline
 
 
 def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1, save_dir=None):
@@ -5398,12 +5440,12 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
                         'max_depth': trial.suggest_int('max_depth', 5, 20),
                         'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
                         'random_state': random_state,
-                        'n_jobs': -1
+                        'n_jobs': n_jobs
                     }
                 else:
                     # For other models, no hyperparameter optimization defined
                     params = {}
-                
+
                 model = model_class(**params)
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_test)
@@ -5420,7 +5462,7 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
                 best_params['random_state'] = random_state
             elif name == 'Random Forest':
                 best_params['random_state'] = random_state
-                best_params['n_jobs'] = -1
+                best_params['n_jobs'] = n_jobs
             
             print(f"  Best params: {best_params}")
             model = model_class(**best_params)
@@ -5434,7 +5476,7 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
             elif name == 'Random Forest':
                 model = model_class(
                     n_estimators=200, max_depth=12, min_samples_split=5,
-                    random_state=random_state, n_jobs=-1
+                    random_state=random_state, n_jobs=n_jobs
                 )
             else:
                 # For other models, try with random_state, if not supported, without
