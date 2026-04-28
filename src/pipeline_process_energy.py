@@ -2322,6 +2322,7 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                             from sim_extractor import split_curves, build_and_train_pipeline, predict_raw_curve
                             from sklearn.linear_model import LinearRegression
                             from sklearn.ensemble import GradientBoostingRegressor
+                            from joblib import Parallel, delayed
 
                             _energy_pipelines = {}
 
@@ -2334,40 +2335,53 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                                     raw_values, activity, object_attributes, pipeline=ep_bound
                                 )
 
-                            for _sensor in _sensors:
-                                _energy_pipelines[_sensor] = {}
-                                for _activity in _activities_list:
-                                    _energy_pipelines[_sensor][_activity] = {}
-                                    for _object in _objects_list:
-                                        print(f"\n  ℹ️ Training pipeline: sensor={_sensor} | activity={_activity} | object={_object}")
-                                        _train_curves, _ = split_curves(
-                                            _df_expanded_train,
-                                            variable=_sensor,
-                                            activities=[_activity],
-                                            objects=[_object],
-                                            test_size=0.0,
-                                            verbose=0,
-                                        )
-                                        if len(_train_curves) < 5:
-                                            print(f"    ⚠️  Only {len(_train_curves)} curves — skipping (too few samples).")
-                                            continue
-                                        _ep_pipeline = build_and_train_pipeline(
-                                            _train_curves,
-                                            variable=_sensor,
-                                            fixed_length=100,
-                                            val_size=0.2,
-                                            models={
-                                                'Linear Regression': LinearRegression,
-                                                'Gradient Boosting': GradientBoostingRegressor,
-                                            },
-                                            optimize_hyperparams=False,
-                                            verbose=VERBOSE_EVAL
-                                        )
-                                        _energy_pipelines[_sensor][_activity][_object] = {
-                                            'reference_curve': _ep_pipeline['reference_curve'],
-                                            'predict_fn':      _make_predict_fn(_ep_pipeline),
-                                            'full_pipeline':   _ep_pipeline,
-                                        }
+                            def _train_one(sensor, activity, obj, df_train):
+                                curves, _ = split_curves(
+                                    df_train,
+                                    variable=sensor,
+                                    activities=[activity],
+                                    objects=[obj],
+                                    test_size=0.0,
+                                    verbose=0,
+                                )
+                                if len(curves) < 5:
+                                    return sensor, activity, obj, None
+                                pipeline = build_and_train_pipeline(
+                                    curves,
+                                    variable=sensor,
+                                    fixed_length=100,
+                                    val_size=0.2,
+                                    models={
+                                        'Linear Regression': LinearRegression,
+                                        'Gradient Boosting': GradientBoostingRegressor,
+                                    },
+                                    optimize_hyperparams=False,
+                                    verbose=0,
+                                )
+                                return sensor, activity, obj, pipeline
+
+                            _combos = [
+                                (s, a, o)
+                                for s in _sensors
+                                for a in _activities_list
+                                for o in _objects_list
+                            ]
+                            print(f"\n  ℹ️ Training {len(_combos)} pipelines in parallel (n_jobs=-1)...")
+
+                            _results = Parallel(n_jobs=-1, backend='loky')(
+                                delayed(_train_one)(s, a, o, _df_expanded_train)
+                                for s, a, o in _combos
+                            )
+
+                            for _sensor, _activity, _object, _ep_pipeline in _results:
+                                if _ep_pipeline is None:
+                                    print(f"    ⚠️  Skipped {_sensor} | {_activity} | {_object} (too few curves).")
+                                    continue
+                                _energy_pipelines.setdefault(_sensor, {}).setdefault(_activity, {})[_object] = {
+                                    'reference_curve': _ep_pipeline['reference_curve'],
+                                    'predict_fn':      _make_predict_fn(_ep_pipeline),
+                                    'full_pipeline':   _ep_pipeline,
+                                }
 
                             all_energy_pipelines[process] = _energy_pipelines
                         else:
