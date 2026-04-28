@@ -256,15 +256,17 @@ RUN_TEST_EVALUATION      = True   # evaluate on held-out test set
 RUN_CURVE_ONLY_EVALUATION = True  # run curve-quality benchmark (MAE/RMSE/R²)
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
-#    'baseline'        DTW + position index (sklearn regressor)
-#    'instance_stats'  DTW + per-curve stats  (leaky — known invalid)
-#    'istats_leakfree' DTW + two-stage leak-free stats
-#    'dtw_phase'       DTW + phase features
-#    'basis'           DTW + B-spline basis expansion
-#    'exog'            DTW + external factors (ef_* columns)
-#    'seq2seq'         DTW + LSTM encoder-decoder
-#    'seq2seq_only'    LSTM encoder-decoder, no DTW
-#    'seq2seq_exog'    DTW + LSTM encoder-decoder + external factors
+#    'baseline'          DTW + position index (sklearn regressor)
+#    'instance_stats'    DTW + per-curve stats  (leaky — known invalid)
+#    'istats_leakfree'   DTW + two-stage leak-free stats
+#    'dtw_phase'         DTW + phase features
+#    'basis'             DTW + B-spline basis expansion
+#    'exog'              DTW + external factors (ef_* columns)
+#    'amplitude_shape'   Separate amplitude (curve_mean) from shape (z-score);
+#                        stage A predicts amplitude from metadata, stage B shape
+#    'seq2seq'           DTW + LSTM encoder-decoder
+#    'seq2seq_only'      LSTM encoder-decoder, no DTW
+#    'seq2seq_exog'      DTW + LSTM encoder-decoder + external factors
 APPROACHES = [
     'baseline',
     # 'instance_stats',
@@ -272,6 +274,7 @@ APPROACHES = [
     # 'dtw_phase',
     # 'basis',
     # 'exog',
+    'amplitude_shape',
     'seq2seq',
     'seq2seq_only',
     'seq2seq_exog',
@@ -1786,7 +1789,7 @@ process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
 process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
 # process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
 # process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
@@ -1801,7 +1804,7 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 # %%
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
-processes_to_run = ['process_2']
+# processes_to_run = ['process_2']
 
 
 
@@ -2586,6 +2589,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         build_and_train_pipeline_dtw_phase,  predict_raw_curve_dtw_phase,
         build_and_train_pipeline_basis,      predict_raw_curve_basis,
         build_and_train_pipeline_exog,            predict_raw_curve_exog,
+        build_and_train_pipeline_amplitude_shape, predict_raw_curve_amplitude_shape,
         build_and_train_pipeline_seq2seq,         predict_raw_curve_seq2seq,
         build_and_train_pipeline_seq2seq_only,    predict_raw_curve_seq2seq_only,
         build_and_train_pipeline_seq2seq_exog,    predict_raw_curve_seq2seq_exog,
@@ -2599,6 +2603,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_dtw_phase       = {}   # Approach 3
     all_energy_pipelines_basis           = {}   # Approach 2
     all_energy_pipelines_exog            = {}   # DTW + External Factors
+    all_energy_pipelines_amplitude_shape = {}   # Amplitude + Shape
     all_energy_pipelines_seq2seq         = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only    = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_exog    = {}   # DTW + Seq2Seq + Ext. Factors
@@ -2656,6 +2661,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_dtw_phase           = {}
         _pipelines_basis               = {}
         _pipelines_exog                = {}
+        _pipelines_amplitude_shape     = {}
         _pipelines_seq2seq             = {}
         _pipelines_seq2seq_only        = {}
         _pipelines_seq2seq_exog        = {}
@@ -2668,7 +2674,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         import concurrent.futures, os as _os
 
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog'}]
+                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','amplitude_shape'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_exog'}]
 
@@ -2735,6 +2741,12 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['exog']['reference_curve'],
                         'predict_fn':      lambda rv, act, attrs, exog=None, ep=_r['exog']: predict_raw_curve_exog(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
                         'full_pipeline':   _r['exog'],
+                    }
+                if 'amplitude_shape' in _r:
+                    _pipelines_amplitude_shape.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['amplitude_shape']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_amplitude_shape(rv, act, attrs, pipeline=ep))(_r['amplitude_shape']),
+                        'full_pipeline':   _r['amplitude_shape'],
                     }
 
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
@@ -2806,6 +2818,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_dtw_phase[_proc]        = _pipelines_dtw_phase
         all_energy_pipelines_basis[_proc]            = _pipelines_basis
         all_energy_pipelines_exog[_proc]             = _pipelines_exog
+        all_energy_pipelines_amplitude_shape[_proc]  = _pipelines_amplitude_shape
         all_energy_pipelines_seq2seq[_proc]          = _pipelines_seq2seq
         all_energy_pipelines_seq2seq_only[_proc]     = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_exog[_proc]     = _pipelines_seq2seq_exog
@@ -2919,6 +2932,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('Approach 2 (B-spline)',       all_energy_pipelines_basis),
             ('Approach 3 (DTW-phase)',      all_energy_pipelines_dtw_phase),
             ('DTW + Ext. Factors',          all_energy_pipelines_exog),
+            ('Amplitude + Shape',           all_energy_pipelines_amplitude_shape),
             ('DTW + Seq2Seq',               all_energy_pipelines_seq2seq),
             ('Seq2Seq only',                all_energy_pipelines_seq2seq_only),
             ('DTW + Seq2Seq + Ext. Factors', all_energy_pipelines_seq2seq_exog),
