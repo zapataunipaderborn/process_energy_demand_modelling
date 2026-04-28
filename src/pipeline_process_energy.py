@@ -2939,11 +2939,11 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
         # ── Master summary table: Process × Sensor × Approach, TRAIN and TEST ─
         display(Markdown("---"))
-        display(Markdown("## Model Summary — Train & Test metrics per Process / Sensor / Approach"))
+        display(Markdown("## Model Summary — Train & Test metrics per Process / Sensor / Approach (median over curves)"))
         _summary = (
             _all_df
             .groupby(['Process', 'Sensor', 'Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
-            .mean()
+            .median()
             .round(4)
         )
         # Unstack Split so TRAIN / TEST appear as column groups side by side
@@ -2959,14 +2959,14 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         report(_summary_wide.to_string())
 
         display(Markdown("---"))
-        display(Markdown("## Detailed comparison — TEST set"))
+        display(Markdown("## Detailed comparison — TEST set (median over curves)"))
 
         _test_df = _all_df[_all_df['Split'] == 'TEST']
         if not _test_df.empty:
             _compare = (
                 _test_df
                 .groupby(['Approach', 'Process', 'Sensor'])[['MAE', 'RMSE', 'WAPE', 'R2']]
-                .mean()
+                .median()
                 .round(4)
             )
             display(_compare)
@@ -2974,11 +2974,11 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             report(_compare.to_string())
 
             # ── Per-activity table ───────────────────────────────────────────
-            display(Markdown("### Per-activity breakdown (TEST)"))
+            display(Markdown("### Per-activity breakdown (TEST) — median over curves"))
             _act_compare = (
                 _test_df
                 .groupby(['Approach', 'Process', 'Sensor', 'Activity'])[['MAE', 'RMSE', 'WAPE', 'R2']]
-                .mean()
+                .median()
                 .round(4)
             )
             display(_act_compare)
