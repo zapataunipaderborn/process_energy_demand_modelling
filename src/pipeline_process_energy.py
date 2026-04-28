@@ -272,9 +272,9 @@ APPROACHES = [
     # 'dtw_phase',
     # 'basis',
     # 'exog',
-    # 'seq2seq',
-    # 'seq2seq_only',
-    # 'seq2seq_exog',
+    'seq2seq',
+    'seq2seq_only',
+    'seq2seq_exog',
 ]
 
 # ── Seq2Seq hyperparameters ───────────────────────────────────────────────────
@@ -1783,8 +1783,8 @@ process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
 process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
 # process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
@@ -1798,7 +1798,7 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 # %%
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
-# processes_to_run = ['process_2']
+processes_to_run = ['process_2']
 
 
 
