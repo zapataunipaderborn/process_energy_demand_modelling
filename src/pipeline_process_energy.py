@@ -691,12 +691,37 @@ production_plan = df.copy()
 print(f"production plan")
 print(production_plan)
 
+
+relevant_columns = [
+      'ef_apparent_temperature_energy', 'datetime_energy',
+       'status_name_energy', 'pro_menge_kg_energy', 'ef_wind_speed_10m_energy',
+       'ef_precipitation_energy', 'medium_power_kW_energy',
+       'ef_wind_direction_100m_energy', 'pro_volstrom_l/h_energy',
+       'dampfmenge_kg/h_nmb+cip_energy', 'cip_turm_f_energy',
+       'ef_relative_humidity_2m_energy', 'cip_turm_g_energy',
+       'ef_temperature_2m_energy', 'pro_power_kW_energy',
+       'pro_temp_out_energy', 'ef_global_tilted_irradiance_energy',
+       'timestamp_start_log', 'timestamp_end_log', 'activity_log',
+       'higher_level_activity_log', 'object_type_log', 'object_log',
+       'case_id_log', 'object_attributes_log']
+
+df_expanded = df_expanded[relevant_columns].copy()
+
 process_datasets['process_2'] = {
     'expanded': df_expanded,
     'event_log': df_event_log,
     'production_plan': production_plan
 }
+# display(df_expanded)
 
+
+
+
+# %%
+display(df_expanded.columns)
+
+# %%
+stop
 # %%
 variable = 'pro_volstrom_l/h_energy'
 
@@ -1579,7 +1604,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
                         mae = np.mean(np.abs(y_real - y_sim_resampled))
                         rmse = np.sqrt(np.mean((y_real - y_sim_resampled)**2))
                         denom = np.sum(np.abs(y_real))
-                        wape = np.sum(np.abs(y_real - y_sim_resampled)) / denom if denom > 0 else 0
+                        wape = np.sum(np.abs(y_real - y_sim_resampled)) / denom * 100 if denom > 0 else 0
                         
                         if sensor not in sensor_metrics:
                             sensor_metrics[sensor] = {'mae': [], 'rmse': [], 'wape': []}
@@ -1804,7 +1829,7 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 # %%
 
 processes_to_run = ['process_2', 'process_3', 'process_4']
-# processes_to_run = ['process_2']
+processes_to_run = ['process_2']
 
 
 
@@ -2857,6 +2882,10 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                 for _o, _ep in _obj_map.items()
             ]
 
+            if not _leaf_eps:
+                print(f"  [WARN] {approach_label} | {_proc} | {_sensor}: no leaf pipelines found, sensor_val keys={list(_sensor_val.keys())[:5]}")
+                continue
+
             for _leaf_acts, _leaf_objs, _ep in _leaf_eps:
                 _fp = _ep.get('full_pipeline', {})
                 _exog_cols_eval = _fp.get('exog_cols', []) if _fp.get('approach') in ('exog', 'seq2seq_exog') else None
@@ -2864,6 +2893,7 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                                           test_size=0.0, verbose=0,
                                           exog_columns=_exog_cols_eval)
                 if not _curves:
+                    print(f"  [WARN] {approach_label} | {_proc} | {_sensor} | act={_leaf_acts} obj={_leaf_objs}: split_curves returned 0 curves")
                     continue
                 show_plots = (split_label == 'TEST')
                 _curve_save = None
@@ -2948,8 +2978,28 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _all_records.extend(_recs)
 
     # ── Side-by-side comparison table ───────────────────────────────────────
+    if not _all_records:
+        print("[ERROR] _all_records is empty — no curves were evaluated. Check WARN messages above.")
     if _all_records:
         _all_df = pd.DataFrame(_all_records)
+
+        # ── Top-level table: Approach × Split (all sensors/processes aggregated) ─
+        display(Markdown("---"))
+        display(Markdown("## Approach Comparison — Train & Test (median over ALL sensors, processes, curves)"))
+        _appr_summary = (
+            _all_df
+            .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+            .median()
+            .round(4)
+            .unstack('Split')
+        )
+        _appr_summary.columns = [f'{m}_{s}' for m, s in _appr_summary.columns]
+        _a_train = [c for c in _appr_summary.columns if c.endswith('_TRAIN')]
+        _a_test  = [c for c in _appr_summary.columns if c.endswith('_TEST')]
+        _appr_summary = _appr_summary[_a_train + _a_test]
+        display(_appr_summary)
+        report("\nAPPROACH COMPARISON (TRAIN & TEST)")
+        report(_appr_summary.to_string())
 
         # ── Master summary table: Process × Sensor × Approach, TRAIN and TEST ─
         display(Markdown("---"))

@@ -5741,65 +5741,97 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
     # ------------------------------------------------------------------
     # GRID PLOTTING (3 columns)
     # ------------------------------------------------------------------
+    import os as _os
+    import itertools as _itertools
+
+    _sensor_slug = (
+        pipeline.get('variable_name', 'sensor')
+        .replace('/', '-').replace(' ', '_')[:80]
+    )
+    _approach = pipeline.get('approach', 'baseline')
+
+    # When saving to disk: plot every curve grouped by activity.
+    # When only displaying interactively: respect max_plot_curves.
+    if save_dir is not None:
+        _os.makedirs(save_dir, exist_ok=True)
+        # Group curves by activity and save one figure per (activity) group
+        from collections import defaultdict as _dd
+        _by_activity = _dd(list)
+        for _c in test_curves:
+            _by_activity[_c['activity']].append(_c)
+
+        for _act, _act_curves in _by_activity.items():
+            _act_slug = _act.replace('/', '-').replace(' ', '_')[:60]
+            _n = len(_act_curves)
+            _n_cols = 3
+            _n_rows = int(np.ceil(_n / _n_cols))
+            _fig, _axes = plt.subplots(_n_rows, _n_cols,
+                                       figsize=(14, 4.5 * max(_n_rows, 1)))
+            _axes = np.array(_axes).reshape(-1)
+            for _ax, _curve in zip(_axes[:_n], _act_curves):
+                _rv = _curve['original_values']
+                _yp = _dispatch_predict(_rv, _curve, pipeline)
+                _r2  = r2_score(_rv, _yp)
+                _rms = np.sqrt(mean_squared_error(_rv, _yp))
+                _ax.plot(_rv, label='Actual', color='steelblue', linewidth=2)
+                _ax.plot(_yp, label='Predicted', color='tomato',
+                         linewidth=2, linestyle='--')
+                _ax.set_title(
+                    f"ID {_curve['instance_id']} | {_act}\n"
+                    f"R²={_r2:.3f}  RMSE={_rms:.4f}", fontsize=9)
+                _ax.set_xlabel("Time step")
+                _ax.set_ylabel("Energy")
+                _ax.grid(True, alpha=0.3)
+                _ax.legend(fontsize=8)
+            for _ax in _axes[_n:]:
+                _ax.set_visible(False)
+            _fig.suptitle(
+                f"{_approach} | {_sensor_slug} | {_act}",
+                fontsize=12, fontweight='bold')
+            plt.tight_layout()
+            _save_path = _os.path.join(
+                save_dir, f"{_approach}__{_sensor_slug}__{_act_slug}.png")
+            plt.savefig(_save_path, dpi=150, bbox_inches='tight')
+            plt.close(_fig)
+
     if verbose:
         n_plot = min(max_plot_curves, len(test_curves))
-
         n_cols = 3
         n_rows = int(np.ceil(n_plot / n_cols))
 
         fig, axes = plt.subplots(
             n_rows, n_cols,
-            figsize=(14, 4.5 * n_rows) # Increased height for suptitle room
+            figsize=(14, 4.5 * n_rows)
         )
-
-        # Very prominent main overall title for the figure
-        fig.suptitle(f"ENERGY CURVE EVALUATION (TEST SET)\nSensor: {pipeline.get('variable_name', 'Unknown')}", 
-                     fontsize=18, fontweight='bold', color='navy', y=0.98)
-        
-        plt.subplots_adjust(top=0.9) # Make room for suptitle
-
-        axes = np.array(axes).reshape(-1)  # flatten safely
+        fig.suptitle(
+            f"ENERGY CURVE EVALUATION (TEST SET)\nSensor: {pipeline.get('variable_name', 'Unknown')}",
+            fontsize=18, fontweight='bold', color='navy', y=0.98)
+        plt.subplots_adjust(top=0.9)
+        axes = np.array(axes).reshape(-1)
 
         for ax, curve in zip(axes[:n_plot], test_curves[:n_plot]):
             raw_values = curve['original_values']
             y_pred = _dispatch_predict(raw_values, curve, pipeline)
-
             r2_val   = r2_score(raw_values, y_pred)
             rmse_val = np.sqrt(mean_squared_error(raw_values, y_pred))
-
             ax.plot(raw_values, label='Actual (raw)', color='steelblue', linewidth=2)
             ax.plot(y_pred, label='Predicted', color='tomato',
                     linewidth=2, linestyle='--')
-
             ax.set_title(
                 f"ID {curve['instance_id']} | {curve['activity']}\n"
-                f"R2={r2_val:.3f}  RMSE={rmse_val:.4f}",
-                fontsize=9
-            )
+                f"R2={r2_val:.3f}  RMSE={rmse_val:.4f}", fontsize=9)
             ax.set_xlabel("Time step")
             ax.set_ylabel("Energy")
             ax.grid(True, alpha=0.3)
             ax.legend(fontsize=8)
 
-        # Hide unused subplots
         for ax in axes[n_plot:]:
             ax.set_visible(False)
 
         plt.suptitle(
-            f"Test Evaluation: Raw Predicted vs Raw Actual (original energy units)\nSensor: {pipeline.get('variable_name', 'Unknown')}",
-            fontsize=14, fontweight='bold', y=1.02
-        )
+            f"Test Evaluation: Raw Predicted vs Raw Actual\nSensor: {pipeline.get('variable_name', 'Unknown')}",
+            fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        if save_dir is not None:
-            import os as _os
-            _os.makedirs(save_dir, exist_ok=True)
-            _sensor_slug = (
-                pipeline.get('variable_name', 'sensor')
-                .replace('/', '-').replace(' ', '_')[:80]
-            )
-            _approach = pipeline.get('approach', 'baseline')
-            _save_path = _os.path.join(save_dir, f"{_approach}__{_sensor_slug}.png")
-            plt.savefig(_save_path, dpi=150, bbox_inches='tight')
         plt.show()
 
     return metrics_df, agg_metrics
