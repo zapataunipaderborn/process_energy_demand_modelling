@@ -10,13 +10,13 @@ import json
 
 # %%
 
-experiment = 'experiment_1'
+experiment = '1'
 resolution = 'original_resolution'
 visuals = True
 
 current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
-folder_gold_base = current_path.parent / 'data' / 'gold' / experiment 
-folder_silver_base = current_path.parent / 'data' / 'silver' 
+folder_gold_base = current_path.parent / 'data' / 'gold' / f'experiment_{experiment}'
+folder_silver_base = current_path.parent / 'data' / 'silver' / f'experiment_{experiment}'
 
 info = {
     'experiment': experiment,
