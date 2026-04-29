@@ -124,7 +124,7 @@ print(process_datasets.keys())
 
 # %%
 processes_to_run = ['process_2', 'process_3', 'process_4']
-processes_to_run = ['process_2']
+# processes_to_run = ['process_2']
 
 
 process_datasets_to_model = process_datasets
@@ -136,9 +136,9 @@ process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
 
 process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
-process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
-process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
+# process_datasets_to_model_sensors['process_2']['objects_to_model'] = ['l01']
+# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
+# process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
 # process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
@@ -2197,25 +2197,28 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                         save_dir,
                         approach_label.replace(' ', '_').replace('/', '-'),
                     )
-                _metrics_df, _agg = evaluate_pipeline_on_test(
-                    _curves, _ep['full_pipeline'],
-                    max_plot_curves=6 if show_plots else 0,
-                    verbose=1 if show_plots else 0,
-                    save_dir=_curve_save,
-                )
-                for _, _r in _metrics_df.iterrows():
-                    records.append({
-                        'Approach': approach_label,
-                        'Process':  _proc,
-                        'Sensor':   _sensor,
-                        'Split':    split_label,
-                        'Activity': _r['activity'],
-                        'N':        _r['n_points'],
-                        'MAE':      _r['MAE'],
-                        'RMSE':     _r['RMSE'],
-                        'WAPE':     _r['WAPE (%)'],
-                        'R2':       _r['R2'],
-                    })
+                try:
+                    _metrics_df, _agg = evaluate_pipeline_on_test(
+                        _curves, _ep['full_pipeline'],
+                        max_plot_curves=6 if show_plots else 0,
+                        verbose=1 if show_plots else 0,
+                        save_dir=_curve_save,
+                    )
+                    for _, _r in _metrics_df.iterrows():
+                        records.append({
+                            'Approach': approach_label,
+                            'Process':  _proc,
+                            'Sensor':   _sensor,
+                            'Split':    split_label,
+                            'Activity': _r['activity'],
+                            'N':        _r['n_points'],
+                            'MAE':      _r['MAE'],
+                            'RMSE':     _r['RMSE'],
+                            'WAPE':     _r['WAPE (%)'],
+                            'R2':       _r['R2'],
+                        })
+                except Exception as _eval_e:
+                    print(f"  [ERROR] {approach_label} | {_proc} | {_sensor} | act={_leaf_acts}: {_eval_e}")
     return records
 
 
@@ -2343,70 +2346,75 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             display(_act_compare)
 
             # ── R² heatmap — one subplot per approach ────────────────────────
-            _approaches = _test_df['Approach'].unique()
-            fig_h, axes_h = plt.subplots(
-                1, len(_approaches),
-                figsize=(max(8, _test_df['Activity'].nunique() * 1.4) * len(_approaches),
-                         max(3, _test_df[['Process', 'Sensor']].drop_duplicates().shape[0] * 1.2))
-            )
-            if len(_approaches) == 1:
-                axes_h = [axes_h]
+            try:
+                _approaches = _test_df['Approach'].unique()
+                fig_h, axes_h = plt.subplots(
+                    1, len(_approaches),
+                    figsize=(max(8, _test_df['Activity'].nunique() * 1.4) * len(_approaches),
+                             max(3, _test_df[['Process', 'Sensor']].drop_duplicates().shape[0] * 1.2))
+                )
+                axes_h = np.array(axes_h).reshape(-1)
 
-            for ax_h, _appr in zip(axes_h, _approaches):
-                _sub = _test_df[_test_df['Approach'] == _appr]
-                _ph = _sub.pivot_table(
-                    index=['Process', 'Sensor'], columns='Activity',
-                    values='R2', aggfunc='mean'
-                )
-                sns.heatmap(
-                    _ph, annot=True, fmt='.3f', cmap='RdYlGn',
-                    vmin=0, vmax=1, linewidths=0.5, ax=ax_h,
-                    cbar_kws={'label': 'R²'}
-                )
-                ax_h.set_title(f'R² — {_appr}', fontsize=11, fontweight='bold')
-                ax_h.set_xticklabels(ax_h.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+                for ax_h, _appr in zip(axes_h, _approaches):
+                    _sub = _test_df[_test_df['Approach'] == _appr]
+                    _ph = _sub.pivot_table(
+                        index=['Process', 'Sensor'], columns='Activity',
+                        values='R2', aggfunc='mean'
+                    )
+                    sns.heatmap(
+                        _ph, annot=True, fmt='.3f', cmap='RdYlGn',
+                        vmin=0, vmax=1, linewidths=0.5, ax=ax_h,
+                        cbar_kws={'label': 'R²'}
+                    )
+                    ax_h.set_title(f'R² — {_appr}', fontsize=11, fontweight='bold')
+                    ax_h.set_xticklabels(ax_h.get_xticklabels(), rotation=30, ha='right', fontsize=8)
 
-            plt.suptitle('Curve R² per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
-            plt.tight_layout()
-            if EXPORT_RESULTS and '_run_dir' in dir():
-                _savefig('r2_heatmap_all_approaches')
-            plt.show()
-
-            # ── Delta heatmaps: each new approach minus baseline ─────────────
-            _base_pivot = _test_df[_test_df['Approach'] == 'Baseline (DTW + pos)'].pivot_table(
-                index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
-            )
-            for _delta_label, _delta_appr in [
-                ('Instance Stats',         'Instance Stats'),
-                ('Approach 2 (B-spline)', 'Approach 2 (B-spline)'),
-                ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
-                ('DTW + Ext. Factors',           'DTW + Ext. Factors'),
-                ('DTW + Seq2Seq',                'DTW + Seq2Seq'),
-                ('Seq2Seq only',                 'Seq2Seq only'),
-                ('DTW + Seq2Seq + Ext. Factors', 'DTW + Seq2Seq + Ext. Factors'),
-            ]:
-                _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
-                    index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
-                )
-                if _base_pivot.empty or _new_pivot.empty:
-                    continue
-                _delta = (_new_pivot - _base_pivot).reindex_like(_base_pivot)
-                fig_d, ax_d = plt.subplots(figsize=(max(8, len(_base_pivot.columns) * 1.4),
-                                                     max(3, len(_base_pivot) * 1.2)))
-                sns.heatmap(
-                    _delta, annot=True, fmt='.3f', cmap='RdYlGn',
-                    center=0, linewidths=0.5, ax=ax_d,
-                    cbar_kws={'label': f'ΔR² ({_delta_label} − Baseline)'}
-                )
-                ax_d.set_title(
-                    f'ΔR² {_delta_label} vs Baseline — green = {_delta_label} better',
-                    fontsize=11, fontweight='bold'
-                )
-                ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+                plt.suptitle('Curve R² per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
                 plt.tight_layout()
                 if EXPORT_RESULTS and '_run_dir' in dir():
-                    _savefig(f'delta_r2_{_delta_label.replace(" ", "_").replace("/", "-")}')
+                    _savefig('r2_heatmap_all_approaches')
                 plt.show()
+            except Exception as _e:
+                print(f"[WARN] R² heatmap failed: {_e}")
+
+            # ── Delta heatmaps: each new approach minus baseline ─────────────
+            try:
+                _base_pivot = _test_df[_test_df['Approach'] == 'Baseline (DTW + pos)'].pivot_table(
+                    index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
+                )
+                for _delta_label, _delta_appr in [
+                    ('Instance Stats',         'Instance Stats'),
+                    ('Approach 2 (B-spline)', 'Approach 2 (B-spline)'),
+                    ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
+                    ('DTW + Ext. Factors',           'DTW + Ext. Factors'),
+                    ('DTW + Seq2Seq',                'DTW + Seq2Seq'),
+                    ('Seq2Seq only',                 'Seq2Seq only'),
+                    ('DTW + Seq2Seq + Ext. Factors', 'DTW + Seq2Seq + Ext. Factors'),
+                ]:
+                    _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
+                        index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
+                    )
+                    if _base_pivot.empty or _new_pivot.empty:
+                        continue
+                    _delta = (_new_pivot - _base_pivot).reindex_like(_base_pivot)
+                    fig_d, ax_d = plt.subplots(figsize=(max(8, len(_base_pivot.columns) * 1.4),
+                                                         max(3, len(_base_pivot) * 1.2)))
+                    sns.heatmap(
+                        _delta, annot=True, fmt='.3f', cmap='RdYlGn',
+                        center=0, linewidths=0.5, ax=ax_d,
+                        cbar_kws={'label': f'ΔR² ({_delta_label} − Baseline)'}
+                    )
+                    ax_d.set_title(
+                        f'ΔR² {_delta_label} vs Baseline — green = {_delta_label} better',
+                        fontsize=11, fontweight='bold'
+                    )
+                    ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+                    plt.tight_layout()
+                    if EXPORT_RESULTS and '_run_dir' in dir():
+                        _savefig(f'delta_r2_{_delta_label.replace(" ", "_").replace("/", "-")}')
+                    plt.show()
+            except Exception as _e:
+                print(f"[WARN] Delta heatmaps failed: {_e}")
 
 elif RUN_CURVE_ONLY_EVALUATION:
     display(Markdown(
@@ -2644,6 +2652,27 @@ else:
             _sw_path = os.path.join(_run_dir, 'summary_train_test.parquet')
             _sw.reset_index().to_parquet(_sw_path, index=False)
             print(f"Saved summary  → {_sw_path}")
+
+        _as = globals().get('_appr_summary')
+        if _as is None or _as.empty:
+            # rebuild from raw records if the display block didn't produce it
+            _as_raw = (
+                _export_df
+                .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+                .median()
+                .round(4)
+                .unstack('Split')
+            )
+            _as_raw.columns = [f'{m}_{s}' for m, s in _as_raw.columns]
+            _a_tr = [c for c in _as_raw.columns if c.endswith('_TRAIN')]
+            _a_te = [c for c in _as_raw.columns if c.endswith('_TEST')]
+            _as = _as_raw[_a_tr + _a_te]
+        if not _as.empty:
+            _as_path = os.path.join(_run_dir, 'summary_by_approach.parquet')
+            _as.reset_index().to_parquet(_as_path, index=False)
+            print(f"Saved approach summary → {_as_path}")
+            display(Markdown("## Approach Summary (saved to parquet)"))
+            display(_as)
     else:
         print("No curve evaluation results found — skipping parquet export.")
 
