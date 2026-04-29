@@ -96,7 +96,14 @@ from xgboost import XGBRegressor
 from pathlib import Path
 import pandas as pd
 
-experiment = '1'
+experiment          = os.environ.get('PIPELINE_DATA_EXPERIMENT', '1')
+# ── Temporal resolution for df_expanded aggregation ──────────────────────────
+#   'original' → no aggregation (keep raw rows)
+#   '1min'     → resample to 1-minute bins
+#   '5min'     → resample to 5-minute bins
+#   '15min'    → resample to 15-minute bins
+TEMPORAL_RESOLUTION = os.environ.get('PIPELINE_TEMPORAL_RESOLUTION', 'original')
+
 current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
 folder_gold_base = current_path.parent / 'data' / 'gold' / f'experiment_{experiment}'
 
@@ -122,9 +129,24 @@ for process_dir in sorted(folder_gold_base.glob('process_*')):
 
 print(process_datasets.keys())
 
+# ── Aggregate df_expanded to the requested temporal resolution ────────────────
+def _aggregate_expanded(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    df = df.copy()
+    df['datetime_energy'] = pd.to_datetime(df['datetime_energy'])
+    numeric_cols = df.select_dtypes(include='number').columns.tolist()
+    non_numeric_cols = [c for c in df.columns if c != 'datetime_energy' and c not in numeric_cols]
+    agg_dict = {c: 'mean' for c in numeric_cols}
+    agg_dict.update({c: 'first' for c in non_numeric_cols})
+    return df.resample(freq, on='datetime_energy').agg(agg_dict).reset_index()
+
+if TEMPORAL_RESOLUTION != 'original':
+    for _pname, _pdata in process_datasets.items():
+        _pdata['expanded'] = _aggregate_expanded(_pdata['expanded'], TEMPORAL_RESOLUTION)
+    print(f"df_expanded aggregated to {TEMPORAL_RESOLUTION} resolution.")
+
 # %%
-processes_to_run = ['process_2', 'process_3', 'process_4']
-# processes_to_run = ['process_2']
+_env_processes   = os.environ.get('PIPELINE_PROCESSES_TO_RUN')
+processes_to_run = _env_processes.split(',') if _env_processes else ['process_2', 'process_3', 'process_4']
 
 
 process_datasets_to_model = process_datasets
@@ -299,7 +321,6 @@ ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
 ML_OPTIMIZE_HYPERPARAMS = False    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
 
-
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION  —  edit everything here, nothing else needs to change
@@ -354,8 +375,9 @@ EXPORT_RESULTS = True   # save parquet + HTML to results/<timestamp>/
 # ── Run folder + live log (created immediately so log captures everything) ───
 import datetime as _dt
 _run_ts       = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+_run_name     = os.environ.get('PIPELINE_RUN_NAME', f'experiment_{experiment}')
 _results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
-_run_dir = os.path.join(_results_root, f"experiment_{experiment}_{_run_ts}")
+_run_dir = os.path.join(_results_root, f"{_run_name}_{_run_ts}")
 _plots_dir    = os.path.join(_run_dir, 'plots')
 os.makedirs(_plots_dir, exist_ok=True)
 os.makedirs(os.path.join(_run_dir, 'curves'), exist_ok=True)
@@ -2709,6 +2731,21 @@ else:
     print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
     print(f"  plots/curves/  → {os.path.join(_run_dir, 'curves')}")
     print(f"  plots/         → {os.path.join(_run_dir, 'plots')}")
+
+    # ── info.json ─────────────────────────────────────────────────────────────
+    import json as _json
+    _info = {
+        'run_name': _run_name,
+        'run_timestamp': _run_ts,
+        'data_experiment': experiment,
+        'temporal_resolution': TEMPORAL_RESOLUTION,
+        'processes': processes_to_run,
+        'approaches': APPROACHES,
+    }
+    _info_path = os.path.join(_run_dir, 'info.json')
+    with open(_info_path, 'w') as _f:
+        _json.dump(_info, _f, indent=2)
+    print(f"Saved info     → {_info_path}")
 
     _total_elapsed = _time.perf_counter() - _pipeline_start
     _h, _rem = divmod(int(_total_elapsed), 3600)
