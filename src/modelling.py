@@ -348,12 +348,13 @@ RUN_CURVE_ONLY_EVALUATION = True  # run curve-quality benchmark (MAE/RMSE/R²)
 #    'seq2seq_exog'      DTW + LSTM encoder-decoder + external factors
 APPROACHES = [
     'baseline',
-    # 'instance_stats',
+    'instance_stats',
     'istats_leakfree',
     # 'dtw_phase',
     # 'basis',
     'exog',
     'amplitude_shape',
+    'amplitude_shape_exog',
     'seq2seq',
     'seq2seq_only',
     # 'seq2seq_exog',
@@ -1931,6 +1932,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         build_and_train_pipeline_basis,      predict_raw_curve_basis,
         build_and_train_pipeline_exog,            predict_raw_curve_exog,
         build_and_train_pipeline_amplitude_shape, predict_raw_curve_amplitude_shape,
+        build_and_train_pipeline_amplitude_shape_exog, predict_raw_curve_amplitude_shape_exog,
         build_and_train_pipeline_seq2seq,         predict_raw_curve_seq2seq,
         build_and_train_pipeline_seq2seq_only,    predict_raw_curve_seq2seq_only,
         build_and_train_pipeline_seq2seq_exog,    predict_raw_curve_seq2seq_exog,
@@ -1945,7 +1947,8 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_dtw_phase       = {}   # Approach 3
     all_energy_pipelines_basis           = {}   # Approach 2
     all_energy_pipelines_exog            = {}   # DTW + External Factors
-    all_energy_pipelines_amplitude_shape = {}   # Amplitude + Shape
+    all_energy_pipelines_amplitude_shape      = {}   # Amplitude + Shape
+    all_energy_pipelines_amplitude_shape_exog = {}   # Amplitude + Shape + EF + temporal
     all_energy_pipelines_seq2seq         = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only    = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_exog    = {}   # DTW + Seq2Seq + Ext. Factors
@@ -2003,7 +2006,8 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_dtw_phase           = {}
         _pipelines_basis               = {}
         _pipelines_exog                = {}
-        _pipelines_amplitude_shape     = {}
+        _pipelines_amplitude_shape      = {}
+        _pipelines_amplitude_shape_exog = {}
         _pipelines_seq2seq             = {}
         _pipelines_seq2seq_only        = {}
         _pipelines_seq2seq_exog        = {}
@@ -2016,7 +2020,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         import concurrent.futures, os as _os
 
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','amplitude_shape'}]
+                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','amplitude_shape','amplitude_shape_exog'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_exog'}]
 
@@ -2089,6 +2093,12 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['amplitude_shape']['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_amplitude_shape(rv, act, attrs, pipeline=ep))(_r['amplitude_shape']),
                         'full_pipeline':   _r['amplitude_shape'],
+                    }
+                if 'amplitude_shape_exog' in _r:
+                    _pipelines_amplitude_shape_exog.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['amplitude_shape_exog']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_amplitude_shape_exog(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['amplitude_shape_exog']),
+                        'full_pipeline':   _r['amplitude_shape_exog'],
                     }
 
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
@@ -2186,7 +2196,8 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_dtw_phase[_proc]        = _pipelines_dtw_phase
         all_energy_pipelines_basis[_proc]            = _pipelines_basis
         all_energy_pipelines_exog[_proc]             = _pipelines_exog
-        all_energy_pipelines_amplitude_shape[_proc]  = _pipelines_amplitude_shape
+        all_energy_pipelines_amplitude_shape[_proc]      = _pipelines_amplitude_shape
+        all_energy_pipelines_amplitude_shape_exog[_proc] = _pipelines_amplitude_shape_exog
         all_energy_pipelines_seq2seq[_proc]          = _pipelines_seq2seq
         all_energy_pipelines_seq2seq_only[_proc]     = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_exog[_proc]     = _pipelines_seq2seq_exog
@@ -2310,6 +2321,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('Approach 3 (DTW-phase)',      all_energy_pipelines_dtw_phase),
             ('DTW + Ext. Factors',          all_energy_pipelines_exog),
             ('Amplitude + Shape',           all_energy_pipelines_amplitude_shape),
+            ('Amplitude + Shape + EF',      all_energy_pipelines_amplitude_shape_exog),
             ('DTW + Seq2Seq',               all_energy_pipelines_seq2seq),
             ('Seq2Seq only',                all_energy_pipelines_seq2seq_only),
             ('DTW + Seq2Seq + Ext. Factors', all_energy_pipelines_seq2seq_exog),
@@ -2394,6 +2406,80 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             )
             display(_act_compare)
 
+            # ── WAPE distribution per approach (boxplots) ───────────────────
+            try:
+                display(Markdown("---"))
+                display(Markdown("### WAPE Distribution — TEST set (per-curve boxplots)"))
+                _wape_cap = _test_df['WAPE'].quantile(0.95)
+                _appr_order = (
+                    _test_df.groupby('Approach')['WAPE'].median()
+                    .sort_values().index.tolist()
+                )
+                fig_wd, ax_wd = plt.subplots(figsize=(max(8, len(_appr_order) * 1.6), 6))
+                sns.boxplot(
+                    data=_test_df[_test_df['WAPE'] <= _wape_cap],
+                    x='Approach', y='WAPE',
+                    order=_appr_order,
+                    palette='tab10',
+                    width=0.5,
+                    flierprops=dict(marker='o', markersize=3, alpha=0.4),
+                    ax=ax_wd,
+                )
+                ax_wd.set_xticklabels(ax_wd.get_xticklabels(), rotation=25, ha='right')
+                ax_wd.set_ylabel('WAPE (%)')
+                ax_wd.set_xlabel('')
+                ax_wd.set_title(
+                    f'WAPE Distribution per Approach — TEST set  '
+                    f'(capped at {_wape_cap:.0f}% = 95th pct)',
+                    fontweight='bold'
+                )
+                ax_wd.grid(True, axis='y', alpha=0.3)
+                plt.tight_layout()
+                if EXPORT_RESULTS and '_run_dir' in dir():
+                    _savefig('wape_distribution')
+                plt.show()
+            except Exception as _e:
+                print(f"[WARN] WAPE distribution plot failed: {_e}")
+
+            # ── WAPE distribution — interactive Plotly version ───────────────
+            try:
+                import plotly.graph_objects as _go
+                _wape_cap_px = _test_df['WAPE'].quantile(0.95)
+                _df_px = _test_df[_test_df['WAPE'] <= _wape_cap_px].copy()
+                _appr_order_px = (
+                    _df_px.groupby('Approach')['WAPE'].median()
+                    .sort_values().index.tolist()
+                )
+                _fig_px = _go.Figure()
+                for _appr_px in _appr_order_px:
+                    _vals_px = _df_px[_df_px['Approach'] == _appr_px]['WAPE'].dropna()
+                    _fig_px.add_trace(_go.Box(
+                        y=_vals_px,
+                        name=_appr_px,
+                        boxpoints='outliers',
+                        marker=dict(size=4, opacity=0.5),
+                        boxmean='sd',
+                    ))
+                _fig_px.update_layout(
+                    title=dict(
+                        text=f'WAPE Distribution per Approach — TEST set'
+                             f'<br><sup>capped at {_wape_cap_px:.0f}% (95th pct) · mean±sd shown as dashed line</sup>',
+                        font=dict(size=14),
+                    ),
+                    yaxis_title='WAPE (%)',
+                    xaxis_title='',
+                    showlegend=False,
+                    height=520,
+                    template='plotly_white',
+                )
+                _fig_px.show()
+                if EXPORT_RESULTS and '_plots_dir' in dir():
+                    _px_path = os.path.join(_plots_dir, 'wape_distribution_interactive.html')
+                    _fig_px.write_html(_px_path, include_plotlyjs='cdn')
+                    print(f"Saved interactive plot → {_px_path}")
+            except Exception as _e:
+                print(f"[WARN] Plotly WAPE distribution failed: {_e}")
+
             # ── R² heatmap — one subplot per approach ────────────────────────
             try:
                 _approaches = _test_df['Approach'].unique()
@@ -2408,7 +2494,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     _sub = _test_df[_test_df['Approach'] == _appr]
                     _ph = _sub.pivot_table(
                         index=['Process', 'Sensor'], columns='Activity',
-                        values='R2', aggfunc='mean'
+                        values='R2', aggfunc='median'
                     )
                     sns.heatmap(
                         _ph, annot=True, fmt='.3f', cmap='RdYlGn',
@@ -2429,7 +2515,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             # ── Delta heatmaps: each new approach minus baseline ─────────────
             try:
                 _base_pivot = _test_df[_test_df['Approach'] == 'DTW + pos'].pivot_table(
-                    index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
+                    index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='median'
                 )
                 for _delta_label, _delta_appr in [
                     ('Instance Stats',         'Instance Stats'),
@@ -2441,7 +2527,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     ('DTW + Seq2Seq + Ext. Factors', 'DTW + Seq2Seq + Ext. Factors'),
                 ]:
                     _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
-                        index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
+                        index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='median'
                     )
                     if _base_pivot.empty or _new_pivot.empty:
                         continue
@@ -2478,6 +2564,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines' in dir() else {},
                     'Amplitude + Shape':              all_energy_pipelines_amplitude_shape
                         if 'all_energy_pipelines_amplitude_shape' in dir() else {},
+                    'Amplitude + Shape + EF':         all_energy_pipelines_amplitude_shape_exog
+                        if 'all_energy_pipelines_amplitude_shape_exog' in dir() else {},
                     'DTW + Seq2Seq':                  all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only':                   all_energy_pipelines_seq2seq_only
@@ -2488,17 +2576,17 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
                 _ranked_bw = (
                     _test_df
-                    .groupby(['Approach', 'Process', 'Sensor', 'Activity'])['R2']
+                    .groupby(['Approach', 'Process', 'Sensor', 'Activity'])['WAPE']
                     .median()
                     .reset_index()
-                    .rename(columns={'R2': 'Median_R2'})
+                    .rename(columns={'WAPE': 'Median_WAPE'})
                 )
 
                 for _appr, _appr_pips in _APPROACH_PIPELINES.items():
                     if not _appr_pips:
                         continue
                     _sub_bw = _ranked_bw[_ranked_bw['Approach'] == _appr].sort_values(
-                        'Median_R2', ascending=False
+                        'Median_WAPE', ascending=True
                     )
                     if _sub_bw.empty:
                         continue
@@ -2512,7 +2600,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if not _n_rows:
                             continue
 
-                        display(Markdown(f"### {_appr} — {_group_label} (by median TEST R²)"))
+                        display(Markdown(f"### {_appr} — {_group_label} (by median TEST WAPE)"))
                         fig_bw, axes_bw = plt.subplots(
                             _n_rows, 3, figsize=(15, 4 * _n_rows), squeeze=False
                         )
@@ -2521,7 +2609,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                             _proc_bw   = _row['Process']
                             _sensor_bw = _row['Sensor']
                             _act_bw    = _row['Activity']
-                            _r2_bw     = _row['Median_R2']
+                            _wape_bw   = _row['Median_WAPE']
 
                             _pip_act = (
                                 _appr_pips
@@ -2563,15 +2651,16 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                                     _rv_bw, _curve_bw['activity'],
                                     _curve_bw.get('attributes', {})
                                 )
-                                _r2_c  = r2_score(_rv_bw, _yp_bw)
-                                _mae_c = mean_absolute_error(_rv_bw, _yp_bw)
+                                _denom_c = np.sum(np.abs(_rv_bw))
+                                _wape_c  = np.sum(np.abs(_rv_bw - _yp_bw)) / _denom_c * 100 if _denom_c != 0 else np.nan
+                                _r2_c    = r2_score(_rv_bw, _yp_bw)
                                 _ax.plot(_rv_bw, label='Actual', color='steelblue', linewidth=2)
                                 _ax.plot(_yp_bw, label='Predicted', color='tomato',
                                          linewidth=2, linestyle='--')
                                 _ax.set_title(
                                     f"{_act_bw[:28]} | {_sensor_bw[:20]}\n"
-                                    f"R²={_r2_c:.3f}  MAE={_mae_c:.2f}  "
-                                    f"(bucket median R²={_r2_bw:.3f})",
+                                    f"WAPE={_wape_c:.1f}%  R²={_r2_c:.3f}  "
+                                    f"(bucket median WAPE={_wape_bw:.1f}%)",
                                     fontsize=8
                                 )
                                 _ax.set_xlabel("Time step")
@@ -2580,7 +2669,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                                 _ax.legend(fontsize=7)
 
                         fig_bw.suptitle(
-                            f"{_appr}  —  {_group_label} by TEST R²",
+                            f"{_appr}  —  {_group_label} by TEST WAPE",
                             fontsize=12, fontweight='bold'
                         )
                         plt.tight_layout()
@@ -2653,7 +2742,7 @@ if profile_summary_records:
     _psummary = (
         profile_summary_df
         .groupby(['Process', 'Sensor', 'Activity', 'Object', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
-        .mean()
+        .median()
         .round(4)
     )
     report(_psummary.to_string())
@@ -2699,7 +2788,7 @@ if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
 if records:
     edf = pd.DataFrame(records)
     # Pivot for clean display: Dataset and Sensor as index, Metric as columns
-    report_pivot = edf.pivot_table(index=['Dataset', 'Sensor'], columns='Metric', values='Value', aggfunc='mean')
+    report_pivot = edf.pivot_table(index=['Dataset', 'Sensor'], columns='Metric', values='Value', aggfunc='median')
     
     # Ensure all requested metrics are in columns
     final_cols = [c for c in ['MAE', 'RMSE', 'WAPE', 'R2'] if c in report_pivot.columns]

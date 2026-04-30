@@ -1756,10 +1756,18 @@ def split_curves(df_expanded, variable, activities, objects,
         if values.ndim != 1:
             continue
         if len(values) >= 5:
-            attributes = (
+            _raw_attrs = (
                 group['object_attributes_log'].iloc[0]
                 if not group['object_attributes_log'].empty else {}
             )
+            attributes = dict(_raw_attrs) if isinstance(_raw_attrs, dict) else {}
+            try:
+                _ts = pd.to_datetime(group['timestamp_start_log'].iloc[0])
+                if not pd.isnull(_ts):
+                    attributes['hour_of_day'] = float(_ts.hour)
+                    attributes['day_of_week']  = float(_ts.dayofweek)
+            except Exception:
+                pass
             entry = {
                 'instance_id':     instance_id,
                 'activity':        group['activity_log'].iloc[0],
@@ -4527,6 +4535,400 @@ def predict_raw_curve_amplitude_shape(raw_values, activity, attributes, pipeline
 
 
 # =============================================================================
+# AMPLITUDE + SHAPE + EXTERNAL FACTORS
+#
+# Extends amplitude_shape with:
+#   - ef_* columns resampled to fixed_length appended to Stage B features
+#   - hour_of_day / day_of_week already land in attributes via split_curves
+# Stage A (amplitude): metadata-only prediction of curve_mean
+# Stage B (shape):     z-score normalised shape from position + metadata + ef_*
+# DTW alignment + decode identical to amplitude_shape.
+# =============================================================================
+
+def build_and_train_pipeline_amplitude_shape_exog(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+    n_jobs=-1,
+):
+    from sklearn.linear_model import LinearRegression
+
+    if verbose:
+        print("\n" + "=" * 80)
+        print("AMPLITUDE + SHAPE + EF PIPELINE  (train curves only)")
+        print("=" * 80)
+
+    if models is None:
+        models = {
+            'Gradient Boosting': GradientBoostingRegressor,
+            'Random Forest':     RandomForestRegressor,
+        }
+
+    # ── DBA barycenter + DTW alignment ───────────────────────────────────────
+    resampled_for_dba = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values'],
+        )
+        for c in train_curves
+    ])[:, :, np.newaxis]
+
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    for curve in train_curves:
+        curve['resampled_values'] = _align_curve_with_dtw(
+            curve['original_values'], reference_curve
+        )
+
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    # Detect ef_* columns present in the training curves
+    ef_cols = sorted({
+        col
+        for c in train_curves
+        for col in c.get('exog_values', {}).keys()
+    })
+
+    # ── Val split ────────────────────────────────────────────────────────────
+    train_idx, val_idx = train_test_split(
+        range(len(train_curves)), test_size=val_size, random_state=random_state
+    )
+    tr_curves = [train_curves[i] for i in train_idx]
+    vl_curves = [train_curves[i] for i in val_idx]
+
+    cat_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+
+    # ── Helper: per-instance metadata row ────────────────────────────────────
+    def _meta_rows(curves):
+        rows = []
+        for c in curves:
+            row = {'curve_length': c['original_length'], 'activity': c['activity']}
+            for key in all_keys:
+                v = c['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(v) if v is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(v) if v is not None else 'None'
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    # ── Stage A: amplitude predictor ─────────────────────────────────────────
+    if verbose:
+        print("\n[A] Training amplitude predictor  (target: curve_mean)...")
+
+    amp_tr = np.array([float(np.mean(c['resampled_values'])) for c in tr_curves])
+    amp_vl = np.array([float(np.mean(c['resampled_values'])) for c in vl_curves])
+
+    X_amp_tr = _meta_rows(tr_curves)
+    X_amp_vl = _meta_rows(vl_curves)
+    X_amp_tr = pd.get_dummies(X_amp_tr, columns=cat_cols, drop_first=True)
+    X_amp_vl = pd.get_dummies(X_amp_vl, columns=cat_cols, drop_first=True)
+    amp_feat_cols = X_amp_tr.columns.tolist()
+    for col in amp_feat_cols:
+        if col not in X_amp_vl.columns:
+            X_amp_vl[col] = 0
+    X_amp_vl = X_amp_vl[amp_feat_cols]
+
+    amp_num_cols = ['curve_length'] + [k for k in all_keys if key_types[k] == 'numeric']
+    amp_num_cols = [c for c in amp_num_cols if c in X_amp_tr.columns]
+    amp_scaler = None
+    if amp_num_cols:
+        X_amp_tr[amp_num_cols] = X_amp_tr[amp_num_cols].astype('float64')
+        X_amp_vl[amp_num_cols] = X_amp_vl[amp_num_cols].astype('float64')
+        amp_scaler = StandardScaler()
+        X_amp_tr.loc[:, amp_num_cols] = amp_scaler.fit_transform(X_amp_tr[amp_num_cols])
+        X_amp_vl.loc[:, amp_num_cols] = amp_scaler.transform(X_amp_vl[amp_num_cols])
+
+    amp_results = {}
+    for name, model_class in models.items():
+        if name == 'Gradient Boosting':
+            m = model_class(n_estimators=200, max_depth=5, learning_rate=0.1,
+                            subsample=0.8, random_state=random_state)
+        elif name == 'Random Forest':
+            m = model_class(n_estimators=200, max_depth=10, random_state=random_state,
+                            n_jobs=n_jobs)
+        else:
+            try:
+                m = model_class(random_state=random_state)
+            except TypeError:
+                m = model_class()
+        m.fit(X_amp_tr, amp_tr)
+        val_r2 = r2_score(amp_vl, m.predict(X_amp_vl))
+        amp_results[name] = {'model': m, 'val_r2': val_r2}
+        if verbose:
+            print(f"     {name}  val R²={val_r2:.4f}")
+
+    best_amp_name  = max(amp_results, key=lambda k: amp_results[k]['val_r2'])
+    best_amp_model = amp_results[best_amp_name]['model']
+    if verbose:
+        print(f"  Best amplitude model: {best_amp_name}  "
+              f"(val R²={amp_results[best_amp_name]['val_r2']:.4f})")
+
+    # ── Stage B: shape predictor (z-score normalised + ef_* per position) ────
+    if verbose:
+        print("\n[B] Training shape predictor  (target: z-score normalised + ef_*)...")
+
+    def _zscore(arr):
+        mu  = float(np.mean(arr))
+        sig = float(np.std(arr)) + 1e-8
+        return (arr - mu) / sig, mu, sig
+
+    _rel_denom = max(fixed_length - 1, 1)
+
+    def _shape_rows(curves, include_target=True):
+        rows = []
+        for c in curves:
+            aligned  = np.asarray(c['resampled_values'], dtype=float)
+            z_curve, _, _ = _zscore(aligned)
+            # Resample ef_* series to fixed_length
+            ef_rs = {}
+            for col in ef_cols:
+                raw_sig = np.asarray(c.get('exog_values', {}).get(col, []), dtype=float)
+                if len(raw_sig) < 2:
+                    ef_rs[col] = np.zeros(fixed_length, dtype=float)
+                else:
+                    ef_rs[col] = np.interp(
+                        np.linspace(0, 1, fixed_length),
+                        np.linspace(0, 1, len(raw_sig)),
+                        raw_sig,
+                    )
+            for pos in range(fixed_length):
+                row = {
+                    'instance_id':  c['instance_id'],
+                    'activity':     c['activity'],
+                    'position_idx': pos,
+                    'relative_pos': pos / _rel_denom,
+                    'curve_length': c['original_length'],
+                }
+                for key in all_keys:
+                    v = c['attributes'].get(key, None)
+                    if key_types[key] == 'numeric':
+                        try:
+                            row[key] = float(v) if v is not None else np.nan
+                        except (ValueError, TypeError):
+                            row[key] = np.nan
+                    else:
+                        row[key] = str(v) if v is not None else 'None'
+                for col in ef_cols:
+                    row[col] = float(ef_rs[col][pos])
+                if include_target:
+                    row['y_shape'] = float(z_curve[pos])
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    df_tr = _shape_rows(tr_curves)
+    df_vl = _shape_rows(vl_curves)
+
+    shape_cat_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    X_sh_tr = df_tr.drop(columns=['instance_id', 'y_shape'], errors='ignore').copy()
+    X_sh_vl = df_vl.drop(columns=['instance_id', 'y_shape'], errors='ignore').copy()
+    X_sh_tr = pd.get_dummies(X_sh_tr, columns=shape_cat_cols, drop_first=True)
+    X_sh_vl = pd.get_dummies(X_sh_vl, columns=shape_cat_cols, drop_first=True)
+    shape_feat_cols = X_sh_tr.columns.tolist()
+    for col in shape_feat_cols:
+        if col not in X_sh_vl.columns:
+            X_sh_vl[col] = 0
+    X_sh_vl = X_sh_vl[shape_feat_cols]
+    y_sh_tr = df_tr['y_shape'].values
+    y_sh_vl = df_vl['y_shape'].values
+
+    shape_num_cols = ['position_idx', 'relative_pos', 'curve_length'] + [
+        k for k in all_keys if key_types[k] == 'numeric'
+    ] + ef_cols
+    shape_num_cols = [c for c in shape_num_cols if c in X_sh_tr.columns]
+    shape_scaler = None
+    if shape_num_cols:
+        X_sh_tr[shape_num_cols] = X_sh_tr[shape_num_cols].astype('float64')
+        X_sh_vl[shape_num_cols] = X_sh_vl[shape_num_cols].astype('float64')
+        shape_scaler = StandardScaler()
+        X_sh_tr.loc[:, shape_num_cols] = shape_scaler.fit_transform(X_sh_tr[shape_num_cols])
+        X_sh_vl.loc[:, shape_num_cols] = shape_scaler.transform(X_sh_vl[shape_num_cols])
+
+    shape_results = {}
+    for name, model_class in models.items():
+        if name == 'Gradient Boosting':
+            m = model_class(n_estimators=200, max_depth=7, learning_rate=0.1,
+                            subsample=0.8, random_state=random_state)
+        elif name == 'Random Forest':
+            m = model_class(n_estimators=200, max_depth=12, min_samples_split=5,
+                            random_state=random_state, n_jobs=n_jobs)
+        else:
+            try:
+                m = model_class(random_state=random_state)
+            except TypeError:
+                m = model_class()
+        m.fit(X_sh_tr, y_sh_tr)
+        val_r2 = r2_score(y_sh_vl, m.predict(X_sh_vl))
+        shape_results[name] = {'model': m, 'val_r2': val_r2}
+        if verbose:
+            print(f"     {name}  val R²={val_r2:.4f}")
+
+    best_shape_name  = max(shape_results, key=lambda k: shape_results[k]['val_r2'])
+    best_shape_model = shape_results[best_shape_name]['model']
+    if verbose:
+        print(f"  Best shape model: {best_shape_name}  "
+              f"(val R²={shape_results[best_shape_name]['val_r2']:.4f})")
+
+    return {
+        'approach':           'amplitude_shape_exog',
+        'reference_curve':    reference_curve,
+        'fixed_length':       fixed_length,
+        'all_keys':           all_keys,
+        'key_types':          key_types,
+        'cat_cols':           cat_cols,
+        'ef_cols':            ef_cols,
+        # Stage A
+        'amp_model':          best_amp_model,
+        'amp_model_name':     best_amp_name,
+        'amp_feat_cols':      amp_feat_cols,
+        'amp_scaler':         amp_scaler,
+        'amp_num_cols':       amp_num_cols,
+        # Stage B
+        'shape_model':        best_shape_model,
+        'shape_model_name':   best_shape_name,
+        'shape_feat_cols':    shape_feat_cols,
+        'shape_scaler':       shape_scaler,
+        'shape_num_cols':     shape_num_cols,
+        'val_r2':             shape_results[best_shape_name]['val_r2'],
+    }
+
+
+def predict_raw_curve_amplitude_shape_exog(raw_values, activity, attributes, pipeline,
+                                           exog_values=None):
+    """
+    Predict using the Amplitude + Shape + EF pipeline.
+
+    Stage A predicts curve_mean (amplitude) from metadata only.
+    Stage B predicts z-score normalised shape from position + metadata + ef_*.
+    Final prediction = shape + predicted_amplitude, DTW-decoded to raw length.
+    """
+    if exog_values is None:
+        exog_values = {}
+
+    reference_curve  = pipeline['reference_curve']
+    fixed_length     = len(reference_curve)
+    all_keys         = pipeline['all_keys']
+    key_types        = pipeline['key_types']
+    cat_cols         = pipeline['cat_cols']
+    ef_cols          = pipeline.get('ef_cols', [])
+
+    amp_model        = pipeline['amp_model']
+    amp_feat_cols    = pipeline['amp_feat_cols']
+    amp_scaler       = pipeline.get('amp_scaler')
+    amp_num_cols     = pipeline.get('amp_num_cols', [])
+
+    shape_model      = pipeline['shape_model']
+    shape_feat_cols  = pipeline['shape_feat_cols']
+    shape_scaler     = pipeline.get('shape_scaler')
+    shape_num_cols   = pipeline.get('shape_num_cols', [])
+
+    def _attr_val(key):
+        v = attributes.get(key, None)
+        if key_types[key] == 'numeric':
+            try:
+                return float(v) if v is not None else np.nan
+            except (ValueError, TypeError):
+                return np.nan
+        return str(v) if v is not None else 'None'
+
+    # ── Stage A: predict amplitude ────────────────────────────────────────────
+    meta_row = {'curve_length': len(raw_values), 'activity': activity}
+    for key in all_keys:
+        meta_row[key] = _attr_val(key)
+
+    X_amp = pd.DataFrame([meta_row])
+    X_amp = pd.get_dummies(X_amp, columns=cat_cols, drop_first=True)
+    for col in amp_feat_cols:
+        if col not in X_amp.columns:
+            X_amp[col] = 0
+    X_amp = X_amp[amp_feat_cols]
+    if amp_scaler is not None and amp_num_cols:
+        cols = [c for c in amp_num_cols if c in X_amp.columns]
+        if cols:
+            X_amp[cols] = X_amp[cols].astype('float64')
+            X_amp.loc[:, cols] = amp_scaler.transform(X_amp[cols])
+
+    predicted_amplitude = float(amp_model.predict(X_amp)[0])
+
+    # ── Stage B: predict z-score shape + ef_* ────────────────────────────────
+    # Resample ef_* to fixed_length
+    ef_rs = {}
+    for col in ef_cols:
+        raw_sig = np.asarray(exog_values.get(col, []), dtype=float)
+        if len(raw_sig) < 2:
+            ef_rs[col] = np.zeros(fixed_length, dtype=float)
+        else:
+            ef_rs[col] = np.interp(
+                np.linspace(0, 1, fixed_length),
+                np.linspace(0, 1, len(raw_sig)),
+                raw_sig,
+            )
+
+    _rel_denom = max(fixed_length - 1, 1)
+    rows = []
+    for pos in range(fixed_length):
+        row = {
+            'position_idx': pos,
+            'relative_pos': pos / _rel_denom,
+            'curve_length': len(raw_values),
+            'activity':     activity,
+        }
+        for key in all_keys:
+            row[key] = _attr_val(key)
+        for col in ef_cols:
+            row[col] = float(ef_rs[col][pos])
+        rows.append(row)
+
+    X_sh = pd.DataFrame(rows)
+    X_sh = pd.get_dummies(X_sh, columns=cat_cols, drop_first=True)
+    for col in shape_feat_cols:
+        if col not in X_sh.columns:
+            X_sh[col] = 0
+    X_sh = X_sh[shape_feat_cols]
+    if shape_scaler is not None and shape_num_cols:
+        cols = [c for c in shape_num_cols if c in X_sh.columns]
+        if cols:
+            X_sh[cols] = X_sh[cols].astype('float64')
+            X_sh.loc[:, cols] = shape_scaler.transform(X_sh[cols])
+
+    y_shape_pred = shape_model.predict(X_sh)
+
+    # ── Combine: shift z-score shape by predicted amplitude ───────────────────
+    y_canonical = y_shape_pred + predicted_amplitude
+
+    # ── DTW decode to raw length ──────────────────────────────────────────────
+    alignment   = dtw(raw_values, reference_curve, keep_internals=True)
+    buckets     = [[] for _ in range(len(raw_values))]
+    path_pairs  = list(zip(alignment.index1, alignment.index2))
+
+    for qi, ri in path_pairs:
+        if 0 <= qi < len(raw_values) and 0 <= ri < fixed_length:
+            buckets[qi].append(y_canonical[ri])
+
+    y_raw_pred = np.empty(len(raw_values), dtype=float)
+    for qi in range(len(raw_values)):
+        if buckets[qi]:
+            y_raw_pred[qi] = float(np.mean(buckets[qi]))
+        else:
+            nearest_qi, nearest_ri = min(path_pairs, key=lambda p: abs(p[0] - qi))
+            _ = nearest_qi
+            y_raw_pred[qi] = float(y_canonical[min(max(nearest_ri, 0), fixed_length - 1)])
+
+    return y_raw_pred
+
+
+# =============================================================================
 # DTW + SEQ2SEQ  —  LSTM encoder-decoder over canonical DBA space
 # =============================================================================
 #
@@ -5494,6 +5896,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
                                               exog_values=curve.get('exog_values', {}))
     if approach == 'amplitude_shape':
         return predict_raw_curve_amplitude_shape(raw_values, act, attrs, pipeline)
+    if approach == 'amplitude_shape_exog':
+        return predict_raw_curve_amplitude_shape_exog(raw_values, act, attrs, pipeline,
+                                                      exog_values=curve.get('exog_values', {}))
     if approach == 'mean_baseline':
         return np.full(len(raw_values), pipeline.get('train_mean', 0.0))
     return predict_raw_curve(raw_values, act, attrs, pipeline)
@@ -5548,7 +5953,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     from sklearn.ensemble import GradientBoostingRegressor
 
     _SKLEARN_APPROACHES = {'baseline', 'instance_stats', 'istats_leakfree',
-                           'dtw_phase', 'basis', 'exog', 'amplitude_shape'}
+                           'dtw_phase', 'basis', 'exog', 'amplitude_shape',
+                           'amplitude_shape_exog'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
     curves, _ = split_curves(
@@ -5607,6 +6013,12 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
         )
     if 'amplitude_shape' in _active:
         result['amplitude_shape'] = build_and_train_pipeline_amplitude_shape(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, models=models,
+            optimize_hyperparams=False, verbose=0, n_jobs=1,
+        )
+    if 'amplitude_shape_exog' in _active:
+        result['amplitude_shape_exog'] = build_and_train_pipeline_amplitude_shape_exog(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models,
             optimize_hyperparams=False, verbose=0, n_jobs=1,
