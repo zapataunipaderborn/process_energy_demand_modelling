@@ -96,13 +96,13 @@ from xgboost import XGBRegressor
 from pathlib import Path
 import pandas as pd
 
-experiment          = os.environ.get('PIPELINE_DATA_EXPERIMENT', '1')
+experiment          = os.environ.get('PIPELINE_DATA_EXPERIMENT', '5')
 # ── Temporal resolution for df_expanded aggregation ──────────────────────────
 #   'original' → no aggregation (keep raw rows)
 #   '1min'     → resample to 1-minute bins
 #   '5min'     → resample to 5-minute bins
 #   '15min'    → resample to 15-minute bins
-TEMPORAL_RESOLUTION = os.environ.get('PIPELINE_TEMPORAL_RESOLUTION', 'original')
+TEMPORAL_RESOLUTION = os.environ.get('PIPELINE_TEMPORAL_RESOLUTION', '15min')
 
 current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
 folder_gold_base = current_path.parent / 'data' / 'gold' / f'experiment_{experiment}'
@@ -349,14 +349,14 @@ RUN_CURVE_ONLY_EVALUATION = True  # run curve-quality benchmark (MAE/RMSE/R²)
 APPROACHES = [
     'baseline',
     # 'instance_stats',
-    # 'istats_leakfree',
+    'istats_leakfree',
     # 'dtw_phase',
     # 'basis',
-    # 'exog',
+    'exog',
     'amplitude_shape',
     'seq2seq',
     'seq2seq_only',
-    'seq2seq_exog',
+    # 'seq2seq_exog',
 ]
 
 # ── Seq2Seq hyperparameters ───────────────────────────────────────────────────
@@ -380,7 +380,6 @@ _results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '
 _run_dir = os.path.join(_results_root, f"{_run_name}_{_run_ts}")
 _plots_dir    = os.path.join(_run_dir, 'plots')
 os.makedirs(_plots_dir, exist_ok=True)
-os.makedirs(os.path.join(_run_dir, 'curves'), exist_ok=True)
 
 LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
 
@@ -1940,6 +1939,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     from sklearn.ensemble import GradientBoostingRegressor
 
     all_energy_pipelines                  = {}   # baseline
+    all_energy_pipelines_mean            = {}   # mean baseline
     all_energy_pipelines_instance_stats  = {}   # Instance Stats (leaky)
     all_energy_pipelines_istats_leakfree = {}   # Instance Stats (leak-free)
     all_energy_pipelines_dtw_phase       = {}   # Approach 3
@@ -2020,7 +2020,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_exog'}]
 
-        _combos = [(s, a, o) for s in _sensors for a in _activities for o in _objects]
+        _combos    = [(s, a, o) for s in _sensors for a in _activities for o in _objects]
         _n_workers = min(len(_combos), _os.cpu_count() or 4)
 
         if _sklearn_approaches and _combos:
@@ -2154,7 +2154,33 @@ if RUN_CURVE_ONLY_EVALUATION:
                     }
                     print(f"  [{_s}|{_a}|{_o}] seq2seq_exog  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
 
+        # ── Mean baseline: predict training mean at every timestep ──────────
+        _pipelines_mean = {}
+        for _s in _sensors:
+            for _a in _activities:
+                for _o in _objects:
+                    _mask_m = (
+                        (_df_train_exp['activity_log'] == _a) &
+                        (_df_train_exp['object_log']   == _o) &
+                        _df_train_exp[_s].notna()
+                    )
+                    _vals_m = _df_train_exp.loc[_mask_m, _s].values
+                    if len(_vals_m) == 0:
+                        continue
+                    _mean_val = float(np.mean(_vals_m))
+                    _pip_m = {
+                        'reference_curve': None,
+                        'full_pipeline': {
+                            'approach':      'mean_baseline',
+                            'train_mean':    _mean_val,
+                            'variable_name': _s,
+                        },
+                        'predict_fn': (lambda m: lambda rv, act, attrs: np.full(len(rv), m))(_mean_val),
+                    }
+                    _pipelines_mean.setdefault(_s, {}).setdefault(_a, {})[_o] = _pip_m
+
         all_energy_pipelines[_proc]                   = _pipelines_baseline
+        all_energy_pipelines_mean[_proc]              = _pipelines_mean
         all_energy_pipelines_instance_stats[_proc]   = _pipelines_instance_stats
         all_energy_pipelines_istats_leakfree[_proc]  = _pipelines_istats_leakfree
         all_energy_pipelines_dtw_phase[_proc]        = _pipelines_dtw_phase
@@ -2276,7 +2302,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown(f"## Split: {_split_label}"))
 
         for _approach_label, _pipelines in [
-            ('Baseline (DTW + pos)',        all_energy_pipelines),
+            ('Mean Baseline',               all_energy_pipelines_mean),
+            ('DTW + pos',        all_energy_pipelines),
             ('Instance Stats (leaky)',      all_energy_pipelines_instance_stats),
             ('Instance Stats (leak-free)',  all_energy_pipelines_istats_leakfree),
             ('Approach 2 (B-spline)',       all_energy_pipelines_basis),
@@ -2293,7 +2320,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _recs = _run_curve_eval(
                 _pipelines, _approach_label, _split_label,
                 _df_src, _activities_map, _objects_map,
-                save_dir=os.path.join(_run_dir, 'curves') if EXPORT_RESULTS else None,
+                save_dir=None,
             )
             _all_records.extend(_recs)
 
@@ -2401,7 +2428,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
             # ── Delta heatmaps: each new approach minus baseline ─────────────
             try:
-                _base_pivot = _test_df[_test_df['Approach'] == 'Baseline (DTW + pos)'].pivot_table(
+                _base_pivot = _test_df[_test_df['Approach'] == 'DTW + pos'].pivot_table(
                     index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='mean'
                 )
                 for _delta_label, _delta_appr in [
@@ -2437,6 +2464,134 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     plt.show()
             except Exception as _e:
                 print(f"[WARN] Delta heatmaps failed: {_e}")
+
+            # ── 5 BEST / 5 WORST curves per approach (TEST R²) ──────────────────
+            try:
+                from sklearn.metrics import r2_score, mean_absolute_error
+                display(Markdown("---"))
+                display(Markdown("## 5 Best & 5 Worst Curve Fits per Approach — TEST set"))
+
+                _APPROACH_PIPELINES = {
+                    'Mean Baseline':                  all_energy_pipelines_mean
+                        if 'all_energy_pipelines_mean' in dir() else {},
+                    'DTW + pos':           all_energy_pipelines
+                        if 'all_energy_pipelines' in dir() else {},
+                    'Amplitude + Shape':              all_energy_pipelines_amplitude_shape
+                        if 'all_energy_pipelines_amplitude_shape' in dir() else {},
+                    'DTW + Seq2Seq':                  all_energy_pipelines_seq2seq
+                        if 'all_energy_pipelines_seq2seq' in dir() else {},
+                    'Seq2Seq only':                   all_energy_pipelines_seq2seq_only
+                        if 'all_energy_pipelines_seq2seq_only' in dir() else {},
+                    'DTW + Seq2Seq + Ext. Factors':   all_energy_pipelines_seq2seq_exog
+                        if 'all_energy_pipelines_seq2seq_exog' in dir() else {},
+                }
+
+                _ranked_bw = (
+                    _test_df
+                    .groupby(['Approach', 'Process', 'Sensor', 'Activity'])['R2']
+                    .median()
+                    .reset_index()
+                    .rename(columns={'R2': 'Median_R2'})
+                )
+
+                for _appr, _appr_pips in _APPROACH_PIPELINES.items():
+                    if not _appr_pips:
+                        continue
+                    _sub_bw = _ranked_bw[_ranked_bw['Approach'] == _appr].sort_values(
+                        'Median_R2', ascending=False
+                    )
+                    if _sub_bw.empty:
+                        continue
+
+                    for _group_label, _group_rows in [
+                        ('5 BEST',  _sub_bw.head(5)),
+                        ('5 WORST', _sub_bw.tail(5)),
+                    ]:
+                        _row_list = list(_group_rows.iterrows())
+                        _n_rows   = len(_row_list)
+                        if not _n_rows:
+                            continue
+
+                        display(Markdown(f"### {_appr} — {_group_label} (by median TEST R²)"))
+                        fig_bw, axes_bw = plt.subplots(
+                            _n_rows, 3, figsize=(15, 4 * _n_rows), squeeze=False
+                        )
+
+                        for _ri, (_, _row) in enumerate(_row_list):
+                            _proc_bw   = _row['Process']
+                            _sensor_bw = _row['Sensor']
+                            _act_bw    = _row['Activity']
+                            _r2_bw     = _row['Median_R2']
+
+                            _pip_act = (
+                                _appr_pips
+                                .get(_proc_bw, {})
+                                .get(_sensor_bw, {})
+                                .get(_act_bw, {})
+                            )
+                            if not _pip_act:
+                                for _ax in axes_bw[_ri]:
+                                    _ax.set_visible(False)
+                                continue
+
+                            _obj_bw = next(iter(_pip_act))
+                            _ep_bw  = _pip_act[_obj_bw]
+                            _df_test_bw = (test_datasets if TEMPORAL_SPLIT else train_datasets).get(
+                                _proc_bw, {}
+                            ).get('expanded')
+                            if _df_test_bw is None or _df_test_bw.empty:
+                                for _ax in axes_bw[_ri]:
+                                    _ax.set_visible(False)
+                                continue
+
+                            _tc_bw, _ = split_curves(
+                                _df_test_bw, _sensor_bw, [_act_bw], [_obj_bw],
+                                test_size=0.0, verbose=0
+                            )
+                            if not _tc_bw:
+                                for _ax in axes_bw[_ri]:
+                                    _ax.set_visible(False)
+                                continue
+
+                            for _ci, _ax in enumerate(axes_bw[_ri]):
+                                if _ci >= len(_tc_bw):
+                                    _ax.set_visible(False)
+                                    continue
+                                _curve_bw = _tc_bw[_ci]
+                                _rv_bw    = _curve_bw['original_values']
+                                _yp_bw    = _ep_bw['predict_fn'](
+                                    _rv_bw, _curve_bw['activity'],
+                                    _curve_bw.get('attributes', {})
+                                )
+                                _r2_c  = r2_score(_rv_bw, _yp_bw)
+                                _mae_c = mean_absolute_error(_rv_bw, _yp_bw)
+                                _ax.plot(_rv_bw, label='Actual', color='steelblue', linewidth=2)
+                                _ax.plot(_yp_bw, label='Predicted', color='tomato',
+                                         linewidth=2, linestyle='--')
+                                _ax.set_title(
+                                    f"{_act_bw[:28]} | {_sensor_bw[:20]}\n"
+                                    f"R²={_r2_c:.3f}  MAE={_mae_c:.2f}  "
+                                    f"(bucket median R²={_r2_bw:.3f})",
+                                    fontsize=8
+                                )
+                                _ax.set_xlabel("Time step")
+                                _ax.set_ylabel("Energy")
+                                _ax.grid(True, alpha=0.3)
+                                _ax.legend(fontsize=7)
+
+                        fig_bw.suptitle(
+                            f"{_appr}  —  {_group_label} by TEST R²",
+                            fontsize=12, fontweight='bold'
+                        )
+                        plt.tight_layout()
+                        if EXPORT_RESULTS and '_run_dir' in dir():
+                            _appr_slug = _appr.replace(" ", "_").replace("+", "p").replace("/", "-")
+                            _gl_slug   = _group_label.replace(" ", "_")
+                            _savefig(f'best_worst_{_appr_slug}_{_gl_slug}')
+                        plt.show()
+            except Exception as _e:
+                print(f"[WARN] Best/worst plot failed: {_e}")
+                import traceback; traceback.print_exc()
 
 elif RUN_CURVE_ONLY_EVALUATION:
     display(Markdown(
@@ -2618,7 +2773,7 @@ report("\n" + "█"*80 + "\n")
 # ── POST-REPORT VISUALIZATIONS: GENERALIZATION GALLERY ───────────────────────
 # (Note: Placed at the very end to provide a final visual verification of curve fitting)
 if RUN_TEST_EVALUATION:
-    _gallery_dir = os.path.join(_run_dir, 'curves') if (EXPORT_RESULTS and '_run_dir' in dir()) else None
+    _gallery_dir = None
 
     for process, sensors in all_energy_pipelines.items():
         exp_test = test_datasets[process].get('expanded')
@@ -2729,8 +2884,7 @@ else:
         print(f"HTML export skipped: {_e}")
 
     print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
-    print(f"  plots/curves/  → {os.path.join(_run_dir, 'curves')}")
-    print(f"  plots/         → {os.path.join(_run_dir, 'plots')}")
+    print(f"  plots/  → {os.path.join(_run_dir, 'plots')}")
 
     # ── info.json ─────────────────────────────────────────────────────────────
     import json as _json

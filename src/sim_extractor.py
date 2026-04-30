@@ -5494,6 +5494,8 @@ def _dispatch_predict(raw_values, curve, pipeline):
                                               exog_values=curve.get('exog_values', {}))
     if approach == 'amplitude_shape':
         return predict_raw_curve_amplitude_shape(raw_values, act, attrs, pipeline)
+    if approach == 'mean_baseline':
+        return np.full(len(raw_values), pipeline.get('train_mean', 0.0))
     return predict_raw_curve(raw_values, act, attrs, pipeline)
 
 
