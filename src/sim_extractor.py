@@ -2434,6 +2434,10 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
             X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
             X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
 
+    # Fill any remaining NaN (missing object_attributes at inference time) with 0.
+    # After scaling, 0 == training mean for numeric features; safe fallback.
+    X_ref = X_ref.fillna(0)
+
     y_ref_pred = model.predict(X_ref)
 
     # 2) Decode canonical predictions to raw timeline using DTW path

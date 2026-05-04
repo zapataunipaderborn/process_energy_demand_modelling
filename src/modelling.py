@@ -512,7 +512,7 @@ def _normalise_metrics(df, cols, lower_set_test_prefixed=None):
     return norm_df
 
 
-def _plot_results_heatmap(cols, title, metric_type='process', local_df=None):
+def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, save_path=None):
     """Displays a normalized heatmap for comparing different simulation modes."""
     # Use global evaluation_results_df if no local_df is provided
     target_df = local_df if local_df is not None else globals().get('evaluation_results_df')
@@ -584,6 +584,8 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None):
     ax.set_ylabel('')
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
     plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
     # Log/Table summary
@@ -940,7 +942,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         # Flatten all simulated curves from the log
         for idx, row in simulated_df.iterrows():
             sim_curves = row.get('simulated_energy_curves', {})
-            if not sim_curves:
+            if not isinstance(sim_curves, dict) or not sim_curves:
                 continue
             
             cid = row[case_col]
@@ -1206,6 +1208,20 @@ def _split_process_datasets(datasets, train_ratio=0.80):
         # ── production plan split ─────────────────────────────────────────
         pp_train = production_plan[production_plan['case_id'].isin(train_cases)].copy()
         pp_test  = production_plan[production_plan['case_id'].isin(test_cases)].copy()
+
+        # If PP case_ids don't match EL case_ids (different ID schemes), split
+        # the PP independently by its own temporal order.
+        if len(pp_train) == 0 and len(pp_test) == 0 and len(production_plan) > 0:
+            pp_case_start = (
+                production_plan
+                .groupby('case_id')['timestamp_start'].min()
+                .sort_values()
+            )
+            n_pp_train = max(1, int(len(pp_case_start) * train_ratio))
+            pp_train_ids = set(pp_case_start.index[:n_pp_train])
+            pp_test_ids  = set(pp_case_start.index[n_pp_train:])
+            pp_train = production_plan[production_plan['case_id'].isin(pp_train_ids)].copy()
+            pp_test  = production_plan[production_plan['case_id'].isin(pp_test_ids)].copy()
 
         # ── expanded df split (uses case_id_log) ─────────────────────────
         exp_train, exp_test = None, None
@@ -1881,7 +1897,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             
             display(Markdown(f"## 📊 Training Verification: {process.upper()}"))
             display(Markdown(f"*Evaluation on training data using real energy curves (verification of modifier fitting)*"))
-            _plot_results_heatmap(_train_cols, f"Training Quality: {process}", local_df=_proc_df)
+            _hm_train_path = os.path.join(_plots_dir, f'process_train_heatmap_{process}.png') if EXPORT_RESULTS and '_plots_dir' in dir() else None
+            _plot_results_heatmap(_train_cols, f"Training Quality: {process}", local_df=_proc_df, save_path=_hm_train_path)
 
 
 if RUN_PROCESS_MODELLING:
@@ -1969,7 +1986,8 @@ if RUN_TEST_EVALUATION and RUN_PROCESS_MODELLING:
         display(Markdown("---"))
         display(Markdown("# 📊 FINAL CONSOLIDATED PERFORMANCE: TEST SET ENSEMBLE"))
         display(Markdown("*Consolidated simulation quality across all processes on unseen data.*"))
-        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble")
+        _hm_path = os.path.join(_plots_dir, 'process_test_heatmap.png') if EXPORT_RESULTS and '_plots_dir' in dir() else None
+        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble", save_path=_hm_path)
 
 
 

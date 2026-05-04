@@ -1426,6 +1426,11 @@ class ProcessSimulation:
                                 next(iter(obj_map.values())) if obj_map else None
                             )
                             if ep is None:
+                                # No pipeline for this sensor/activity — carry forward previous state
+                                for sfx in ('_mean', '_end', '_std'):
+                                    key = f'{sensor}{sfx}'
+                                    if key in current_energy_state:
+                                        new_energy_state[key] = current_energy_state[key]
                                 continue
                             ref_curve  = ep.get('reference_curve')
                             if ref_curve is None:
