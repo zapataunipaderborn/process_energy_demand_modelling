@@ -340,8 +340,9 @@ TEMPORAL_SPLIT      = True    # True → split by case start time; False → use
 TRAIN_RATIO         = 0.80    # fraction of cases used for training
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
-RUN_TEST_EVALUATION      = True   # evaluate on held-out test set
-RUN_CURVE_ONLY_EVALUATION = True  # run curve-quality benchmark (MAE/RMSE/R²)
+RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
+RUN_CURVE_ONLY_EVALUATION = True   # run curve-quality benchmark (MAE/RMSE/R²)
+RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'false').lower() == 'true'
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          DTW + position index (sklearn regressor)
@@ -1281,10 +1282,10 @@ MODES_TO_COMPARE = _filtered_modes
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
 
-if RUN_CURVE_ONLY_EVALUATION:
-    print("RUN_CURVE_ONLY_EVALUATION=True — skipping process modelling loop.")
+if not RUN_PROCESS_MODELLING:
+    print("RUN_PROCESS_MODELLING=False — skipping process modelling loop.")
 
-for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION else []:
+for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []:
     print("\n" + "="*80)
     print(f"ANALYZING {process.upper()}")
     print("="*80)
@@ -1367,13 +1368,48 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
                 display(Markdown(f"### 🌐 Petri Net: {obj_name} ({obj_type})"))
                 display(Markdown(f"*Process: {process} | Mining Algorithm: {alg_name}*"))
 
-                
                 # In Jupyter, this will display the Graphviz object
                 view_obj = pm4py.view_petri_net(model['net'], model['im'], model['fm'], format='png')
                 if view_obj:
                     display(view_obj)
+
+                if EXPORT_RESULTS and '_run_dir' in dir():
+                    _pn_dir = os.path.join(_run_dir, 'petri_nets')
+                    os.makedirs(_pn_dir, exist_ok=True)
+                    _safe = lambda s: str(s).replace('/', '_').replace(' ', '_')
+                    _stem = f"{process}_{alg_name}_{_safe(obj_name)}_{_safe(obj_type)}"
+                    try:
+                        pm4py.save_vis_petri_net(
+                            model['net'], model['im'], model['fm'],
+                            os.path.join(_pn_dir, f"{_stem}.png"),
+                        )
+                    except Exception as _ve:
+                        print(f"    (PNG save failed: {_ve})")
+                    try:
+                        pm4py.write_pnml(
+                            model['net'], model['im'], model['fm'],
+                            os.path.join(_pn_dir, f"{_stem}.pnml"),
+                        )
+                    except Exception as _ve:
+                        print(f"    (PNML save failed: {_ve})")
             except Exception as e:
                 print(f"    (Could not render Petri net: {e})")
+
+    # ── Save DFGs from training event log ────────────────────────────────────
+    if EXPORT_RESULTS and '_run_dir' in dir():
+        try:
+            _dfg_dir = os.path.join(_run_dir, 'dfgs')
+            os.makedirs(_dfg_dir, exist_ok=True)
+            _train_log_pm = pm4py.format_dataframe(
+                df_train.dropna(subset=['case_id', 'activity', 'timestamp_start']),
+                case_id='case_id', activity_key='activity', timestamp_key='timestamp_start',
+            )
+            _dfg, _dfg_start, _dfg_end = pm4py.discover_dfg(_train_log_pm)
+            _dfg_path = os.path.join(_dfg_dir, f"{process}_train_dfg.png")
+            pm4py.save_vis_dfg(_dfg, _dfg_start, _dfg_end, _dfg_path)
+            print(f"  Saved DFG → {_dfg_path}")
+        except Exception as _de:
+            print(f"  (DFG save failed for {process}: {_de})")
 
     print("\n" + "="*50)
     print("PROBABILISTIC END ACTIVITY STATS (from train set):")
@@ -1848,7 +1884,7 @@ for process in process_datasets_to_model.keys() if not RUN_CURVE_ONLY_EVALUATION
             _plot_results_heatmap(_train_cols, f"Training Quality: {process}", local_df=_proc_df)
 
 
-if not RUN_CURVE_ONLY_EVALUATION:
+if RUN_PROCESS_MODELLING:
     # Convert the results list into a DataFrame
     evaluation_results_df = pd.DataFrame(evaluation_results_list)
 
@@ -1867,11 +1903,19 @@ if not RUN_CURVE_ONLY_EVALUATION:
     print("AGGREGATED EVALUATION RESULTS — MODE COMPARISON")
     print("="*80)
 
-    evaluation_results_df.to_parquet(
-        "evaluation_results.parquet",
-        engine="pyarrow",
-        index=False
-    )
+    if EXPORT_RESULTS and '_run_dir' in dir():
+        _pm_full_path = os.path.join(_run_dir, 'process_eval_results.parquet')
+        evaluation_results_df.to_parquet(_pm_full_path, index=False)
+        print(f"Saved process eval results → {_pm_full_path}")
+
+        _core_prefixes = ['process', 'mode', 'split']
+        for _pfx in ['train', 'test']:
+            for _base in CORE_METRIC_BASES:
+                _core_prefixes.append(f'{_pfx}_{_base}')
+        _core_cols = [c for c in _core_prefixes if c in evaluation_results_df.columns]
+        _pm_core_path = os.path.join(_run_dir, 'process_eval_core_metrics.parquet')
+        evaluation_results_df[_core_cols].to_parquet(_pm_core_path, index=False)
+        print(f"Saved process core metrics  → {_pm_core_path}")
     evaluation_results_df
 
     # ── Per-process breakdown: show modes sorted by test_overall_score ────────
@@ -1917,7 +1961,7 @@ if not RUN_CURVE_ONLY_EVALUATION:
 # ── FINAL SUMMARY ─────────────────────────────────────────────────────────────
 # All modeling and per-process evaluations are complete.
 
-if RUN_TEST_EVALUATION and not RUN_CURVE_ONLY_EVALUATION:
+if RUN_TEST_EVALUATION and RUN_PROCESS_MODELLING:
     # Final consolidated summary of TEST set performance across ALL processes
     # (Focuses strictly on the core metrics to maintain clarity)
     _final_test_cols = [f"test_{b}" for b in CORE_METRIC_BASES if f"test_{b}" in evaluation_results_df.columns]
