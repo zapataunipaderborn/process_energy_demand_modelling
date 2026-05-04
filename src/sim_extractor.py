@@ -1804,6 +1804,159 @@ def split_curves(df_expanded, variable, activities, objects,
 
 
 # =============================================================================
+# STEP 1 (variant) — SPLIT CURVES WITH PREVIOUS-ACTIVITY CONTEXT
+# =============================================================================
+
+def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
+                                    test_size=0.15, random_state=42, verbose=1,
+                                    exog_columns=None):
+    """
+    Like split_curves() but enriches each curve's 'attributes' with summary
+    statistics from the immediately preceding activity instance in the same case.
+
+    All added features are known at activity-start time — zero leakage:
+        prev_act_name   — name of the previous activity (str; 'none' if first)
+        prev_act_mean   — mean of target variable during previous activity
+        prev_act_std    — std  of target variable during previous activity
+        prev_act_max    — max  of target variable during previous activity
+        prev_act_end    — last observed value of target variable in previous activity
+        prev_act_length — number of timesteps in previous activity
+
+    NaN is used for numeric fields when no preceding activity exists.
+    Also accepts exog_columns exactly like split_curves().
+    """
+    if verbose:
+        print("=" * 80)
+        print("STEP 1 — RAW TRAIN/TEST SPLIT + PREVIOUS-ACTIVITY CONTEXT")
+        print("=" * 80)
+
+    exog_cols_present = [c for c in (exog_columns or []) if c in df_expanded.columns]
+
+    # ── Build per-case activity timeline from the full df_expanded ────────────
+    # Groups every (case, activity, object, ts_start) instance and pre-computes
+    # stats on the target variable. Covers ALL activities, not just the target ones,
+    # so a target curve can look back at any predecessor in the same case.
+    _grp_cols = ['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log']
+    _case_timelines = {}   # case_id -> [(ts_start, stats_dict), ...] sorted by ts_start
+
+    if variable in df_expanded.columns:
+        _tl = df_expanded[_grp_cols + ['datetime_energy', variable]].copy()
+        _tl['timestamp_start_log'] = pd.to_datetime(_tl['timestamp_start_log'])
+        _tl['datetime_energy']     = pd.to_datetime(_tl['datetime_energy'])
+        _tl = _tl.sort_values(['case_id_log', 'timestamp_start_log', 'datetime_energy'])
+
+        for (_case_id, _act, _obj, _ts_start), _grp in _tl.groupby(_grp_cols):
+            _vals = np.asarray(_grp[variable].dropna().values, dtype=float)
+            _ts   = pd.to_datetime(_ts_start)
+            # Use 0.0 as numeric sentinel when stats are undefined; the
+            # categorical prev_act_name flag carries the "no predecessor"
+            # signal so models trained without NaN-handling still work.
+            _stats = {
+                'prev_act_name':   _act,
+                'prev_act_mean':   float(np.mean(_vals))  if len(_vals) >= 1 else 0.0,
+                'prev_act_std':    float(np.std(_vals))   if len(_vals) >= 2 else 0.0,
+                'prev_act_max':    float(np.max(_vals))   if len(_vals) >= 1 else 0.0,
+                'prev_act_end':    float(_vals[-1])       if len(_vals) >= 1 else 0.0,
+                'prev_act_length': float(len(_vals)),
+            }
+            _case_timelines.setdefault(_case_id, []).append((_ts, _stats))
+
+    for _cid in _case_timelines:
+        _case_timelines[_cid].sort(key=lambda x: x[0])
+
+    def _prev_stats(case_id, ts_start):
+        """Return stats of the activity that started immediately before ts_start."""
+        prev = None
+        for t, s in _case_timelines.get(case_id, []):
+            if t < ts_start:
+                prev = s
+            else:
+                break
+        if prev is None:
+            return {
+                'prev_act_name':   'none',
+                'prev_act_mean':   0.0,
+                'prev_act_std':    0.0,
+                'prev_act_max':    0.0,
+                'prev_act_end':    0.0,
+                'prev_act_length': 0.0,
+            }
+        return dict(prev)
+
+    # ── Extract target curves — identical filtering to split_curves ────────────
+    df = df_expanded.copy()
+    keep_cols = ['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log',
+                 'datetime_energy', variable, 'object_attributes_log'] + exog_cols_present
+    keep_cols = [c for c in keep_cols if c in df.columns]
+    df = df[keep_cols]
+    df = df[df['object_log'].isin(objects)]
+    df = df[df['activity_log'].isin(activities)]
+    df['timestamp_start_log'] = pd.to_datetime(df['timestamp_start_log'])
+    df['datetime_energy']     = pd.to_datetime(df['datetime_energy'])
+    df = df.sort_values(['case_id_log', 'timestamp_start_log', 'datetime_energy'])
+
+    df['activity_instance_id'] = df.groupby(
+        ['case_id_log', 'object_log', 'activity_log', 'timestamp_start_log']
+    ).ngroup()
+
+    curves_data = []
+    for instance_id, group in df.groupby('activity_instance_id'):
+        group  = group.sort_values('datetime_energy').reset_index(drop=True)
+        values = np.asarray(group[variable].dropna().values).squeeze()
+        if values.ndim != 1 or len(values) < 5:
+            continue
+
+        case_id  = group['case_id_log'].iloc[0]
+        ts_start = pd.to_datetime(group['timestamp_start_log'].iloc[0])
+
+        _raw_attrs = (group['object_attributes_log'].iloc[0]
+                      if 'object_attributes_log' in group.columns
+                      and not group['object_attributes_log'].empty else {})
+        attributes = dict(_raw_attrs) if isinstance(_raw_attrs, dict) else {}
+        try:
+            if not pd.isnull(ts_start):
+                attributes['hour_of_day'] = float(ts_start.hour)
+                attributes['day_of_week']  = float(ts_start.dayofweek)
+        except Exception:
+            pass
+
+        attributes.update(_prev_stats(case_id, ts_start))
+
+        entry = {
+            'instance_id':     instance_id,
+            'activity':        group['activity_log'].iloc[0],
+            'original_values': values,
+            'original_length': len(values),
+            'attributes':      attributes,
+        }
+        if exog_cols_present:
+            entry['exog_values'] = {col: group[col].values for col in exog_cols_present}
+        curves_data.append(entry)
+
+    if verbose:
+        print(f"Total curves extracted : {len(curves_data)}")
+
+    all_ids = list(range(len(curves_data)))
+    if test_size <= 0:
+        train_ids, test_ids = all_ids, []
+    elif test_size >= 1.0:
+        train_ids, test_ids = [], all_ids
+    else:
+        train_ids, test_ids = train_test_split(
+            all_ids, test_size=test_size, random_state=random_state
+        )
+
+    train_curves = [curves_data[i] for i in train_ids]
+    test_curves  = [curves_data[i] for i in test_ids]
+
+    if verbose:
+        print(f"Train curves : {len(train_curves)}")
+        print(f"Test curves  : {len(test_curves)}  <- set aside, never touched until evaluation")
+
+    return train_curves, test_curves
+
+
+# =============================================================================
 # STEP 1b — VISUALISE RAW TRAINING CURVES (verbose=1 only, before DTW/DBA)
 # =============================================================================
 
@@ -4154,6 +4307,85 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
 
 
 # =============================================================================
+# DTW + EXTERNAL FACTORS + PREVIOUS-ACTIVITY CONTEXT PIPELINE
+# =============================================================================
+
+def build_and_train_pipeline_exog_prev_activity(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+    n_jobs=-1,
+):
+    """
+    DTW + external factors + previous-activity context.
+
+    The prev-activity features (prev_act_mean, prev_act_std, prev_act_max,
+    prev_act_end, prev_act_length, prev_act_name) must already be present in
+    each curve's 'attributes' dict — populated by split_curves_with_prev_activity().
+    They flow through the standard attribute path in build_and_train_pipeline_exog(),
+    so no changes to the feature-matrix logic are needed.
+    """
+    pipeline = build_and_train_pipeline_exog(
+        train_curves, variable,
+        fixed_length=fixed_length,
+        val_size=val_size,
+        random_state=random_state,
+        models=models,
+        optimize_hyperparams=optimize_hyperparams,
+        n_trials=n_trials,
+        verbose=verbose,
+        n_jobs=n_jobs,
+    )
+    pipeline['approach'] = 'exog_prev_activity'
+
+    # Per-activity training-curve medians — used as first-of-case defaults
+    # during autoregressive test-time rollout (no real predecessor available).
+    _by_act = {}
+    for _c in train_curves:
+        _v = np.asarray(_c['original_values'], dtype=float)
+        if len(_v) == 0:
+            continue
+        _a = _c['activity']
+        _by_act.setdefault(_a, {'m': [], 's': [], 'mx': [], 'e': [], 'l': []})
+        _by_act[_a]['m'].append(float(np.mean(_v)))
+        _by_act[_a]['s'].append(float(np.std(_v))  if len(_v) >= 2 else 0.0)
+        _by_act[_a]['mx'].append(float(np.max(_v)))
+        _by_act[_a]['e'].append(float(_v[-1]))
+        _by_act[_a]['l'].append(float(len(_v)))
+
+    pipeline['first_of_case_defaults'] = {
+        _a: {
+            'prev_act_name':   'none',
+            'prev_act_mean':   float(np.median(_d['m'])),
+            'prev_act_std':    float(np.median(_d['s'])),
+            'prev_act_max':    float(np.median(_d['mx'])),
+            'prev_act_end':    float(np.median(_d['e'])),
+            'prev_act_length': float(np.median(_d['l'])),
+        }
+        for _a, _d in _by_act.items()
+    }
+    return pipeline
+
+
+def predict_raw_curve_exog_prev_activity(raw_values, activity, attributes, pipeline,
+                                         exog_values=None):
+    """
+    Predict using the exog + previous-activity pipeline.
+
+    Thin alias to predict_raw_curve_exog — the prev-activity features live in
+    'attributes' and are handled transparently by the base exog predict function.
+    """
+    return predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
+                                  exog_values=exog_values or {})
+
+
+# =============================================================================
 # AMPLITUDE + SHAPE PIPELINE
 #
 # Splits the prediction problem into two independent stages:
@@ -5870,6 +6102,83 @@ def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
     return y_raw_pred
 
 
+def build_and_train_pipeline_seq2seq_prev_activity(
+    train_curves,
+    variable,
+    fixed_length=100,
+    val_size=0.2,
+    random_state=42,
+    hidden_size=128,
+    num_layers=2,
+    dropout=0.1,
+    epochs=80,
+    batch_size=32,
+    lr=1e-3,
+    teacher_forcing_ratio=0.5,
+    patience=10,
+    verbose=1,
+    n_jobs=-1,
+):
+    """
+    DTW + Seq2Seq + External Factors + Previous-Activity context.
+
+    prev_act_* features must already be in each curve's 'attributes' dict —
+    populated by split_curves_with_prev_activity(). They flow through
+    build_and_train_pipeline_seq2seq_exog unchanged because _infer_key_types
+    picks them up as numeric attributes from the attributes dict.
+    """
+    pipeline = build_and_train_pipeline_seq2seq_exog(
+        train_curves, variable,
+        fixed_length=fixed_length,
+        val_size=val_size,
+        random_state=random_state,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        teacher_forcing_ratio=teacher_forcing_ratio,
+        patience=patience,
+        verbose=verbose,
+    )
+    pipeline['approach'] = 'seq2seq_prev_activity'
+
+    # Per-activity training-curve medians for first-of-case autoregressive defaults
+    _by_act = {}
+    for _c in train_curves:
+        _v = np.asarray(_c['original_values'], dtype=float)
+        if len(_v) == 0:
+            continue
+        _a = _c['activity']
+        _by_act.setdefault(_a, {'m': [], 's': [], 'mx': [], 'e': [], 'l': []})
+        _by_act[_a]['m'].append(float(np.mean(_v)))
+        _by_act[_a]['s'].append(float(np.std(_v))  if len(_v) >= 2 else 0.0)
+        _by_act[_a]['mx'].append(float(np.max(_v)))
+        _by_act[_a]['e'].append(float(_v[-1]))
+        _by_act[_a]['l'].append(float(len(_v)))
+
+    pipeline['first_of_case_defaults'] = {
+        _a: {
+            'prev_act_name':   'none',
+            'prev_act_mean':   float(np.median(_d['m'])),
+            'prev_act_std':    float(np.median(_d['s'])),
+            'prev_act_max':    float(np.median(_d['mx'])),
+            'prev_act_end':    float(np.median(_d['e'])),
+            'prev_act_length': float(np.median(_d['l'])),
+        }
+        for _a, _d in _by_act.items()
+    }
+    return pipeline
+
+
+def predict_raw_curve_seq2seq_prev_activity(raw_values, activity, attributes, pipeline,
+                                             exog_values=None):
+    """Thin alias — prev_act_* features live in attributes, handled by seq2seq_exog path."""
+    return predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
+                                          exog_values=exog_values or {})
+
+
 # =============================================================================
 # STEP 4 — EVALUATE ON RAW TEST CURVES
 # =============================================================================
@@ -5881,6 +6190,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'exog':
         return predict_raw_curve_exog(raw_values, act, attrs, pipeline,
                                       exog_values=curve.get('exog_values', {}))
+    if approach == 'exog_prev_activity':
+        return predict_raw_curve_exog_prev_activity(raw_values, act, attrs, pipeline,
+                                                    exog_values=curve.get('exog_values', {}))
     if approach == 'instance_stats':
         return predict_raw_curve_instance_stats(raw_values, act, attrs, pipeline)
     if approach == 'dtw_phase':
@@ -5894,6 +6206,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'seq2seq_exog':
         return predict_raw_curve_seq2seq_exog(raw_values, act, attrs, pipeline,
                                               exog_values=curve.get('exog_values', {}))
+    if approach == 'seq2seq_prev_activity':
+        return predict_raw_curve_seq2seq_prev_activity(raw_values, act, attrs, pipeline,
+                                                       exog_values=curve.get('exog_values', {}))
     if approach == 'amplitude_shape':
         return predict_raw_curve_amplitude_shape(raw_values, act, attrs, pipeline)
     if approach == 'amplitude_shape_exog':
@@ -5940,7 +6255,8 @@ def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1):
 
 
 def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_cols,
-                             fixed_length=100, val_size=0.2):
+                             fixed_length=100, val_size=0.2,
+                             optimize_hyperparams=False, n_trials=50):
     """
     Top-level picklable worker for RUN_CURVE_ONLY_EVALUATION parallel training.
     Trains all sklearn-based approaches for one (sensor, activity, object) combo.
@@ -5954,7 +6270,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
 
     _SKLEARN_APPROACHES = {'baseline', 'instance_stats', 'istats_leakfree',
                            'dtw_phase', 'basis', 'exog', 'amplitude_shape',
-                           'amplitude_shape_exog'}
+                           'amplitude_shape_exog', 'exog_prev_activity'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
     curves, _ = split_curves(
@@ -5975,54 +6291,64 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     }
     result = {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': False}
 
+    _hp_kwargs = dict(optimize_hyperparams=optimize_hyperparams, n_trials=n_trials)
+
     if 'baseline' in _active:
         result['baseline'] = build_and_train_pipeline(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'instance_stats' in _active:
         result['instance_stats'] = build_and_train_pipeline_instance_stats(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'istats_leakfree' in _active:
         result['istats_leakfree'] = build_and_train_pipeline_istats_leakfree(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'dtw_phase' in _active:
         result['dtw_phase'] = build_and_train_pipeline_dtw_phase(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'basis' in _active:
         result['basis'] = build_and_train_pipeline_basis(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'exog' in _active and ef_cols:
         result['exog'] = build_and_train_pipeline_exog(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'amplitude_shape' in _active:
         result['amplitude_shape'] = build_and_train_pipeline_amplitude_shape(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'amplitude_shape_exog' in _active:
         result['amplitude_shape_exog'] = build_and_train_pipeline_amplitude_shape_exog(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models,
-            optimize_hyperparams=False, verbose=0, n_jobs=1,
+            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
+    if 'exog_prev_activity' in _active:
+        _prev_curves, _ = split_curves_with_prev_activity(
+            df_train,
+            variable=sensor,
+            activities=[activity],
+            objects=[obj],
+            test_size=0.0,
+            verbose=0,
+            exog_columns=ef_cols,
+        )
+        if len(_prev_curves) >= 5:
+            result['exog_prev_activity'] = build_and_train_pipeline_exog_prev_activity(
+                _prev_curves, variable=sensor,
+                fixed_length=fixed_length, val_size=val_size,
+                models=models, verbose=0, n_jobs=1, **_hp_kwargs,
+            )
     return result
 
 
@@ -6040,7 +6366,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     """
     import torch
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
-    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_exog'}
+    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_exog', 'seq2seq_prev_activity'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
         return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
@@ -6085,6 +6411,25 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
             verbose=False,
         )
+
+    if 'seq2seq_prev_activity' in _active:
+        _prev_curves, _ = split_curves_with_prev_activity(
+            df_train,
+            variable=sensor,
+            activities=[activity],
+            objects=[obj],
+            test_size=0.0,
+            verbose=0,
+            exog_columns=ef_cols,
+        )
+        if len(_prev_curves) >= 5:
+            result['seq2seq_prev_activity'] = build_and_train_pipeline_seq2seq_prev_activity(
+                _prev_curves, variable=sensor, fixed_length=fixed_length,
+                val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
+                dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
+                teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
+                verbose=False,
+            )
 
     return result
 
