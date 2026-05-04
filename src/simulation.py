@@ -48,6 +48,7 @@ class ProcessSimulation:
                  energy_transition_modifiers=None,
                  energy_state_columns=None,
                  energy_pipelines=None,
+                 activity_exog_means=None,
                  duration_scale_clip=None,
                  logit_bias_clip=None,
                  verbose=True):
@@ -123,6 +124,7 @@ class ProcessSimulation:
         self.energy_transition_modifiers  = energy_transition_modifiers or {}
         self.energy_state_columns         = energy_state_columns or []
         self.energy_pipelines             = energy_pipelines or {}
+        self.activity_exog_means          = activity_exog_means or {}
         self.duration_scale_clip          = duration_scale_clip
         self.logit_bias_clip              = logit_bias_clip
 
@@ -1283,6 +1285,18 @@ class ProcessSimulation:
                     c: float(np.mean(vals)) if vals else 0.0
                     for c, vals in all_means.items()
                 }
+                # Seed ef_* using the global mean across all start-activity exog means
+                if self.activity_exog_means:
+                    _ef_seed_vals: dict[str, list] = {}
+                    for _sa in (_start_acts or self.activity_exog_means.keys()):
+                        for _col, _v in self.activity_exog_means.get(_sa, {}).items():
+                            _ef_seed_vals.setdefault(_col, []).append(_v)
+                    if not _ef_seed_vals:  # fallback: all activities
+                        for _act_means in self.activity_exog_means.values():
+                            for _col, _v in _act_means.items():
+                                _ef_seed_vals.setdefault(_col, []).append(_v)
+                    for _col, _vs in _ef_seed_vals.items():
+                        seed_state[_col] = float(np.mean(_vs))
                 current_energy_state = seed_state if seed_state else None
             else:
                 current_energy_state = None
@@ -1439,10 +1453,20 @@ class ProcessSimulation:
                                     f"has no 'reference_curve'."
                                 )
                             predict_fn = ep.get('predict_fn')
+                            # Build exog_values dict for pipelines that use external factors
+                            _exog_vals = {}
+                            if ep.get('exog_cols') and self.activity_exog_means:
+                                _act_means = self.activity_exog_means.get(chosen_label, {})
+                                _exog_vals = {
+                                    col: np.array([v])
+                                    for col, v in _act_means.items()
+                                    if col in ep['exog_cols']
+                                }
                             curve = (predict_fn(
                                          raw_values=ref_curve,
                                          activity=chosen_label,
                                          object_attributes=object_attributes,
+                                         exog=_exog_vals if _exog_vals else None,
                                      ) if predict_fn is not None
                                      else np.asarray(ref_curve, dtype=float))
 
@@ -1459,6 +1483,14 @@ class ProcessSimulation:
                                 f"Energy pipeline prediction failed for sensor '{sensor}', "
                                 f"activity '{chosen_label}', object '{object_name}': {exc}"
                             ) from exc
+
+                    # Populate ef_* columns from precomputed activity means (or carry forward)
+                    if self.activity_exog_means and chosen_label in self.activity_exog_means:
+                        new_energy_state.update(self.activity_exog_means[chosen_label])
+                    elif current_energy_state:
+                        for _k, _v in current_energy_state.items():
+                            if _k not in new_energy_state:
+                                new_energy_state[_k] = _v
 
                     # Validate — raise if any expected column is missing
                     if self.energy_state_columns:
@@ -1564,6 +1596,18 @@ class ProcessSimulation:
                     c: float(np.mean(vals)) if vals else 0.0
                     for c, vals in all_means.items()
                 }
+                # Seed ef_* columns using start-activity exog means
+                if self.activity_exog_means:
+                    _ef_seed_vals_d: dict[str, list] = {}
+                    for _sa in (_start_acts or self.activity_exog_means.keys()):
+                        for _col, _v in self.activity_exog_means.get(_sa, {}).items():
+                            _ef_seed_vals_d.setdefault(_col, []).append(_v)
+                    if not _ef_seed_vals_d:
+                        for _act_means in self.activity_exog_means.values():
+                            for _col, _v in _act_means.items():
+                                _ef_seed_vals_d.setdefault(_col, []).append(_v)
+                    for _col, _vs in _ef_seed_vals_d.items():
+                        seed_state[_col] = float(np.mean(_vs))
                 current_energy_state = seed_state if seed_state else None
             else:
                 current_energy_state = None
@@ -1674,6 +1718,12 @@ class ProcessSimulation:
                     activity_history.insert(0, (chosen_label, activity_duration))
                     activity_history = activity_history[:2]
                     prev_activity    = chosen_label
+
+                    # Update ef_* in energy state to reflect current activity's conditions
+                    if current_energy_state is not None and self.activity_exog_means:
+                        _act_ef = self.activity_exog_means.get(chosen_label, {})
+                        if _act_ef:
+                            current_energy_state = {**current_energy_state, **_act_ef}
 
             if step >= max_steps:
                 print(f"    WARNING: max steps ({max_steps}) reached.")

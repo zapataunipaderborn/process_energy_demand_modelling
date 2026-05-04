@@ -39,12 +39,12 @@ EXPERIMENTS = [
     #     'run_process_modelling': True,
     # },
     # {
-    #     'data_experiment':      '1',
-    #     'run_name':             'experiment_10',
-    #     'processes_to_run':     ['process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':  'original',
-    #     'run_process_modelling': True,
-    # },
+        'data_experiment':      '1',
+        'run_name':             'experiment_10',
+        'processes_to_run':     ['process_2', 'process_3', 'process_4'],
+        'temporal_resolution':  'original',
+        'run_process_modelling': True,
+    },
     # Add more experiments here...
 ]
 

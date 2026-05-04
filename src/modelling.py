@@ -1646,6 +1646,14 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             if _df_expanded_train is None or _df_expanded_train.empty:
                 print("⚠️  No expanded training df available — skipping energy modifiers.")
             else:
+                # Detect external-factor columns (ef_*) from expanded training df
+                _ef_ep_cols = [
+                    c for c in _df_expanded_train.columns
+                    if c.startswith('ef_')
+                    and _df_expanded_train[c].dtype in ('float64', 'float32', 'int64', 'int32')
+                ]
+                if _ef_ep_cols:
+                    print(f"  ℹ️  Energy models will use {len(_ef_ep_cols)} external factor(s): {_ef_ep_cols}")
                 # Auto-detect sensor columns: any *_energy column that is not a log column.
                 # If process_datasets_to_model_sensors is defined and has sensors_to_model,
                 # use that curated list instead (it is defined later in the energy-modelling section).
@@ -1670,6 +1678,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
                 if not _sensors:
                     print("⚠️  No sensors found for this process — skipping energy modifiers.")
+                    _activity_exog_means = {}
                 else:
                     # Initialise direct-model dicts so they're always defined in scope
                     _energy_direct_dur_mods = {}
@@ -1682,6 +1691,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 duration_models=ENERGY_DURATION_MODELS,
                                 transition_models=ENERGY_TRANSITION_MODELS,
                                 min_samples=ENERGY_MIN_SAMPLES,
+                                ef_cols=_ef_ep_cols,
                             )
                         energy_modifiers_by_process[process] = {
                             'duration':    _energy_dur_mods,
@@ -1713,6 +1723,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                     duration_models=ENERGY_DURATION_MODELS,
                                     transition_models=ENERGY_TRANSITION_MODELS,
                                     min_samples=ENERGY_MIN_SAMPLES,
+                                    ef_cols=_ef_ep_cols,
                                 )
                             if _direct_report:
                                 report("\n" + "="*80)
@@ -1730,7 +1741,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         # Only run this if we actually want to evaluate on Test results
                         # as this DTW-based training is the slowest part of the pipeline.
                         if RUN_TEST_EVALUATION:
-                            from sim_extractor import predict_raw_curve, _train_energy_pipeline_worker
+                            from sim_extractor import (predict_raw_curve, predict_raw_curve_exog,
+                                                       _train_energy_pipeline_worker)
                             import concurrent.futures, os
 
                             _energy_pipelines = {}
@@ -1740,9 +1752,27 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             _objects_list    = _config.get('objects_to_model',    _df_expanded_train['object_log'].dropna().unique().tolist())
 
                             def _make_predict_fn(ep_bound):
-                                return lambda raw_values, activity, object_attributes: predict_raw_curve(
-                                    raw_values, activity, object_attributes, pipeline=ep_bound
-                                )
+                                _ep_exog = ep_bound.get('exog_cols', [])
+                                if _ep_exog:
+                                    return (lambda ep: lambda raw_values, activity, object_attributes, exog=None:
+                                        predict_raw_curve_exog(raw_values, activity, object_attributes,
+                                                               pipeline=ep, exog_values=exog or {})
+                                    )(ep_bound)
+                                return (lambda ep: lambda raw_values, activity, object_attributes, exog=None:
+                                    predict_raw_curve(raw_values, activity, object_attributes, pipeline=ep)
+                                )(ep_bound)
+
+                            # Pre-compute per-activity mean exog values from training data
+                            _activity_exog_means = {}
+                            if _ef_ep_cols and 'activity_log' in _df_expanded_train.columns:
+                                for _act in _activities_list:
+                                    _act_rows = _df_expanded_train[_df_expanded_train['activity_log'] == _act]
+                                    if len(_act_rows) > 0:
+                                        _activity_exog_means[_act] = {
+                                            col: float(_act_rows[col].mean())
+                                            for col in _ef_ep_cols
+                                            if col in _act_rows.columns and not _act_rows[col].isna().all()
+                                        }
 
                             _combos = [
                                 (s, a, o)
@@ -1751,18 +1781,19 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 for o in _objects_list
                             ]
                             _n_workers = min(len(_combos), os.cpu_count() or 4)
-                            print(f"\n  ℹ️ Training {len(_combos)} pipelines across {_n_workers} workers...")
+                            print(f"\n  ℹ️ Training {len(_combos)} pipelines across {_n_workers} workers"
+                                  f" ({'with' if _ef_ep_cols else 'without'} external factors)...")
                             print(f"     sensors={_sensors}")
                             print(f"     activities={_activities_list}")
                             print(f"     objects={_objects_list}")
-                            print(f"     combos={_combos}")
 
                             # ProcessPoolExecutor works from Jupyter notebooks; joblib/loky does not
                             # reliably spawn from an interactive kernel on Linux.
                             _results = []
                             with concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers) as _ctx:
                                 _futures = {
-                                    _ctx.submit(_train_energy_pipeline_worker, s, a, o, _df_expanded_train, 1): (s, a, o)
+                                    _ctx.submit(_train_energy_pipeline_worker, s, a, o,
+                                                _df_expanded_train, 1, _ef_ep_cols): (s, a, o)
                                     for s, a, o in _combos
                                 }
                                 for _fut in concurrent.futures.as_completed(_futures):
@@ -1779,17 +1810,20 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 _energy_pipelines.setdefault(_sensor, {}).setdefault(_activity, {})[_object] = {
                                     'reference_curve': _ep_pipeline['reference_curve'],
                                     'predict_fn':      _make_predict_fn(_ep_pipeline),
+                                    'exog_cols':       _ep_pipeline.get('exog_cols', []),
                                     'full_pipeline':   _ep_pipeline,
                                 }
 
                             all_energy_pipelines[process] = _energy_pipelines
                         else:
                             _energy_pipelines = {}
+                            _activity_exog_means = {}
 
                     except Exception as _exc:
                         print(f"⚠️  extract_energy_modifiers or ML curve modeling failed: {_exc}")
                         _energy_dur_mods, _energy_tr_mods, _energy_state_cols = {}, {}, []
                         _energy_pipelines = {}
+                        _activity_exog_means = {}
 
                 # ── Simulate energy-aware modes ───────────────────────────
                 for _energy_mode in _energy_modes_requested:
@@ -1812,6 +1846,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             energy_transition_modifiers=_tr_mods,
                             energy_state_columns=_energy_state_cols,
                             energy_pipelines=_energy_pipelines,
+                            activity_exog_means=_activity_exog_means,
                             duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
                             logit_bias_clip=ENERGY_LOGIT_BIAS_CLIP,
                             verbose=VERBOSE_EVAL,

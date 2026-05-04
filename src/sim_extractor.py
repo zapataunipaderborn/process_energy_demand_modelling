@@ -1003,7 +1003,8 @@ def _energy_summary(curve: np.ndarray, sensor_name: str) -> dict:
 
 def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log',
                                 timestamp_start_col='timestamp_start_log',
-                                datetime_energy_col='datetime_energy'):
+                                datetime_energy_col='datetime_energy',
+                                ef_cols=None):
     """
     For every activity instance in df_expanded, compute the energy-state
     feature vector from the *actual* sensor measurements.
@@ -1016,8 +1017,9 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
           - 'duration'  : float  (minutes)
           - 'next_activity' : str  (or '__END__')
           - one key per sensor × 3 features  (mean, end, std)
+          - one key per ef_col (mean over the instance window)
     energy_state_columns : list[str]
-        Ordered list of the 3×N feature names.
+        Ordered list of the 3×N feature names, followed by ef_col names.
     """
     records = []
 
@@ -1025,6 +1027,8 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+    _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
+    energy_state_columns += _ef_cols_present
 
     # Group by activity instance
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
@@ -1070,6 +1074,11 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
 
         if not ok:
             continue
+
+        # Add mean external-factor values over the activity window
+        for col in _ef_cols_present:
+            vals = grp[col].dropna().values
+            row[col] = float(np.mean(vals)) if len(vals) > 0 else np.nan
 
         records.append(row)
 
@@ -1135,6 +1144,7 @@ def extract_energy_modifiers(
     min_samples=30,
     timestamp_start_col='timestamp_start_log',
     datetime_energy_col='datetime_energy',
+    ef_cols=None,
 ):
     """
     Mine energy-modifier models from *training* df_expanded.
@@ -1177,7 +1187,9 @@ def extract_energy_modifiers(
         activity_col=activity_col,
         timestamp_start_col=timestamp_start_col,
         datetime_energy_col=datetime_energy_col,
+        ef_cols=ef_cols,
     )
+    print(f"  External factors : {[c for c in (ef_cols or []) if c in df_expanded.columns]}")
 
     if df_recs.empty:
         print("  WARNING: no valid activity instances found — returning empty modifiers.")
@@ -1211,12 +1223,14 @@ def extract_energy_modifiers(
         return LogisticRegression(max_iter=1000, random_state=42) # fallback
 
     df_recs = _build_energy_state_matrix_with_next(
-        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
+        ef_cols=ef_cols,
     )
-    
+
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+    energy_state_columns += [c for c in (ef_cols or []) if c in df_expanded.columns and c in df_recs.columns]
 
     if df_recs.empty:
         print("  WARNING: no valid instances with next_activity — returning empty modifiers.")
@@ -1375,6 +1389,7 @@ def extract_energy_direct_models(
     min_samples=30,
     timestamp_start_col='timestamp_start_log',
     datetime_energy_col='datetime_energy',
+    ef_cols=None,
 ):
     """
     Train per-activity ML models that *directly* predict duration and next
@@ -1442,12 +1457,15 @@ def extract_energy_direct_models(
     # from the PREVIOUS activity (what's available before this activity fires)
     # and the duration + next_activity of THIS activity.
     df_recs = _build_energy_state_matrix_with_next(
-        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
+        ef_cols=ef_cols,
     )
+    print(f"  External factors : {[c for c in (ef_cols or []) if c in df_expanded.columns]}")
 
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+    energy_state_columns += [c for c in (ef_cols or []) if c in df_expanded.columns and c in df_recs.columns]
 
     if df_recs.empty:
         print("  WARNING: no valid instances — returning empty models.")
@@ -1574,7 +1592,8 @@ def extract_energy_direct_models(
 
 
 def _build_energy_state_matrix_with_next(
-    df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col
+    df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
+    ef_cols=None,
 ):
     """
     Like _build_energy_state_matrix but also resolves next_activity
@@ -1585,6 +1604,8 @@ def _build_energy_state_matrix_with_next(
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+    _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
+    energy_state_columns += _ef_cols_present
 
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
     available_group_cols = [c for c in group_cols if c in df_expanded.columns]
@@ -1644,6 +1665,10 @@ def _build_energy_state_matrix_with_next(
             row.update(_energy_summary(curve, sensor))
 
         if ok:
+            # Add mean external-factor values over the activity window
+            for col in _ef_cols_present:
+                vals = grp[col].dropna().values
+                row[col] = float(np.mean(vals)) if len(vals) > 0 else np.nan
             records.append(row)
 
     return pd.DataFrame(records)
@@ -6223,11 +6248,13 @@ def _dispatch_predict(raw_values, curve, pipeline):
     return predict_raw_curve(raw_values, act, attrs, pipeline)
 
 
-def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1):
+def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1, ef_cols=None):
     """
     Top-level (picklable) worker for parallel pipeline training.
     Trains one pipeline for a single (sensor, activity, object) combination.
     Must be a module-level function so joblib/loky can pickle it.
+    When ef_cols are provided, trains an exog pipeline that uses external
+    factors as additional predictors.
     """
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import GradientBoostingRegressor
@@ -6239,22 +6266,39 @@ def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1):
         objects=[obj],
         test_size=0.0,
         verbose=0,
+        exog_columns=ef_cols or [],
     )
     if len(curves) < 5:
         return sensor, activity, obj, None
-    pipeline = build_and_train_pipeline(
-        curves,
-        variable=sensor,
-        fixed_length=100,
-        val_size=0.2,
-        models={
-            'Linear Regression': LinearRegression,
-            'Gradient Boosting': GradientBoostingRegressor,
-        },
-        optimize_hyperparams=False,
-        verbose=0,
-        n_jobs=n_jobs,
-    )
+
+    if ef_cols:
+        pipeline = build_and_train_pipeline_exog(
+            curves,
+            variable=sensor,
+            fixed_length=100,
+            val_size=0.2,
+            models={
+                'Linear Regression': LinearRegression,
+                'Gradient Boosting': GradientBoostingRegressor,
+            },
+            optimize_hyperparams=False,
+            verbose=0,
+            n_jobs=n_jobs,
+        )
+    else:
+        pipeline = build_and_train_pipeline(
+            curves,
+            variable=sensor,
+            fixed_length=100,
+            val_size=0.2,
+            models={
+                'Linear Regression': LinearRegression,
+                'Gradient Boosting': GradientBoostingRegressor,
+            },
+            optimize_hyperparams=False,
+            verbose=0,
+            n_jobs=n_jobs,
+        )
     return sensor, activity, obj, pipeline
 
 
