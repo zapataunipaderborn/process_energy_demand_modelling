@@ -1484,10 +1484,12 @@ class ProcessSimulation:
                                 f"activity '{chosen_label}', object '{object_name}': {exc}"
                             ) from exc
 
-                    # Populate ef_* columns from precomputed activity means (or carry forward)
+                    # Populate ef_* columns from precomputed activity means
                     if self.activity_exog_means and chosen_label in self.activity_exog_means:
                         new_energy_state.update(self.activity_exog_means[chosen_label])
-                    elif current_energy_state:
+                    # Always carry forward any state columns not yet populated (e.g. sensors
+                    # with no trained pipeline, or weather sensors absent from energy_pipelines)
+                    if current_energy_state:
                         for _k, _v in current_energy_state.items():
                             if _k not in new_energy_state:
                                 new_energy_state[_k] = _v
