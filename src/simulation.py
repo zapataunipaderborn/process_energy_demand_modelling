@@ -51,6 +51,7 @@ class ProcessSimulation:
                  activity_exog_means=None,
                  duration_scale_clip=None,
                  logit_bias_clip=None,
+                 temporal_resolution_minutes=15.0,
                  verbose=True):
         # Backward-compatible input handling: extract_process now returns
         # (stats_df, raw_df, process_models), while older callers pass stats_df only.
@@ -127,6 +128,7 @@ class ProcessSimulation:
         self.activity_exog_means          = activity_exog_means or {}
         self.duration_scale_clip          = duration_scale_clip
         self.logit_bias_clip              = logit_bias_clip
+        self.temporal_resolution_minutes  = float(temporal_resolution_minutes) if temporal_resolution_minutes else 15.0
 
         # Verification: confirm global model is loaded for ml_global_model
         if self.mode == 'ml_global_model' and self.ml_models is not None:
@@ -1462,13 +1464,22 @@ class ProcessSimulation:
                                     for col, v in _act_means.items()
                                     if col in ep['exog_cols']
                                 }
+                            # Use predicted duration to set curve_length so the model
+                            # receives the same feature value it saw during training.
+                            # Resample ref_curve to the expected number of timesteps.
+                            _n_ts = max(2, round(activity_duration / self.temporal_resolution_minutes))
+                            _input_curve = np.interp(
+                                np.linspace(0, 1, _n_ts),
+                                np.linspace(0, 1, len(ref_curve)),
+                                ref_curve,
+                            )
                             curve = (predict_fn(
-                                         raw_values=ref_curve,
+                                         raw_values=_input_curve,
                                          activity=chosen_label,
                                          object_attributes=object_attributes,
                                          exog=_exog_vals if _exog_vals else None,
                                      ) if predict_fn is not None
-                                     else np.asarray(ref_curve, dtype=float))
+                                     else _input_curve)
 
                             # Log the full curve for evaluation later
                             if self.events and self.events[-1]['activity'] == chosen_label:

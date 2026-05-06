@@ -104,6 +104,18 @@ experiment          = os.environ.get('PIPELINE_DATA_EXPERIMENT', '5')
 #   '15min'    → resample to 15-minute bins
 TEMPORAL_RESOLUTION = os.environ.get('PIPELINE_TEMPORAL_RESOLUTION', '15min')
 
+# Parse to minutes so the simulation can convert duration → expected timestep count
+def _parse_resolution_minutes(res_str):
+    import re
+    if res_str == 'original':
+        return 1.0   # raw rows — assume 1-minute equivalent as fallback
+    m = re.match(r'^(\d+(?:\.\d+)?)(min|h)$', res_str.strip())
+    if m:
+        val = float(m.group(1))
+        return val * 60.0 if m.group(2) == 'h' else val
+    return 15.0  # safe default
+TEMPORAL_RESOLUTION_MINUTES = _parse_resolution_minutes(TEMPORAL_RESOLUTION)
+
 current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
 folder_gold_base = current_path.parent / 'data' / 'gold' / f'experiment_{experiment}'
 
@@ -262,7 +274,7 @@ ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
 
 ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
 ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_SAMPLES         = 15          # skip ML (use statistical) if n_samples < this
+ENERGY_MIN_SAMPLES         = 5           # skip ML (use statistical) if n_samples < this
 
 # Will be populated per process after energy modelling:
 energy_modifiers_by_process = {}
@@ -327,7 +339,7 @@ ML_OPTUNA_TRIALS        = 20
 #   regressor hyperparameters (learning rate, max_depth, n_estimators, etc.)
 #   instead of using defaults.  Significantly slower but often improves fit.
 # ─────────────────────────────────────────────────────────────────────────────
-CURVE_OPTIMIZE_HYPERPARAMS = True   # ← Optuna search for sklearn curve models
+CURVE_OPTIMIZE_HYPERPARAMS = False   # ← Optuna search for sklearn curve models
 CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) combo
 
 # %%
@@ -337,12 +349,12 @@ CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) 
 
 # ── Train / test split ────────────────────────────────────────────────────────
 TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
-TRAIN_RATIO         = 0.80    # fraction of cases used for training
+TRAIN_RATIO         = 0.50    # fraction of cases used for training
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
 RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
 RUN_CURVE_ONLY_EVALUATION = True   # run curve-quality benchmark (MAE/RMSE/R²)
-RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'false').lower() == 'true'
+RUN_PROCESS_MODELLING     = True#os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'false').lower() == 'true'
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          DTW + position index (sklearn regressor)
@@ -979,23 +991,40 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
                         rmse = np.sqrt(np.mean((y_real - y_sim_resampled)**2))
                         denom = np.sum(np.abs(y_real))
                         wape = np.sum(np.abs(y_real - y_sim_resampled)) / denom * 100 if denom > 0 else 0
-                        
+                        ss_tot = np.sum((y_real - np.mean(y_real))**2)
+                        ss_res = np.sum((y_real - y_sim_resampled)**2)
+                        r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
                         if sensor not in sensor_metrics:
-                            sensor_metrics[sensor] = {'mae': [], 'rmse': [], 'wape': []}
+                            sensor_metrics[sensor] = {'mae': [], 'rmse': [], 'wape': [], 'r2': [], 'activity': []}
                         sensor_metrics[sensor]['mae'].append(mae)
                         sensor_metrics[sensor]['rmse'].append(rmse)
                         sensor_metrics[sensor]['wape'].append(wape)
-        
+                        sensor_metrics[sensor]['r2'].append(r2)
+                        sensor_metrics[sensor]['activity'].append(act)
+
         # Aggregate per sensor
         agg_energy = {}
+        act_energy = {}
         for sensor, m in sensor_metrics.items():
-            s_mae = np.mean(m['mae'])
+            s_mae  = np.mean(m['mae'])
             s_rmse = np.mean(m['rmse'])
             s_wape = np.mean(m['wape'])
-            agg_energy[sensor] = {'MAE': s_mae, 'RMSE': s_rmse, 'WAPE': s_wape}
-            report(f"  {sensor:40}: MAE={s_mae:.2f}, RMSE={s_rmse:.2f}, WAPE={s_wape:.4f}")
-        
+            s_r2   = np.mean(m['r2'])
+            agg_energy[sensor] = {'MAE': s_mae, 'RMSE': s_rmse, 'WAPE': s_wape, 'R2': s_r2}
+            report(f"  {sensor:40}: MAE={s_mae:.2f}, RMSE={s_rmse:.2f}, WAPE={s_wape:.4f}  R²={s_r2:.4f}")
+            # Per-activity breakdown
+            for _a in set(m['activity']):
+                _idxs = [i for i, x in enumerate(m['activity']) if x == _a]
+                act_energy[(sensor, _a)] = {
+                    'MAE':  float(np.mean([m['mae'][i]  for i in _idxs])),
+                    'RMSE': float(np.mean([m['rmse'][i] for i in _idxs])),
+                    'WAPE': float(np.mean([m['wape'][i] for i in _idxs])),
+                    'R2':   float(np.mean([m['r2'][i]   for i in _idxs])),
+                }
+
         results['energy_metrics'] = agg_energy
+        results['activity_energy_metrics'] = act_energy
         energy_results = agg_energy
 
     # ========== 8. OVERALL QUALITY SCORE ==========
@@ -1297,6 +1326,7 @@ MODES_TO_COMPARE = _filtered_modes
 
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
+_combined_sim_store = []  # stores (process, mode, sim_df, exp_df, sensors) for curve plotting
 
 if not RUN_PROCESS_MODELLING:
     print("RUN_PROCESS_MODELLING=False — skipping process modelling loop.")
@@ -1666,11 +1696,13 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 if _sensors_from_config:
                     _sensors = _sensors_from_config
                 else:
-                    # Fall back: all *_energy columns that are numeric and not log columns
+                    # Fall back: all *_energy columns that are numeric, not log columns,
+                    # and not external-factor columns (ef_* are inputs, not prediction targets)
                     _sensors = [
                         c for c in _df_expanded_train.columns
                         if c.endswith('_energy')
                         and not c.endswith('_log')
+                        and not c.startswith('ef_')
                         and _df_expanded_train[c].dtype in ('float64', 'float32', 'int64', 'int32')
                     ]
                     if _sensors:
@@ -1882,6 +1914,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             activity_exog_means=exog_means if exog_means is not None else _activity_exog_means,
                             duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
                             logit_bias_clip=ENERGY_LOGIT_BIAS_CLIP,
+                            temporal_resolution_minutes=TEMPORAL_RESOLUTION_MINUTES,
                             verbose=VERBOSE_EVAL,
                         ).run()
 
@@ -1945,11 +1978,23 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                     for _sensor, _vals in _met.items():
                                         for _mn, _mv in _vals.items():
                                             _energy_flattened[f"test_energy_{_sensor}_{_mn}"] = _mv
+                                elif _cat == 'activity_energy_metrics':
+                                    pass  # kept in _eval_test for plotting; not flattened into wide df
                                 elif isinstance(_met, dict):
                                     for _mn, _mv in _met.items():
                                         _energy_flattened[f"test_{_cat}_{_mn}"] = _mv
                                 else:
                                     _energy_flattened[f"test_{_cat}"] = _met
+
+                            # Store sim df for later curve plotting
+                            _combined_sim_store.append({
+                                'process':  process,
+                                'mode':     _energy_mode,
+                                'sim_df':   _energy_sim_test,
+                                'exp_df':   _exp_test,
+                                'sensors':  _sensors,
+                                'act_metrics': _eval_test.get('activity_energy_metrics', {}),
+                            })
 
                     process_mode_results.append(_energy_flattened)
                     evaluation_results_list.append(_energy_flattened)
@@ -2619,7 +2664,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
     def _savefig(name):
         _plot_counter[0] += 1
-        _p = os.path.join(_plots_dir, f"{_plot_counter[0]:02d}_{name}.png")
+        _safe = name.replace('/', '_per_').replace('\\', '_')
+        _p = os.path.join(_plots_dir, f"{_plot_counter[0]:02d}_{_safe}.png")
         plt.savefig(_p, dpi=150, bbox_inches='tight')
 
     display(Markdown("---"))
@@ -3117,13 +3163,124 @@ if profile_summary_records:
     display(_psummary)
 
 # ── SIMULATION CURVE VISUALS (SIMULATED VS REAL) ───────────────────────────
-# We look for simulated logs in evaluation_results_list that have 'simulated_energy_curves'
 report("\n" + "="*80)
 report("VISUAL COMPARISON: SIMULATED (TEST RUN) VS REAL DATA")
 report("="*80)
 
+if _combined_sim_store:
+    from collections import defaultdict
+    from scipy.interpolate import interp1d as _interp1d
 
+    _N_SAMPLE_CURVES = 4  # max example curves per activity in the plot grid
 
+    # ── per-activity metrics table ────────────────────────────────────────
+    _act_metric_rows = []
+    for _entry in _combined_sim_store:
+        for (_sensor, _act), _vals in _entry['act_metrics'].items():
+            _act_metric_rows.append({
+                'Process': _entry['process'], 'Mode': _entry['mode'],
+                'Sensor': _sensor, 'Activity': _act,
+                **_vals,
+            })
+    if _act_metric_rows:
+        _act_df = pd.DataFrame(_act_metric_rows)
+        report("\nPER-ACTIVITY ENERGY METRICS (TEST SET, combined sim):")
+        report("-" * 80)
+        _act_pivot = (
+            _act_df.groupby(['Process', 'Mode', 'Sensor', 'Activity'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+            .mean().round(4)
+        )
+        report(_act_pivot.to_string())
+        display(_act_pivot)
+
+    # ── curve plots per (process, mode, sensor) ───────────────────────────
+    for _entry in _combined_sim_store:
+        _proc   = _entry['process']
+        _mode   = _entry['mode']
+        _sdf    = _entry['sim_df']
+        _edf    = _entry['exp_df']
+        _s_list = _entry.get('sensors', [])
+
+        if _sdf is None or _sdf.empty or 'simulated_energy_curves' not in _sdf.columns:
+            continue
+
+        _case_col = 'case_id_log' if 'case_id_log' in _sdf.columns else \
+                    next((c for c in _sdf.columns if 'case' in c.lower()), None)
+        _act_col  = 'activity_log' if 'activity_log' in _sdf.columns else \
+                    next((c for c in _sdf.columns if 'activity' in c.lower()), None)
+        if not _case_col or not _act_col:
+            continue
+
+        for _sensor in _s_list:
+            # collect (activity, y_real, y_sim) pairs
+            _by_act = defaultdict(list)
+            for _, _row in _sdf.iterrows():
+                _sc = _row.get('simulated_energy_curves', {})
+                if not isinstance(_sc, dict) or _sensor not in _sc:
+                    continue
+                _cid = _row[_case_col]
+                _act = _row[_act_col]
+                _real_rows = _edf[
+                    (_edf['case_id_log'] == _cid) & (_edf['activity_log'] == _act)
+                ] if 'case_id_log' in _edf.columns else pd.DataFrame()
+                if _real_rows.empty or _sensor not in _real_rows.columns:
+                    continue
+                _y_real = _real_rows[_sensor].dropna().values
+                if len(_y_real) < 2:
+                    continue
+                _y_sim = np.asarray(_sc[_sensor], dtype=float)
+                if len(_y_sim) != len(_y_real):
+                    _f = _interp1d(np.linspace(0, 1, len(_y_sim)), _y_sim,
+                                   kind='linear', fill_value='extrapolate')
+                    _y_sim = _f(np.linspace(0, 1, len(_y_real)))
+                _by_act[_act].append((_y_real, _y_sim))
+
+            if not _by_act:
+                continue
+
+            _acts_sorted = sorted(_by_act.keys())
+            _n_rows = len(_acts_sorted)
+            _n_cols = _N_SAMPLE_CURVES
+
+            fig, axes = plt.subplots(_n_rows, _n_cols,
+                                     figsize=(3.5 * _n_cols, 2.2 * _n_rows),
+                                     squeeze=False)
+            fig.suptitle(f'{_proc}  |  {_mode}  |  {_sensor}\n'
+                         f'Real (blue) vs Simulated (orange)',
+                         fontsize=10, fontweight='bold')
+
+            for _ai, _act in enumerate(_acts_sorted):
+                _pairs = _by_act[_act][:_n_cols]
+                # compute per-activity R² for subplot annotation
+                _r2_vals = []
+                for _yr, _ys in _pairs:
+                    _ss = np.sum((_yr - np.mean(_yr))**2)
+                    _r2_vals.append(1 - np.sum((_yr - _ys)**2) / _ss if _ss > 0 else 0.0)
+
+                for _ci, (_yr, _ys) in enumerate(_pairs):
+                    ax = axes[_ai][_ci]
+                    ax.plot(_yr, color='steelblue', lw=1.5, alpha=0.85, label='Real')
+                    ax.plot(_ys, color='darkorange', lw=1.5, alpha=0.85,
+                            linestyle='--', label='Sim')
+                    ax.set_title(f'R²={_r2_vals[_ci]:.3f}', fontsize=7)
+                    ax.tick_params(labelsize=6)
+                    if _ci == 0:
+                        ax.set_ylabel(_act, fontsize=7, rotation=0,
+                                      ha='right', va='center', labelpad=60)
+                for _ci in range(len(_pairs), _n_cols):
+                    axes[_ai][_ci].axis('off')
+
+            _handles = [
+                plt.Line2D([0], [0], color='steelblue', lw=1.5, label='Real'),
+                plt.Line2D([0], [0], color='darkorange', lw=1.5,
+                           linestyle='--', label='Simulated'),
+            ]
+            fig.legend(handles=_handles, loc='upper right', fontsize=8)
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            _savefig(f'sim_curves_{_proc}_{_mode}_{_sensor}')
+            plt.show()
+else:
+    report("  No combined simulation results available for curve plotting.")
 
 # ── FINAL CONSOLIDATED ENERGY PERFORMANCE REPORT ───────────────────────────
 report("\n" + "█"*80)
