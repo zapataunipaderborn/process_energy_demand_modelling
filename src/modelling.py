@@ -330,7 +330,7 @@ MINING_SEARCH_SPACE = {
 # ─────────────────────────────────────────────────────────────────────────────
 ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
 ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
-ML_OPTIMIZE_HYPERPARAMS = False    # ← set True to enable Optuna tuning
+ML_OPTIMIZE_HYPERPARAMS = True    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -339,7 +339,7 @@ ML_OPTUNA_TRIALS        = 20
 #   regressor hyperparameters (learning rate, max_depth, n_estimators, etc.)
 #   instead of using defaults.  Significantly slower but often improves fit.
 # ─────────────────────────────────────────────────────────────────────────────
-CURVE_OPTIMIZE_HYPERPARAMS = False   # ← Optuna search for sklearn curve models
+CURVE_OPTIMIZE_HYPERPARAMS = True   # ← Optuna search for sklearn curve models
 CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) combo
 
 # %%

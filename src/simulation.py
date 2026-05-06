@@ -1732,8 +1732,85 @@ class ProcessSimulation:
                     activity_history = activity_history[:2]
                     prev_activity    = chosen_label
 
-                    # Update ef_* in energy state to reflect current activity's conditions
-                    if current_energy_state is not None and self.activity_exog_means:
+                    # ── Update energy state from simulated curve ──────────────
+                    # Predict the sensor curve for the just-fired activity and
+                    # compress it to (mean, end, std) so the next iteration has
+                    # a realistic energy state to drive transition and duration
+                    # predictions — this is the closed feedback loop.
+                    if self.energy_pipelines and chosen_label is not None:
+                        new_energy_state = {}
+                        for sensor, act_map in self.energy_pipelines.items():
+                            try:
+                                obj_map = act_map.get(chosen_label, {})
+                                ep = obj_map.get(object_name) or (
+                                    next(iter(obj_map.values())) if obj_map else None
+                                )
+                                if ep is None:
+                                    for sfx in ('_mean', '_end', '_std'):
+                                        key = f'{sensor}{sfx}'
+                                        if current_energy_state and key in current_energy_state:
+                                            new_energy_state[key] = current_energy_state[key]
+                                    continue
+                                ref_curve = ep.get('reference_curve')
+                                if ref_curve is None:
+                                    raise ValueError(
+                                        f"energy_pipelines['{sensor}']['{chosen_label}']['{object_name}'] "
+                                        f"has no 'reference_curve'."
+                                    )
+                                predict_fn = ep.get('predict_fn')
+                                _exog_vals = {}
+                                if ep.get('exog_cols') and self.activity_exog_means:
+                                    _act_means = self.activity_exog_means.get(chosen_label, {})
+                                    _exog_vals = {
+                                        col: np.array([v])
+                                        for col, v in _act_means.items()
+                                        if col in ep['exog_cols']
+                                    }
+                                _n_ts = max(2, round(activity_duration / self.temporal_resolution_minutes))
+                                _input_curve = np.interp(
+                                    np.linspace(0, 1, _n_ts),
+                                    np.linspace(0, 1, len(ref_curve)),
+                                    ref_curve,
+                                )
+                                curve = (predict_fn(
+                                             raw_values=_input_curve,
+                                             activity=chosen_label,
+                                             object_attributes=object_attributes,
+                                             exog=_exog_vals if _exog_vals else None,
+                                         ) if predict_fn is not None
+                                         else _input_curve)
+
+                                if self.events and self.events[-1]['activity'] == chosen_label:
+                                    if 'simulated_energy_curves' not in self.events[-1]:
+                                        self.events[-1]['simulated_energy_curves'] = {}
+                                    self.events[-1]['simulated_energy_curves'][sensor] = curve
+
+                                from sim_extractor import _energy_summary
+                                new_energy_state.update(_energy_summary(curve, sensor))
+                            except Exception as exc:
+                                raise ValueError(
+                                    f"Energy pipeline prediction failed for sensor '{sensor}', "
+                                    f"activity '{chosen_label}', object '{object_name}': {exc}"
+                                ) from exc
+
+                        if self.activity_exog_means and chosen_label in self.activity_exog_means:
+                            new_energy_state.update(self.activity_exog_means[chosen_label])
+                        if current_energy_state:
+                            for _k, _v in current_energy_state.items():
+                                if _k not in new_energy_state:
+                                    new_energy_state[_k] = _v
+
+                        if self.energy_state_columns:
+                            missing = [c for c in self.energy_state_columns
+                                       if c not in new_energy_state]
+                            if missing:
+                                raise ValueError(
+                                    f"Energy state missing columns: {missing}. "
+                                    f"Check sensor config for activity '{chosen_label}'."
+                                )
+
+                        current_energy_state = new_energy_state
+                    elif current_energy_state is not None and self.activity_exog_means:
                         _act_ef = self.activity_exog_means.get(chosen_label, {})
                         if _act_ef:
                             current_energy_state = {**current_energy_state, **_act_ef}
