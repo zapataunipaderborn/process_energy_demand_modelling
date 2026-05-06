@@ -262,7 +262,7 @@ ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
 
 ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
 ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_SAMPLES         = 1           # STRICT: skip ML (use statistical) if n_samples < 30
+ENERGY_MIN_SAMPLES         = 15          # skip ML (use statistical) if n_samples < this
 
 # Will be populated per process after energy modelling:
 energy_modifiers_by_process = {}
@@ -364,8 +364,8 @@ APPROACHES = [
     # 'basis',
     'exog',
     'exog_prev_activity',
-    'amplitude_shape',
-    'amplitude_shape_exog',
+    #'amplitude_shape',
+
     'seq2seq',
     'seq2seq_only',
     # 'seq2seq_exog',
@@ -1762,17 +1762,27 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                     predict_raw_curve(raw_values, activity, object_attributes, pipeline=ep)
                                 )(ep_bound)
 
-                            # Pre-compute per-activity mean exog values from training data
+                            # Pre-compute per-activity exog stats from training data.
+                            # Raw key (ef_col) retained for curve-prediction pipelines that
+                            # still use exog_cols with raw names.  Expanded keys (_mean/_end/_std)
+                            # are required by energy_state_columns after the ef_* expansion.
                             _activity_exog_means = {}
                             if _ef_ep_cols and 'activity_log' in _df_expanded_train.columns:
                                 for _act in _activities_list:
                                     _act_rows = _df_expanded_train[_df_expanded_train['activity_log'] == _act]
                                     if len(_act_rows) > 0:
-                                        _activity_exog_means[_act] = {
-                                            col: float(_act_rows[col].mean())
-                                            for col in _ef_ep_cols
-                                            if col in _act_rows.columns and not _act_rows[col].isna().all()
-                                        }
+                                        _ef_entry = {}
+                                        for col in _ef_ep_cols:
+                                            if col not in _act_rows.columns or _act_rows[col].isna().all():
+                                                continue
+                                            _vals = _act_rows[col].dropna()
+                                            _mean = float(_vals.mean())
+                                            _std  = float(_vals.std()) if len(_vals) > 1 else 0.0
+                                            _ef_entry[col]              = _mean  # raw key for curve pipelines
+                                            _ef_entry[f'{col}_mean']    = _mean
+                                            _ef_entry[f'{col}_end']     = _mean  # best proxy at sim time
+                                            _ef_entry[f'{col}_std']     = _std
+                                        _activity_exog_means[_act] = _ef_entry
 
                             _combos = [
                                 (s, a, o)
@@ -1831,7 +1841,30 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     print(f"  ▶ SIMULATION MODE: {_energy_mode.upper()}")
                     print("─"*80)
 
-                    def _run_energy_sim(plan, stats_df, pm):
+                    def _build_activity_exog_means(df_expanded, activities, ef_cols):
+                        """Compute per-activity ef_* stats from any expanded dataframe."""
+                        means = {}
+                        if not ef_cols or 'activity_log' not in df_expanded.columns:
+                            return means
+                        for act in activities:
+                            act_rows = df_expanded[df_expanded['activity_log'] == act]
+                            if len(act_rows) == 0:
+                                continue
+                            entry = {}
+                            for col in ef_cols:
+                                if col not in act_rows.columns or act_rows[col].isna().all():
+                                    continue
+                                vals = act_rows[col].dropna()
+                                mean = float(vals.mean())
+                                std  = float(vals.std()) if len(vals) > 1 else 0.0
+                                entry[col]           = mean   # raw key for curve pipelines
+                                entry[f'{col}_mean'] = mean
+                                entry[f'{col}_end']  = mean   # best proxy at sim time
+                                entry[f'{col}_std']  = std
+                            means[act] = entry
+                        return means
+
+                    def _run_energy_sim(plan, stats_df, pm, exog_means=None):
                         # Direct modes use the direct ML models; modifier modes use the modifier models
                         _is_direct = _energy_mode in _ENERGY_DIRECT_MODES
                         _dur_mods  = _energy_direct_dur_mods if _is_direct else _energy_dur_mods
@@ -1846,7 +1879,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             energy_transition_modifiers=_tr_mods,
                             energy_state_columns=_energy_state_cols,
                             energy_pipelines=_energy_pipelines,
-                            activity_exog_means=_activity_exog_means,
+                            activity_exog_means=exog_means if exog_means is not None else _activity_exog_means,
                             duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
                             logit_bias_clip=ENERGY_LOGIT_BIAS_CLIP,
                             verbose=VERBOSE_EVAL,
@@ -1888,10 +1921,17 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     if RUN_TEST_EVALUATION:
                         _df_test = test_datasets[process]['event_log'] if test_datasets else None
                         if TEMPORAL_SPLIT and _df_test is not None and len(_df_test) > 0:
-                            _pp_test = test_datasets[process]['production_plan']
+                            _pp_test  = test_datasets[process]['production_plan']
                             _exp_test = test_datasets[process]['expanded']
+                            # ef_* are real observable external factors — use actual test-set
+                            # values instead of training-time means so the model sees real
+                            # conditions, not a constant proxy.
+                            _exog_means_test = _build_activity_exog_means(
+                                _exp_test, _activities_list, _ef_ep_cols
+                            ) if _ef_ep_cols else _activity_exog_means
                             _energy_sim_test = _run_energy_sim(
-                                _pp_test, _best_base_stats, _best_base_pm
+                                _pp_test, _best_base_stats, _best_base_pm,
+                                exog_means=_exog_means_test,
                             )
                             if VERBOSE_EVAL:
                                 print(f"\n  Simulated log TEST  ({_energy_mode}): "
@@ -2042,7 +2082,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         build_and_train_pipeline_exog,            predict_raw_curve_exog,
         build_and_train_pipeline_exog_prev_activity, predict_raw_curve_exog_prev_activity,
         build_and_train_pipeline_amplitude_shape, predict_raw_curve_amplitude_shape,
-        build_and_train_pipeline_amplitude_shape_exog, predict_raw_curve_amplitude_shape_exog,
+        # amplitude_shape_exog removed
         build_and_train_pipeline_seq2seq,         predict_raw_curve_seq2seq,
         build_and_train_pipeline_seq2seq_only,    predict_raw_curve_seq2seq_only,
         build_and_train_pipeline_seq2seq_exog,    predict_raw_curve_seq2seq_exog,
@@ -2060,7 +2100,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_exog            = {}   # DTW + External Factors
     all_energy_pipelines_exog_prev_activity   = {}   # DTW + Ext. Factors + Prev Activity
     all_energy_pipelines_amplitude_shape      = {}   # Amplitude + Shape
-    all_energy_pipelines_amplitude_shape_exog = {}   # Amplitude + Shape + EF + temporal
+    all_energy_pipelines_amplitude_shape_exog = {}   # removed — kept as empty for safety
     all_energy_pipelines_seq2seq              = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_exog         = {}   # DTW + Seq2Seq + Ext. Factors
@@ -2121,7 +2161,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_exog                = {}
         _pipelines_exog_prev_activity   = {}
         _pipelines_amplitude_shape      = {}
-        _pipelines_amplitude_shape_exog = {}
+        _pipelines_amplitude_shape_exog = {}  # removed
         _pipelines_seq2seq                  = {}
         _pipelines_seq2seq_only             = {}
         _pipelines_seq2seq_exog             = {}
@@ -2135,7 +2175,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         import concurrent.futures, os as _os
 
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','exog_prev_activity','amplitude_shape','amplitude_shape_exog'}]
+                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','exog_prev_activity','amplitude_shape'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_exog','seq2seq_prev_activity'}]
 
@@ -2209,12 +2249,6 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['amplitude_shape']['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_amplitude_shape(rv, act, attrs, pipeline=ep))(_r['amplitude_shape']),
                         'full_pipeline':   _r['amplitude_shape'],
-                    }
-                if 'amplitude_shape_exog' in _r:
-                    _pipelines_amplitude_shape_exog.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['amplitude_shape_exog']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_amplitude_shape_exog(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['amplitude_shape_exog']),
-                        'full_pipeline':   _r['amplitude_shape_exog'],
                     }
                 if 'exog_prev_activity' in _r:
                     _pipelines_exog_prev_activity.setdefault(_s, {}).setdefault(_a, {})[_o] = {
@@ -2329,7 +2363,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_exog[_proc]             = _pipelines_exog
         all_energy_pipelines_exog_prev_activity[_proc]   = _pipelines_exog_prev_activity
         all_energy_pipelines_amplitude_shape[_proc]      = _pipelines_amplitude_shape
-        all_energy_pipelines_amplitude_shape_exog[_proc] = _pipelines_amplitude_shape_exog
+
         all_energy_pipelines_seq2seq[_proc]               = _pipelines_seq2seq
         all_energy_pipelines_seq2seq_only[_proc]          = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_exog[_proc]          = _pipelines_seq2seq_exog
@@ -2616,7 +2650,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('DTW + Ext. Factors',          all_energy_pipelines_exog),
             ('DTW + Ext. Factors + Prev Act', all_energy_pipelines_exog_prev_activity),
             ('Amplitude + Shape',           all_energy_pipelines_amplitude_shape),
-            ('Amplitude + Shape + EF',      all_energy_pipelines_amplitude_shape_exog),
+
             ('DTW + Seq2Seq',               all_energy_pipelines_seq2seq),
             ('Seq2Seq only',                all_energy_pipelines_seq2seq_only),
             ('DTW + Seq2Seq + Ext. Factors', all_energy_pipelines_seq2seq_exog),
@@ -2886,8 +2920,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_exog_prev_activity' in dir() else {},
                     'Amplitude + Shape':              all_energy_pipelines_amplitude_shape
                         if 'all_energy_pipelines_amplitude_shape' in dir() else {},
-                    'Amplitude + Shape + EF':         all_energy_pipelines_amplitude_shape_exog
-                        if 'all_energy_pipelines_amplitude_shape_exog' in dir() else {},
+
                     'DTW + Seq2Seq':                  all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only':                   all_energy_pipelines_seq2seq_only

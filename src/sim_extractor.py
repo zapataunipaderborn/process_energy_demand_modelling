@@ -1028,7 +1028,8 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
-    energy_state_columns += _ef_cols_present
+    for _efc in _ef_cols_present:
+        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
 
     # Group by activity instance
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
@@ -1075,10 +1076,17 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
         if not ok:
             continue
 
-        # Add mean external-factor values over the activity window
+        # Add mean/end/std of external-factor values over the activity window
         for col in _ef_cols_present:
             vals = grp[col].dropna().values
-            row[col] = float(np.mean(vals)) if len(vals) > 0 else np.nan
+            if len(vals) > 0:
+                row[f'{col}_mean'] = float(np.mean(vals))
+                row[f'{col}_end']  = float(vals[-1])
+                row[f'{col}_std']  = float(np.std(vals)) if len(vals) > 1 else 0.0
+            else:
+                row[f'{col}_mean'] = np.nan
+                row[f'{col}_end']  = np.nan
+                row[f'{col}_std']  = np.nan
 
         records.append(row)
 
@@ -1230,7 +1238,9 @@ def extract_energy_modifiers(
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
-    energy_state_columns += [c for c in (ef_cols or []) if c in df_expanded.columns and c in df_recs.columns]
+    for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
+        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+    energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
 
     if df_recs.empty:
         print("  WARNING: no valid instances with next_activity — returning empty modifiers.")
@@ -1465,7 +1475,9 @@ def extract_energy_direct_models(
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
-    energy_state_columns += [c for c in (ef_cols or []) if c in df_expanded.columns and c in df_recs.columns]
+    for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
+        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+    energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
 
     if df_recs.empty:
         print("  WARNING: no valid instances — returning empty models.")
@@ -1605,7 +1617,8 @@ def _build_energy_state_matrix_with_next(
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
-    energy_state_columns += _ef_cols_present
+    for _efc in _ef_cols_present:
+        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
 
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
     available_group_cols = [c for c in group_cols if c in df_expanded.columns]
@@ -1665,10 +1678,17 @@ def _build_energy_state_matrix_with_next(
             row.update(_energy_summary(curve, sensor))
 
         if ok:
-            # Add mean external-factor values over the activity window
+            # Add mean/end/std of external-factor values over the activity window
             for col in _ef_cols_present:
                 vals = grp[col].dropna().values
-                row[col] = float(np.mean(vals)) if len(vals) > 0 else np.nan
+                if len(vals) > 0:
+                    row[f'{col}_mean'] = float(np.mean(vals))
+                    row[f'{col}_end']  = float(vals[-1])
+                    row[f'{col}_std']  = float(np.std(vals)) if len(vals) > 1 else 0.0
+                else:
+                    row[f'{col}_mean'] = np.nan
+                    row[f'{col}_end']  = np.nan
+                    row[f'{col}_std']  = np.nan
             records.append(row)
 
     return pd.DataFrame(records)
