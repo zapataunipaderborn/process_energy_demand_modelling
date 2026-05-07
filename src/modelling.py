@@ -2535,6 +2535,8 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                             'RMSE':     _r['RMSE'],
                             'WAPE':     _r['WAPE (%)'],
                             'R2':       _r['R2'],
+                            'sMAE':     _r.get('sMAE'),
+                            'sRMSE':    _r.get('sRMSE'),
                         })
                 except Exception as _eval_e:
                     print(f"  [ERROR] {approach_label} | {_proc} | {_sensor} | act={_leaf_acts}: {_eval_e}")
@@ -2665,6 +2667,16 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
                     _den  = float(np.sum(np.abs(_raw_values)))
                     _wape = float(np.sum(np.abs(_raw_values - _yp))) / _den * 100 if _den != 0 else np.nan
 
+                    _mu_ar  = _raw_values.mean()
+                    _sig_ar = _raw_values.std()
+                    if _sig_ar > 1e-10:
+                        _zt_ar = (_raw_values - _mu_ar) / _sig_ar
+                        _zp_ar = (_yp         - _mu_ar) / _sig_ar
+                        _smae_ar  = float(np.mean(np.abs(_zt_ar - _zp_ar)))
+                        _srmse_ar = float(np.sqrt(np.mean((_zt_ar - _zp_ar) ** 2)))
+                    else:
+                        _smae_ar = _srmse_ar = np.nan
+
                     records.append({
                         'Approach': approach_label,
                         'Process':  _proc,
@@ -2676,6 +2688,8 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
                         'RMSE':     _rmse,
                         'WAPE':     _wape,
                         'R2':       _r2,
+                        'sMAE':     _smae_ar,
+                        'sRMSE':    _srmse_ar,
                     })
 
                     _yp_arr = np.asarray(_yp, dtype=float)
@@ -3476,9 +3490,13 @@ else:
 
         # ── Energy heatmaps: rows=Approach, columns=Metric, aggregated over all
         #    processes and sensors. One heatmap per split × aggregation.
+        # sMAE / sRMSE are computed per curve by z-scoring y_true with its own
+        # mean and std, applying the same transform to y_pred, then computing
+        # MAE and RMSE on the standardised values.
+
         def _plot_curve_energy_heatmap(df, split, agg, save_dir):
-            """Heatmap: rows=Approach, columns=MAE/RMSE/WAPE/R2, agg across everything."""
-            _metrics = [m for m in ['MAE', 'RMSE', 'WAPE', 'R2'] if m in df.columns]
+            """Heatmap: rows=Approach, columns=sMAE/sRMSE/WAPE/R2, agg across everything."""
+            _metrics = [m for m in ['sMAE', 'sRMSE', 'WAPE'] if m in df.columns]
             _sub = df[df['Split'] == split]
             if _sub.empty or not _metrics:
                 return
@@ -3501,7 +3519,7 @@ else:
             _agg_norm = _agg_norm.loc[_agg_norm.mean(axis=1).sort_values(ascending=False).index]
             _agg_annot = _agg.reindex(_agg_norm.index).round(3)
 
-            _title = f"Energy Curves — {split} ({agg})"
+            _title = f"Energy Curves — {split} ({agg})  |  sMAE & sRMSE standardised by per-sensor std, WAPE scale-free"
             _fig, _ax = plt.subplots(figsize=(len(_metrics) * 4, max(4, len(_agg_norm) * 0.7)))
             sns.heatmap(_agg_norm, annot=_agg_annot, fmt='', cmap='RdYlGn', vmin=0, vmax=1,
                         linewidths=0.5, ax=_ax, annot_kws={'size': 10},
@@ -3520,7 +3538,11 @@ else:
         if '_energy_results_dir' in globals():
             display(Markdown("---"))
             display(Markdown("# 📊 Energy Prediction Heatmaps"))
-            display(Markdown("*Rows: approaches — Columns: MAE / RMSE / WAPE / R2 — aggregated across all processes and sensors*"))
+            display(Markdown(
+                "*Rows: approaches — Columns: sMAE / sRMSE / WAPE — "
+                "sMAE and sRMSE standardised by per-sensor std (estimated from R²), "
+                "all three metrics are scale-free and comparable across sensors*"
+            ))
             for _split in sorted(_export_df['Split'].unique()):
                 display(Markdown(f"## {_split}"))
                 _plot_curve_energy_heatmap(_export_df, _split, 'median', _energy_results_dir)

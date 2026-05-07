@@ -6535,6 +6535,16 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
         _denom = np.sum(np.abs(raw_values))
         wape = np.sum(np.abs(raw_values - y_pred)) / _denom * 100 if _denom != 0 else np.nan
 
+        _mu  = raw_values.mean()
+        _sig = raw_values.std()
+        if _sig > 1e-10:
+            _zt = (raw_values - _mu) / _sig
+            _zp = (y_pred    - _mu) / _sig
+            smae  = float(np.mean(np.abs(_zt - _zp)))
+            srmse = float(np.sqrt(np.mean((_zt - _zp) ** 2)))
+        else:
+            smae = srmse = np.nan
+
         per_curve_metrics.append({
             'instance_id': curve['instance_id'],
             'activity':    curve['activity'],
@@ -6543,6 +6553,8 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
             'RMSE':        rmse,
             'WAPE (%)':    wape,
             'R2':          r2,
+            'sMAE':        smae,
+            'sRMSE':       srmse,
         })
 
         all_true.extend(raw_values.tolist())
