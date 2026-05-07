@@ -18,33 +18,33 @@ from pathlib import Path
 EXPERIMENTS = [
     {
     'data_experiment':      '1',
-        'run_name':             'experiment_21',
+        'run_name':             'experiment_31',
         'processes_to_run':     ['process_2', 'process_3', 'process_4'],
         'temporal_resolution':  '15min',
         'run_process_modelling': True,
     },
 
-    {
-        'data_experiment':      '1',
-        'run_name':             'experiment_22',
-        'processes_to_run':     ['process_2', 'process_3', 'process_4'],
-        'temporal_resolution':  '5min',
-        'run_process_modelling': True,
-    },
-    {
-        'data_experiment':      '1',
-        'run_name':             'experiment_23',
-        'processes_to_run':     ['process_2', 'process_3', 'process_4'],
-        'temporal_resolution':  '1min',
-        'run_process_modelling': True,
-    },
-    {
-        'data_experiment':      '1',
-        'run_name':             'experiment_24',
-        'processes_to_run':     ['process_2', 'process_3', 'process_4'],
-        'temporal_resolution':  'original',
-        'run_process_modelling': True,
-    },
+    # {
+    #     'data_experiment':      '1',
+    #     'run_name':             'experiment_22',
+    #     'processes_to_run':     ['process_2', 'process_3', 'process_4'],
+    #     'temporal_resolution':  '5min',
+    #     'run_process_modelling': True,
+    # },
+    # {
+    #     'data_experiment':      '1',
+    #     'run_name':             'experiment_23',
+    #     'processes_to_run':     ['process_2', 'process_3', 'process_4'],
+    #     'temporal_resolution':  '1min',
+    #     'run_process_modelling': True,
+    # },
+    # {
+    #     'data_experiment':      '1',
+    #     'run_name':             'experiment_24',
+    #     'processes_to_run':     ['process_2', 'process_3', 'process_4'],
+    #     'temporal_resolution':  'original',
+    #     'run_process_modelling': True,
+    # },
 
 ]
 

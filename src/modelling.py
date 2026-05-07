@@ -403,8 +403,12 @@ _run_ts       = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
 _run_name     = os.environ.get('PIPELINE_RUN_NAME', f'experiment_{experiment}')
 _results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
 _run_dir = os.path.join(_results_root, f"{_run_name}_{_run_ts}")
-_plots_dir    = os.path.join(_run_dir, 'plots')
+_plots_dir           = os.path.join(_run_dir, 'plots')
+_process_results_dir = os.path.join(_run_dir, 'process_results')
+_energy_results_dir  = os.path.join(_run_dir, 'energy_results')
 os.makedirs(_plots_dir, exist_ok=True)
+os.makedirs(_process_results_dir, exist_ok=True)
+os.makedirs(_energy_results_dir, exist_ok=True)
 
 LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
 
@@ -524,24 +528,27 @@ def _normalise_metrics(df, cols, lower_set_test_prefixed=None):
     return norm_df
 
 
-def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, save_path=None):
+def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, save_path=None, agg='mean'):
     """Displays a normalized heatmap for comparing different simulation modes."""
     # Use global evaluation_results_df if no local_df is provided
     target_df = local_df if local_df is not None else globals().get('evaluation_results_df')
-    
+
     if not cols or target_df is None or target_df.empty or 'mode' not in target_df.columns:
         return
-    
+
     # Filter columns that actually exist in the dataframe AND are numeric
     valid_cols = [
-        c for c in cols 
+        c for c in cols
         if c in target_df.columns and target_df[c].dtype in ('float64', 'float32', 'int64', 'int32')
     ]
     if not valid_cols:
         return
 
     # Phase-agnostic normalization
-    mode_avg = target_df.groupby('mode')[valid_cols].mean()
+    if agg == 'median':
+        mode_avg = target_df.groupby('mode')[valid_cols].median()
+    else:
+        mode_avg = target_df.groupby('mode')[valid_cols].mean()
     # We pass higher_is_better if it exists globally, otherwise empty set for base check
     global_lower = globals().get('lower_is_better', set())
     mode_avg_norm = _normalise_metrics(mode_avg, valid_cols, global_lower)
@@ -2017,8 +2024,10 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             
             display(Markdown(f"## 📊 Training Verification: {process.upper()}"))
             display(Markdown(f"*Evaluation on training data using real energy curves (verification of modifier fitting)*"))
-            _hm_train_path = os.path.join(_plots_dir, f'process_train_heatmap_{process}.png') if EXPORT_RESULTS and '_plots_dir' in dir() else None
-            _plot_results_heatmap(_train_cols, f"Training Quality: {process}", local_df=_proc_df, save_path=_hm_train_path)
+            _hm_train_mean_path = os.path.join(_process_results_dir, f'process_train_heatmap_{process}_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+            _hm_train_median_path = os.path.join(_process_results_dir, f'process_train_heatmap_{process}_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+            _plot_results_heatmap(_train_cols, f"Training Quality (Mean): {process}", local_df=_proc_df, save_path=_hm_train_mean_path, agg='mean')
+            _plot_results_heatmap(_train_cols, f"Training Quality (Median): {process}", local_df=_proc_df, save_path=_hm_train_median_path, agg='median')
 
 
 if RUN_PROCESS_MODELLING:
@@ -2054,6 +2063,19 @@ if RUN_PROCESS_MODELLING:
         evaluation_results_df[_core_cols].to_parquet(_pm_core_path, index=False)
         print(f"Saved process core metrics  → {_pm_core_path}")
     evaluation_results_df
+
+    # ── Combined Training Heatmap — ALL processes together ────────────────────
+    _all_train_cols = [f"train_{b}" for b in CORE_METRIC_BASES if f"train_{b}" in evaluation_results_df.columns]
+    if not _all_train_cols:
+        _all_train_cols = [c for c in evaluation_results_df.columns if c.startswith('train_') and not c.startswith('train_energy_')]
+    if _all_train_cols:
+        display(Markdown("---"))
+        display(Markdown("## 📊 Training Quality: ALL Processes Combined"))
+        display(Markdown("*Aggregated across all processes on training data.*"))
+        _hm_train_all_mean_path = os.path.join(_process_results_dir, 'process_train_heatmap_all_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+        _hm_train_all_median_path = os.path.join(_process_results_dir, 'process_train_heatmap_all_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+        _plot_results_heatmap(_all_train_cols, "Training Quality (Mean): All Processes", save_path=_hm_train_all_mean_path, agg='mean')
+        _plot_results_heatmap(_all_train_cols, "Training Quality (Median): All Processes", save_path=_hm_train_all_median_path, agg='median')
 
     # ── Per-process breakdown: show modes sorted by test_overall_score ────────
     report("\n" + "="*80)
@@ -2106,8 +2128,22 @@ if RUN_TEST_EVALUATION and RUN_PROCESS_MODELLING:
         display(Markdown("---"))
         display(Markdown("# 📊 FINAL CONSOLIDATED PERFORMANCE: TEST SET ENSEMBLE"))
         display(Markdown("*Consolidated simulation quality across all processes on unseen data.*"))
-        _hm_path = os.path.join(_plots_dir, 'process_test_heatmap.png') if EXPORT_RESULTS and '_plots_dir' in dir() else None
-        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble", save_path=_hm_path)
+        _hm_path_mean = os.path.join(_process_results_dir, 'process_test_heatmap_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+        _hm_path_median = os.path.join(_process_results_dir, 'process_test_heatmap_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble (Mean)", save_path=_hm_path_mean, agg='mean')
+        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble (Median)", save_path=_hm_path_median, agg='median')
+
+        # ── Per-process test heatmaps ──────────────────────────────────────────
+        display(Markdown("## 📊 Test Performance: Per Process"))
+        for _proc_name, _proc_grp in evaluation_results_df.groupby('process'):
+            _proc_test_cols = [c for c in _final_test_cols if c in _proc_grp.columns]
+            if not _proc_test_cols:
+                continue
+            display(Markdown(f"### {_proc_name.upper()}"))
+            _hm_proc_mean = os.path.join(_process_results_dir, f'process_test_heatmap_{_proc_name}_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+            _hm_proc_median = os.path.join(_process_results_dir, f'process_test_heatmap_{_proc_name}_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+            _plot_results_heatmap(_proc_test_cols, f"Test Performance (Mean): {_proc_name}", local_df=_proc_grp, save_path=_hm_proc_mean, agg='mean')
+            _plot_results_heatmap(_proc_test_cols, f"Test Performance (Median): {_proc_name}", local_df=_proc_grp, save_path=_hm_proc_median, agg='median')
 
 
 
@@ -3437,6 +3473,58 @@ else:
         _parquet_path = os.path.join(_run_dir, 'curve_eval_results.parquet')
         _export_df.to_parquet(_parquet_path, index=False)
         print(f"Saved results  → {_parquet_path}")
+
+        # ── Energy heatmaps: rows=Approach, columns=Metric, aggregated over all
+        #    processes and sensors. One heatmap per split × aggregation.
+        def _plot_curve_energy_heatmap(df, split, agg, save_dir):
+            """Heatmap: rows=Approach, columns=MAE/RMSE/WAPE/R2, agg across everything."""
+            _metrics = [m for m in ['MAE', 'RMSE', 'WAPE', 'R2'] if m in df.columns]
+            _sub = df[df['Split'] == split]
+            if _sub.empty or not _metrics:
+                return
+            _fn = 'median' if agg == 'median' else 'mean'
+            _agg = _sub.groupby('Approach')[_metrics].agg(_fn)
+
+            # Normalise column-wise: R2 higher-is-better; MAE/RMSE/WAPE lower-is-better
+            _agg_norm = _agg.copy().astype(float)
+            for _m in _metrics:
+                _vals = _agg[_m]
+                _mn, _mx = _vals.min(), _vals.max()
+                if _mn == _mx:
+                    _agg_norm[_m] = 0.5
+                elif _m == 'R2':
+                    _agg_norm[_m] = (_vals - _mn) / (_mx - _mn)
+                else:
+                    _agg_norm[_m] = 1 - (_vals - _mn) / (_mx - _mn)
+
+            # Sort rows by mean normalised score, best first
+            _agg_norm = _agg_norm.loc[_agg_norm.mean(axis=1).sort_values(ascending=False).index]
+            _agg_annot = _agg.reindex(_agg_norm.index).round(3)
+
+            _title = f"Energy Curves — {split} ({agg})"
+            _fig, _ax = plt.subplots(figsize=(len(_metrics) * 4, max(4, len(_agg_norm) * 0.7)))
+            sns.heatmap(_agg_norm, annot=_agg_annot, fmt='', cmap='RdYlGn', vmin=0, vmax=1,
+                        linewidths=0.5, ax=_ax, annot_kws={'size': 10},
+                        cbar_kws={'label': 'Normalised score (1 = best)'})
+            _ax.set_title(_title, fontsize=12, fontweight='bold')
+            _ax.set_xlabel('Metric')
+            _ax.set_ylabel('Approach')
+            _ax.set_xticklabels(_ax.get_xticklabels(), rotation=0, fontsize=11)
+            _ax.set_yticklabels(_ax.get_yticklabels(), rotation=0, fontsize=9)
+            plt.tight_layout()
+            _fname = os.path.join(save_dir, f'energy_{split.lower()}_{agg}.png')
+            plt.savefig(_fname, dpi=150, bbox_inches='tight')
+            plt.show()
+            print(f"Saved {_fname}")
+
+        if '_energy_results_dir' in globals():
+            display(Markdown("---"))
+            display(Markdown("# 📊 Energy Prediction Heatmaps"))
+            display(Markdown("*Rows: approaches — Columns: MAE / RMSE / WAPE / R2 — aggregated across all processes and sensors*"))
+            for _split in sorted(_export_df['Split'].unique()):
+                display(Markdown(f"## {_split}"))
+                _plot_curve_energy_heatmap(_export_df, _split, 'median', _energy_results_dir)
+                _plot_curve_energy_heatmap(_export_df, _split, 'mean',   _energy_results_dir)
 
         _sw = globals().get('_summary_wide')
         if _sw is not None and not _sw.empty:
