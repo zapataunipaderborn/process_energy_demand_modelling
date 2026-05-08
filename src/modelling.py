@@ -158,12 +158,17 @@ if TEMPORAL_RESOLUTION != 'original':
 
 # %%
 _env_processes   = os.environ.get('PIPELINE_PROCESSES_TO_RUN')
-processes_to_run = _env_processes.split(',') if _env_processes else ['process_2', 'process_3', 'process_4']
+processes_to_run = _env_processes.split(',') if _env_processes else ['process_1', 'process_2', 'process_3', 'process_4']
 
 
 process_datasets_to_model = process_datasets
 
 process_datasets_to_model_sensors = process_datasets_to_model.copy()
+process_datasets_to_model_sensors['process_1'] = process_datasets_to_model_sensors.get('process_1', {})
+# process_datasets_to_model_sensors['process_1']['objects_to_model'] = ['autoclaving_1']
+# process_datasets_to_model_sensors['process_1']['activities_to_model'] = ['heat', 'hold', 'cool']
+# process_datasets_to_model_sensors['process_1']['sensors_to_model'] = ['autoclave_steam_demand_kW_energy', 'autoclave_cooling_water_demand_kW_energy', 'destillation_steam_demand_kW_energy']
+
 process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
 # process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['Erhitzer']
 # process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
@@ -512,14 +517,13 @@ def _normalise_metrics(df, cols, lower_set_test_prefixed=None):
         if len(vals) == 0:
             continue
         vmin, vmax = vals.min(), vals.max()
+
         rng = vmax - vmin if vmax != vmin else 1.0
-        
         clean_c = c.replace('test_', '').replace('train_', '')
-        
-        # Check if it's lower-is-better
+
         is_lower = clean_c in base_lower_names or any(m in clean_c for m in ['MAE', 'RMSE', 'WAPE'])
-        # (Exception: R2 is higher is better)
-        if 'R2' in clean_c: is_lower = False
+        if 'R2' in clean_c:
+            is_lower = False
 
         if is_lower:
             norm_df[c] = (vmax - df[c]) / rng
@@ -1873,6 +1877,13 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         _energy_dur_mods, _energy_tr_mods, _energy_state_cols = {}, {}, []
                         _energy_pipelines = {}
                         _activity_exog_means = {}
+                        _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
+                        _activities_list = _config.get(
+                            'activities_to_model',
+                            _df_expanded_train['activity_log'].dropna().unique().tolist()
+                            if _df_expanded_train is not None and 'activity_log' in _df_expanded_train.columns
+                            else []
+                        )
 
                 # ── Simulate energy-aware modes ───────────────────────────
                 for _energy_mode in _energy_modes_requested:

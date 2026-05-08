@@ -14,7 +14,7 @@ from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-N_BATCHES      = 120
+N_BATCHES      = 500
 START_DATE     = datetime(2024, 1, 15)
 RANDOM_SEED    = 42
 VOLUME_RANGE_L = (200, 800)   # uniform per batch
@@ -35,9 +35,9 @@ NUM_RESOURCES = {
     'Water_supply': 1,
     'Destillation': 1,
     'Bottling':     1,
-    'Autoclaving':  4,
-    'Packaging':    2,
-    'Warehousing':  2,
+    'Autoclaving':  1,
+    'Packaging':    1,
+    'Warehousing':  1,
 }
 
 # Internal activities per station + (base_duration_minutes, relative_variability) per recipe
@@ -233,13 +233,13 @@ def simulate(n_batches: int = N_BATCHES,
 
                 events.append({
                     'case_id':               case_id,
-                    'activity':              act_name,
+                    'activity':              f'{station}_{act_name}',
                     'timestamp_start':       ts_start,
                     'timestamp_end':         ts_end,
                     'higher_level_activity': station,
                     'object_type':           object_type,
                     'object':                resource_name,
-                    'object_attributes':     str(obj_attrs),
+                    'object_attributes':     obj_attrs,
                 })
                 current_time = ts_end + timedelta(seconds=1)
 
@@ -330,15 +330,16 @@ def build_expanded(df_event_log: pd.DataFrame,
     rows: list[dict] = []
 
     for _, ev in df_event_log.iterrows():
-        station  = ev['higher_level_activity']
-        activity = ev['activity']
+        station   = ev['higher_level_activity']
+        activity  = ev['activity']                          # compound: 'Station_actname'
+        act_short = activity[len(station) + 1:]             # short:    'actname'
         ts_start = pd.Timestamp(ev['timestamp_start'])
         ts_end   = pd.Timestamp(ev['timestamp_end'])
         dur_min  = max(1.0, (ts_end - ts_start).total_seconds() / 60.0)
 
         T, RH = weather_at(ts_start.to_pydatetime(), rng)
 
-        curve = _power_curve(activity, station, dur_min, T, RH, rng)
+        curve = _power_curve(act_short, station, dur_min, T, RH, rng)
         if curve is None:
             continue
 
@@ -374,9 +375,9 @@ def build_expanded(df_event_log: pd.DataFrame,
             val = max(0.0, float(curve[i]))
             if station == 'Destillation':
                 row['destillation_steam_demand_kW_energy'] = val
-            elif station == 'Autoclaving' and activity in ('heat', 'hold', 'prepare'):
+            elif station == 'Autoclaving' and act_short in ('heat', 'hold', 'prepare'):
                 row['autoclave_steam_demand_kW_energy'] = val
-            elif station == 'Autoclaving' and activity == 'cool':
+            elif station == 'Autoclaving' and act_short == 'cool':
                 row['autoclave_cooling_water_demand_kW_energy'] = val
             elif station == 'Bottling':
                 row['bottling_power_kW_energy'] = val
