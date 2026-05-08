@@ -691,8 +691,9 @@ def _safe_simplicity(net):
     return float(1.0 / (1.0 + 0.005 * float(complexity)))
 
 def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=None,
-                                       case_col='case_id', activity_col='activity', 
-                                       start_col='timestamp_start', end_col='timestamp_end'):
+                                       case_col='case_id', activity_col='activity',
+                                       start_col='timestamp_start', end_col='timestamp_end',
+                                       process_models=None, station_col='higher_level_activity'):
     """
     Comprehensive evaluation of simulation quality based on process mining literature
     
@@ -933,17 +934,46 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         'simplicity': np.nan,
     }
 
-    if len(sim_for_dfg) > 0 and len(real_for_dfg) > 0:
-        try:
-            # Mine a reference model from the real log and replay simulated traces on it.
-            ref_net, ref_im, ref_fm = pm4py.discover_petri_net_inductive(real_log)
-
-            conformance_metrics['fitness'] = _mean_trace_fitness(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['precision'] = _safe_precision(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['generalization'] = _safe_generalization(sim_log, ref_net, ref_im, ref_fm)
-            conformance_metrics['simplicity'] = _safe_simplicity(ref_net)
-        except Exception as e:
-            print(f"Conformance dimensions unavailable: {e}")
+    if process_models is not None:
+        # Per-station evaluation: filter the REAL log by station and replay against
+        # each station's own net.  This avoids the cross-station precision artifact
+        # and is not confounded by the simulation's inflated event count.
+        fit_list, prec_list, gen_list, sim_list = [], [], [], []
+        seen_stations: set = set()
+        for key, pm_entry in process_models.items():
+            _obj, obj_type, station = key
+            if (obj_type, station) in seen_stations:
+                continue
+            seen_stations.add((obj_type, station))
+            net_s, im_s, fm_s = pm_entry["net"], pm_entry["im"], pm_entry["fm"]
+            if station_col in real_df.columns:
+                df_st = real_df[real_df[station_col] == station].dropna(
+                    subset=[case_col, activity_col, start_col])
+            else:
+                df_st = real_df.dropna(subset=[case_col, activity_col, start_col])
+            if len(df_st) == 0:
+                continue
+            try:
+                log_st = pm4py.format_dataframe(
+                    df_st, case_id=case_col,
+                    activity_key=activity_col, timestamp_key=start_col)
+                f  = _mean_trace_fitness(log_st, net_s, im_s, fm_s)
+                p  = _safe_precision(log_st, net_s, im_s, fm_s)
+                g  = _safe_generalization(log_st, net_s, im_s, fm_s)
+                s  = _safe_simplicity(net_s)
+                if not np.isnan(f):  fit_list.append(f)
+                if not np.isnan(p):  prec_list.append(p)
+                if not np.isnan(g):  gen_list.append(g)
+                if not np.isnan(s):  sim_list.append(s)
+            except Exception as e:
+                report(f"  Conformance skipped for station '{station}': {e}")
+        if fit_list:  conformance_metrics['fitness']        = float(np.mean(fit_list))
+        if prec_list: conformance_metrics['precision']      = float(np.mean(prec_list))
+        if gen_list:  conformance_metrics['generalization'] = float(np.mean(gen_list))
+        if sim_list:  conformance_metrics['simplicity']     = float(np.mean(sim_list))
+    # For non-Petri modes (statistical, ML) there is no process model, so
+    # conformance metrics stay NaN.  Direct sim-vs-real comparison is
+    # already captured by the DFG edge metrics and the basic metrics above.
 
     for m_name, m_val in conformance_metrics.items():
         if pd.isna(m_val):
@@ -1539,7 +1569,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print(f"\n  🔍 EVALUATION ON {split_label}  [{sim_mode}]")
         print("  " + "="*76)
 
-        eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train)
+        eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train,
+                                                          process_models=mode_pm)
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
         #plot_simulation_comparison(simulated_log_train, df_train)
@@ -1583,7 +1614,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
             print("  " + "="*76)
 
-            eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test)
+            eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test,
+                                                              process_models=mode_pm)
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
             #plot_simulation_comparison(simulated_log_test, df_test)
@@ -1945,8 +1977,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
                     # Use _df_expanded_train for energy comparison in comprehensive_simulation_evaluation
                     _eval_train = comprehensive_simulation_evaluation(
-                        _energy_sim_train, df_train, real_expanded_df=_df_expanded_train
-                    )
+                        _energy_sim_train, df_train, real_expanded_df=_df_expanded_train,
+                        process_models=_best_base_pm)
 
                     _energy_flattened = {
                         'process':           process,
@@ -1989,8 +2021,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                       f"{len(_energy_sim_test)} events")
 
                             _eval_test = comprehensive_simulation_evaluation(
-                                _energy_sim_test, _df_test, real_expanded_df=_exp_test
-                            )
+                                _energy_sim_test, _df_test, real_expanded_df=_exp_test,
+                                process_models=_best_base_pm)
                             for _cat, _met in _eval_test.items():
                                 if _cat == 'energy_metrics' and isinstance(_met, dict):
                                     for _sensor, _vals in _met.items():
