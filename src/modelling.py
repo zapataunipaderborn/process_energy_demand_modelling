@@ -463,10 +463,17 @@ METRICS_LOWER_IS_BETTER = {
 
 # The core set of metrics the user wants to see in the heatmaps
 CORE_METRIC_BASES = [
+    # Overall
     'overall_score',
+    # Direct sim-output vs real-log comparison
     'basic_metrics_event_count_ratio',
     'duration_metrics_mean_duration_error',
-    'duration_metrics_median_duration_error', 
+    'duration_metrics_median_duration_error',
+    'activity_metrics_js_divergence',
+    'control_flow_metrics_edge_precision',
+    'control_flow_metrics_edge_recall',
+    'control_flow_metrics_edge_f1_score',
+    # Process model quality (Petri net vs real log)
     'conformance_metrics_fitness',
     'conformance_metrics_precision',
     'conformance_metrics_generalization',
@@ -566,20 +573,30 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
     current_labels = {
         'train_overall_score': 'Overall',
         'test_overall_score':  'Overall',
-        'train_basic_metrics_event_count_ratio': 'EvtRatio',
-        'test_basic_metrics_event_count_ratio':  'EvtRatio',
-        'train_duration_metrics_mean_duration_error': 'MeanDurErr',
-        'test_duration_metrics_mean_duration_error':  'MeanDurErr',
-        'train_duration_metrics_median_duration_error': 'MedDurErr',
-        'test_duration_metrics_median_duration_error':  'MedDurErr',
-        'train_conformance_metrics_fitness': 'Fitness',
-        'test_conformance_metrics_fitness':  'Fitness',
-        'train_conformance_metrics_precision': 'Precision',
-        'test_conformance_metrics_precision':  'Precision',
-        'train_conformance_metrics_generalization': 'Generaliz',
-        'test_conformance_metrics_generalization':  'Generaliz',
-        'train_conformance_metrics_simplicity': 'Simplicity',
-        'test_conformance_metrics_simplicity':  'Simplicity',
+        # Direct sim-vs-real
+        'train_basic_metrics_event_count_ratio':      '1/EvtRatio',
+        'test_basic_metrics_event_count_ratio':       '1/EvtRatio',
+        'train_duration_metrics_mean_duration_error': '1-MeanDurErr',
+        'test_duration_metrics_mean_duration_error':  '1-MeanDurErr',
+        'train_duration_metrics_median_duration_error': '1-MedDurErr',
+        'test_duration_metrics_median_duration_error':  '1-MedDurErr',
+        'train_activity_metrics_js_divergence':       '1-JS div',
+        'test_activity_metrics_js_divergence':        '1-JS div',
+        'train_control_flow_metrics_edge_precision':  'EdgePrec',
+        'test_control_flow_metrics_edge_precision':   'EdgePrec',
+        'train_control_flow_metrics_edge_recall':     'EdgeRec',
+        'test_control_flow_metrics_edge_recall':      'EdgeRec',
+        'train_control_flow_metrics_edge_f1_score':   'EdgeF1',
+        'test_control_flow_metrics_edge_f1_score':    'EdgeF1',
+        # Process model quality
+        'train_conformance_metrics_fitness':          'Fitness',
+        'test_conformance_metrics_fitness':           'Fitness',
+        'train_conformance_metrics_precision':        'Precision',
+        'test_conformance_metrics_precision':         'Precision',
+        'train_conformance_metrics_generalization':   'Generaliz',
+        'test_conformance_metrics_generalization':    'Generaliz',
+        'train_conformance_metrics_simplicity':       'Simplicity',
+        'test_conformance_metrics_simplicity':        'Simplicity',
     }
     
     for c in valid_cols:
@@ -597,7 +614,20 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
     disp_cols = [current_labels[c] for c in valid_cols]
     plot_df = mode_avg_norm[valid_cols].copy()
     plot_df.columns = disp_cols
-    annot_df = mode_avg[valid_cols].reindex(mode_avg_norm.index).round(3)
+
+    # Annotation values: transform so 1 = best for every metric
+    annot_df = mode_avg[valid_cols].reindex(mode_avg_norm.index).copy()
+    for c in valid_cols:
+        clean_c = c.replace('test_', '').replace('train_', '')
+        is_lower = clean_c in METRICS_LOWER_IS_BETTER or any(m in clean_c for m in ['MAE', 'RMSE', 'WAPE'])
+        if is_lower:
+            annot_df[c] = (1.0 - annot_df[c]).clip(0, 1)
+        elif clean_c == 'basic_metrics_event_count_ratio':
+            # 1.0 = perfect; above 1 or below 1 both worse
+            annot_df[c] = annot_df[c].apply(
+                lambda r: (1.0 / r if r > 1 else r) if pd.notna(r) and r > 0 else np.nan
+            ).clip(0, 1)
+    annot_df = annot_df.round(3)
     annot_df.columns = disp_cols
 
     fig, ax = plt.subplots(figsize=(max(10, len(valid_cols) * 1.2), max(3, len(mode_avg_norm) * 0.8)))
@@ -1072,16 +1102,20 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report("\n8. OVERALL QUALITY ASSESSMENT")
     report("-" * 40)
 
-    # Active score requested by user:
-    # keep conformance metrics + mean duration + event_count_ratio.
-    # all active metrics have equal weight.
+    # All components transformed so that 1 = perfect, 0 = worst.
+    _evt_ratio = results['basic_metrics']['event_count_ratio']
+    _js_div    = results['activity_metrics'].get('js_divergence', np.nan)
+    _edge_f1   = results['control_flow_metrics'].get('edge_f1_score', np.nan)
     active_components = {
-        'event_count_ratio': results['basic_metrics']['event_count_ratio'],
+        # 1/ratio when ratio>1, ratio when ratio<1 → 1.0 when ratio=1.0
+        'event_count_ratio':        (1.0 / _evt_ratio if _evt_ratio > 1 else _evt_ratio) if _evt_ratio and not np.isnan(_evt_ratio) else np.nan,
         'mean_duration_similarity': (1.0 - results['duration_metrics']['mean_duration_error']),
-        'fitness': results['conformance_metrics'].get('fitness'),
-        'precision': results['conformance_metrics'].get('precision'),
-        'generalization': results['conformance_metrics'].get('generalization'),
-        'simplicity': results['conformance_metrics'].get('simplicity'),
+        'js_similarity':            (1.0 - _js_div) if not np.isnan(_js_div) else np.nan,
+        'edge_f1':                  _edge_f1,
+        'fitness':                  results['conformance_metrics'].get('fitness'),
+        'precision':                results['conformance_metrics'].get('precision'),
+        'generalization':           results['conformance_metrics'].get('generalization'),
+        'simplicity':               results['conformance_metrics'].get('simplicity'),
     }
 
     active_values = []
