@@ -1606,6 +1606,10 @@ class ProcessSimulation:
                                 _ef_seed_vals_d.setdefault(_col, []).append(_v)
                     for _col, _vs in _ef_seed_vals_d.items():
                         seed_state[_col] = float(np.mean(_vs))
+                # Zero-init prev_activity one-hot (no previous activity at case start)
+                for _col in self.energy_state_columns:
+                    if _col.startswith('prev_act_'):
+                        seed_state[_col] = 0.0
                 current_energy_state = seed_state if seed_state else None
             else:
                 current_energy_state = None
@@ -1678,7 +1682,10 @@ class ProcessSimulation:
                         mdl = self.energy_duration_modifiers[chosen_label]
                         energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
                         try:
-                            activity_duration = max(0.1, float(mdl.predict([energy_vec])[0]))
+                            _raw = float(mdl.predict([energy_vec])[0])
+                            if getattr(mdl, '_log_duration', False):
+                                _raw = np.exp(_raw)
+                            activity_duration = max(0.1, _raw)
                             if self.verbose:
                                 print(f"    [{chosen_label}] direct ML duration: "
                                       f"{activity_duration:.1f} min")
@@ -1799,6 +1806,17 @@ class ProcessSimulation:
                         _act_ef = self.activity_exog_means.get(chosen_label, {})
                         if _act_ef:
                             current_energy_state = {**current_energy_state, **_act_ef}
+
+                    # Update prev_activity one-hot for the next iteration
+                    if current_energy_state is not None:
+                        _prev_act_cols = [c for c in self.energy_state_columns
+                                          if c.startswith('prev_act_')]
+                        if _prev_act_cols:
+                            for _pc in _prev_act_cols:
+                                current_energy_state[_pc] = 0.0
+                            _pa_key = f'prev_act_{chosen_label}'
+                            if _pa_key in self.energy_state_columns:
+                                current_energy_state[_pa_key] = 1.0
 
             if step >= max_steps:
                 print(f"    WARNING: max steps ({max_steps}) reached.")

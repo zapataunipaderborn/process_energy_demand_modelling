@@ -995,11 +995,16 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
 # ---------------------------------------------------------------------------
 
 def _energy_summary(curve: np.ndarray, sensor_name: str) -> dict:
-    """Reduce a 1-D sensor curve to 3 scalar features."""
+    """Reduce a 1-D sensor curve to 6 scalar features."""
+    start = float(curve[0])
+    end   = float(curve[-1])
     return {
-        f'{sensor_name}_mean': float(np.mean(curve)),
-        f'{sensor_name}_end':  float(curve[-1]),
-        f'{sensor_name}_std':  float(np.std(curve)),
+        f'{sensor_name}_mean':     float(np.mean(curve)),
+        f'{sensor_name}_end':      end,
+        f'{sensor_name}_std':      float(np.std(curve)),
+        f'{sensor_name}_start':    start,
+        f'{sensor_name}_delta':    end - start,
+        f'{sensor_name}_integral': float(np.trapz(curve) / max(len(curve), 1)),
     }
 
 
@@ -1028,7 +1033,8 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
     # Determine feature column order once
     energy_state_columns = []
     for s in sensors:
-        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
     for _efc in _ef_cols_present:
         energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
@@ -1239,7 +1245,8 @@ def extract_energy_modifiers(
 
     energy_state_columns = []
     for s in sensors:
-        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
         energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
@@ -1443,7 +1450,7 @@ def extract_energy_direct_models(
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, accuracy_score
+    from sklearn.metrics import r2_score, accuracy_score, balanced_accuracy_score
     from collections import Counter
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1476,7 +1483,8 @@ def extract_energy_direct_models(
 
     energy_state_columns = []
     for s in sensors:
-        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
         energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
@@ -1487,13 +1495,21 @@ def extract_energy_direct_models(
 
     print(f"  Total instances  : {len(df_recs)}")
 
+    # One-hot encode prev_activity and add to feature set
+    if 'prev_activity' in df_recs.columns:
+        prev_dummies = pd.get_dummies(df_recs['prev_activity'], prefix='prev_act').astype(float)
+        df_recs = pd.concat([df_recs.reset_index(drop=True), prev_dummies.reset_index(drop=True)], axis=1)
+        energy_state_columns = energy_state_columns + [c for c in prev_dummies.columns
+                                                        if c not in energy_state_columns]
+        print(f"  Prev-activity cols: {len(prev_dummies.columns)}")
+
     duration_models_direct   = {}
     transition_models_direct = {}
     model_choices_report     = {}
 
     for activity, grp in df_recs.groupby('activity'):
         X       = grp[energy_state_columns].values
-        y_dur   = grp['duration'].values          # raw minutes — direct target
+        y_dur   = np.log(grp['duration'].values.clip(0.1))   # log-space target
         y_tr    = grp['next_activity'].values
         n       = len(grp)
         n_classes = len(set(y_tr))
@@ -1534,6 +1550,7 @@ def extract_energy_direct_models(
                 best_mdl = get_regressor(best_dur_name)
                 best_mdl.fit(X, y_dur)
                 best_mdl._mean_duration      = mean_dur
+                best_mdl._log_duration       = True
                 best_mdl._train_feature_mean = train_feature_mean
                 best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
@@ -1555,7 +1572,9 @@ def extract_energy_direct_models(
 
         # ── Transition: direct classifier for sampling ────────────────
         if n_classes >= 2:
-            majority_acc   = Counter(yt_val).most_common(1)[0][1] / len(yt_val)
+            majority_class = Counter(yt_tr).most_common(1)[0][0]
+            majority_pred  = np.full(len(yt_val), majority_class)
+            majority_acc   = balanced_accuracy_score(yt_val, majority_pred)
             best_tr_score  = -float('inf')
             best_tr_name   = None
 
@@ -1563,7 +1582,7 @@ def extract_energy_direct_models(
                 try:
                     clf   = get_classifier(model_name)
                     clf.fit(X_tr, yt_tr)
-                    score = accuracy_score(yt_val, clf.predict(X_val))
+                    score = balanced_accuracy_score(yt_val, clf.predict(X_val))
                     if score > best_tr_score:
                         best_tr_score = score
                         best_tr_name  = model_name
@@ -1578,22 +1597,22 @@ def extract_energy_direct_models(
                     best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                     transition_models_direct[str(activity)] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} (Acc={best_tr_score:.3f})'
+                        f'{best_tr_name} (BalAcc={best_tr_score:.3f})'
                     )
                     if best_clf._feature_importance:
                         top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                         act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(val Acc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
+                          f"(val BalAcc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
                 except Exception as exc:
                     print(f"  [{activity}] Transition FAILED: {exc}")
                     act_report['Transition Approach'] = 'Statistical (ML fit failed)'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best ML Acc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
+                    f'Statistical (best ML BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(best ML val Acc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+                      f"(best ML val BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
@@ -1617,7 +1636,8 @@ def _build_energy_state_matrix_with_next(
 
     energy_state_columns = []
     for s in sensors:
-        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std']
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
     for _efc in _ef_cols_present:
         energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
@@ -1642,15 +1662,20 @@ def _build_energy_state_matrix_with_next(
         .sort_values(order_cols + ['ts'])
         .reset_index()
     )
-    # next_activity within each (case, object)
+    # next_activity and prev_activity within each (case, object)
     if order_cols:
         instance_info['next_activity'] = (
             instance_info.groupby(order_cols)['activity'].shift(-1).fillna('__END__')
         )
+        instance_info['prev_activity'] = (
+            instance_info.groupby(order_cols)['activity'].shift(1).fillna('__START__')
+        )
     else:
         instance_info['next_activity'] = '__END__'
+        instance_info['prev_activity'] = '__START__'
 
     next_map = dict(zip(instance_info['_instance_id'], instance_info['next_activity']))
+    prev_map = dict(zip(instance_info['_instance_id'], instance_info['prev_activity']))
 
     for instance_id, grp in df.groupby('_instance_id'):
         grp = grp.sort_values(datetime_energy_col)
@@ -1665,7 +1690,8 @@ def _build_energy_state_matrix_with_next(
             continue
 
         row = {'activity': activity, 'duration': duration,
-               'next_activity': str(next_map.get(instance_id, '__END__'))}
+               'next_activity': str(next_map.get(instance_id, '__END__')),
+               'prev_activity': str(prev_map.get(instance_id, '__START__'))}
         ok = True
         for sensor in sensors:
             if sensor not in grp.columns:

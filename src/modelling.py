@@ -355,7 +355,7 @@ CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) 
 
 # ── Train / test split ────────────────────────────────────────────────────────
 TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
-TRAIN_RATIO         = 0.70    # fraction of cases used for training
+TRAIN_RATIO         = 0.50    # fraction of cases used for training
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
 RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
@@ -412,9 +412,11 @@ _run_dir = os.path.join(_results_root, f"{_run_name}_{_run_ts}")
 _plots_dir           = os.path.join(_run_dir, 'plots')
 _process_results_dir = os.path.join(_run_dir, 'process_results')
 _energy_results_dir  = os.path.join(_run_dir, 'energy_results')
+_predicted_logs_dir  = os.path.join(_run_dir, 'predicted_logs')
 os.makedirs(_plots_dir, exist_ok=True)
 os.makedirs(_process_results_dir, exist_ok=True)
 os.makedirs(_energy_results_dir, exist_ok=True)
+os.makedirs(_predicted_logs_dir, exist_ok=True)
 
 LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
 
@@ -645,17 +647,17 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
         print(metrics_table.to_string())
 
 
-def _plot_short_heatmap(target_df, title, save_path=None, agg='mean'):
-    """Short heatmap: 5 error metrics (0=best) + Overall, saved to process_results."""
+def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='test'):
+    """Short heatmap: 5 error metrics (0=best) + Overall. Works for train or test split."""
     if target_df is None or target_df.empty or 'mode' not in target_df.columns:
         return
 
-    _col_evt   = 'test_basic_metrics_event_count_ratio'
-    _col_dur_w = 'test_duration_metrics_mean_duration_error'
-    _col_dur_a = 'test_duration_metrics_activity_duration_error'
-    _col_js    = 'test_activity_metrics_js_divergence'
-    _col_f1    = 'test_control_flow_metrics_edge_f1_score'
-    _col_ov    = 'test_overall_error'
+    _col_evt   = f'{split}_basic_metrics_event_count_ratio'
+    _col_dur_w = f'{split}_duration_metrics_mean_duration_error'
+    _col_dur_a = f'{split}_duration_metrics_activity_duration_error'
+    _col_js    = f'{split}_activity_metrics_js_divergence'
+    _col_f1    = f'{split}_control_flow_metrics_edge_f1_score'
+    _col_ov    = f'{split}_overall_error'
 
     needed = [_col_evt, _col_dur_w, _col_js, _col_f1, _col_ov]
     available = [c for c in needed if c in target_df.columns]
@@ -1719,6 +1721,25 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
             print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
 
+            # ── Save predicted log + test set to predicted_logs/ ──────────
+            if EXPORT_RESULTS:
+                _safe_process = str(process).replace(' ', '_').replace('/', '_')
+                _safe_mode    = str(sim_mode).replace(' ', '_').replace('/', '_')
+
+                # Test set — same for all modes, overwriting is fine
+                _test_path = os.path.join(_predicted_logs_dir, f'{_safe_process}_test_set.parquet')
+                df_test.to_parquet(_test_path, index=False)
+
+                # Predicted log — drop simulated_energy_curves (numpy arrays, not parquet-safe)
+                _pred_df = simulated_log_test.drop(
+                    columns=[c for c in simulated_log_test.columns
+                              if c == 'simulated_energy_curves'],
+                    errors='ignore',
+                )
+                _pred_path = os.path.join(_predicted_logs_dir, f'{_safe_process}_{_safe_mode}.parquet')
+                _pred_df.to_parquet(_pred_path, index=False)
+                print(f"  💾 Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
+
             print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
             print("  " + "="*76)
 
@@ -1899,7 +1920,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             m for m in _energy_modes_requested if m in _ENERGY_DIRECT_MODES
                         ]
                         if _direct_modes_requested:
-                            _energy_direct_dur_mods, _energy_direct_tr_mods, _, _direct_report = \
+                            _energy_direct_dur_mods, _energy_direct_tr_mods, _direct_energy_state_cols, _direct_report = \
                                 extract_energy_direct_models(
                                     df_expanded=_df_expanded_train,
                                     sensors=_sensors,
@@ -2059,6 +2080,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         _is_direct = _energy_mode in _ENERGY_DIRECT_MODES
                         _dur_mods  = _energy_direct_dur_mods if _is_direct else _energy_dur_mods
                         _tr_mods   = _energy_direct_tr_mods  if _is_direct else _energy_tr_mods
+                        _state_cols = _direct_energy_state_cols if _is_direct else _energy_state_cols
                         return ProcessSimulation(
                             stats_df, plan,
                             mode=_energy_mode,
@@ -2067,7 +2089,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             process_models=pm,
                             energy_duration_modifiers=_dur_mods,
                             energy_transition_modifiers=_tr_mods,
-                            energy_state_columns=_energy_state_cols,
+                            energy_state_columns=_state_cols,
                             energy_pipelines=_energy_pipelines,
                             activity_exog_means=exog_means if exog_means is not None else _activity_exog_means,
                             duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
@@ -2174,11 +2196,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 _train_cols = [c for c in _proc_df.columns if c.startswith('train_') and not c.startswith('train_energy_')]
             
             display(Markdown(f"## 📊 Training Verification: {process.upper()}"))
-            display(Markdown(f"*Evaluation on training data using real energy curves (verification of modifier fitting)*"))
+            display(Markdown(f"*Evaluation on training data — same metrics as test (0 = best)*"))
             _hm_train_mean_path = os.path.join(_process_results_dir, f'process_train_heatmap_{process}_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
             _hm_train_median_path = os.path.join(_process_results_dir, f'process_train_heatmap_{process}_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-            _plot_results_heatmap(_train_cols, f"Training Quality (Mean): {process}", local_df=_proc_df, save_path=_hm_train_mean_path, agg='mean')
-            _plot_results_heatmap(_train_cols, f"Training Quality (Median): {process}", local_df=_proc_df, save_path=_hm_train_median_path, agg='median')
+            _plot_short_heatmap(_proc_df, f"Training Quality (Mean): {process}", save_path=_hm_train_mean_path, agg='mean', split='train')
+            _plot_short_heatmap(_proc_df, f"Training Quality (Median): {process}", save_path=_hm_train_median_path, agg='median', split='train')
 
 
 if RUN_PROCESS_MODELLING:
@@ -2216,17 +2238,13 @@ if RUN_PROCESS_MODELLING:
     evaluation_results_df
 
     # ── Combined Training Heatmap — ALL processes together ────────────────────
-    _all_train_cols = [f"train_{b}" for b in CORE_METRIC_BASES if f"train_{b}" in evaluation_results_df.columns]
-    if not _all_train_cols:
-        _all_train_cols = [c for c in evaluation_results_df.columns if c.startswith('train_') and not c.startswith('train_energy_')]
-    if _all_train_cols:
-        display(Markdown("---"))
-        display(Markdown("## 📊 Training Quality: ALL Processes Combined"))
-        display(Markdown("*Aggregated across all processes on training data.*"))
-        _hm_train_all_mean_path = os.path.join(_process_results_dir, 'process_train_heatmap_all_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-        _hm_train_all_median_path = os.path.join(_process_results_dir, 'process_train_heatmap_all_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-        _plot_results_heatmap(_all_train_cols, "Training Quality (Mean): All Processes", save_path=_hm_train_all_mean_path, agg='mean')
-        _plot_results_heatmap(_all_train_cols, "Training Quality (Median): All Processes", save_path=_hm_train_all_median_path, agg='median')
+    display(Markdown("---"))
+    display(Markdown("## 📊 Training Quality: ALL Processes Combined"))
+    display(Markdown("*Aggregated across all processes on training data — same metrics as test (0 = best)*"))
+    _hm_train_all_mean_path   = os.path.join(_process_results_dir, 'process_train_heatmap_all_mean.png')   if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+    _hm_train_all_median_path = os.path.join(_process_results_dir, 'process_train_heatmap_all_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+    _plot_short_heatmap(evaluation_results_df, "Training Quality (Mean): All Processes",   save_path=_hm_train_all_mean_path,   agg='mean',   split='train')
+    _plot_short_heatmap(evaluation_results_df, "Training Quality (Median): All Processes", save_path=_hm_train_all_median_path, agg='median', split='train')
 
     # ── Per-process breakdown: show modes sorted by test_overall_error ───────
     report("\n" + "="*80)
