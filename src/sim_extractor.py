@@ -1219,6 +1219,7 @@ def extract_energy_modifiers(
     from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import r2_score, accuracy_score
     import warnings
@@ -1349,7 +1350,7 @@ def extract_energy_modifiers(
 
                 for model_name in transition_models:
                     try:
-                        clf = get_classifier(model_name)
+                        clf = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                         clf.fit(X_tr, yt_tr)
                         preds = clf.predict(X_val)
                         score = accuracy_score(yt_val, preds)
@@ -1361,7 +1362,7 @@ def extract_energy_modifiers(
 
                 if best_tr_name is not None and best_tr_score > majority_class_acc:
                     try:
-                        best_clf = get_classifier(best_tr_name)
+                        best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                         best_clf.fit(X, y_tr)
                         best_clf._train_feature_mean = train_feature_mean
                         best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
@@ -1449,6 +1450,7 @@ def extract_energy_direct_models(
     from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import r2_score, accuracy_score, balanced_accuracy_score
     from collections import Counter
@@ -1580,7 +1582,7 @@ def extract_energy_direct_models(
 
             for model_name in transition_models:
                 try:
-                    clf   = get_classifier(model_name)
+                    clf   = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                     clf.fit(X_tr, yt_tr)
                     score = balanced_accuracy_score(yt_val, clf.predict(X_val))
                     if score > best_tr_score:
@@ -1591,7 +1593,7 @@ def extract_energy_direct_models(
 
             if best_tr_name is not None and best_tr_score > majority_acc:
                 try:
-                    best_clf = get_classifier(best_tr_name)
+                    best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)
                     best_clf._train_feature_mean = train_feature_mean
                     best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
@@ -1653,6 +1655,7 @@ def extract_energy_direct_models_global(
     from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import r2_score, balanced_accuracy_score
     from collections import Counter
@@ -1764,7 +1767,7 @@ def extract_energy_direct_models_global(
         best_tr_score, best_tr_name = -float('inf'), None
         for model_name in transition_models:
             try:
-                clf = get_classifier(model_name)
+                clf = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                 clf.fit(X_tr, yt_tr)
                 score = balanced_accuracy_score(yt_val, clf.predict(X_val))
                 if score > best_tr_score:
@@ -1773,7 +1776,7 @@ def extract_energy_direct_models_global(
                 pass
 
         if best_tr_name is not None and best_tr_score > majority_acc:
-            best_clf = get_classifier(best_tr_name)
+            best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
             best_clf.fit(X, y_tr)
             best_clf._train_feature_mean = train_feature_mean
             best_clf._curr_act_columns   = curr_act_columns
