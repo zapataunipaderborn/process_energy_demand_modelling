@@ -449,7 +449,7 @@ class ProcessSimulation:
         unique_objects = (
             self.activity_stats[['object', 'object_type',
                                  'higher_level_activity']]
-            .drop_duplicates()
+            .drop_duplicates(subset=['higher_level_activity'])
         )
 
         for _, obj_config in unique_objects.iterrows():
@@ -615,7 +615,7 @@ class ProcessSimulation:
         unique_objects = (
             self.activity_stats[['object', 'object_type',
                                  'higher_level_activity']]
-            .drop_duplicates()
+            .drop_duplicates(subset=['higher_level_activity'])
         )
 
         for _, obj_config in unique_objects.iterrows():
@@ -885,7 +885,7 @@ class ProcessSimulation:
         unique_objects = (
             self.activity_stats[['object', 'object_type',
                                  'higher_level_activity']]
-            .drop_duplicates()
+            .drop_duplicates(subset=['higher_level_activity'])
         )
 
         for _, obj_config in unique_objects.iterrows():
@@ -1225,7 +1225,7 @@ class ProcessSimulation:
         current_sim_time = start_time.timestamp()
         unique_objects = (
             self.activity_stats[['object', 'object_type', 'higher_level_activity']]
-            .drop_duplicates()
+            .drop_duplicates(subset=['higher_level_activity'])
         )
 
         for _, obj_config in unique_objects.iterrows():
@@ -1556,7 +1556,7 @@ class ProcessSimulation:
         current_sim_time = start_time.timestamp()
         unique_objects = (
             self.activity_stats[['object', 'object_type', 'higher_level_activity']]
-            .drop_duplicates()
+            .drop_duplicates(subset=['higher_level_activity'])
         )
 
         for _, obj_config in unique_objects.iterrows():
@@ -1872,7 +1872,7 @@ class ProcessSimulation:
             return
 
         # ── All other modes: statistical / ML ────────────────────────
-        unique_objects = self.activity_stats[['object', 'object_type', 'higher_level_activity']].drop_duplicates()
+        unique_objects = self.activity_stats[['object', 'object_type', 'higher_level_activity']].drop_duplicates(subset=['higher_level_activity'])
         
         current_sim_time = start_time.timestamp()
         

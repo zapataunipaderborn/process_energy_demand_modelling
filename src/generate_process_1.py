@@ -35,7 +35,7 @@ NUM_RESOURCES = {
     'Water_supply': 1,
     'Destillation': 1,
     'Bottling':     1,
-    'Autoclaving':  1,
+    'Autoclaving':  3,
     'Packaging':    1,
     'Warehousing':  1,
 }
@@ -233,10 +233,11 @@ def simulate(n_batches: int = N_BATCHES,
 
                 events.append({
                     'case_id':               case_id,
-                    'activity':              f'{station}_{act_name}',
+                    'activity':              f'{resource_name}_{act_name}',
                     'timestamp_start':       ts_start,
                     'timestamp_end':         ts_end,
-                    'higher_level_activity': station,
+                    'higher_level_activity': 'sterilization_process',
+                    'station':               station,
                     'object_type':           object_type,
                     'object':                resource_name,
                     'object_attributes':     obj_attrs,
@@ -330,9 +331,9 @@ def build_expanded(df_event_log: pd.DataFrame,
     rows: list[dict] = []
 
     for _, ev in df_event_log.iterrows():
-        station   = ev['higher_level_activity']
-        activity  = ev['activity']                          # compound: 'Station_actname'
-        act_short = activity[len(station) + 1:]             # short:    'actname'
+        station   = ev['station']
+        activity  = ev['activity']                          # compound: 'resource_actname'
+        act_short = activity[len(ev['object']) + 1:]        # short:    'actname'
         ts_start = pd.Timestamp(ev['timestamp_start'])
         ts_end   = pd.Timestamp(ev['timestamp_end'])
         dur_min  = max(1.0, (ts_end - ts_start).total_seconds() / 60.0)
@@ -365,6 +366,7 @@ def build_expanded(df_event_log: pd.DataFrame,
                 'timestamp_end_log':            ev['timestamp_end'],
                 'activity_log':                 ev['activity'],
                 'higher_level_activity_log':    ev['higher_level_activity'],
+                'station_log':                  ev['station'],
                 'object_type_log':              ev['object_type'],
                 'object_log':                   ev['object'],
                 'case_id_log':                  ev['case_id'],
@@ -416,7 +418,8 @@ def main():
     df_event_log = simulate()
     print(f"  {len(df_event_log)} events, "
           f"{df_event_log['case_id'].nunique()} batches, "
-          f"{df_event_log['higher_level_activity'].nunique()} stations")
+          f"{df_event_log['station'].nunique()} stations, "
+          f"{df_event_log['activity'].nunique()} unique activities")
 
     print("Building energy time series…")
     df_expanded = build_expanded(df_event_log)
