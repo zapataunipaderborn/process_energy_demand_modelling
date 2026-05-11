@@ -355,7 +355,7 @@ CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) 
 
 # ── Train / test split ────────────────────────────────────────────────────────
 TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
-TRAIN_RATIO         = 0.50    # fraction of cases used for training
+TRAIN_RATIO         = 0.70    # fraction of cases used for training
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
 RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
@@ -458,27 +458,20 @@ METRICS_LOWER_IS_BETTER = {
     'duration_metrics_mean_duration_error',
     'duration_metrics_median_duration_error',
     'duration_metrics_std_duration_error',
+    'duration_metrics_activity_duration_error',
     'case_metrics_events_per_case_ks',
     'case_metrics_median_events_per_case_error',
+    'overall_error',
 }
 
-# The core set of metrics the user wants to see in the heatmaps
+# The 5 short metrics + overall shown in the main heatmap (all 0 = best)
 CORE_METRIC_BASES = [
-    # Overall
-    'overall_score',
-    # Direct sim-output vs real-log comparison
-    'basic_metrics_event_count_ratio',
+    'overall_error',
+    'basic_metrics_event_count_ratio',        # displayed as |ratio-1|
     'duration_metrics_mean_duration_error',
-    'duration_metrics_median_duration_error',
+    'duration_metrics_activity_duration_error',
     'activity_metrics_js_divergence',
-    'control_flow_metrics_edge_precision',
-    'control_flow_metrics_edge_recall',
-    'control_flow_metrics_edge_f1_score',
-    # Process model quality (Petri net vs real log)
-    'conformance_metrics_fitness',
-    'conformance_metrics_precision',
-    'conformance_metrics_generalization',
-    'conformance_metrics_simplicity',
+    'control_flow_metrics_edge_f1_score',     # displayed as 1-EdgeF1
 ]
 
 # Default definitions to avoid NameError when testing is skipped
@@ -491,7 +484,6 @@ higher_is_better = set()
 # Metrics where HIGHER is better (prefixes like train_ or test_ are stripped before checking)
 METRICS_HIGHER_IS_BETTER = {
 
-    'overall_score',
     'basic_metrics_event_count_ratio',
     'basic_metrics_case_count_ratio',
     'activity_metrics_activity_coverage_ratio',
@@ -565,15 +557,15 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
     global_lower = globals().get('lower_is_better', set())
     mode_avg_norm = _normalise_metrics(mode_avg, valid_cols, global_lower)
     
-    # Sort by overall score if available
-    sort_opts = ['test_overall_score', 'train_overall_score', valid_cols[0]]
+    # Sort by overall error if available (ascending = best first)
+    sort_opts = ['test_overall_error', 'train_overall_error', valid_cols[0]]
     sort_key = next((k for k in sort_opts if k in mode_avg_norm.columns), valid_cols[0])
-    mode_avg_norm = mode_avg_norm.sort_values(sort_key, ascending=False)
+    mode_avg_norm = mode_avg_norm.sort_values(sort_key, ascending=True)
     
     # Generate labels dynamically
     current_labels = {
-        'train_overall_score': 'Overall',
-        'test_overall_score':  'Overall',
+        'train_overall_error': 'Overall',
+        'test_overall_error':  'Overall',
         # Direct sim-vs-real
         'train_basic_metrics_event_count_ratio':      '1/EvtRatio',
         'test_basic_metrics_event_count_ratio':       '1/EvtRatio',
@@ -581,6 +573,8 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
         'test_duration_metrics_mean_duration_error':  '1-MeanDurErr',
         'train_duration_metrics_median_duration_error': '1-MedDurErr',
         'test_duration_metrics_median_duration_error':  '1-MedDurErr',
+        'train_duration_metrics_activity_duration_error': '1-ActDurErr',
+        'test_duration_metrics_activity_duration_error':  '1-ActDurErr',
         'train_activity_metrics_js_divergence':       '1-JS div',
         'test_activity_metrics_js_divergence':        '1-JS div',
         'train_control_flow_metrics_edge_precision':  'EdgePrec',
@@ -649,6 +643,76 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
     print("-" * len(title))
     with pd.option_context('display.max_columns', None, 'display.width', 200):
         print(metrics_table.to_string())
+
+
+def _plot_short_heatmap(target_df, title, save_path=None, agg='mean'):
+    """Short heatmap: 5 error metrics (0=best) + Overall, saved to process_results."""
+    if target_df is None or target_df.empty or 'mode' not in target_df.columns:
+        return
+
+    _col_evt   = 'test_basic_metrics_event_count_ratio'
+    _col_dur_w = 'test_duration_metrics_mean_duration_error'
+    _col_dur_a = 'test_duration_metrics_activity_duration_error'
+    _col_js    = 'test_activity_metrics_js_divergence'
+    _col_f1    = 'test_control_flow_metrics_edge_f1_score'
+    _col_ov    = 'test_overall_error'
+
+    needed = [_col_evt, _col_dur_w, _col_js, _col_f1, _col_ov]
+    available = [c for c in needed if c in target_df.columns]
+    if not available:
+        return
+
+    if agg == 'median':
+        mode_avg = target_df.groupby('mode')[[c for c in [_col_evt, _col_dur_w, _col_dur_a,
+                                                           _col_js, _col_f1, _col_ov]
+                                              if c in target_df.columns]].median()
+    else:
+        mode_avg = target_df.groupby('mode')[[c for c in [_col_evt, _col_dur_w, _col_dur_a,
+                                                           _col_js, _col_f1, _col_ov]
+                                              if c in target_df.columns]].mean()
+
+    hm = pd.DataFrame(index=mode_avg.index)
+
+    if _col_evt in mode_avg.columns:
+        hm['EvtRatioErr']   = (mode_avg[_col_evt] - 1.0).abs()
+    if _col_dur_w in mode_avg.columns:
+        hm['DurErr(whole)'] = mode_avg[_col_dur_w]
+    if _col_dur_a in mode_avg.columns:
+        hm['DurErr(activ)'] = mode_avg[_col_dur_a]
+    if _col_js in mode_avg.columns:
+        hm['JS div']        = mode_avg[_col_js]
+    if _col_f1 in mode_avg.columns:
+        hm['1-EdgeF1']      = 1.0 - mode_avg[_col_f1]
+    if _col_ov in mode_avg.columns:
+        hm['Overall']       = mode_avg[_col_ov]
+
+    err_cols = [c for c in ['EvtRatioErr', 'DurErr(whole)', 'DurErr(activ)', 'JS div', '1-EdgeF1'] if c in hm.columns]
+    if 'Overall' not in hm.columns and err_cols:
+        hm['Overall'] = hm[err_cols].mean(axis=1)
+
+    hm = hm.sort_values('Overall', ascending=True)
+
+    n_rows = max(2, len(hm))
+    fig, ax = plt.subplots(figsize=(max(10, len(hm.columns) * 1.5), n_rows * 0.9 + 1.8))
+    sep = len(hm.columns) - 1  # separator before Overall
+    sns.heatmap(hm.round(3), annot=True, fmt='.3f', cmap='RdYlGn_r',
+                vmin=0, vmax=1, linewidths=0.5, linecolor='white',
+                cbar_kws={'label': 'Error (0 = best)', 'shrink': 0.7}, ax=ax)
+    ax.axvline(x=sep, color='navy', linewidth=2.0)
+    ax.set_title(f'{title}\nAll metrics: 0 = best  |  Overall = mean of first {sep} columns',
+                 fontsize=11, fontweight='bold')
+    ax.set_ylabel('Mode')
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+    print(f"\n{title.upper()} — SHORT METRICS (0 = best)")
+    print("-" * 60)
+    with pd.option_context('display.max_columns', None, 'display.width', 200):
+        print(hm.round(4).to_string())
+
 
 # %% [markdown]
 # # Define Paths and Load Datasets
@@ -851,12 +915,24 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report(f"\nKolmogorov-Smirnov Test: KS={duration_ks_stat:.4f}, p-value={duration_ks_pvalue:.4f}")
     report(f"(p > 0.05 suggests distributions are similar)")
     
+    # Per-activity duration error: mean of |sim_act - real_act| / real_act across activities
+    _real_act_dur = (real_df.assign(_d=(real_df[end_col] - real_df[start_col]).dt.total_seconds())
+                     .groupby(activity_col)['_d'].mean())
+    _sim_act_dur  = (simulated_df.assign(_d=(simulated_df[end_col] - simulated_df[start_col]).dt.total_seconds())
+                     .groupby(activity_col)['_d'].mean())
+    _common_acts  = _real_act_dur.index.intersection(_sim_act_dur.index)
+    _act_dur_errs = [abs(_sim_act_dur[a] - _real_act_dur[a]) / _real_act_dur[a]
+                     for a in _common_acts if _real_act_dur[a] != 0]
+    activity_duration_error = float(np.mean(_act_dur_errs)) if _act_dur_errs else np.nan
+    report(f"Per-activity mean duration error: {activity_duration_error:.4f} (0=perfect)")
+
     results['duration_metrics'] = {
         'ks_statistic': duration_ks_stat,
         'ks_pvalue': duration_ks_pvalue,
         'mean_duration_error': duration_stats.loc['Mean', 'Error'],
         'median_duration_error': duration_stats.loc['Median', 'Error'],
-        'std_duration_error': duration_stats.loc['Std', 'Error']
+        'std_duration_error': duration_stats.loc['Std', 'Error'],
+        'activity_duration_error': activity_duration_error,
     }
     
     # ========== 4. CASE-LEVEL ANALYSIS ==========
@@ -1103,48 +1179,45 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report("\n8. OVERALL QUALITY ASSESSMENT")
     report("-" * 40)
 
-    # All components transformed so that 1 = perfect, 0 = worst.
-    _evt_ratio = results['basic_metrics']['event_count_ratio']
-    _js_div    = results['activity_metrics'].get('js_divergence', np.nan)
-    _edge_f1   = results['control_flow_metrics'].get('edge_f1_score', np.nan)
-    active_components = {
-        # 1/ratio when ratio>1, ratio when ratio<1 → 1.0 when ratio=1.0
-        'event_count_ratio':        (1.0 / _evt_ratio if _evt_ratio > 1 else _evt_ratio) if _evt_ratio and not np.isnan(_evt_ratio) else np.nan,
-        'mean_duration_similarity': (1.0 - results['duration_metrics']['mean_duration_error']),
-        'js_similarity':            (1.0 - _js_div) if not np.isnan(_js_div) else np.nan,
-        'edge_f1':                  _edge_f1,
-        'fitness':                  results['conformance_metrics'].get('fitness'),
-        'precision':                results['conformance_metrics'].get('precision'),
-        'generalization':           results['conformance_metrics'].get('generalization'),
-        'simplicity':               results['conformance_metrics'].get('simplicity'),
+    # Short-heatmap error components (0 = perfect, matching the notebook short heatmap).
+    _evt_ratio  = results['basic_metrics']['event_count_ratio']
+    _js_div     = results['activity_metrics'].get('js_divergence', np.nan)
+    _edge_f1    = results['control_flow_metrics'].get('edge_f1_score', np.nan)
+    _dur_whole  = results['duration_metrics']['mean_duration_error']
+    _dur_activ  = results['duration_metrics'].get('activity_duration_error', np.nan)
+
+    short_components = {
+        'evt_ratio_err':      abs(_evt_ratio - 1.0) if pd.notna(_evt_ratio) else np.nan,
+        'dur_err_whole':      _dur_whole,
+        'dur_err_activ':      _dur_activ,
+        'js_div':             _js_div,
+        'edge_err (1-EdgeF1)': (1.0 - _edge_f1) if pd.notna(_edge_f1) else np.nan,
     }
 
-    active_values = []
-    report("\nActive Score Components:")
-    for comp_name, comp_val in active_components.items():
+    report("\nShort-heatmap error components (0 = best):")
+    err_values = []
+    for comp_name, comp_val in short_components.items():
         if pd.isna(comp_val):
             report(f"  {comp_name:30}: n/a")
-            continue
-        comp_val = float(comp_val)
-        comp_val = max(0.0, min(1.0, comp_val))
-        active_values.append(comp_val)
-        report(f"  {comp_name:30}: {comp_val:.4f}")
+        else:
+            report(f"  {comp_name:30}: {comp_val:.4f}")
+            err_values.append(float(comp_val))
 
-    overall_score = float(np.mean(active_values)) if active_values else np.nan
-    report(f"\nOVERALL QUALITY SCORE (active): {overall_score:.4f} (0=worst, 1=perfect)")
-    
-    if pd.notna(overall_score) and overall_score >= 0.8:
+    overall_error = float(np.mean(err_values)) if err_values else np.nan
+    report(f"\nOVERALL ERROR SCORE: {overall_error:.4f} (0=perfect)")
+
+    if pd.notna(overall_error) and overall_error <= 0.05:
         quality_assessment = "EXCELLENT"
-    elif pd.notna(overall_score) and overall_score >= 0.6:
+    elif pd.notna(overall_error) and overall_error <= 0.15:
         quality_assessment = "GOOD"
-    elif pd.notna(overall_score) and overall_score >= 0.4:
+    elif pd.notna(overall_error) and overall_error <= 0.30:
         quality_assessment = "FAIR"
     else:
         quality_assessment = "POOR"
-    
+
     report(f"QUALITY ASSESSMENT: {quality_assessment}")
-    
-    results['overall_score'] = overall_score
+
+    results['overall_error'] = overall_error
     results['quality_assessment'] = quality_assessment
     
     return results
@@ -1682,12 +1755,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     ]
 
     if combined_candidates:
-        # Use -inf when score is missing so valid scores are preferred.
-        best_row = max(
+        # Use +inf when error is missing so valid (lower) errors are preferred.
+        best_row = min(
             combined_candidates,
             key=lambda r: (
-                float(r.get('train_overall_score'))
-                if pd.notna(r.get('train_overall_score')) else -np.inf
+                float(r.get('train_overall_error'))
+                if pd.notna(r.get('train_overall_error')) else np.inf
             )
         )
 
@@ -1700,9 +1773,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("  ▶ SIMULATION MODE: PETRI_NET_COMBINED")
         print("─"*80)
         print(
-            "  Selected mode for this process based on TRAIN overall score: "
+            "  Selected mode for this process based on TRAIN overall error (0=best): "
             f"{combined_row['selected_mode']} "
-            f"(train_overall_score={best_row.get('train_overall_score')})"
+            f"(train_overall_error={best_row.get('train_overall_error')})"
         )
 
         process_mode_results.append(combined_row)
@@ -1733,11 +1806,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 "petri_net_inductive to MODES_TO_COMPARE."
             )
         else:
-            _best_base_row = max(
+            _best_base_row = min(
                 _base_candidates,
                 key=lambda r: (
-                    float(r.get('train_overall_score'))
-                    if pd.notna(r.get('train_overall_score')) else -np.inf
+                    float(r.get('train_overall_error'))
+                    if pd.notna(r.get('train_overall_error')) else np.inf
                 )
             )
             _best_base_alg = _best_base_row.get('mining_algorithm')
@@ -1746,7 +1819,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
             print("\n" + "="*80)
             print(f"ENERGY-AWARE MODES: using '{_best_base_row['mode']}' as base PN "
-                  f"(train_overall_score={_best_base_row.get('train_overall_score'):.4f})")
+                  f"(train_overall_error={_best_base_row.get('train_overall_error'):.4f})")
             print("="*80)
 
             # ── Extract energy modifiers once per process ─────────────────
@@ -2115,7 +2188,7 @@ if RUN_PROCESS_MODELLING:
     # Reorder columns to place key columns first
     priority_cols = ['process', 'mode', 'split']
     for prefix in ['train', 'test']:
-        for col_name in ['overall_score', 'quality_assessment']:
+        for col_name in ['overall_error', 'quality_assessment']:
             full = f"{prefix}_{col_name}"
             if full in evaluation_results_df.columns:
                 priority_cols.append(full)
@@ -2155,17 +2228,17 @@ if RUN_PROCESS_MODELLING:
         _plot_results_heatmap(_all_train_cols, "Training Quality (Mean): All Processes", save_path=_hm_train_all_mean_path, agg='mean')
         _plot_results_heatmap(_all_train_cols, "Training Quality (Median): All Processes", save_path=_hm_train_all_median_path, agg='median')
 
-    # ── Per-process breakdown: show modes sorted by test_overall_score ────────
+    # ── Per-process breakdown: show modes sorted by test_overall_error ───────
     report("\n" + "="*80)
-    report("PER-PROCESS RESULTS — MODES SORTED BY test_overall_score")
+    report("PER-PROCESS RESULTS — MODES SORTED BY test_overall_error (0=best)")
     report("="*80)
 
-    sort_col = 'test_overall_score'
+    sort_col = 'test_overall_error'
     if sort_col in evaluation_results_df.columns:
         # Columns to display (key columns only for readability)
         display_cols = ['process', 'mode', 'split']
         for prefix in ['test', 'train']:
-            for col_name in ['overall_score', 'quality_assessment']:
+            for col_name in ['overall_error', 'quality_assessment']:
                 full = f"{prefix}_{col_name}"
                 if full in evaluation_results_df.columns:
                     display_cols.append(full)
@@ -2179,7 +2252,7 @@ if RUN_PROCESS_MODELLING:
             report(f"\n{'─'*80}")
             report(f"  PROCESS: {process_name}")
             report(f"{'─'*80}")
-            sorted_grp = grp.sort_values(sort_col, ascending=False)
+            sorted_grp = grp.sort_values(sort_col, ascending=True)
             # Pretty-print with pandas
             with pd.option_context('display.max_columns', None,
                                    'display.width', 200,
@@ -2199,29 +2272,24 @@ if RUN_PROCESS_MODELLING:
 # All modeling and per-process evaluations are complete.
 
 if RUN_TEST_EVALUATION and RUN_PROCESS_MODELLING:
-    # Final consolidated summary of TEST set performance across ALL processes
-    # (Focuses strictly on the core metrics to maintain clarity)
-    _final_test_cols = [f"test_{b}" for b in CORE_METRIC_BASES if f"test_{b}" in evaluation_results_df.columns]
-    if _final_test_cols:
-        display(Markdown("---"))
-        display(Markdown("# 📊 FINAL CONSOLIDATED PERFORMANCE: TEST SET ENSEMBLE"))
-        display(Markdown("*Consolidated simulation quality across all processes on unseen data.*"))
-        _hm_path_mean = os.path.join(_process_results_dir, 'process_test_heatmap_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-        _hm_path_median = os.path.join(_process_results_dir, 'process_test_heatmap_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble (Mean)", save_path=_hm_path_mean, agg='mean')
-        _plot_results_heatmap(_final_test_cols, "Generalization Performance: Test Set Ensemble (Median)", save_path=_hm_path_median, agg='median')
+    display(Markdown("---"))
+    display(Markdown("# 📊 FINAL CONSOLIDATED PERFORMANCE: TEST SET"))
+    display(Markdown("*EvtRatioErr · DurErr(whole) · DurErr(activ) · JS div · 1-EdgeF1 · Overall  (0 = best)*"))
 
-        # ── Per-process test heatmaps ──────────────────────────────────────────
-        display(Markdown("## 📊 Test Performance: Per Process"))
-        for _proc_name, _proc_grp in evaluation_results_df.groupby('process'):
-            _proc_test_cols = [c for c in _final_test_cols if c in _proc_grp.columns]
-            if not _proc_test_cols:
-                continue
-            display(Markdown(f"### {_proc_name.upper()}"))
-            _hm_proc_mean = os.path.join(_process_results_dir, f'process_test_heatmap_{_proc_name}_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-            _hm_proc_median = os.path.join(_process_results_dir, f'process_test_heatmap_{_proc_name}_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-            _plot_results_heatmap(_proc_test_cols, f"Test Performance (Mean): {_proc_name}", local_df=_proc_grp, save_path=_hm_proc_mean, agg='mean')
-            _plot_results_heatmap(_proc_test_cols, f"Test Performance (Median): {_proc_name}", local_df=_proc_grp, save_path=_hm_proc_median, agg='median')
+    # ── All-process heatmap ────────────────────────────────────────────────────
+    _short_path_mean   = os.path.join(_process_results_dir, 'process_test_short_mean.png')   if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+    _short_path_median = os.path.join(_process_results_dir, 'process_test_short_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+    _plot_short_heatmap(evaluation_results_df, "Process Results — All Processes (Mean)",   save_path=_short_path_mean,   agg='mean')
+    _plot_short_heatmap(evaluation_results_df, "Process Results — All Processes (Median)", save_path=_short_path_median, agg='median')
+
+    # ── Per-process heatmaps ───────────────────────────────────────────────────
+    display(Markdown("## 📊 Per Process"))
+    for _proc_name, _proc_grp in evaluation_results_df.groupby('process'):
+        display(Markdown(f"### {_proc_name.upper()}"))
+        _short_proc_mean   = os.path.join(_process_results_dir, f'process_test_short_{_proc_name}_mean.png')   if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+        _short_proc_median = os.path.join(_process_results_dir, f'process_test_short_{_proc_name}_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
+        _plot_short_heatmap(_proc_grp, f"{_proc_name} (Mean)",   save_path=_short_proc_mean,   agg='mean')
+        _plot_short_heatmap(_proc_grp, f"{_proc_name} (Median)", save_path=_short_proc_median, agg='median')
 
 
 
