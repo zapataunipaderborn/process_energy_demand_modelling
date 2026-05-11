@@ -88,7 +88,7 @@ from simulation import ProcessSimulation
 from sim_modeller import SimModeller
 
 from sklearn.linear_model import Lasso, LogisticRegression
-from sim_extractor import extract_energy_modifiers, extract_energy_direct_models
+from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
 from xgboost import XGBRegressor
 
 # %%
@@ -245,6 +245,7 @@ MODES_TO_COMPARE = [
     'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
     'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
     'petri_net_energy_direct',                  # ML predicts both directly per activity
+    #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
     #'ml_duration_only',
@@ -263,11 +264,13 @@ _ENERGY_AWARE_MODES = {
     'petri_net_energy_direct',
     'petri_net_energy_direct_duration_only',
     'petri_net_energy_direct_transition_only',
+    'petri_net_energy_direct_global',
 }
 _ENERGY_DIRECT_MODES = {
     'petri_net_energy_direct',
     'petri_net_energy_direct_duration_only',
     'petri_net_energy_direct_transition_only',
+    'petri_net_energy_direct_global',
 }
 
 # ── Duration modifier models ───────────────────────────────────────────────
@@ -1939,6 +1942,24 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 report(_direct_df.to_string(index=False))
                                 display(_direct_df)
 
+                        # ── Train global direct model (one model, all activities pooled) ──
+                        _global_dur_mods, _global_tr_mods, _global_energy_state_cols = {}, {}, []
+                        _global_modes_requested = [
+                            m for m in _energy_modes_requested if m == 'petri_net_energy_direct_global'
+                        ]
+                        if _global_modes_requested:
+                            _global_dur_mods, _global_tr_mods, _global_energy_state_cols, _global_report = \
+                                extract_energy_direct_models_global(
+                                    df_expanded=_df_expanded_train,
+                                    sensors=_sensors,
+                                    duration_models=ENERGY_DURATION_MODELS,
+                                    transition_models=ENERGY_TRANSITION_MODELS,
+                                    min_samples=ENERGY_MIN_SAMPLES,
+                                    ef_cols=_ef_ep_cols,
+                                )
+                            report(f"\nGlobal model: Duration={_global_report.get('Duration','n/a')}  "
+                                   f"Transition={_global_report.get('Transition','n/a')}")
+
                         # ── Train Dynamic ML Curve Predictors ──────────────────
                         # One pipeline per (sensor, activity, object) so each barycenter
                         # and model is fit on a homogeneous set of curves.
@@ -2077,10 +2098,20 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
                     def _run_energy_sim(plan, stats_df, pm, exog_means=None):
                         # Direct modes use the direct ML models; modifier modes use the modifier models
-                        _is_direct = _energy_mode in _ENERGY_DIRECT_MODES
-                        _dur_mods  = _energy_direct_dur_mods if _is_direct else _energy_dur_mods
-                        _tr_mods   = _energy_direct_tr_mods  if _is_direct else _energy_tr_mods
-                        _state_cols = _direct_energy_state_cols if _is_direct else _energy_state_cols
+                        _is_global  = _energy_mode == 'petri_net_energy_direct_global'
+                        _is_direct  = _energy_mode in _ENERGY_DIRECT_MODES
+                        if _is_global:
+                            _dur_mods   = _global_dur_mods
+                            _tr_mods    = _global_tr_mods
+                            _state_cols = _global_energy_state_cols
+                        elif _is_direct:
+                            _dur_mods   = _energy_direct_dur_mods
+                            _tr_mods    = _energy_direct_tr_mods
+                            _state_cols = _direct_energy_state_cols
+                        else:
+                            _dur_mods   = _energy_dur_mods
+                            _tr_mods    = _energy_tr_mods
+                            _state_cols = _energy_state_cols
                         return ProcessSimulation(
                             stats_df, plan,
                             mode=_energy_mode,

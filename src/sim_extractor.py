@@ -1624,6 +1624,172 @@ def extract_energy_direct_models(
     return duration_models_direct, transition_models_direct, energy_state_columns, model_choices_report
 
 
+def extract_energy_direct_models_global(
+    df_expanded,
+    sensors,
+    activity_col='activity_log',
+    duration_models=None,
+    transition_models=None,
+    min_samples=30,
+    timestamp_start_col='timestamp_start_log',
+    datetime_energy_col='datetime_energy',
+    ef_cols=None,
+):
+    """
+    Train ONE global duration regressor and ONE global transition classifier
+    on all activities pooled together.  The current activity is included as a
+    ``curr_act_*`` one-hot feature so the single model can distinguish activities.
+
+    Returns dicts keyed by ``'__global__'`` (same interface as the per-activity
+    variant), plus the extended ``energy_state_columns`` list that includes the
+    ``curr_act_*`` columns.
+    """
+    print("\n" + "=" * 70)
+    print("ENERGY DIRECT GLOBAL MODEL EXTRACTION")
+    print("=" * 70)
+    print(f"  Sensors          : {sensors}")
+
+    from xgboost import XGBRegressor
+    from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import r2_score, balanced_accuracy_score
+    from collections import Counter
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+
+    if duration_models is None:   duration_models   = ['xgboost']
+    if transition_models is None: transition_models = ['logistic']
+
+    def get_regressor(name):
+        if name == 'xgboost': return XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                                                   subsample=0.8, colsample_bytree=0.8,
+                                                   verbosity=0, random_state=42)
+        if name == 'linear':  return LinearRegression()
+        if name == 'lasso':   return Lasso(alpha=0.1, random_state=42)
+        if name == 'mlp':     return MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+        if name == 'statistical': return StatisticalDurationBaseline(log_ratio=False)
+        return XGBRegressor(n_estimators=200, random_state=42)
+
+    def get_classifier(name):
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, C=0.5, random_state=42)
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42)
+        if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=200, max_depth=4, random_state=42)
+        return LogisticRegression(max_iter=1000, random_state=42)
+
+    df_recs = _build_energy_state_matrix_with_next(
+        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
+        ef_cols=ef_cols,
+    )
+    print(f"  External factors : {[c for c in (ef_cols or []) if c in df_expanded.columns]}")
+
+    # Base sensor + ef feature columns
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
+    for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
+        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+    energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+
+    if df_recs.empty or len(df_recs) < min_samples:
+        print("  WARNING: not enough instances — returning empty global models.")
+        return {}, {}, energy_state_columns, {}
+
+    print(f"  Total instances  : {len(df_recs)}")
+
+    # One-hot encode prev_activity
+    if 'prev_activity' in df_recs.columns:
+        prev_dummies = pd.get_dummies(df_recs['prev_activity'], prefix='prev_act').astype(float)
+        df_recs = pd.concat([df_recs.reset_index(drop=True), prev_dummies.reset_index(drop=True)], axis=1)
+        energy_state_columns += [c for c in prev_dummies.columns if c not in energy_state_columns]
+
+    # One-hot encode current activity (the global model's key feature)
+    curr_dummies = pd.get_dummies(df_recs['activity'], prefix='curr_act').astype(float)
+    df_recs = pd.concat([df_recs.reset_index(drop=True), curr_dummies.reset_index(drop=True)], axis=1)
+    curr_act_columns = list(curr_dummies.columns)
+    energy_state_columns += [c for c in curr_act_columns if c not in energy_state_columns]
+
+    print(f"  Curr-activity cols: {len(curr_act_columns)}  |  Total features: {len(energy_state_columns)}")
+
+    X     = df_recs[energy_state_columns].values
+    y_dur = np.log(df_recs['duration'].values.clip(0.1))
+    y_tr  = df_recs['next_activity'].values
+    mean_dur = float(np.exp(np.mean(y_dur)))
+
+    train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+
+    X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
+        X, y_dur, y_tr, test_size=0.2, random_state=42,
+        stratify=pd.cut(y_dur, bins=5, labels=False),
+    )
+
+    report = {}
+
+    # ── Global duration model ─────────────────────────────────────────────
+    best_dur_score, best_dur_name = -float('inf'), None
+    for model_name in duration_models:
+        try:
+            mdl = get_regressor(model_name)
+            mdl.fit(X_tr, yd_tr)
+            score = r2_score(yd_val, mdl.predict(X_val))
+            if score > best_dur_score:
+                best_dur_score, best_dur_name = score, model_name
+        except Exception:
+            pass
+
+    dur_models_out = {}
+    if best_dur_name is not None and best_dur_score > 0.05:
+        best_mdl = get_regressor(best_dur_name)
+        best_mdl.fit(X, y_dur)
+        best_mdl._log_duration       = True
+        best_mdl._mean_duration      = mean_dur
+        best_mdl._train_feature_mean = train_feature_mean
+        best_mdl._curr_act_columns   = curr_act_columns
+        best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
+        dur_models_out['__global__'] = best_mdl
+        report['Duration'] = f'GLOBAL {best_dur_name} (val R²={best_dur_score:.3f})'
+        print(f"  Global duration -> {best_dur_name} (val R²={best_dur_score:.3f}) ✓")
+    else:
+        report['Duration'] = f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0.05)'
+        print(f"  Global duration -> statistical (best ML val R²={best_dur_score:.3f} ≤ 0.05)")
+
+    # ── Global transition model ───────────────────────────────────────────
+    n_classes    = len(set(y_tr))
+    tr_models_out = {}
+    if n_classes >= 2:
+        majority_class = Counter(yt_tr).most_common(1)[0][0]
+        majority_acc   = balanced_accuracy_score(yt_val, np.full(len(yt_val), majority_class))
+        best_tr_score, best_tr_name = -float('inf'), None
+        for model_name in transition_models:
+            try:
+                clf = get_classifier(model_name)
+                clf.fit(X_tr, yt_tr)
+                score = balanced_accuracy_score(yt_val, clf.predict(X_val))
+                if score > best_tr_score:
+                    best_tr_score, best_tr_name = score, model_name
+            except Exception:
+                pass
+
+        if best_tr_name is not None and best_tr_score > majority_acc:
+            best_clf = get_classifier(best_tr_name)
+            best_clf.fit(X, y_tr)
+            best_clf._train_feature_mean = train_feature_mean
+            best_clf._curr_act_columns   = curr_act_columns
+            best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
+            tr_models_out['__global__'] = best_clf
+            report['Transition'] = f'GLOBAL {best_tr_name} (val BalAcc={best_tr_score:.3f})'
+            print(f"  Global transition -> {best_tr_name} (val BalAcc={best_tr_score:.3f}) ✓")
+        else:
+            report['Transition'] = f'Statistical (best ML BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
+            print(f"  Global transition -> statistical (val BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+    else:
+        report['Transition'] = 'Statistical (1 class only)'
+
+    return dur_models_out, tr_models_out, energy_state_columns, report
+
+
 def _build_energy_state_matrix_with_next(
     df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
     ef_cols=None,

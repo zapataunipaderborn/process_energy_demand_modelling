@@ -107,6 +107,7 @@ class ProcessSimulation:
             'petri_net_energy_direct',
             'petri_net_energy_direct_duration_only',
             'petri_net_energy_direct_transition_only',
+            'petri_net_energy_direct_global',
         )
         if self.mode in _ENERGY_MODES:
             if self.process_models is None or len(self.process_models) == 0:
@@ -1606,9 +1607,9 @@ class ProcessSimulation:
                                 _ef_seed_vals_d.setdefault(_col, []).append(_v)
                     for _col, _vs in _ef_seed_vals_d.items():
                         seed_state[_col] = float(np.mean(_vs))
-                # Zero-init prev_activity one-hot (no previous activity at case start)
+                # Zero-init prev_activity and curr_activity one-hots at case start
                 for _col in self.energy_state_columns:
-                    if _col.startswith('prev_act_'):
+                    if _col.startswith('prev_act_') or _col.startswith('curr_act_'):
                         seed_state[_col] = 0.0
                 current_energy_state = seed_state if seed_state else None
             else:
@@ -1632,12 +1633,26 @@ class ProcessSimulation:
                 #   the enabled transition whose label matches best.
                 # Else: use base PN stochastic weights.
                 chosen_transition = None
-                if (enable_transitions
+                visible_enabled = [t for t in enabled_list if t.label is not None]
+                _has_global_tr = '__global__' in self.energy_transition_modifiers
+                _tr_lookup_key = '__global__' if _has_global_tr else (prev_activity if prev_activity else None)
+                if len(visible_enabled) <= 1:
+                    pass  # deterministic or single-option step — PN fallback below is correct
+                elif (enable_transitions
                         and current_energy_state is not None
                         and prev_activity is not None
-                        and prev_activity in self.energy_transition_modifiers):
-                    clf = self.energy_transition_modifiers[prev_activity]
-                    energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
+                        and _tr_lookup_key is not None
+                        and _tr_lookup_key in self.energy_transition_modifiers):
+                    clf = self.energy_transition_modifiers[_tr_lookup_key]
+                    if _has_global_tr:
+                        # Global model: set curr_act_* to the query activity (prev_activity here)
+                        _ev = dict(current_energy_state)
+                        for _c in self.energy_state_columns:
+                            if _c.startswith('curr_act_'):
+                                _ev[_c] = 1.0 if _c == f'curr_act_{prev_activity}' else 0.0
+                        energy_vec = [_ev.get(c, 0.0) for c in self.energy_state_columns]
+                    else:
+                        energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
                     try:
                         proba_vec  = clf.predict_proba([energy_vec])[0]
                         label_prob = dict(zip(clf.classes_, proba_vec))
@@ -1676,11 +1691,21 @@ class ProcessSimulation:
                     activity_count += 1
 
                     # ── Duration: direct ML prediction or statistical ──
+                    _has_global_dur = '__global__' in self.energy_duration_modifiers
+                    _dur_lookup_key = '__global__' if _has_global_dur else chosen_label
                     if (enable_duration
                             and current_energy_state is not None
-                            and chosen_label in self.energy_duration_modifiers):
-                        mdl = self.energy_duration_modifiers[chosen_label]
-                        energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
+                            and _dur_lookup_key in self.energy_duration_modifiers):
+                        mdl = self.energy_duration_modifiers[_dur_lookup_key]
+                        if _has_global_dur:
+                            # Global model: set curr_act_* to the activity whose duration we want
+                            _ev = dict(current_energy_state)
+                            for _c in self.energy_state_columns:
+                                if _c.startswith('curr_act_'):
+                                    _ev[_c] = 1.0 if _c == f'curr_act_{chosen_label}' else 0.0
+                            energy_vec = [_ev.get(c, 0.0) for c in self.energy_state_columns]
+                        else:
+                            energy_vec = [current_energy_state[c] for c in self.energy_state_columns]
                         try:
                             _raw = float(mdl.predict([energy_vec])[0])
                             if getattr(mdl, '_log_duration', False):
@@ -1807,7 +1832,7 @@ class ProcessSimulation:
                         if _act_ef:
                             current_energy_state = {**current_energy_state, **_act_ef}
 
-                    # Update prev_activity one-hot for the next iteration
+                    # Update prev_activity one-hot; keep curr_act_* zeroed (set on-the-fly per call)
                     if current_energy_state is not None:
                         _prev_act_cols = [c for c in self.energy_state_columns
                                           if c.startswith('prev_act_')]
@@ -1817,6 +1842,9 @@ class ProcessSimulation:
                             _pa_key = f'prev_act_{chosen_label}'
                             if _pa_key in self.energy_state_columns:
                                 current_energy_state[_pa_key] = 1.0
+                        for _cc in self.energy_state_columns:
+                            if _cc.startswith('curr_act_'):
+                                current_energy_state[_cc] = 0.0
 
             if step >= max_steps:
                 print(f"    WARNING: max steps ({max_steps}) reached.")
@@ -1864,7 +1892,8 @@ class ProcessSimulation:
         # ── Energy-direct Petri net modes (full ML prediction) ───────
         if self.mode in ('petri_net_energy_direct',
                          'petri_net_energy_direct_duration_only',
-                         'petri_net_energy_direct_transition_only'):
+                         'petri_net_energy_direct_transition_only',
+                         'petri_net_energy_direct_global'):
             enable_dur = self.mode != 'petri_net_energy_direct_transition_only'
             enable_tr  = self.mode != 'petri_net_energy_direct_duration_only'
             self._simulate_petri_net_energy_direct_for_case(
