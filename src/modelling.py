@@ -160,6 +160,7 @@ if TEMPORAL_RESOLUTION != 'original':
 _env_processes   = os.environ.get('PIPELINE_PROCESSES_TO_RUN')
 processes_to_run = _env_processes.split(',') if _env_processes else ['process_1', 'process_2', 'process_3', 'process_4']
 
+print(f"Processes to run: {processes_to_run}")
 
 process_datasets_to_model = process_datasets
 

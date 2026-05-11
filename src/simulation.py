@@ -95,9 +95,9 @@ class ProcessSimulation:
         if self.mode in ('petri_net', 'petri_net_statistical',
                          'petri_net_statistical_memory') \
                 and (self.process_models is None or len(self.process_models) == 0):
-            print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no "
-                  "process_models provided – falling back to statistical mode.")
-            self.mode = 'statistical'
+            raise ValueError(
+                f"mode='{self.mode}' requires process_models but none were provided "
+                f"or all failed to mine. Check sim_extractor output.")
 
         # Energy-aware mode validation
         _ENERGY_MODES = (
@@ -464,14 +464,10 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                # No Petri net for this group → fall back to statistical
-                print(f"  No Petri net for {key} — falling back to "
-                      f"statistical simulation.")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
-                continue
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net mode: no Petri net found for key {key}. "
+                    f"Available keys: {available}")
 
             net = model['net']
             im  = model['im']
@@ -633,13 +629,10 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                print(f"  ⚠️ No Petri net for {key} — FALLING BACK to "
-                      f"statistical simulation (this means results = statistical!)")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
-                continue
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net_statistical mode: no Petri net found for key {key}. "
+                    f"Available keys: {available}")
             
             print(f"  ✅ Petri net FOUND for {key}")
             print(f"  [DEBUG] label_stochastic: {model.get('label_stochastic', {})}")
@@ -900,13 +893,10 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                print(f"  ⚠️ No Petri net for {key} — falling back to "
-                      f"statistical simulation.")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
-                continue
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net_statistical_memory mode: no Petri net found for key {key}. "
+                    f"Available keys: {available}")
 
             net = model['net']
             im  = model['im']
@@ -1240,13 +1230,10 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                print(f"  ⚠️  No Petri net for {key} — falling back to "
-                      f"statistical simulation.")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
-                continue
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net_energy mode: no Petri net found for key {key}. "
+                    f"Available keys: {available}")
 
             net             = model['net']
             im              = model['im']
@@ -1571,12 +1558,10 @@ class ProcessSimulation:
             model = self.process_models.get(key) if self.process_models else None
 
             if model is None:
-                print(f"  ⚠️  No Petri net for {key} — falling back to statistical.")
-                self._simulate_statistical_for_object(
-                    case_id, object_attributes, current_sim_time,
-                    object_name, object_type, higher_level_activity
-                )
-                continue
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net_energy_direct mode: no Petri net found for key {key}. "
+                    f"Available keys: {available}")
 
             net             = model['net']
             im              = model['im']

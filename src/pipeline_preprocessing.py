@@ -16,7 +16,7 @@ visuals = True
 
 current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
 folder_gold_base = current_path.parent / 'data' / 'gold' / f'experiment_{experiment}'
-folder_silver_base = current_path.parent / 'data' / 'silver' / f'experiment_{experiment}'
+folder_silver_base = current_path.parent / 'data' / 'silver'
 
 info = {
     'experiment': experiment,
@@ -183,8 +183,8 @@ for (obj, change), group in activity_groups:
 df_activities = pd.DataFrame(activity_rows)
 
 # Now set the required columns on df_activities
-df_activities['higher_level_activity'] = 'shift'
-df_activities['object_type'] = 'production_line'
+df_activities['higher_level_activity'] = df_activities['temp_object']#'production_line'#'shift'
+df_activities['object_type'] = df_activities['temp_object']#'production_line'
 df_activities['object'] = df_activities['temp_object']
 
 # Define a function to determine the shift based on datetime hour
@@ -364,7 +364,7 @@ display(df_expanded)
 #     'event_log': df_event_log,
 #     'production_plan': production_plan
 # }
-# display(df_expanded)
+display(df_expanded)
 
 # %%
 
@@ -416,7 +416,7 @@ for (obj, change), group in activity_groups:
 df_activities = pd.DataFrame(activity_rows)
 
 # Now set the required columns on df_activities
-df_activities['higher_level_activity'] = 'shift'
+df_activities['higher_level_activity'] = 'tower'#'shift'
 df_activities['object_type'] = 'tower'
 df_activities['object'] = df_activities['temp_object']
 
