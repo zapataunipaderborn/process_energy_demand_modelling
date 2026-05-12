@@ -814,6 +814,91 @@ def _safe_simplicity(net):
     complexity = len(net.places) + len(net.transitions) + len(net.arcs)
     return float(1.0 / (1.0 + 0.005 * float(complexity)))
 
+def _per_case_median_metrics(simulated_df, real_df,
+                             case_col='case_id', activity_col='activity',
+                             start_col='timestamp_start', end_col='timestamp_end'):
+    """
+    Compute EvtRatioErr, DurErr(whole), DurErr(activ), JS-div, 1-EdgeF1
+    independently for every case that exists in both logs, then return
+    the MEDIAN across cases.  This removes the global-pooling bias where
+    a few large cases dominate the aggregate.
+    """
+    common = sorted(set(simulated_df[case_col].dropna().unique()) &
+                    set(real_df[case_col].dropna().unique()))
+    if not common:
+        return {}
+
+    rows = []
+    for cid in common:
+        rc = real_df[real_df[case_col] == cid]
+        sc = simulated_df[simulated_df[case_col] == cid]
+        if rc.empty:
+            continue
+
+        # --- EvtRatioErr ---
+        evt_ratio_err = abs(len(sc) / len(rc) - 1.0)
+
+        # --- DurErr(whole): relative error of mean event duration ---
+        real_durs = (rc[end_col] - rc[start_col]).dt.total_seconds() / 60.0
+        sim_durs  = (sc[end_col] - sc[start_col]).dt.total_seconds() / 60.0
+        real_mu = real_durs.mean()
+        dur_err_whole = abs(sim_durs.mean() - real_mu) / real_mu if real_mu > 0 else np.nan
+
+        # --- DurErr(activ): mean relative error across activity types in this case ---
+        r_act = (rc.assign(_d=(rc[end_col]-rc[start_col]).dt.total_seconds()/60.0)
+                   .groupby(activity_col)['_d'].mean())
+        s_act = (sc.assign(_d=(sc[end_col]-sc[start_col]).dt.total_seconds()/60.0)
+                   .groupby(activity_col)['_d'].mean())
+        common_acts = r_act.index.intersection(s_act.index)
+        act_errs = [abs(s_act[a] - r_act[a]) / r_act[a]
+                    for a in common_acts if r_act[a] > 0]
+        dur_err_activ = float(np.mean(act_errs)) if act_errs else np.nan
+
+        # --- JS divergence of activity-frequency distribution ---
+        all_acts = sorted(set(rc[activity_col].dropna()) | set(sc[activity_col].dropna()))
+        r_cnt = rc[activity_col].value_counts()
+        s_cnt = sc[activity_col].value_counts()
+        p = np.array([r_cnt.get(a, 0) for a in all_acts], dtype=float) + 1e-9
+        q = np.array([s_cnt.get(a, 0) for a in all_acts], dtype=float) + 1e-9
+        p /= p.sum(); q /= q.sum()
+        m = 0.5 * (p + q)
+        js_div = float(0.5 * (np.sum(p * np.log(p / m)) + np.sum(q * np.log(q / m))))
+
+        # --- EdgeF1 on the directly-follows graph of this case ---
+        def _case_edges(df):
+            grp = df.sort_values(start_col)
+            acts = grp[activity_col].tolist()
+            return set(zip(acts, acts[1:]))
+
+        r_edges = _case_edges(rc)
+        s_edges = _case_edges(sc)
+        if r_edges or s_edges:
+            tp = len(r_edges & s_edges)
+            prec = tp / len(s_edges) if s_edges else 0.0
+            rec  = tp / len(r_edges) if r_edges else 0.0
+            ef1  = 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
+        else:
+            ef1 = np.nan
+
+        rows.append({'evt_ratio_err': evt_ratio_err,
+                     'dur_err_whole': dur_err_whole,
+                     'dur_err_activ': dur_err_activ,
+                     'js_div':        js_div,
+                     'edge_f1':       ef1})
+
+    if not rows:
+        return {}
+    df = pd.DataFrame(rows)
+    return {
+        'evt_ratio_err': float(df['evt_ratio_err'].median()),
+        'dur_err_whole': float(df['dur_err_whole'].median()),
+        'dur_err_activ': float(df['dur_err_activ'].median()),
+        'js_div':        float(df['js_div'].median()),
+        'edge_f1':       float(df['edge_f1'].median()),
+        'n_cases':       len(rows),
+    }
+
+
 def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=None,
                                        case_col='case_id', activity_col='activity',
                                        start_col='timestamp_start', end_col='timestamp_end',
@@ -1208,19 +1293,28 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report("\n8. OVERALL QUALITY ASSESSMENT")
     report("-" * 40)
 
-    # Short-heatmap error components (0 = perfect, matching the notebook short heatmap).
-    _evt_ratio  = results['basic_metrics']['event_count_ratio']
-    _js_div     = results['activity_metrics'].get('js_divergence', np.nan)
-    _edge_f1    = results['control_flow_metrics'].get('edge_f1_score', np.nan)
-    _dur_whole  = results['duration_metrics']['mean_duration_error']
-    _dur_activ  = results['duration_metrics'].get('activity_duration_error', np.nan)
+    # Short-heatmap error components: computed per-case, then median across cases.
+    # This avoids large cases dominating the pooled aggregate.
+    _pc = _per_case_median_metrics(simulated_df, real_df,
+                                   case_col=case_col, activity_col=activity_col,
+                                   start_col=start_col, end_col=end_col)
+    report(f"\nPer-case median metrics ({_pc.get('n_cases', 0)} cases matched):")
+
+    # Fall back to global values for any metric the per-case routine couldn't compute
+    _evt_ratio_global = results['basic_metrics']['event_count_ratio']
+    _js_div_global    = results['activity_metrics'].get('js_divergence', np.nan)
+    _edge_f1_global   = results['control_flow_metrics'].get('edge_f1_score', np.nan)
+    _dur_whole_global = results['duration_metrics']['mean_duration_error']
+    _dur_activ_global = results['duration_metrics'].get('activity_duration_error', np.nan)
 
     short_components = {
-        'evt_ratio_err':      abs(_evt_ratio - 1.0) if pd.notna(_evt_ratio) else np.nan,
-        'dur_err_whole':      _dur_whole,
-        'dur_err_activ':      _dur_activ,
-        'js_div':             _js_div,
-        'edge_err (1-EdgeF1)': (1.0 - _edge_f1) if pd.notna(_edge_f1) else np.nan,
+        'evt_ratio_err':       _pc.get('evt_ratio_err',
+                                       abs(_evt_ratio_global - 1.0) if pd.notna(_evt_ratio_global) else np.nan),
+        'dur_err_whole':       _pc.get('dur_err_whole', _dur_whole_global),
+        'dur_err_activ':       _pc.get('dur_err_activ', _dur_activ_global),
+        'js_div':              _pc.get('js_div', _js_div_global),
+        'edge_err (1-EdgeF1)': (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
+                               ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan),
     }
 
     report("\nShort-heatmap error components (0 = best):")
