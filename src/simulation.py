@@ -1667,14 +1667,26 @@ class ProcessSimulation:
                         proba_vec  = clf.predict_proba([energy_vec])[0]
                         label_prob = dict(zip(clf.classes_, proba_vec))
 
-                        # Score each visible enabled transition by ML probability
-                        weights = []
+                        # Blend ML transition probabilities with base PN stochastic
+                        # weights: α controls how strongly the ML opinion is used.
+                        # Silent transitions have no ML opinion, so they use PN.
+                        ml_w = []
+                        pn_w = []
                         for t in enabled_list:
+                            pn_t = float(stochastic_map.get(t, 1e-6))
+                            pn_w.append(pn_t)
                             if t.label is not None:
-                                weights.append(label_prob.get(str(t.label).strip(), 1e-6))
+                                ml_w.append(float(label_prob.get(str(t.label).strip(), 1e-6)))
                             else:
-                                # Silent transitions: use base PN weight
-                                weights.append(stochastic_map.get(t, 1e-6))
+                                ml_w.append(pn_t)
+
+                        def _norm(ws):
+                            s = sum(ws)
+                            return [w / s for w in ws] if s > 0 else [1.0 / len(ws)] * len(ws)
+                        ml_p = _norm(ml_w)
+                        pn_p = _norm(pn_w)
+                        alpha = float(getattr(clf, '_blend_alpha', 1.0))
+                        weights = [alpha * m + (1.0 - alpha) * p for m, p in zip(ml_p, pn_p)]
 
                         total = sum(weights)
                         if total > 0:
@@ -1719,14 +1731,18 @@ class ProcessSimulation:
                         try:
                             _raw = float(mdl.predict([energy_vec])[0])
                             if getattr(mdl, '_log_duration', False):
+                                # _log_act_mean is the per-activity baseline added back
+                                # when the model is trained on residuals (new format).
+                                # Defaults to 0.0 so older absolute-log models still work.
+                                _base = float(getattr(mdl, '_log_act_mean', 0.0))
                                 if use_distribution:
                                     _log_std = getattr(mdl, '_log_std', 0.0)
                                     _noise   = np.random.normal(0.0, _log_std) if _log_std > 0 else 0.0
                                     _mc      = getattr(mdl, '_mean_correction_dist',
                                                        getattr(mdl, '_mean_correction', 1.0))
-                                    _raw = np.exp(_raw + _noise) * _mc
+                                    _raw = np.exp(_base + _raw + _noise) * _mc
                                 else:
-                                    _raw = np.exp(_raw) * getattr(mdl, '_mean_correction', 1.0)
+                                    _raw = np.exp(_base + _raw) * getattr(mdl, '_mean_correction', 1.0)
                             activity_duration = max(0.1, _raw)
                             if self.verbose:
                                 print(f"    [{chosen_label}] direct ML duration: "

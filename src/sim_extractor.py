@@ -28,10 +28,13 @@ _DIST_MAP = {
 # ML model acceptance thresholds.
 # Duration: ML is used only when CV MAE is at least this fraction below the
 #           mean-prediction baseline (e.g. 0.80 = must beat baseline by ≥20%).
-# Transition: ML is used only when CV F1 exceeds the majority-class baseline
-#             by at least this absolute margin (e.g. 0.05 = 5 percentage points).
+# Transition: ML is *kept* (and blended) when CV balanced-accuracy exceeds the
+#             majority-class baseline by at least this absolute margin.
+# _TR_BLEND_FULL: lift over baseline at which the simulator uses fully-ML
+#             transition probabilities (linear interpolation below this).
 _DUR_ACCEPTANCE_RATIO = 0.80   # require ≥20% MAE improvement over baseline
-_TR_ACCEPTANCE_MARGIN = 0.05   # require ≥5 pp F1 improvement over baseline
+_TR_ACCEPTANCE_MARGIN = 0.01   # require ≥1 pp balanced-accuracy lift
+_TR_BLEND_FULL        = 0.05   # ≥5 pp lift → α = 1.0 (pure ML routing)
 
 
 def fit_best_distribution(data):
@@ -1574,24 +1577,29 @@ def extract_energy_direct_models(
         if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
             try:
                 best_mdl = get_regressor(best_dur_name)
-                best_mdl.fit(X, y_dur)
-                # Mean recalibration: exp(log_pred) is the geometric mean; correct toward
-                # the arithmetic mean so DurErr(whole) is not systematically biased.
-                _log_preds = best_mdl.predict(X)
-                _pred_mean = float(np.mean(np.exp(_log_preds)))
+                # Residual learning: fit on (log_duration − per-activity log mean) so the
+                # model predicts a centered correction rather than absolute log-duration.
+                # The per-activity log mean acts as a robust baseline that degrades
+                # gracefully on small samples and bounds runaway exp() blow-ups.
+                _log_act_mean = float(np.mean(y_dur))
+                y_residual = y_dur - _log_act_mean
+                best_mdl.fit(X, y_residual)
+                _pred_residuals = best_mdl.predict(X)
+                _pred_durs = np.exp(_log_act_mean + _pred_residuals)
+                _pred_mean = float(np.mean(_pred_durs))
                 _true_mean = float(np.mean(np.exp(y_dur)))
                 best_mdl._mean_correction    = _true_mean / _pred_mean if _pred_mean > 0 else 1.0
-                # Distribution parameters for energy_dist mode: residual log-std + lognormal-aware correction
-                _residual_std = float(np.std(y_dur - _log_preds))
+                _residual_std = float(np.std(y_residual - _pred_residuals))
                 best_mdl._log_std = max(_residual_std, 0.01)
                 _pred_lnorm_mean = _pred_mean * float(np.exp(0.5 * _residual_std ** 2))
                 best_mdl._mean_correction_dist = _true_mean / _pred_lnorm_mean if _pred_lnorm_mean > 0 else 1.0
                 best_mdl._mean_duration      = mean_dur
                 best_mdl._log_duration       = True
+                best_mdl._log_act_mean       = _log_act_mean
                 best_mdl._train_feature_mean = train_feature_mean
                 best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
-                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f}, log_std={best_mdl._log_std:.3f})'
+                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f}, base_log={_log_act_mean:.2f}, corr={best_mdl._mean_correction:.3f}, log_std={best_mdl._log_std:.3f})'
                 if best_mdl._feature_importance:
                     top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                     act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
@@ -1608,51 +1616,58 @@ def extract_energy_direct_models(
                   f"(best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
         # ── Transition: direct classifier for sampling ────────────────
+        # Use balanced_accuracy (penalises always-majority predictors) and KEEP
+        # the model with a blend factor α — simulation blends ML probs with PN
+        # weights so a marginally-better classifier still contributes routing
+        # signal instead of being thrown away.
         if n_classes >= 2:
-            majority_baseline_f1 = float(cross_val_score(
+            majority_baseline_ba = float(cross_val_score(
                 DummyClassifier(strategy='most_frequent'), X, y_tr,
-                cv=_kf, scoring='f1_weighted', error_score=0.0,
+                cv=_kf, scoring='balanced_accuracy', error_score=0.0,
             ).mean())
             best_tr_score  = -float('inf')
             best_tr_name   = None
 
             for model_name in transition_models:
                 try:
-                    cv_f1 = float(cross_val_score(
+                    cv_ba = float(cross_val_score(
                         get_classifier(model_name), X, y_tr,
                         cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
-                        scoring='f1_weighted', error_score=0.0,
+                        scoring='balanced_accuracy', error_score=0.0,
                     ).mean())
-                    if cv_f1 > best_tr_score:
-                        best_tr_score = cv_f1
+                    if cv_ba > best_tr_score:
+                        best_tr_score = cv_ba
                         best_tr_name  = model_name
                 except Exception:
                     pass
 
-            if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
+            lift = best_tr_score - majority_baseline_ba
+            if best_tr_name is not None and lift > _TR_ACCEPTANCE_MARGIN:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)
                     best_clf._train_feature_mean = train_feature_mean
                     best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
+                    best_clf._blend_alpha = float(min(1.0, max(0.0, lift / _TR_BLEND_FULL)))
                     transition_models_direct[str(activity)] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} (CV F1={best_tr_score:.3f})'
+                        f'{best_tr_name} (CV BA={best_tr_score:.3f}, lift={lift:+.3f}, α={best_clf._blend_alpha:.2f})'
                     )
                     if best_clf._feature_importance:
                         top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                         act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(CV F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
+                          f"(CV BA={best_tr_score:.3f}) > majority baseline ({majority_baseline_ba:.3f}), "
+                          f"α={best_clf._blend_alpha:.2f} ✓")
                 except Exception as exc:
                     print(f"  [{activity}] Transition FAILED: {exc}")
                     act_report['Transition Approach'] = 'Statistical (ML fit failed)'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best ML CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
+                    f'Statistical (best ML CV BA={best_tr_score:.3f}, lift={lift:+.3f} ≤ {_TR_ACCEPTANCE_MARGIN})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(best ML CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
+                      f"(best ML CV BA={best_tr_score:.3f}, lift={lift:+.3f} ≤ {_TR_ACCEPTANCE_MARGIN})")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
