@@ -365,7 +365,7 @@ CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) 
 
 # ── Train / test split ────────────────────────────────────────────────────────
 TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
-TRAIN_RATIO         = 0.50    # fraction of cases used for training
+TRAIN_RATIO         = 0.70    # fraction of cases used for training
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
 RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
@@ -1786,14 +1786,17 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     ]
 
     if combined_candidates:
-        # Use +inf when error is missing so valid (lower) errors are preferred.
-        best_row = min(
-            combined_candidates,
-            key=lambda r: (
-                float(r.get('train_overall_error'))
-                if pd.notna(r.get('train_overall_error')) else np.inf
-            )
-        )
+        def _combined_selection_score(r):
+            """Overall 5-metric train error (0 = best)."""
+            evt   = abs(float(r.get('train_basic_metrics_event_count_ratio', np.nan)) - 1.0)
+            dur_w = float(r.get('train_duration_metrics_mean_duration_error', np.nan))
+            dur_a = float(r.get('train_duration_metrics_activity_duration_error', np.nan))
+            js    = float(r.get('train_activity_metrics_js_divergence', np.nan))
+            f1    = 1.0 - float(r.get('train_control_flow_metrics_edge_f1_score', np.nan))
+            vals  = [v for v in (evt, dur_w, dur_a, js, f1) if np.isfinite(v)]
+            return float(np.mean(vals)) if vals else np.inf
+
+        best_row = min(combined_candidates, key=_combined_selection_score)
 
         combined_row = dict(best_row)
         combined_row['mode'] = 'petri_net_combined'
@@ -1804,9 +1807,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("  ▶ SIMULATION MODE: PETRI_NET_COMBINED")
         print("─"*80)
         print(
-            "  Selected mode for this process based on TRAIN overall error (0=best): "
+            "  Selected mode based on TRAIN overall 5-metric score (0=best): "
             f"{combined_row['selected_mode']} "
-            f"(train_overall_error={best_row.get('train_overall_error')})"
+            f"(score={_combined_selection_score(best_row):.4f})"
         )
 
         process_mode_results.append(combined_row)
