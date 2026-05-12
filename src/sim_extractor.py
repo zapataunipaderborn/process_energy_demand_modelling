@@ -1427,6 +1427,7 @@ def extract_energy_direct_models(
     timestamp_start_col='timestamp_start_log',
     datetime_energy_col='datetime_energy',
     ef_cols=None,
+    activity_config=None,
 ):
     """
     Train per-activity ML models that *directly* predict duration and next
@@ -1471,6 +1472,7 @@ def extract_energy_direct_models(
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
+    from sklearn.utils.class_weight import compute_class_weight
     from collections import Counter
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1487,8 +1489,8 @@ def extract_energy_direct_models(
         return XGBRegressor(n_estimators=100, random_state=42)
 
     def get_classifier(name):
-        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42)
-        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced')
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42, class_weight='balanced')
         if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
         return LogisticRegression(max_iter=1000, random_state=42)
 
@@ -1508,6 +1510,14 @@ def extract_energy_direct_models(
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
         energy_state_columns += [f'{_efc}_mean']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+    for _c in ['prev_act_mean', 'prev_act_std', 'prev_act_max', 'prev_act_end', 'prev_act_len']:
+        if _c in df_recs.columns and _c not in energy_state_columns:
+            energy_state_columns.append(_c)
+    # Add ctx features computed by _build_energy_state_matrix_with_next
+    for _ctx_c in ['ctx_prev_duration', 'ctx_case_position', 'ctx_time_in_case',
+                   'ctx_activity_occurrence_count']:
+        if _ctx_c in df_recs.columns and _ctx_c not in energy_state_columns:
+            energy_state_columns.append(_ctx_c)
     _ef_feats_present = [c for c in energy_state_columns if c.startswith('ef_')]
     print(f"  EF features      : {_ef_feats_present if _ef_feats_present else 'none'}")
     print(f"  Total features   : {len(energy_state_columns)}")
@@ -1517,6 +1527,36 @@ def extract_energy_direct_models(
         return {}, {}, energy_state_columns, {}
 
     print(f"  Total instances  : {len(df_recs)}")
+
+    # Statistical duration as a feature: log(mean_duration_from_fitted_distribution)
+    # Constant within a per-activity model (no intra-activity signal) but meaningful
+    # in a global model where activities have very different typical durations.
+    # At simulation time this is injected fresh for each activity, so the model
+    # sees the correct baseline even when generalising.
+    if activity_config is not None and 'activity' in df_recs.columns:
+        df_recs['stat_log_dur'] = df_recs['activity'].apply(
+            lambda a: float(np.log(max(0.1, (activity_config or {}).get(str(a), {}).get('duration', 1.0))))
+        )
+        if 'stat_log_dur' not in energy_state_columns:
+            energy_state_columns.append('stat_log_dur')
+        print(f"  stat_log_dur     : added ({df_recs['stat_log_dur'].nunique()} unique values across activities)")
+
+    # Empirical PN transition frequencies — give the transition classifier the "prior"
+    # routing distribution per activity so it can learn energy-driven deviations.
+    # Features are constant within each per-activity group (vary across activities in
+    # global models). Named pn_freq_{next_act} to match simulation-time injection.
+    if 'next_activity' in df_recs.columns and 'activity' in df_recs.columns:
+        _pn_all_classes = sorted(df_recs['next_activity'].dropna().unique())
+        for _cls in _pn_all_classes:
+            df_recs[f'pn_freq_{_cls}'] = 0.0
+        for _act_key, _act_grp in df_recs.groupby('activity'):
+            _cnts = _act_grp['next_activity'].value_counts(normalize=True)
+            for _nxt, _freq in _cnts.items():
+                df_recs.loc[_act_grp.index, f'pn_freq_{_nxt}'] = float(_freq)
+        _pn_freq_cols = [f'pn_freq_{c}' for c in _pn_all_classes]
+        energy_state_columns = energy_state_columns + [c for c in _pn_freq_cols
+                                                        if c not in energy_state_columns]
+        print(f"  PN-freq features : {len(_pn_freq_cols)} next-activity priors")
 
     # One-hot encode prev_activity and add to feature set
     if 'prev_activity' in df_recs.columns:
@@ -1579,9 +1619,13 @@ def extract_energy_direct_models(
                 best_mdl = get_regressor(best_dur_name)
                 # Residual learning: fit on (log_duration − per-activity log mean) so the
                 # model predicts a centered correction rather than absolute log-duration.
-                # The per-activity log mean acts as a robust baseline that degrades
-                # gracefully on small samples and bounds runaway exp() blow-ups.
-                _log_act_mean = float(np.mean(y_dur))
+                # Prefer the fitted-distribution mean from activity_config (more stable on
+                # small samples); fall back to the empirical log-mean from training data.
+                _stat_dur = (activity_config or {}).get(str(activity), {}).get('duration')
+                if _stat_dur and _stat_dur > 0:
+                    _log_act_mean = float(np.log(max(0.1, _stat_dur)))
+                else:
+                    _log_act_mean = float(np.mean(y_dur))
                 y_residual = y_dur - _log_act_mean
                 best_mdl.fit(X, y_residual)
                 _pred_residuals = best_mdl.predict(X)
@@ -1645,7 +1689,11 @@ def extract_energy_direct_models(
             if best_tr_name is not None and lift > _TR_ACCEPTANCE_MARGIN:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
-                    best_clf.fit(X, y_tr)
+                    _classes = np.unique(y_tr)
+                    _cw = compute_class_weight(class_weight='balanced', classes=_classes, y=y_tr)
+                    _class_weight = dict(zip(_classes, _cw))
+                    _sample_weight = np.array([_class_weight[c] for c in y_tr])
+                    best_clf.fit(X, y_tr, sample_weight=_sample_weight)
                     best_clf._train_feature_mean = train_feature_mean
                     best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                     best_clf._blend_alpha = float(min(1.0, max(0.0, lift / _TR_BLEND_FULL)))
@@ -1712,6 +1760,7 @@ def extract_energy_direct_models_global(
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
+    from sklearn.utils.class_weight import compute_class_weight
     from collections import Counter
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1730,8 +1779,8 @@ def extract_energy_direct_models_global(
         return XGBRegressor(n_estimators=200, random_state=42)
 
     def get_classifier(name):
-        if name == 'logistic':          return LogisticRegression(max_iter=1000, C=0.5, random_state=42)
-        if name == 'random_forest':     return RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42)
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, C=0.5, random_state=42, class_weight='balanced')
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42, class_weight='balanced')
         if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=200, max_depth=4, random_state=42)
         return LogisticRegression(max_iter=1000, random_state=42)
 
@@ -1749,6 +1798,9 @@ def extract_energy_direct_models_global(
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
         energy_state_columns += [f'{_efc}_mean']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+    for _c in ['prev_act_mean', 'prev_act_std', 'prev_act_max', 'prev_act_end', 'prev_act_len']:
+        if _c in df_recs.columns and _c not in energy_state_columns:
+            energy_state_columns.append(_c)
     _ef_feats_present = [c for c in energy_state_columns if c.startswith('ef_')]
     print(f"  EF features      : {_ef_feats_present if _ef_feats_present else 'none'}")
     print(f"  Total features   : {len(energy_state_columns)}")
@@ -1850,7 +1902,11 @@ def extract_energy_direct_models_global(
 
         if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
             best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
-            best_clf.fit(X, y_tr)
+            _classes = np.unique(y_tr)
+            _cw = compute_class_weight(class_weight='balanced', classes=_classes, y=y_tr)
+            _class_weight = dict(zip(_classes, _cw))
+            _sample_weight = np.array([_class_weight[c] for c in y_tr])
+            best_clf.fit(X, y_tr, sample_weight=_sample_weight)
             best_clf._train_feature_mean = train_feature_mean
             best_clf._curr_act_columns   = curr_act_columns
             best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
@@ -2095,9 +2151,17 @@ def _build_energy_state_matrix_with_next(
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
+    prev_act_numeric_cols = ['prev_act_mean', 'prev_act_std',
+                             'prev_act_max', 'prev_act_end', 'prev_act_len']
+    energy_state_columns += prev_act_numeric_cols
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
     for _efc in _ef_cols_present:
         energy_state_columns += [f'{_efc}_mean']
+    # Process-context features: these capture where we are in the case, not the energy signal.
+    # They are the strongest predictors of loop-exit / branching decisions.
+    _ctx_cols = ['ctx_prev_duration', 'ctx_case_position', 'ctx_time_in_case',
+                 'ctx_activity_occurrence_count']
+    energy_state_columns += _ctx_cols
 
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
     available_group_cols = [c for c in group_cols if c in df_expanded.columns]
@@ -2106,6 +2170,65 @@ def _build_energy_state_matrix_with_next(
     df[datetime_energy_col] = pd.to_datetime(df[datetime_energy_col])
     df[timestamp_start_col] = pd.to_datetime(df[timestamp_start_col])
     df['_instance_id'] = df.groupby(available_group_cols).ngroup()
+
+    # Pre-compute per-instance summaries so we can use the previous activity's
+    # energy state as features for the current activity.
+    primary_sensor = sensors[0] if sensors else None
+    instance_summaries = {}
+    instance_durations = {}
+    for instance_id, grp in df.groupby('_instance_id'):
+        grp = grp.sort_values(datetime_energy_col)
+        activity = str(grp[activity_col].iloc[0]).strip()
+
+        ts_col_end = 'timestamp_end_log'
+        if timestamp_start_col in grp.columns and ts_col_end in grp.columns:
+            ts = pd.to_datetime(grp[timestamp_start_col].iloc[0])
+            te = pd.to_datetime(grp[ts_col_end].iloc[0])
+            duration = max(0.1, (te - ts).total_seconds() / 60)
+        else:
+            continue
+
+        summary = {}
+        ok = True
+        primary_curve = None
+        for sensor in sensors:
+            if sensor not in grp.columns:
+                raise ValueError(
+                    f"Sensor column '{sensor}' not found in df_expanded. "
+                    f"Available: {list(grp.columns)}"
+                )
+            curve = grp[sensor].dropna().values
+            if len(curve) < 2:
+                ok = False
+                break
+            if primary_sensor == sensor:
+                primary_curve = curve
+            summary.update(_energy_summary(curve, sensor))
+
+        if not ok:
+            continue
+
+        # Add mean/end/std of external-factor values over the activity window
+        for col in _ef_cols_present:
+            vals = grp[col].dropna().values
+            if len(vals) > 0:
+                summary[f'{col}_mean'] = float(np.mean(vals))
+                summary[f'{col}_end']  = float(vals[-1])
+                summary[f'{col}_std']  = float(np.std(vals)) if len(vals) > 1 else 0.0
+            else:
+                summary[f'{col}_mean'] = np.nan
+                summary[f'{col}_end']  = np.nan
+                summary[f'{col}_std']  = np.nan
+
+        if primary_curve is not None:
+            summary['__primary_mean'] = float(np.mean(primary_curve))
+            summary['__primary_std'] = float(np.std(primary_curve))
+            summary['__primary_max'] = float(np.max(primary_curve))
+            summary['__primary_end'] = float(primary_curve[-1])
+            summary['__primary_len'] = float(len(primary_curve))
+
+        instance_summaries[instance_id] = summary
+        instance_durations[instance_id] = duration
 
     # Build ordered list of instances per (case, object) for next_activity
     order_cols = [c for c in ['case_id_log', 'object_log'] if c in df.columns]
@@ -2127,54 +2250,74 @@ def _build_energy_state_matrix_with_next(
         instance_info['prev_activity'] = (
             instance_info.groupby(order_cols)['activity'].shift(1).fillna('__START__')
         )
+        instance_info['prev_instance_id'] = (
+            instance_info.groupby(order_cols)['_instance_id'].shift(1)
+        )
     else:
         instance_info['next_activity'] = '__END__'
         instance_info['prev_activity'] = '__START__'
+        instance_info['prev_instance_id'] = None
 
     next_map = dict(zip(instance_info['_instance_id'], instance_info['next_activity']))
     prev_map = dict(zip(instance_info['_instance_id'], instance_info['prev_activity']))
 
-    for instance_id, grp in df.groupby('_instance_id'):
-        grp = grp.sort_values(datetime_energy_col)
-        activity = str(grp[activity_col].iloc[0]).strip()
+    # Process-context features: position within the case and elapsed time
+    if order_cols:
+        instance_info['ctx_case_position'] = instance_info.groupby(order_cols).cumcount().astype(float)
+        _first_ts = instance_info.groupby(order_cols)['ts'].transform('first')
+        instance_info['ctx_time_in_case'] = (
+            (instance_info['ts'] - _first_ts).dt.total_seconds() / 60.0
+        )
+    else:
+        instance_info['ctx_case_position'] = 0.0
+        instance_info['ctx_time_in_case'] = 0.0
+    ctx_position_map  = dict(zip(instance_info['_instance_id'], instance_info['ctx_case_position']))
+    ctx_time_map      = dict(zip(instance_info['_instance_id'], instance_info['ctx_time_in_case']))
+    if order_cols:
+        instance_info['ctx_activity_occurrence_count'] = (
+            instance_info.groupby(order_cols + ['activity']).cumcount().astype(float)
+        )
+    else:
+        instance_info['ctx_activity_occurrence_count'] = 0.0
+    ctx_occ_map = dict(zip(instance_info['_instance_id'], instance_info['ctx_activity_occurrence_count']))
 
-        ts_col_end = 'timestamp_end_log'
-        if timestamp_start_col in grp.columns and ts_col_end in grp.columns:
-            ts = pd.to_datetime(grp[timestamp_start_col].iloc[0])
-            te = pd.to_datetime(grp[ts_col_end].iloc[0])
-            duration = max(0.1, (te - ts).total_seconds() / 60)
-        else:
+    for _, inst_row in instance_info.iterrows():
+        instance_id = inst_row['_instance_id']
+        if instance_id not in instance_summaries:
             continue
 
-        row = {'activity': activity, 'duration': duration,
-               'next_activity': str(next_map.get(instance_id, '__END__')),
-               'prev_activity': str(prev_map.get(instance_id, '__START__'))}
-        ok = True
-        for sensor in sensors:
-            if sensor not in grp.columns:
-                raise ValueError(
-                    f"Sensor column '{sensor}' not found in df_expanded. "
-                    f"Available: {list(grp.columns)}"
-                )
-            curve = grp[sensor].dropna().values
-            if len(curve) < 2:
-                ok = False
-                break
-            row.update(_energy_summary(curve, sensor))
+        activity = str(inst_row['activity']).strip()
+        duration = instance_durations.get(instance_id)
+        if duration is None:
+            continue
 
-        if ok:
-            # Add mean/end/std of external-factor values over the activity window
-            for col in _ef_cols_present:
-                vals = grp[col].dropna().values
-                if len(vals) > 0:
-                    row[f'{col}_mean'] = float(np.mean(vals))
-                    row[f'{col}_end']  = float(vals[-1])
-                    row[f'{col}_std']  = float(np.std(vals)) if len(vals) > 1 else 0.0
-                else:
-                    row[f'{col}_mean'] = np.nan
-                    row[f'{col}_end']  = np.nan
-                    row[f'{col}_std']  = np.nan
-            records.append(row)
+        prev_id = inst_row.get('prev_instance_id')
+        curr_summary = instance_summaries[instance_id]
+        prev_summary = instance_summaries.get(prev_id) if pd.notna(prev_id) else None
+        base_summary = prev_summary if prev_summary is not None else curr_summary
+
+        _prev_dur = instance_durations.get(prev_id, 0.0) if pd.notna(prev_id) else 0.0
+        row = {
+            'activity': activity,
+            'duration': duration,
+            'next_activity': str(next_map.get(instance_id, '__END__')),
+            'prev_activity': str(prev_map.get(instance_id, '__START__')),
+            'prev_act_mean': base_summary.get('__primary_mean', np.nan),
+            'prev_act_std': base_summary.get('__primary_std', np.nan),
+            'prev_act_max': base_summary.get('__primary_max', np.nan),
+            'prev_act_end': base_summary.get('__primary_end', np.nan),
+            'prev_act_len': base_summary.get('__primary_len', np.nan),
+            'ctx_prev_duration':              float(_prev_dur),
+            'ctx_case_position':              float(ctx_position_map.get(instance_id, 0.0)),
+            'ctx_time_in_case':               float(ctx_time_map.get(instance_id, 0.0)),
+            'ctx_activity_occurrence_count':  float(ctx_occ_map.get(instance_id, 0.0)),
+        }
+
+        for k, v in base_summary.items():
+            if not k.startswith('__primary_'):
+                row[k] = v
+
+        records.append(row)
 
     return pd.DataFrame(records)
 

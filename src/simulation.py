@@ -1528,6 +1528,7 @@ class ProcessSimulation:
         self, case_id, object_attributes, start_time,
         enable_duration=True, enable_transitions=True,
         use_distribution=False,
+        use_shape_preserving=False,
     ):
         """
         Simulate one case using the Petri net for structure, but with ML models
@@ -1578,6 +1579,10 @@ class ProcessSimulation:
             prev_activity    = None
             max_steps        = max(max_case_length * 2, 50)
             step             = 0
+            _last_activity_duration     = 0.0   # feeds ctx_prev_duration next iteration
+            _case_start_ts              = current_sim_time
+            _activity_occurrence_counts: dict = {}   # {activity_label: count fired so far}
+            _last_occurrence_count: float = 0.0      # occurrence count of the last-fired activity
 
             # Seed energy state from start-activity modifier means (same logic as modifier method)
             if self.energy_state_columns:
@@ -1609,9 +1614,13 @@ class ProcessSimulation:
                                 _ef_seed_vals_d.setdefault(_col, []).append(_v)
                     for _col, _vs in _ef_seed_vals_d.items():
                         seed_state[_col] = float(np.mean(_vs))
-                # Zero-init prev_activity and curr_activity one-hots at case start
+                # Zero-init prev_activity/curr_activity one-hots at case start
+                _prev_act_numeric = {'prev_act_mean', 'prev_act_std',
+                                     'prev_act_max', 'prev_act_end', 'prev_act_len'}
                 for _col in self.energy_state_columns:
-                    if _col.startswith('prev_act_') or _col.startswith('curr_act_'):
+                    if _col.startswith('curr_act_'):
+                        seed_state[_col] = 0.0
+                    elif _col.startswith('prev_act_') and _col not in _prev_act_numeric:
                         seed_state[_col] = 0.0
                 current_energy_state = seed_state if seed_state else None
             else:
@@ -1624,18 +1633,46 @@ class ProcessSimulation:
                     print(f"    Deadlock after {activity_count} activities.")
                     break
 
-                # Keep temporal EF features in sync with the simulation clock
+                # Keep temporal EF and process-context features in sync each step
                 if current_energy_state is not None and self.energy_state_columns:
                     _ts_now = datetime.fromtimestamp(current_sim_time)
                     if 'ef_hour_of_day_mean' in self.energy_state_columns:
                         current_energy_state['ef_hour_of_day_mean'] = float(_ts_now.hour)
                     if 'ef_day_of_week_mean' in self.energy_state_columns:
                         current_energy_state['ef_day_of_week_mean'] = float(_ts_now.weekday())
+                    if 'ctx_prev_duration' in self.energy_state_columns:
+                        current_energy_state['ctx_prev_duration'] = _last_activity_duration
+                    if 'ctx_case_position' in self.energy_state_columns:
+                        current_energy_state['ctx_case_position'] = float(activity_count)
+                    if 'ctx_time_in_case' in self.energy_state_columns:
+                        current_energy_state['ctx_time_in_case'] = (
+                            (current_sim_time - _case_start_ts) / 60.0
+                        )
+                    if 'ctx_activity_occurrence_count' in self.energy_state_columns:
+                        current_energy_state['ctx_activity_occurrence_count'] = _last_occurrence_count
 
                 enabled_list = sorted(
                     enabled,
                     key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
                 )
+
+                # Inject live PN stochastic frequencies for enabled transitions.
+                # These match the pn_freq_{label} features added at training time so the
+                # transition classifier can learn energy-driven deviations from the PN prior.
+                # Zero out ALL pn_freq_* first so disabled activities don't carry stale values.
+                if current_energy_state is not None and any(
+                    c.startswith('pn_freq_') for c in self.energy_state_columns
+                ):
+                    for _fc in self.energy_state_columns:
+                        if _fc.startswith('pn_freq_'):
+                            current_energy_state[_fc] = 0.0
+                    _pn_vis = [t for t in enabled_list if t.label is not None]
+                    _pn_total = sum(float(stochastic_map.get(t, 1.0)) for t in _pn_vis)
+                    for _t in _pn_vis:
+                        _feat = f'pn_freq_{str(_t.label).strip()}'
+                        if _feat in self.energy_state_columns:
+                            _w = float(stochastic_map.get(_t, 1.0))
+                            current_energy_state[_feat] = _w / _pn_total if _pn_total > 0 else 0.0
 
                 # ── Transition sampling ───────────────────────────────
                 # If ML classifier exists for prev_activity AND enable_transitions:
@@ -1712,6 +1749,15 @@ class ProcessSimulation:
                     chosen_label = str(chosen_transition.label).strip()
                     activity_count += 1
 
+                    # Inject stat_log_dur for the current activity so the duration model
+                    # sees the fitted-distribution mean as a calibration feature.
+                    if (current_energy_state is not None
+                            and 'stat_log_dur' in self.energy_state_columns):
+                        _act_key_sl = (chosen_label, object_name, object_type, higher_level_activity)
+                        _sl_cfg = self.activity_config.get(_act_key_sl, {})
+                        _sl_dur = float(_sl_cfg.get('duration', 1.0))
+                        current_energy_state['stat_log_dur'] = float(np.log(max(0.1, _sl_dur)))
+
                     # ── Duration: direct ML prediction or statistical ──
                     _has_global_dur = '__global__' in self.energy_duration_modifiers
                     _dur_lookup_key = '__global__' if _has_global_dur else chosen_label
@@ -1731,11 +1777,20 @@ class ProcessSimulation:
                         try:
                             _raw = float(mdl.predict([energy_vec])[0])
                             if getattr(mdl, '_log_duration', False):
-                                # _log_act_mean is the per-activity baseline added back
-                                # when the model is trained on residuals (new format).
-                                # Defaults to 0.0 so older absolute-log models still work.
                                 _base = float(getattr(mdl, '_log_act_mean', 0.0))
-                                if use_distribution:
+                                if use_shape_preserving:
+                                    # Shape-preserving: ignore ML point estimate entirely;
+                                    # sample from per-activity fitted distribution so
+                                    # DurErr(activ) matches statistical quality.
+                                    _act_key = (chosen_label, object_name, object_type, higher_level_activity)
+                                    _act_cfg  = self.activity_config.get(_act_key, {})
+                                    _dist_name   = _act_cfg.get('dist_name')
+                                    _dist_params = _act_cfg.get('dist_params')
+                                    if _dist_params and any(p != 0 for p in _dist_params[1:]):
+                                        _raw = max(0.1, float(sample_from_dist(_dist_name, _dist_params)))
+                                    else:
+                                        _raw = float(_act_cfg.get('duration', np.exp(_base)))
+                                elif use_distribution:
                                     _log_std = getattr(mdl, '_log_std', 0.0)
                                     _noise   = np.random.normal(0.0, _log_std) if _log_std > 0 else 0.0
                                     _mc      = getattr(mdl, '_mean_correction_dist',
@@ -1750,20 +1805,22 @@ class ProcessSimulation:
                         except Exception as exc:
                             if self.verbose:
                                 print(f"    WARNING: direct duration prediction failed: {exc}")
+                            _fallback_mode = 'statistical' if use_shape_preserving else self.base_simulation_mode
                             activity_duration = self._get_activity_duration(
                                 chosen_label, object_name, object_type,
                                 higher_level_activity, object_attributes,
                                 activity_history=activity_history,
                                 activity_index=activity_count,
-                                override_mode=self.base_simulation_mode,
+                                override_mode=_fallback_mode,
                             )
                     else:
+                        _fallback_mode = 'statistical' if use_shape_preserving else self.base_simulation_mode
                         activity_duration = self._get_activity_duration(
                             chosen_label, object_name, object_type,
                             higher_level_activity, object_attributes,
                             activity_history=activity_history,
                             activity_index=activity_count,
-                            override_mode=self.base_simulation_mode,
+                            override_mode=_fallback_mode,
                         )
 
                     start_time_obj   = datetime.fromtimestamp(current_sim_time)
@@ -1780,7 +1837,10 @@ class ProcessSimulation:
 
                     activity_history.insert(0, (chosen_label, activity_duration))
                     activity_history = activity_history[:2]
-                    prev_activity    = chosen_label
+                    prev_activity             = chosen_label
+                    _last_activity_duration   = activity_duration
+                    _last_occurrence_count    = float(_activity_occurrence_counts.get(chosen_label, 0))
+                    _activity_occurrence_counts[chosen_label] = int(_last_occurrence_count) + 1
 
                     # ── Update energy state from simulated curve ──────────────
                     # Predict the sensor curve for the just-fired activity and
@@ -1789,6 +1849,7 @@ class ProcessSimulation:
                     # predictions — this is the closed feedback loop.
                     if self.energy_pipelines and chosen_label is not None:
                         new_energy_state = {}
+                        _primary_curve = None
                         for sensor, act_map in self.energy_pipelines.items():
                             try:
                                 obj_map = act_map.get(chosen_label, {})
@@ -1830,6 +1891,9 @@ class ProcessSimulation:
                                          ) if predict_fn is not None
                                          else _input_curve)
 
+                                if _primary_curve is None:
+                                    _primary_curve = curve
+
                                 if self.events and self.events[-1]['activity'] == chosen_label:
                                     if 'simulated_energy_curves' not in self.events[-1]:
                                         self.events[-1]['simulated_energy_curves'] = {}
@@ -1842,6 +1906,13 @@ class ProcessSimulation:
                                     f"Energy pipeline prediction failed for sensor '{sensor}', "
                                     f"activity '{chosen_label}', object '{object_name}': {exc}"
                                 ) from exc
+
+                        if _primary_curve is not None:
+                            new_energy_state['prev_act_mean'] = float(np.mean(_primary_curve))
+                            new_energy_state['prev_act_std'] = float(np.std(_primary_curve))
+                            new_energy_state['prev_act_max'] = float(np.max(_primary_curve))
+                            new_energy_state['prev_act_end'] = float(_primary_curve[-1])
+                            new_energy_state['prev_act_len'] = float(len(_primary_curve))
 
                         if self.activity_exog_means and chosen_label in self.activity_exog_means:
                             new_energy_state.update(self.activity_exog_means[chosen_label])
@@ -1867,8 +1938,10 @@ class ProcessSimulation:
 
                     # Update prev_activity one-hot; keep curr_act_* zeroed (set on-the-fly per call)
                     if current_energy_state is not None:
+                        _prev_act_numeric = {'prev_act_mean', 'prev_act_std',
+                                             'prev_act_max', 'prev_act_end', 'prev_act_len'}
                         _prev_act_cols = [c for c in self.energy_state_columns
-                                          if c.startswith('prev_act_')]
+                                          if c.startswith('prev_act_') and c not in _prev_act_numeric]
                         if _prev_act_cols:
                             for _pc in _prev_act_cols:
                                 current_energy_state[_pc] = 0.0
@@ -1960,8 +2033,10 @@ class ProcessSimulation:
                             _all_means[c].append(v)
                 seed_state = {c: float(np.mean(vs)) if vs else 0.0
                               for c, vs in _all_means.items()}
+                _prev_act_numeric = {'prev_act_mean', 'prev_act_std',
+                                     'prev_act_max', 'prev_act_end', 'prev_act_len'}
                 for _col in self.energy_state_columns:
-                    if _col.startswith('prev_act_'):
+                    if _col.startswith('prev_act_') and _col not in _prev_act_numeric:
                         seed_state[_col] = 0.0
                 current_energy_state = seed_state if seed_state else None
             else:
@@ -2121,8 +2196,10 @@ class ProcessSimulation:
                             current_energy_state = {**current_energy_state, **new_energy_state}
 
                     # Update prev_act one-hots
+                    _prev_act_numeric = {'prev_act_mean', 'prev_act_std',
+                                         'prev_act_max', 'prev_act_end', 'prev_act_len'}
                     for _col in self.energy_state_columns:
-                        if _col.startswith('prev_act_'):
+                        if _col.startswith('prev_act_') and _col not in _prev_act_numeric:
                             current_energy_state[_col] = (
                                 1.0 if _col == f'prev_act_{chosen_label}' else 0.0
                             )
@@ -2192,6 +2269,16 @@ class ProcessSimulation:
                 enable_duration=True,
                 enable_transitions=True,
                 use_distribution=True,
+            )
+            return
+
+        # ── Shape-preserving: ML shifts the per-activity mean; shape from fitted dist
+        if self.mode == 'petri_net_direct_test':
+            self._simulate_petri_net_energy_direct_for_case(
+                case_id, object_attributes, start_time,
+                enable_duration=True,
+                enable_transitions=True,
+                use_shape_preserving=True,
             )
             return
 

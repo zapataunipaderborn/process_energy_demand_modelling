@@ -257,6 +257,7 @@ MODES_TO_COMPARE = [
     'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
     'petri_net_energy_direct',                  # ML predicts both directly per activity
     'petri_net_energy_dist',                    # ML predicts log-mean; sample from LogNormal(predicted_μ, residual_σ)
+    'petri_net_direct_test',                    # ML shifts mean; shape sampled from fitted per-activity distribution
     # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
     'petri_net_quantile_blend',
     #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
@@ -280,6 +281,7 @@ _ENERGY_AWARE_MODES = {
     'petri_net_energy_direct_transition_only',
     'petri_net_energy_direct_global',
     'petri_net_energy_dist',
+    'petri_net_direct_test',
     # Quantile-blend: ML predicts quantile of fitted dist + entropy-weighted transition blend
     'petri_net_quantile_blend',
 }
@@ -289,6 +291,7 @@ _ENERGY_DIRECT_MODES = {
     'petri_net_energy_direct_transition_only',
     'petri_net_energy_direct_global',
     'petri_net_energy_dist',
+    'petri_net_direct_test',
 }
 _ENERGY_QUANTILE_MODES = {
     'petri_net_quantile_blend',
@@ -1856,10 +1859,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         else:
             _best_base_row = min(
                 _base_candidates,
-                key=lambda r: (
-                    float(r.get('train_overall_error'))
-                    if pd.notna(r.get('train_overall_error')) else np.inf
-                )
+                key=_combined_selection_score,
             )
             _best_base_alg = _best_base_row.get('mining_algorithm')
             _best_base_pm  = extraction_by_algorithm[_best_base_alg]['process_models']
@@ -1911,9 +1911,20 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     print("⚠️  No sensors found for this process — skipping energy modifiers.")
                     _activity_exog_means = {}
                 else:
-                    # Initialise direct-model dicts so they're always defined in scope
-                    _energy_direct_dur_mods = {}
-                    _energy_direct_tr_mods  = {}
+                    # Initialise ALL model dicts before try so they're defined even if an
+                    # exception occurs mid-block (each set gets overwritten on success).
+                    _energy_dur_mods           = {}
+                    _energy_tr_mods            = {}
+                    _energy_state_cols         = []
+                    _energy_direct_dur_mods    = {}
+                    _energy_direct_tr_mods     = {}
+                    _direct_energy_state_cols  = []
+                    _quantile_dur_mods         = {}
+                    _quantile_tr_mods          = {}
+                    _quantile_energy_state_cols = []
+                    _global_dur_mods           = {}
+                    _global_tr_mods            = {}
+                    _global_energy_state_cols  = []
                     try:
                         _energy_dur_mods, _energy_tr_mods, _energy_state_cols, _model_choices_report = \
                             extract_energy_modifiers(
@@ -1947,6 +1958,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             m for m in _energy_modes_requested if m in _ENERGY_DIRECT_MODES
                         ]
                         if _direct_modes_requested:
+                            # Flatten activity_config to {activity_str: stats} for direct models
+                            _act_dur_config = {}
+                            for (_act, _obj, _otype, _higher), _stats in _best_base_stats.items():
+                                _ak = str(_act)
+                                if _ak not in _act_dur_config:
+                                    _act_dur_config[_ak] = _stats
                             _energy_direct_dur_mods, _energy_direct_tr_mods, _direct_energy_state_cols, _direct_report = \
                                 extract_energy_direct_models(
                                     df_expanded=_df_expanded_train,
@@ -1955,6 +1972,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                     transition_models=ENERGY_TRANSITION_MODELS,
                                     min_samples=ENERGY_MIN_SAMPLES,
                                     ef_cols=_ef_ep_cols,
+                                    activity_config=_act_dur_config,
                                 )
                             if _direct_report:
                                 report("\n" + "="*80)
