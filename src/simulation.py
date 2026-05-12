@@ -1623,6 +1623,14 @@ class ProcessSimulation:
                     print(f"    Deadlock after {activity_count} activities.")
                     break
 
+                # Keep temporal EF features in sync with the simulation clock
+                if current_energy_state is not None and self.energy_state_columns:
+                    _ts_now = datetime.fromtimestamp(current_sim_time)
+                    if 'ef_hour_of_day_mean' in self.energy_state_columns:
+                        current_energy_state['ef_hour_of_day_mean'] = float(_ts_now.hour)
+                    if 'ef_day_of_week_mean' in self.energy_state_columns:
+                        current_energy_state['ef_day_of_week_mean'] = float(_ts_now.weekday())
+
                 enabled_list = sorted(
                     enabled,
                     key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),

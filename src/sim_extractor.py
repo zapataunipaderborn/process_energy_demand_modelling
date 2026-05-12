@@ -1045,7 +1045,7 @@ def _build_energy_state_matrix(df_expanded, sensors, activity_col='activity_log'
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
     for _efc in _ef_cols_present:
-        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+        energy_state_columns += [f'{_efc}_mean']
 
     # Group by activity instance
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
@@ -1258,7 +1258,7 @@ def extract_energy_modifiers(
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
-        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+        energy_state_columns += [f'{_efc}_mean']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
 
     if df_recs.empty:
@@ -1503,8 +1503,11 @@ def extract_energy_direct_models(
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
-        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+        energy_state_columns += [f'{_efc}_mean']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+    _ef_feats_present = [c for c in energy_state_columns if c.startswith('ef_')]
+    print(f"  EF features      : {_ef_feats_present if _ef_feats_present else 'none'}")
+    print(f"  Total features   : {len(energy_state_columns)}")
 
     if df_recs.empty:
         print("  WARNING: no valid instances — returning empty models.")
@@ -1723,8 +1726,11 @@ def extract_energy_direct_models_global(
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
     for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
-        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+        energy_state_columns += [f'{_efc}_mean']
     energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+    _ef_feats_present = [c for c in energy_state_columns if c.startswith('ef_')]
+    print(f"  EF features      : {_ef_feats_present if _ef_feats_present else 'none'}")
+    print(f"  Total features   : {len(energy_state_columns)}")
 
     if df_recs.empty or len(df_recs) < min_samples:
         print("  WARNING: not enough instances — returning empty global models.")
@@ -1909,7 +1915,7 @@ def extract_energy_quantile_models(
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_recs.columns]
     for _efc in _ef_cols_present:
-        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+        energy_state_columns += [f'{_efc}_mean']
 
     # Add prev_activity one-hot (same as energy_direct)
     if 'prev_activity' in df_recs.columns:
@@ -2065,7 +2071,7 @@ def _build_energy_state_matrix_with_next(
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
     _ef_cols_present = [c for c in (ef_cols or []) if c in df_expanded.columns]
     for _efc in _ef_cols_present:
-        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+        energy_state_columns += [f'{_efc}_mean']
 
     group_cols = ['case_id_log', 'object_log', activity_col, timestamp_start_col]
     available_group_cols = [c for c in group_cols if c in df_expanded.columns]

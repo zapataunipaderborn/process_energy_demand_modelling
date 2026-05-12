@@ -141,6 +141,17 @@ for process_dir in sorted(folder_gold_base.glob('process_*')):
 
 print(process_datasets.keys())
 
+# Add temporal EF features derived from datetime_energy before any aggregation
+for _pname, _pdata in process_datasets.items():
+    _exp = _pdata.get('expanded')
+    if _exp is not None and 'datetime_energy' in _exp.columns:
+        _dt = pd.to_datetime(_exp['datetime_energy'])
+        _exp['ef_hour_of_day'] = _dt.dt.hour.astype(float)
+        _exp['ef_day_of_week'] = _dt.dt.dayofweek.astype(float)
+        print(f"  [{_pname}] ef_hour_of_day range {_exp['ef_hour_of_day'].min():.0f}–{_exp['ef_hour_of_day'].max():.0f}, "
+              f"ef_day_of_week range {_exp['ef_day_of_week'].min():.0f}–{_exp['ef_day_of_week'].max():.0f}")
+print("Added ef_hour_of_day and ef_day_of_week to all expanded datasets.")
+
 # ── Aggregate df_expanded to the requested temporal resolution ────────────────
 def _aggregate_expanded(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     df = df.copy()
