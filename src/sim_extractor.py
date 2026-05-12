@@ -1220,7 +1220,8 @@ def extract_energy_modifiers(
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import KFold, cross_val_score
+    from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1288,27 +1289,30 @@ def extract_energy_modifiers(
             y_tr = grp_act['next_activity'].values
             n_classes = len(set(y_tr))
 
-            # Train/Val Split
-            X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
-                X, y_dur, y_tr, test_size=0.2, random_state=42
-            )
+            # CV-based model selection — more stable than a single 80/20 split
+            n_splits = max(2, min(5, n // 5))
+            _kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
             # --- Duration Model Selection ---
             # Statistical baseline MAE: always predicting the training mean.
-            # ML modifier is only kept if its val MAE beats that baseline.
+            # ML modifier is only kept if its CV MAE beats that baseline.
             if mean_dur > 0:
-                stat_baseline_mae = mean_absolute_error(yd_val, np.full(len(yd_val), np.mean(yd_tr)))
+                stat_baseline_mae = float(-cross_val_score(
+                    DummyRegressor(strategy='mean'), X, y_dur,
+                    cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
+                ).mean())
                 best_dur_score = float('inf')
                 best_dur_name = None  # None → statistical wins
 
                 for model_name in duration_models:
                     try:
-                        mdl = get_regressor(model_name)
-                        mdl.fit(X_tr, yd_tr)
-                        preds = mdl.predict(X_val)
-                        score = mean_absolute_error(yd_val, preds)
-                        if score < best_dur_score:
-                            best_dur_score = score
+                        cv_mae = float(-cross_val_score(
+                            get_regressor(model_name), X, y_dur,
+                            cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                            scoring='neg_mean_absolute_error', error_score=np.inf,
+                        ).mean())
+                        if cv_mae < best_dur_score:
+                            best_dur_score = cv_mae
                             best_dur_name = model_name
                     except Exception:
                         pass
@@ -1326,7 +1330,7 @@ def extract_energy_modifiers(
                             top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                             act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                         print(f"  [{activity}] Duration -> ML:{best_dur_name} "
-                              f"(val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
+                              f"(CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
                     except Exception as exc:
                         print(f"  [{activity}] Duration FAILED: {exc}")
                         act_report['Duration Approach'] = 'Statistical (ML fit failed)'
@@ -1335,28 +1339,29 @@ def extract_energy_modifiers(
                         f'Statistical (best ML MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
                     )
                     print(f"  [{activity}] Duration -> statistical "
-                          f"(best ML val MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
+                          f"(best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
             # --- Transition Model Selection ---
             # Statistical baseline: weighted F1 when always predicting the majority class.
             # ML modifier is only kept if it beats that baseline.
             if n_classes >= 2:
-                from collections import Counter
-                majority_class = Counter(yt_val).most_common(1)[0][0]
-                majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
-                                                average='weighted', zero_division=0)
+                majority_baseline_f1 = float(cross_val_score(
+                    DummyClassifier(strategy='most_frequent'), X, y_tr,
+                    cv=_kf, scoring='f1_weighted', error_score=0.0,
+                ).mean())
 
                 best_tr_score = -float('inf')
                 best_tr_name = None  # None → statistical wins
 
                 for model_name in transition_models:
                     try:
-                        clf = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
-                        clf.fit(X_tr, yt_tr)
-                        preds = clf.predict(X_val)
-                        score = f1_score(yt_val, preds, average='weighted', zero_division=0)
-                        if score > best_tr_score:
-                            best_tr_score = score
+                        cv_f1 = float(cross_val_score(
+                            get_classifier(model_name), X, y_tr,
+                            cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                            scoring='f1_weighted', error_score=0.0,
+                        ).mean())
+                        if cv_f1 > best_tr_score:
+                            best_tr_score = cv_f1
                             best_tr_name = model_name
                     except Exception:
                         pass
@@ -1375,7 +1380,7 @@ def extract_energy_modifiers(
                             top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                             act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                         print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                              f"(val F1={best_tr_score:.3f}) > majority baseline "
+                              f"(CV F1={best_tr_score:.3f}) > majority baseline "
                               f"({majority_baseline_f1:.3f}) ✓")
                     except Exception as exc:
                         print(f"  [{activity}] Transition FAILED: {exc}")
@@ -1386,7 +1391,7 @@ def extract_energy_modifiers(
                         f'≤ majority baseline {majority_baseline_f1:.3f})'
                     )
                     print(f"  [{activity}] Transition -> statistical "
-                          f"(best ML val F1={best_tr_score:.3f} ≤ majority "
+                          f"(best ML CV F1={best_tr_score:.3f} ≤ majority "
                           f"baseline {majority_baseline_f1:.3f})")
             else:
                 act_report['Transition Approach'] = 'Statistical (1 class only)'
@@ -1452,7 +1457,8 @@ def extract_energy_direct_models(
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import KFold, cross_val_score
+    from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
     from collections import Counter
     import warnings
@@ -1529,22 +1535,27 @@ def extract_energy_direct_models(
             model_choices_report[str(activity)] = act_report
             continue
 
-        X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
-            X, y_dur, y_tr, test_size=0.2, random_state=42
-        )
+        # CV-based model selection — more stable than a single 80/20 split
+        n_splits = max(2, min(5, n // 5))
+        _kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
         # ── Duration: direct regression on minutes ────────────────────
-        stat_baseline_mae = mean_absolute_error(yd_val, np.full(len(yd_val), np.mean(yd_tr)))
+        stat_baseline_mae = float(-cross_val_score(
+            DummyRegressor(strategy='mean'), X, y_dur,
+            cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
+        ).mean())
         best_dur_score = float('inf')
         best_dur_name  = None
 
         for model_name in duration_models:
             try:
-                mdl = get_regressor(model_name)
-                mdl.fit(X_tr, yd_tr)
-                score = mean_absolute_error(yd_val, mdl.predict(X_val))
-                if score < best_dur_score:
-                    best_dur_score = score
+                cv_mae = float(-cross_val_score(
+                    get_regressor(model_name), X, y_dur,
+                    cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                    scoring='neg_mean_absolute_error', error_score=np.inf,
+                ).mean())
+                if cv_mae < best_dur_score:
+                    best_dur_score = cv_mae
                     best_dur_name  = model_name
             except Exception:
                 pass
@@ -1558,37 +1569,40 @@ def extract_energy_direct_models(
                 best_mdl._train_feature_mean = train_feature_mean
                 best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
-                act_report['Duration Approach'] = f'{best_dur_name} (MAE={best_dur_score:.3f})'
+                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f})'
                 if best_mdl._feature_importance:
                     top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                     act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                 print(f"  [{activity}] Duration -> ML:{best_dur_name} "
-                      f"(val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
+                      f"(CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
             except Exception as exc:
                 print(f"  [{activity}] Duration FAILED: {exc}")
                 act_report['Duration Approach'] = 'Statistical (ML fit failed)'
         else:
             act_report['Duration Approach'] = (
-                f'Statistical (best ML MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
+                f'Statistical (best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
             )
             print(f"  [{activity}] Duration -> statistical "
-                  f"(best ML val MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
+                  f"(best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
         # ── Transition: direct classifier for sampling ────────────────
         if n_classes >= 2:
-            majority_class = Counter(yt_tr).most_common(1)[0][0]
-            majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
-                                            average='weighted', zero_division=0)
+            majority_baseline_f1 = float(cross_val_score(
+                DummyClassifier(strategy='most_frequent'), X, y_tr,
+                cv=_kf, scoring='f1_weighted', error_score=0.0,
+            ).mean())
             best_tr_score  = -float('inf')
             best_tr_name   = None
 
             for model_name in transition_models:
                 try:
-                    clf   = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
-                    clf.fit(X_tr, yt_tr)
-                    score = f1_score(yt_val, clf.predict(X_val), average='weighted', zero_division=0)
-                    if score > best_tr_score:
-                        best_tr_score = score
+                    cv_f1 = float(cross_val_score(
+                        get_classifier(model_name), X, y_tr,
+                        cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                        scoring='f1_weighted', error_score=0.0,
+                    ).mean())
+                    if cv_f1 > best_tr_score:
+                        best_tr_score = cv_f1
                         best_tr_name  = model_name
                 except Exception:
                     pass
@@ -1601,22 +1615,22 @@ def extract_energy_direct_models(
                     best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                     transition_models_direct[str(activity)] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} (F1={best_tr_score:.3f})'
+                        f'{best_tr_name} (CV F1={best_tr_score:.3f})'
                     )
                     if best_clf._feature_importance:
                         top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                         act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(val F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
+                          f"(CV F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
                 except Exception as exc:
                     print(f"  [{activity}] Transition FAILED: {exc}")
                     act_report['Transition Approach'] = 'Statistical (ML fit failed)'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best ML F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
+                    f'Statistical (best ML CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(best ML val F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
+                      f"(best ML CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
@@ -1658,7 +1672,8 @@ def extract_energy_direct_models_global(
     from sklearn.neural_network import MLPRegressor
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import KFold, cross_val_score
+    from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
     from collections import Counter
     import warnings
@@ -1725,23 +1740,26 @@ def extract_energy_direct_models_global(
 
     train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
 
-    X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
-        X, y_dur, y_tr, test_size=0.2, random_state=42,
-        stratify=pd.cut(y_dur, bins=5, labels=False),
-    )
+    # CV-based model selection for global model (5-fold, dataset is large enough)
+    _kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
     report = {}
 
     # ── Global duration model ─────────────────────────────────────────────
-    stat_baseline_mae = mean_absolute_error(yd_val, np.full(len(yd_val), np.mean(yd_tr)))
+    stat_baseline_mae = float(-cross_val_score(
+        DummyRegressor(strategy='mean'), X, y_dur,
+        cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
+    ).mean())
     best_dur_score, best_dur_name = float('inf'), None
     for model_name in duration_models:
         try:
-            mdl = get_regressor(model_name)
-            mdl.fit(X_tr, yd_tr)
-            score = mean_absolute_error(yd_val, mdl.predict(X_val))
-            if score < best_dur_score:
-                best_dur_score, best_dur_name = score, model_name
+            cv_mae = float(-cross_val_score(
+                get_regressor(model_name), X, y_dur,
+                cv=KFold(n_splits=5, shuffle=True, random_state=42),
+                scoring='neg_mean_absolute_error', error_score=np.inf,
+            ).mean())
+            if cv_mae < best_dur_score:
+                best_dur_score, best_dur_name = cv_mae, model_name
         except Exception:
             pass
 
@@ -1755,27 +1773,30 @@ def extract_energy_direct_models_global(
         best_mdl._curr_act_columns   = curr_act_columns
         best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
         dur_models_out['__global__'] = best_mdl
-        report['Duration'] = f'GLOBAL {best_dur_name} (val MAE={best_dur_score:.3f})'
-        print(f"  Global duration -> {best_dur_name} (val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
+        report['Duration'] = f'GLOBAL {best_dur_name} (CV MAE={best_dur_score:.3f})'
+        print(f"  Global duration -> {best_dur_name} (CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
     else:
-        report['Duration'] = f'Statistical (best ML MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
-        print(f"  Global duration -> statistical (best ML val MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
+        report['Duration'] = f'Statistical (best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
+        print(f"  Global duration -> statistical (best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
     # ── Global transition model ───────────────────────────────────────────
     n_classes    = len(set(y_tr))
     tr_models_out = {}
     if n_classes >= 2:
-        majority_class   = Counter(yt_tr).most_common(1)[0][0]
-        majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
-                                        average='weighted', zero_division=0)
+        majority_baseline_f1 = float(cross_val_score(
+            DummyClassifier(strategy='most_frequent'), X, y_tr,
+            cv=_kf, scoring='f1_weighted', error_score=0.0,
+        ).mean())
         best_tr_score, best_tr_name = -float('inf'), None
         for model_name in transition_models:
             try:
-                clf = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
-                clf.fit(X_tr, yt_tr)
-                score = f1_score(yt_val, clf.predict(X_val), average='weighted', zero_division=0)
-                if score > best_tr_score:
-                    best_tr_score, best_tr_name = score, model_name
+                cv_f1 = float(cross_val_score(
+                    get_classifier(model_name), X, y_tr,
+                    cv=KFold(n_splits=5, shuffle=True, random_state=42),
+                    scoring='f1_weighted', error_score=0.0,
+                ).mean())
+                if cv_f1 > best_tr_score:
+                    best_tr_score, best_tr_name = cv_f1, model_name
             except Exception:
                 pass
 
@@ -1786,11 +1807,11 @@ def extract_energy_direct_models_global(
             best_clf._curr_act_columns   = curr_act_columns
             best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
             tr_models_out['__global__'] = best_clf
-            report['Transition'] = f'GLOBAL {best_tr_name} (val F1={best_tr_score:.3f})'
-            print(f"  Global transition -> {best_tr_name} (val F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
+            report['Transition'] = f'GLOBAL {best_tr_name} (CV F1={best_tr_score:.3f})'
+            print(f"  Global transition -> {best_tr_name} (CV F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
         else:
-            report['Transition'] = f'Statistical (best ML F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
-            print(f"  Global transition -> statistical (val F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
+            report['Transition'] = f'Statistical (best ML CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
+            print(f"  Global transition -> statistical (CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
     else:
         report['Transition'] = 'Statistical (1 class only)'
 
@@ -1822,7 +1843,8 @@ def extract_energy_quantile_models(
     from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
                                    GradientBoostingRegressor)
     from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import KFold, cross_val_score
+    from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
     from collections import Counter
     import warnings
@@ -1902,32 +1924,36 @@ def extract_energy_quantile_models(
             model_choices_report[act_str] = act_report
             continue
 
-        X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
-            X, y_dur, y_tr, test_size=0.2, random_state=42
-        )
+        # CV-based model selection — more stable than a single 80/20 split
+        n_splits = max(2, min(5, n // 5))
+        _kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
         # ── Duration: quantile regression ─────────────────────────────
         dn, dp = dist_lookup.get(act_str, ('norm', None))
         if dp is not None:
             dist_obj = _DIST_MAP.get(dn, scipy_stats.norm)
             try:
-                q_tr  = np.clip(dist_obj.cdf(yd_tr, *dp), 1e-4, 1 - 1e-4)
-                q_val = np.clip(dist_obj.cdf(yd_val, *dp), 1e-4, 1 - 1e-4)
+                q_full = np.clip(dist_obj.cdf(y_dur, *dp), 1e-4, 1 - 1e-4)
             except Exception:
                 dp = None  # distribution CDF failed — skip
 
         if dp is not None:
-            stat_baseline_mae = mean_absolute_error(q_val, np.full(len(q_val), np.mean(q_tr)))
+            stat_baseline_mae = float(-cross_val_score(
+                DummyRegressor(strategy='mean'), X, q_full,
+                cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
+            ).mean())
             best_dur_score = float('inf')
             best_dur_name  = None
 
             for model_name in duration_models:
                 try:
-                    mdl = get_regressor(model_name)
-                    mdl.fit(X_tr, q_tr)
-                    score = mean_absolute_error(q_val, mdl.predict(X_val))
-                    if score < best_dur_score:
-                        best_dur_score = score
+                    cv_mae = float(-cross_val_score(
+                        get_regressor(model_name), X, q_full,
+                        cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                        scoring='neg_mean_absolute_error', error_score=np.inf,
+                    ).mean())
+                    if cv_mae < best_dur_score:
+                        best_dur_score = cv_mae
                         best_dur_name  = model_name
                 except Exception:
                     pass
@@ -1935,42 +1961,45 @@ def extract_energy_quantile_models(
             if best_dur_name is not None and best_dur_score < stat_baseline_mae:
                 try:
                     best_mdl = get_regressor(best_dur_name)
-                    best_mdl.fit(X, np.clip(dist_obj.cdf(y_dur, *dp), 1e-4, 1 - 1e-4))
+                    best_mdl.fit(X, q_full)
                     best_mdl._is_quantile        = True
                     best_mdl._dist_name          = dn
                     best_mdl._dist_params        = dp
                     best_mdl._jitter_std         = jitter_std
                     best_mdl._train_feature_mean = train_feature_mean
                     quantile_duration_models[act_str] = best_mdl
-                    act_report['Duration Approach'] = f'{best_dur_name} quantile (MAE={best_dur_score:.3f})'
+                    act_report['Duration Approach'] = f'{best_dur_name} quantile (CV MAE={best_dur_score:.3f})'
                     print(f"  [{activity}] Duration -> quantile:{best_dur_name} "
-                          f"(val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
+                          f"(CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
                 except Exception as exc:
                     act_report['Duration Approach'] = f'Statistical (quantile fit failed: {exc})'
             else:
                 act_report['Duration Approach'] = (
-                    f'Statistical (best quantile MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
+                    f'Statistical (best quantile CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
                 )
                 print(f"  [{activity}] Duration -> statistical "
-                      f"(quantile MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
+                      f"(quantile CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
         else:
             act_report['Duration Approach'] = 'Statistical (no distribution params)'
 
         # ── Transition: calibrated classifier (same as energy_direct) ──
         if n_classes >= 2:
-            majority_class = Counter(yt_tr).most_common(1)[0][0]
-            majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
-                                            average='weighted', zero_division=0)
+            majority_baseline_f1 = float(cross_val_score(
+                DummyClassifier(strategy='most_frequent'), X, y_tr,
+                cv=_kf, scoring='f1_weighted', error_score=0.0,
+            ).mean())
             best_tr_score  = -float('inf')
             best_tr_name   = None
 
             for model_name in transition_models:
                 try:
-                    clf   = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
-                    clf.fit(X_tr, yt_tr)
-                    score = f1_score(yt_val, clf.predict(X_val), average='weighted', zero_division=0)
-                    if score > best_tr_score:
-                        best_tr_score = score
+                    cv_f1 = float(cross_val_score(
+                        get_classifier(model_name), X, y_tr,
+                        cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                        scoring='f1_weighted', error_score=0.0,
+                    ).mean())
+                    if cv_f1 > best_tr_score:
+                        best_tr_score = cv_f1
                         best_tr_name  = model_name
                 except Exception:
                     pass
@@ -1982,18 +2011,18 @@ def extract_energy_quantile_models(
                     best_clf._train_feature_mean = train_feature_mean
                     transition_models_out[act_str] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} calibrated (F1={best_tr_score:.3f})'
+                        f'{best_tr_name} calibrated (CV F1={best_tr_score:.3f})'
                     )
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(val F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
+                          f"(CV F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
                 except Exception as exc:
                     act_report['Transition Approach'] = f'Statistical (fit failed: {exc})'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
+                    f'Statistical (best CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
+                      f"(CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
