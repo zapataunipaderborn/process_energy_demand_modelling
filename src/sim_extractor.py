@@ -1577,15 +1577,21 @@ def extract_energy_direct_models(
                 best_mdl.fit(X, y_dur)
                 # Mean recalibration: exp(log_pred) is the geometric mean; correct toward
                 # the arithmetic mean so DurErr(whole) is not systematically biased.
-                _pred_mean = float(np.mean(np.exp(best_mdl.predict(X))))
+                _log_preds = best_mdl.predict(X)
+                _pred_mean = float(np.mean(np.exp(_log_preds)))
                 _true_mean = float(np.mean(np.exp(y_dur)))
                 best_mdl._mean_correction    = _true_mean / _pred_mean if _pred_mean > 0 else 1.0
+                # Distribution parameters for energy_dist mode: residual log-std + lognormal-aware correction
+                _residual_std = float(np.std(y_dur - _log_preds))
+                best_mdl._log_std = max(_residual_std, 0.01)
+                _pred_lnorm_mean = _pred_mean * float(np.exp(0.5 * _residual_std ** 2))
+                best_mdl._mean_correction_dist = _true_mean / _pred_lnorm_mean if _pred_lnorm_mean > 0 else 1.0
                 best_mdl._mean_duration      = mean_dur
                 best_mdl._log_duration       = True
                 best_mdl._train_feature_mean = train_feature_mean
                 best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
-                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f})'
+                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f}, log_std={best_mdl._log_std:.3f})'
                 if best_mdl._feature_importance:
                     top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                     act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
@@ -1786,16 +1792,21 @@ def extract_energy_direct_models_global(
     if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
         best_mdl = get_regressor(best_dur_name)
         best_mdl.fit(X, y_dur)
-        _pred_mean = float(np.mean(np.exp(best_mdl.predict(X))))
+        _log_preds = best_mdl.predict(X)
+        _pred_mean = float(np.mean(np.exp(_log_preds)))
         _true_mean = float(np.mean(np.exp(y_dur)))
         best_mdl._mean_correction    = _true_mean / _pred_mean if _pred_mean > 0 else 1.0
+        _residual_std = float(np.std(y_dur - _log_preds))
+        best_mdl._log_std = max(_residual_std, 0.01)
+        _pred_lnorm_mean = _pred_mean * float(np.exp(0.5 * _residual_std ** 2))
+        best_mdl._mean_correction_dist = _true_mean / _pred_lnorm_mean if _pred_lnorm_mean > 0 else 1.0
         best_mdl._log_duration       = True
         best_mdl._mean_duration      = mean_dur
         best_mdl._train_feature_mean = train_feature_mean
         best_mdl._curr_act_columns   = curr_act_columns
         best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
         dur_models_out['__global__'] = best_mdl
-        report['Duration'] = f'GLOBAL {best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f})'
+        report['Duration'] = f'GLOBAL {best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f}, log_std={best_mdl._log_std:.3f})'
         print(f"  Global duration -> {best_dur_name} (CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
     else:
         report['Duration'] = f'Statistical (best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'

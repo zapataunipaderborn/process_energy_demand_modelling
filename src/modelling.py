@@ -256,6 +256,7 @@ MODES_TO_COMPARE = [
     'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
     'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
     'petri_net_energy_direct',                  # ML predicts both directly per activity
+    'petri_net_energy_dist',                    # ML predicts log-mean; sample from LogNormal(predicted_μ, residual_σ)
     # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
     'petri_net_quantile_blend',
     #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
@@ -278,6 +279,7 @@ _ENERGY_AWARE_MODES = {
     'petri_net_energy_direct_duration_only',
     'petri_net_energy_direct_transition_only',
     'petri_net_energy_direct_global',
+    'petri_net_energy_dist',
     # Quantile-blend: ML predicts quantile of fitted dist + entropy-weighted transition blend
     'petri_net_quantile_blend',
 }
@@ -286,6 +288,7 @@ _ENERGY_DIRECT_MODES = {
     'petri_net_energy_direct_duration_only',
     'petri_net_energy_direct_transition_only',
     'petri_net_energy_direct_global',
+    'petri_net_energy_dist',
 }
 _ENERGY_QUANTILE_MODES = {
     'petri_net_quantile_blend',

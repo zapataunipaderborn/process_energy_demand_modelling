@@ -1527,6 +1527,7 @@ class ProcessSimulation:
     def _simulate_petri_net_energy_direct_for_case(
         self, case_id, object_attributes, start_time,
         enable_duration=True, enable_transitions=True,
+        use_distribution=False,
     ):
         """
         Simulate one case using the Petri net for structure, but with ML models
@@ -1718,7 +1719,14 @@ class ProcessSimulation:
                         try:
                             _raw = float(mdl.predict([energy_vec])[0])
                             if getattr(mdl, '_log_duration', False):
-                                _raw = np.exp(_raw) * getattr(mdl, '_mean_correction', 1.0)
+                                if use_distribution:
+                                    _log_std = getattr(mdl, '_log_std', 0.0)
+                                    _noise   = np.random.normal(0.0, _log_std) if _log_std > 0 else 0.0
+                                    _mc      = getattr(mdl, '_mean_correction_dist',
+                                                       getattr(mdl, '_mean_correction', 1.0))
+                                    _raw = np.exp(_raw + _noise) * _mc
+                                else:
+                                    _raw = np.exp(_raw) * getattr(mdl, '_mean_correction', 1.0)
                             activity_duration = max(0.1, _raw)
                             if self.verbose:
                                 print(f"    [{chosen_label}] direct ML duration: "
@@ -2158,6 +2166,16 @@ class ProcessSimulation:
                 case_id, object_attributes, start_time,
                 enable_duration=enable_dur,
                 enable_transitions=enable_tr,
+            )
+            return
+
+        # ── Energy-dist: same as energy_direct but samples from predicted distribution
+        if self.mode == 'petri_net_energy_dist':
+            self._simulate_petri_net_energy_direct_for_case(
+                case_id, object_attributes, start_time,
+                enable_duration=True,
+                enable_transitions=True,
+                use_distribution=True,
             )
             return
 
