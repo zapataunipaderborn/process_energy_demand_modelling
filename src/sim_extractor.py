@@ -1221,7 +1221,7 @@ def extract_energy_modifiers(
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, accuracy_score
+    from sklearn.metrics import mean_absolute_error, f1_score
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -1294,10 +1294,11 @@ def extract_energy_modifiers(
             )
 
             # --- Duration Model Selection ---
-            # Statistical baseline: R²=0 (predicting the mean, i.e. no energy effect).
-            # ML modifier is only kept if it beats R²>0 on the validation split.
+            # Statistical baseline MAE: always predicting the training mean.
+            # ML modifier is only kept if its val MAE beats that baseline.
             if mean_dur > 0:
-                best_dur_score = -float('inf')
+                stat_baseline_mae = mean_absolute_error(yd_val, np.full(len(yd_val), np.mean(yd_tr)))
+                best_dur_score = float('inf')
                 best_dur_name = None  # None → statistical wins
 
                 for model_name in duration_models:
@@ -1305,16 +1306,14 @@ def extract_energy_modifiers(
                         mdl = get_regressor(model_name)
                         mdl.fit(X_tr, yd_tr)
                         preds = mdl.predict(X_val)
-                        score = r2_score(yd_val, preds)
-                        if score > best_dur_score:
+                        score = mean_absolute_error(yd_val, preds)
+                        if score < best_dur_score:
                             best_dur_score = score
                             best_dur_name = model_name
                     except Exception:
                         pass
 
-                # Statistical baseline R² = 0 (always predicts the mean).
-                # Keep ML only if it genuinely improves over the statistical baseline.
-                if best_dur_name is not None and best_dur_score > 0.05:
+                if best_dur_name is not None and best_dur_score < stat_baseline_mae:
                     try:
                         best_mdl = get_regressor(best_dur_name)
                         best_mdl.fit(X, y_dur)
@@ -1322,28 +1321,30 @@ def extract_energy_modifiers(
                         best_mdl._train_feature_mean = train_feature_mean
                         best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                         energy_duration_modifiers[str(activity)] = best_mdl
-                        act_report['Duration Approach'] = f'{best_dur_name} (R²={best_dur_score:.3f})'
+                        act_report['Duration Approach'] = f'{best_dur_name} (MAE={best_dur_score:.3f})'
                         if best_mdl._feature_importance:
                             top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                             act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                         print(f"  [{activity}] Duration -> ML:{best_dur_name} "
-                              f"(val R²={best_dur_score:.3f}) > statistical (R²=0) ✓")
+                              f"(val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
                     except Exception as exc:
                         print(f"  [{activity}] Duration FAILED: {exc}")
                         act_report['Duration Approach'] = 'Statistical (ML fit failed)'
                 else:
                     act_report['Duration Approach'] = (
-                        f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0.05)'
+                        f'Statistical (best ML MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
                     )
                     print(f"  [{activity}] Duration -> statistical "
-                          f"(best ML val R²={best_dur_score:.3f} ≤ 0.05, no improvement)")
+                          f"(best ML val MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
             # --- Transition Model Selection ---
-            # Statistical baseline: majority-class accuracy (predict the most common next activity).
+            # Statistical baseline: weighted F1 when always predicting the majority class.
             # ML modifier is only kept if it beats that baseline.
             if n_classes >= 2:
                 from collections import Counter
-                majority_class_acc = Counter(yt_val).most_common(1)[0][1] / len(yt_val)
+                majority_class = Counter(yt_val).most_common(1)[0][0]
+                majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
+                                                average='weighted', zero_division=0)
 
                 best_tr_score = -float('inf')
                 best_tr_name = None  # None → statistical wins
@@ -1353,14 +1354,14 @@ def extract_energy_modifiers(
                         clf = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                         clf.fit(X_tr, yt_tr)
                         preds = clf.predict(X_val)
-                        score = accuracy_score(yt_val, preds)
+                        score = f1_score(yt_val, preds, average='weighted', zero_division=0)
                         if score > best_tr_score:
                             best_tr_score = score
                             best_tr_name = model_name
                     except Exception:
                         pass
 
-                if best_tr_name is not None and best_tr_score > majority_class_acc:
+                if best_tr_name is not None and best_tr_score > majority_baseline_f1:
                     try:
                         best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                         best_clf.fit(X, y_tr)
@@ -1368,25 +1369,25 @@ def extract_energy_modifiers(
                         best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                         energy_transition_modifiers[str(activity)] = best_clf
                         act_report['Transition Approach'] = (
-                            f'{best_tr_name} (Acc={best_tr_score:.3f})'
+                            f'{best_tr_name} (F1={best_tr_score:.3f})'
                         )
                         if best_clf._feature_importance:
                             top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                             act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                         print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                              f"(val Acc={best_tr_score:.3f}) > majority baseline "
-                              f"({majority_class_acc:.3f}) ✓")
+                              f"(val F1={best_tr_score:.3f}) > majority baseline "
+                              f"({majority_baseline_f1:.3f}) ✓")
                     except Exception as exc:
                         print(f"  [{activity}] Transition FAILED: {exc}")
                         act_report['Transition Approach'] = 'Statistical (ML fit failed)'
                 else:
                     act_report['Transition Approach'] = (
-                        f'Statistical (best ML Acc={best_tr_score:.3f} '
-                        f'≤ majority baseline {majority_class_acc:.3f})'
+                        f'Statistical (best ML F1={best_tr_score:.3f} '
+                        f'≤ majority baseline {majority_baseline_f1:.3f})'
                     )
                     print(f"  [{activity}] Transition -> statistical "
-                          f"(best ML val Acc={best_tr_score:.3f} ≤ majority "
-                          f"baseline {majority_class_acc:.3f})")
+                          f"(best ML val F1={best_tr_score:.3f} ≤ majority "
+                          f"baseline {majority_baseline_f1:.3f})")
             else:
                 act_report['Transition Approach'] = 'Statistical (1 class only)'
 
@@ -1425,7 +1426,7 @@ def extract_energy_direct_models(
 
     For each activity the best ML model is chosen by validation score and
     kept only if it beats the statistical baseline:
-      - Duration  : kept when val R² > 0  (baseline = always predict mean)
+      - Duration  : kept when val MAE < baseline MAE (baseline = always predict mean)
       - Transition: kept when val Acc > majority-class accuracy
 
     Returns
@@ -1452,7 +1453,7 @@ def extract_energy_direct_models(
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, accuracy_score, balanced_accuracy_score
+    from sklearn.metrics import mean_absolute_error, f1_score
     from collections import Counter
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1533,21 +1534,22 @@ def extract_energy_direct_models(
         )
 
         # ── Duration: direct regression on minutes ────────────────────
-        best_dur_score = -float('inf')
+        stat_baseline_mae = mean_absolute_error(yd_val, np.full(len(yd_val), np.mean(yd_tr)))
+        best_dur_score = float('inf')
         best_dur_name  = None
 
         for model_name in duration_models:
             try:
                 mdl = get_regressor(model_name)
                 mdl.fit(X_tr, yd_tr)
-                score = r2_score(yd_val, mdl.predict(X_val))
-                if score > best_dur_score:
+                score = mean_absolute_error(yd_val, mdl.predict(X_val))
+                if score < best_dur_score:
                     best_dur_score = score
                     best_dur_name  = model_name
             except Exception:
                 pass
 
-        if best_dur_name is not None and best_dur_score > 0.05:
+        if best_dur_name is not None and best_dur_score < stat_baseline_mae:
             try:
                 best_mdl = get_regressor(best_dur_name)
                 best_mdl.fit(X, y_dur)
@@ -1556,27 +1558,27 @@ def extract_energy_direct_models(
                 best_mdl._train_feature_mean = train_feature_mean
                 best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
-                act_report['Duration Approach'] = f'{best_dur_name} (R²={best_dur_score:.3f})'
+                act_report['Duration Approach'] = f'{best_dur_name} (MAE={best_dur_score:.3f})'
                 if best_mdl._feature_importance:
                     top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                     act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                 print(f"  [{activity}] Duration -> ML:{best_dur_name} "
-                      f"(val R²={best_dur_score:.3f}) > statistical ✓")
+                      f"(val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
             except Exception as exc:
                 print(f"  [{activity}] Duration FAILED: {exc}")
                 act_report['Duration Approach'] = 'Statistical (ML fit failed)'
         else:
             act_report['Duration Approach'] = (
-                f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0.05)'
+                f'Statistical (best ML MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
             )
             print(f"  [{activity}] Duration -> statistical "
-                  f"(best ML val R²={best_dur_score:.3f} ≤ 0.05)")
+                  f"(best ML val MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
         # ── Transition: direct classifier for sampling ────────────────
         if n_classes >= 2:
             majority_class = Counter(yt_tr).most_common(1)[0][0]
-            majority_pred  = np.full(len(yt_val), majority_class)
-            majority_acc   = balanced_accuracy_score(yt_val, majority_pred)
+            majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
+                                            average='weighted', zero_division=0)
             best_tr_score  = -float('inf')
             best_tr_name   = None
 
@@ -1584,14 +1586,14 @@ def extract_energy_direct_models(
                 try:
                     clf   = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                     clf.fit(X_tr, yt_tr)
-                    score = balanced_accuracy_score(yt_val, clf.predict(X_val))
+                    score = f1_score(yt_val, clf.predict(X_val), average='weighted', zero_division=0)
                     if score > best_tr_score:
                         best_tr_score = score
                         best_tr_name  = model_name
                 except Exception:
                     pass
 
-            if best_tr_name is not None and best_tr_score > majority_acc:
+            if best_tr_name is not None and best_tr_score > majority_baseline_f1:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)
@@ -1599,22 +1601,22 @@ def extract_energy_direct_models(
                     best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
                     transition_models_direct[str(activity)] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} (BalAcc={best_tr_score:.3f})'
+                        f'{best_tr_name} (F1={best_tr_score:.3f})'
                     )
                     if best_clf._feature_importance:
                         top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                         act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(val BalAcc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
+                          f"(val F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
                 except Exception as exc:
                     print(f"  [{activity}] Transition FAILED: {exc}")
                     act_report['Transition Approach'] = 'Statistical (ML fit failed)'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best ML BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
+                    f'Statistical (best ML F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(best ML val BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+                      f"(best ML val F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
@@ -1657,7 +1659,7 @@ def extract_energy_direct_models_global(
     from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, balanced_accuracy_score
+    from sklearn.metrics import mean_absolute_error, f1_score
     from collections import Counter
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1731,19 +1733,20 @@ def extract_energy_direct_models_global(
     report = {}
 
     # ── Global duration model ─────────────────────────────────────────────
-    best_dur_score, best_dur_name = -float('inf'), None
+    stat_baseline_mae = mean_absolute_error(yd_val, np.full(len(yd_val), np.mean(yd_tr)))
+    best_dur_score, best_dur_name = float('inf'), None
     for model_name in duration_models:
         try:
             mdl = get_regressor(model_name)
             mdl.fit(X_tr, yd_tr)
-            score = r2_score(yd_val, mdl.predict(X_val))
-            if score > best_dur_score:
+            score = mean_absolute_error(yd_val, mdl.predict(X_val))
+            if score < best_dur_score:
                 best_dur_score, best_dur_name = score, model_name
         except Exception:
             pass
 
     dur_models_out = {}
-    if best_dur_name is not None and best_dur_score > 0.05:
+    if best_dur_name is not None and best_dur_score < stat_baseline_mae:
         best_mdl = get_regressor(best_dur_name)
         best_mdl.fit(X, y_dur)
         best_mdl._log_duration       = True
@@ -1752,41 +1755,42 @@ def extract_energy_direct_models_global(
         best_mdl._curr_act_columns   = curr_act_columns
         best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
         dur_models_out['__global__'] = best_mdl
-        report['Duration'] = f'GLOBAL {best_dur_name} (val R²={best_dur_score:.3f})'
-        print(f"  Global duration -> {best_dur_name} (val R²={best_dur_score:.3f}) ✓")
+        report['Duration'] = f'GLOBAL {best_dur_name} (val MAE={best_dur_score:.3f})'
+        print(f"  Global duration -> {best_dur_name} (val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
     else:
-        report['Duration'] = f'Statistical (best ML R²={best_dur_score:.3f} ≤ 0.05)'
-        print(f"  Global duration -> statistical (best ML val R²={best_dur_score:.3f} ≤ 0.05)")
+        report['Duration'] = f'Statistical (best ML MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
+        print(f"  Global duration -> statistical (best ML val MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
 
     # ── Global transition model ───────────────────────────────────────────
     n_classes    = len(set(y_tr))
     tr_models_out = {}
     if n_classes >= 2:
-        majority_class = Counter(yt_tr).most_common(1)[0][0]
-        majority_acc   = balanced_accuracy_score(yt_val, np.full(len(yt_val), majority_class))
+        majority_class   = Counter(yt_tr).most_common(1)[0][0]
+        majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
+                                        average='weighted', zero_division=0)
         best_tr_score, best_tr_name = -float('inf'), None
         for model_name in transition_models:
             try:
                 clf = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                 clf.fit(X_tr, yt_tr)
-                score = balanced_accuracy_score(yt_val, clf.predict(X_val))
+                score = f1_score(yt_val, clf.predict(X_val), average='weighted', zero_division=0)
                 if score > best_tr_score:
                     best_tr_score, best_tr_name = score, model_name
             except Exception:
                 pass
 
-        if best_tr_name is not None and best_tr_score > majority_acc:
+        if best_tr_name is not None and best_tr_score > majority_baseline_f1:
             best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
             best_clf.fit(X, y_tr)
             best_clf._train_feature_mean = train_feature_mean
             best_clf._curr_act_columns   = curr_act_columns
             best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
             tr_models_out['__global__'] = best_clf
-            report['Transition'] = f'GLOBAL {best_tr_name} (val BalAcc={best_tr_score:.3f})'
-            print(f"  Global transition -> {best_tr_name} (val BalAcc={best_tr_score:.3f}) ✓")
+            report['Transition'] = f'GLOBAL {best_tr_name} (val F1={best_tr_score:.3f})'
+            print(f"  Global transition -> {best_tr_name} (val F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
         else:
-            report['Transition'] = f'Statistical (best ML BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
-            print(f"  Global transition -> statistical (val BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+            report['Transition'] = f'Statistical (best ML F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
+            print(f"  Global transition -> statistical (val F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
     else:
         report['Transition'] = 'Statistical (1 class only)'
 
@@ -1819,7 +1823,7 @@ def extract_energy_quantile_models(
                                    GradientBoostingRegressor)
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import train_test_split
-    from sklearn.metrics import r2_score, balanced_accuracy_score
+    from sklearn.metrics import mean_absolute_error, f1_score
     from collections import Counter
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -1913,21 +1917,22 @@ def extract_energy_quantile_models(
                 dp = None  # distribution CDF failed — skip
 
         if dp is not None:
-            best_dur_score = -float('inf')
+            stat_baseline_mae = mean_absolute_error(q_val, np.full(len(q_val), np.mean(q_tr)))
+            best_dur_score = float('inf')
             best_dur_name  = None
 
             for model_name in duration_models:
                 try:
                     mdl = get_regressor(model_name)
                     mdl.fit(X_tr, q_tr)
-                    score = r2_score(q_val, mdl.predict(X_val))
-                    if score > best_dur_score:
+                    score = mean_absolute_error(q_val, mdl.predict(X_val))
+                    if score < best_dur_score:
                         best_dur_score = score
                         best_dur_name  = model_name
                 except Exception:
                     pass
 
-            if best_dur_name is not None and best_dur_score > 0.05:
+            if best_dur_name is not None and best_dur_score < stat_baseline_mae:
                 try:
                     best_mdl = get_regressor(best_dur_name)
                     best_mdl.fit(X, np.clip(dist_obj.cdf(y_dur, *dp), 1e-4, 1 - 1e-4))
@@ -1937,25 +1942,25 @@ def extract_energy_quantile_models(
                     best_mdl._jitter_std         = jitter_std
                     best_mdl._train_feature_mean = train_feature_mean
                     quantile_duration_models[act_str] = best_mdl
-                    act_report['Duration Approach'] = f'{best_dur_name} quantile (R²={best_dur_score:.3f})'
+                    act_report['Duration Approach'] = f'{best_dur_name} quantile (MAE={best_dur_score:.3f})'
                     print(f"  [{activity}] Duration -> quantile:{best_dur_name} "
-                          f"(val R²={best_dur_score:.3f}) ✓")
+                          f"(val MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
                 except Exception as exc:
                     act_report['Duration Approach'] = f'Statistical (quantile fit failed: {exc})'
             else:
                 act_report['Duration Approach'] = (
-                    f'Statistical (best quantile R²={best_dur_score:.3f} ≤ 0.05)'
+                    f'Statistical (best quantile MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
                 )
                 print(f"  [{activity}] Duration -> statistical "
-                      f"(quantile R²={best_dur_score:.3f} ≤ 0.05)")
+                      f"(quantile MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
         else:
             act_report['Duration Approach'] = 'Statistical (no distribution params)'
 
         # ── Transition: calibrated classifier (same as energy_direct) ──
         if n_classes >= 2:
             majority_class = Counter(yt_tr).most_common(1)[0][0]
-            majority_pred  = np.full(len(yt_val), majority_class)
-            majority_acc   = balanced_accuracy_score(yt_val, majority_pred)
+            majority_baseline_f1 = f1_score(yt_val, np.full(len(yt_val), majority_class),
+                                            average='weighted', zero_division=0)
             best_tr_score  = -float('inf')
             best_tr_name   = None
 
@@ -1963,32 +1968,32 @@ def extract_energy_quantile_models(
                 try:
                     clf   = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
                     clf.fit(X_tr, yt_tr)
-                    score = balanced_accuracy_score(yt_val, clf.predict(X_val))
+                    score = f1_score(yt_val, clf.predict(X_val), average='weighted', zero_division=0)
                     if score > best_tr_score:
                         best_tr_score = score
                         best_tr_name  = model_name
                 except Exception:
                     pass
 
-            if best_tr_name is not None and best_tr_score > majority_acc:
+            if best_tr_name is not None and best_tr_score > majority_baseline_f1:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)
                     best_clf._train_feature_mean = train_feature_mean
                     transition_models_out[act_str] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} calibrated (BalAcc={best_tr_score:.3f})'
+                        f'{best_tr_name} calibrated (F1={best_tr_score:.3f})'
                     )
                     print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(val BalAcc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
+                          f"(val F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
                 except Exception as exc:
                     act_report['Transition Approach'] = f'Statistical (fit failed: {exc})'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
+                    f'Statistical (best F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+                      f"(F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
@@ -2105,7 +2110,7 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from dtw import dtw
 from tslearn.barycenters import dtw_barycenter_averaging
@@ -2582,7 +2587,7 @@ def build_and_train_pipeline(
         'all_keys'         — attribute key names (inferred from train only)
         'key_types'        — {key: 'numeric'|'category'} (from train only)
         'feature_columns'  — exact column order the model expects
-        'val_r2'           — float
+        'val_mae'          — float
         'all_results'      — dict with train/val metrics per model
     """
     if verbose:
@@ -2730,7 +2735,7 @@ def build_and_train_pipeline(
                     params = {}
                 m = model_class(**params)
                 m.fit(X_train, y_train)
-                return r2_score(y_val, m.predict(X_val))
+                return -mean_absolute_error(y_val, m.predict(X_val))
 
             sampler = optuna.samplers.TPESampler(seed=random_state)
             study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -2765,32 +2770,32 @@ def build_and_train_pipeline(
 
         train_pred = model.predict(X_train)
         val_pred   = model.predict(X_val)
-        train_r2   = r2_score(y_train, train_pred)
-        val_r2     = r2_score(y_val,   val_pred)
+        train_mae  = mean_absolute_error(y_train, train_pred)
+        val_mae    = mean_absolute_error(y_val,   val_pred)
         train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
         val_rmse   = np.sqrt(mean_squared_error(y_val,   val_pred))
 
         if verbose:
-            print(f"     Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}")
-            print(f"     Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+            print(f"     Train  MAE={train_mae:.4f}  RMSE={train_rmse:.4f}")
+            print(f"     Val    MAE={val_mae:.4f}  RMSE={val_rmse:.4f}")
 
         all_results[name] = {
             'model':      model,
-            'train_r2':   train_r2,
-            'val_r2':     val_r2,
+            'train_mae':  train_mae,
+            'val_mae':    val_mae,
             'train_rmse': train_rmse,
             'val_rmse':   val_rmse,
         }
 
     # ------------------------------------------------------------------
-    # 2e. Select best model by val R2
+    # 2e. Select best model by val MAE
     # ------------------------------------------------------------------
-    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_name  = min(all_results, key=lambda k: all_results[k]['val_mae'])
     best_model = all_results[best_name]['model']
 
     if verbose:
         print(f"\n Best model : {best_name}  "
-              f"(val R2={all_results[best_name]['val_r2']:.4f})")
+              f"(val MAE={all_results[best_name]['val_mae']:.4f})")
 
     pipeline = {
         'model':           best_model,
@@ -2802,7 +2807,7 @@ def build_and_train_pipeline(
         'feature_columns': feature_columns,
         'feature_scaler':  feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
-        'val_r2':          all_results[best_name]['val_r2'],
+        'val_mae':         all_results[best_name]['val_mae'],
         'all_results':     all_results,
     }
 
@@ -3139,7 +3144,7 @@ def build_and_train_pipeline_instance_stats(
                     params = {}
                 m = model_class(**params)
                 m.fit(X_train, y_train)
-                return r2_score(y_val, m.predict(X_val))
+                return -mean_absolute_error(y_val, m.predict(X_val))
 
             sampler = optuna.samplers.TPESampler(seed=random_state)
             study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -3173,29 +3178,29 @@ def build_and_train_pipeline_instance_stats(
 
         train_pred = model.predict(X_train)
         val_pred   = model.predict(X_val)
-        train_r2   = r2_score(y_train, train_pred)
-        val_r2     = r2_score(y_val,   val_pred)
+        train_mae  = mean_absolute_error(y_train, train_pred)
+        val_mae    = mean_absolute_error(y_val,   val_pred)
         train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
         val_rmse   = np.sqrt(mean_squared_error(y_val,   val_pred))
 
         if verbose:
-            print(f"     Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}")
-            print(f"     Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+            print(f"     Train  MAE={train_mae:.4f}  RMSE={train_rmse:.4f}")
+            print(f"     Val    MAE={val_mae:.4f}  RMSE={val_rmse:.4f}")
 
         all_results[name] = {
             'model':      model,
-            'train_r2':   train_r2,
-            'val_r2':     val_r2,
+            'train_mae':  train_mae,
+            'val_mae':    val_mae,
             'train_rmse': train_rmse,
             'val_rmse':   val_rmse,
         }
 
-    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_name  = min(all_results, key=lambda k: all_results[k]['val_mae'])
     best_model = all_results[best_name]['model']
 
     if verbose:
         print(f"\n Best model : {best_name}  "
-              f"(val R2={all_results[best_name]['val_r2']:.4f})")
+              f"(val MAE={all_results[best_name]['val_mae']:.4f})")
 
     pipeline = {
         'approach':        'instance_stats',
@@ -3208,7 +3213,7 @@ def build_and_train_pipeline_instance_stats(
         'feature_columns': feature_columns,
         'feature_scaler':  feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
-        'val_r2':          all_results[best_name]['val_r2'],
+        'val_mae':         all_results[best_name]['val_mae'],
         'all_results':     all_results,
     }
 
@@ -3456,19 +3461,19 @@ def build_and_train_pipeline_istats_leakfree(
 
         sp_model = MultiOutputRegressor(base)
         sp_model.fit(X_sp_train, y_sp_train)
-        val_r2 = float(np.mean([
-            r2_score(y_sp_val[:, i], sp_model.predict(X_sp_val)[:, i])
+        val_mae = float(np.mean([
+            mean_absolute_error(y_sp_val[:, i], sp_model.predict(X_sp_val)[:, i])
             for i in range(y_sp.shape[1])
         ]))
-        sp_results[name] = {'model': sp_model, 'val_r2': val_r2}
+        sp_results[name] = {'model': sp_model, 'val_mae': val_mae}
         if verbose:
-            print(f"     {name}  mean-val-R²={val_r2:.4f}")
+            print(f"     {name}  mean-val-MAE={val_mae:.4f}")
 
-    best_sp_name  = max(sp_results, key=lambda k: sp_results[k]['val_r2'])
+    best_sp_name  = min(sp_results, key=lambda k: sp_results[k]['val_mae'])
     best_sp_model = sp_results[best_sp_name]['model']
     if verbose:
         print(f"  Best stats predictor: {best_sp_name}  "
-              f"(mean val R²={sp_results[best_sp_name]['val_r2']:.4f})")
+              f"(mean val MAE={sp_results[best_sp_name]['val_mae']:.4f})")
 
     # ── Stage 2: train curve-shape model (identical to instance_stats) ───────
     if verbose:
@@ -3533,23 +3538,23 @@ def build_and_train_pipeline_istats_leakfree(
                 model = model_class()
 
         model.fit(X_train, y_train)
-        val_r2   = r2_score(y_val,   model.predict(X_val))
-        val_rmse = np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
-        train_r2   = r2_score(y_train, model.predict(X_train))
+        val_mae    = mean_absolute_error(y_val,   model.predict(X_val))
+        val_rmse   = np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
+        train_mae  = mean_absolute_error(y_train, model.predict(X_train))
         train_rmse = np.sqrt(mean_squared_error(y_train, model.predict(X_train)))
         if verbose:
-            print(f"       Train R²={train_r2:.4f}  RMSE={train_rmse:.4f} | "
-                  f"Val R²={val_r2:.4f}  RMSE={val_rmse:.4f}")
+            print(f"       Train MAE={train_mae:.4f}  RMSE={train_rmse:.4f} | "
+                  f"Val MAE={val_mae:.4f}  RMSE={val_rmse:.4f}")
         all_results[name] = {
-            'model': model, 'train_r2': train_r2, 'val_r2': val_r2,
+            'model': model, 'train_mae': train_mae, 'val_mae': val_mae,
             'train_rmse': train_rmse, 'val_rmse': val_rmse,
         }
 
-    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_name  = min(all_results, key=lambda k: all_results[k]['val_mae'])
     best_model = all_results[best_name]['model']
     if verbose:
         print(f"\n  Best curve model: {best_name}  "
-              f"(val R²={all_results[best_name]['val_r2']:.4f})")
+              f"(val MAE={all_results[best_name]['val_mae']:.4f})")
 
     return {
         'approach':            'istats_leakfree',
@@ -3562,7 +3567,7 @@ def build_and_train_pipeline_istats_leakfree(
         'feature_columns':     feature_columns,
         'feature_scaler':      feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
-        'val_r2':              all_results[best_name]['val_r2'],
+        'val_mae':             all_results[best_name]['val_mae'],
         'all_results':         all_results,
         # Stage 1
         'stats_predictor':         best_sp_model,
@@ -3932,7 +3937,7 @@ def build_and_train_pipeline_dtw_phase(
                     params = {}
                 m = model_class(**params)
                 m.fit(X_train, y_train)
-                return r2_score(y_val, m.predict(X_val))
+                return -mean_absolute_error(y_val, m.predict(X_val))
 
             sampler = optuna.samplers.TPESampler(seed=random_state)
             study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -3966,30 +3971,30 @@ def build_and_train_pipeline_dtw_phase(
 
         train_pred = model.predict(X_train)
         val_pred   = model.predict(X_val)
-        train_r2   = r2_score(y_train, train_pred)
-        val_r2     = r2_score(y_val,   val_pred)
+        train_mae  = mean_absolute_error(y_train, train_pred)
+        val_mae    = mean_absolute_error(y_val,   val_pred)
         train_rmse = np.sqrt(mean_squared_error(y_train, train_pred))
         val_rmse   = np.sqrt(mean_squared_error(y_val,   val_pred))
 
         if verbose:
-            print(f"     Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}")
-            print(f"     Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+            print(f"     Train  MAE={train_mae:.4f}  RMSE={train_rmse:.4f}")
+            print(f"     Val    MAE={val_mae:.4f}  RMSE={val_rmse:.4f}")
 
         all_results[name] = {
             'model':      model,
-            'train_r2':   train_r2,
-            'val_r2':     val_r2,
+            'train_mae':  train_mae,
+            'val_mae':    val_mae,
             'train_rmse': train_rmse,
             'val_rmse':   val_rmse,
         }
 
-    # 2e. Best model by val R2
-    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    # 2e. Best model by val MAE
+    best_name  = min(all_results, key=lambda k: all_results[k]['val_mae'])
     best_model = all_results[best_name]['model']
 
     if verbose:
         print(f"\n Best model : {best_name}  "
-              f"(val R2={all_results[best_name]['val_r2']:.4f})")
+              f"(val MAE={all_results[best_name]['val_mae']:.4f})")
 
     pipeline = {
         'approach':        'dtw_phase',
@@ -4002,7 +4007,7 @@ def build_and_train_pipeline_dtw_phase(
         'feature_columns': feature_columns,
         'feature_scaler':  feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
-        'val_r2':          all_results[best_name]['val_r2'],
+        'val_mae':         all_results[best_name]['val_mae'],
         'all_results':     all_results,
     }
 
@@ -4298,8 +4303,8 @@ def build_and_train_pipeline_basis(
                 m = MultiOutputRegressor(base, n_jobs=n_jobs)
                 m.fit(X_train, Y_train)
                 Y_pred = m.predict(X_val)
-                return float(np.mean([r2_score(Y_val[:, k], Y_pred[:, k])
-                                      for k in range(n_basis)]))
+                return -float(np.mean([mean_absolute_error(Y_val[:, k], Y_pred[:, k])
+                                       for k in range(n_basis)]))
 
             sampler = optuna.samplers.TPESampler(seed=random_state)
             study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -4333,9 +4338,9 @@ def build_and_train_pipeline_basis(
         Y_train_pred = model.predict(X_train)
         Y_val_pred   = model.predict(X_val)
 
-        train_r2   = float(np.mean([r2_score(Y_train[:, k], Y_train_pred[:, k])
+        train_mae  = float(np.mean([mean_absolute_error(Y_train[:, k], Y_train_pred[:, k])
                                     for k in range(n_basis)]))
-        val_r2     = float(np.mean([r2_score(Y_val[:, k], Y_val_pred[:, k])
+        val_mae    = float(np.mean([mean_absolute_error(Y_val[:, k], Y_val_pred[:, k])
                                     for k in range(n_basis)]))
         train_rmse = float(np.mean([np.sqrt(mean_squared_error(Y_train[:, k], Y_train_pred[:, k]))
                                     for k in range(n_basis)]))
@@ -4343,22 +4348,22 @@ def build_and_train_pipeline_basis(
                                     for k in range(n_basis)]))
 
         if verbose:
-            print(f"    Train  R2={train_r2:.4f}  RMSE={train_rmse:.4f}  (avg over {n_basis} basis)")
-            print(f"    Val    R2={val_r2:.4f}  RMSE={val_rmse:.4f}")
+            print(f"    Train  MAE={train_mae:.4f}  RMSE={train_rmse:.4f}  (avg over {n_basis} basis)")
+            print(f"    Val    MAE={val_mae:.4f}  RMSE={val_rmse:.4f}")
 
         all_results[name] = {
             'model':      model,
-            'train_r2':   train_r2,
-            'val_r2':     val_r2,
+            'train_mae':  train_mae,
+            'val_mae':    val_mae,
             'train_rmse': train_rmse,
             'val_rmse':   val_rmse,
         }
 
-    best_name  = max(all_results, key=lambda k: all_results[k]['val_r2'])
+    best_name  = min(all_results, key=lambda k: all_results[k]['val_mae'])
     best_model = all_results[best_name]['model']
 
     if verbose:
-        print(f"\n  Best model: {best_name}  (val R2={all_results[best_name]['val_r2']:.4f})")
+        print(f"\n  Best model: {best_name}  (val MAE={all_results[best_name]['val_mae']:.4f})")
 
     pipeline = {
         'approach':        'basis_expansion',
@@ -4376,7 +4381,7 @@ def build_and_train_pipeline_basis(
         'feature_columns': feature_columns,
         'feature_scaler':  feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
-        'val_r2':          all_results[best_name]['val_r2'],
+        'val_mae':         all_results[best_name]['val_mae'],
         'all_results':     all_results,
     }
 
@@ -4621,7 +4626,7 @@ def build_and_train_pipeline_exog(
 
     # ── Train models ──────────────────────────────────────────────────────────
     all_results = {}
-    best_model, best_name, best_val_r2 = None, None, -np.inf
+    best_model, best_name, best_val_mae = None, None, np.inf
 
     for name, model_class in models.items():
         if verbose:
@@ -4629,19 +4634,19 @@ def build_and_train_pipeline_exog(
         model = model_class()
         model.fit(X_train, y_train)
 
-        train_r2 = float(r2_score(y_train, model.predict(X_train)))
-        val_r2   = float(r2_score(y_val,   model.predict(X_val)))
+        train_mae = float(mean_absolute_error(y_train, model.predict(X_train)))
+        val_mae   = float(mean_absolute_error(y_val,   model.predict(X_val)))
         if verbose:
-            print(f"    train R²={train_r2:.4f}  val R²={val_r2:.4f}")
+            print(f"    train MAE={train_mae:.4f}  val MAE={val_mae:.4f}")
 
-        all_results[name] = {'train_r2': train_r2, 'val_r2': val_r2}
-        if val_r2 > best_val_r2:
-            best_val_r2  = val_r2
+        all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae}
+        if val_mae < best_val_mae:
+            best_val_mae = val_mae
             best_model   = model
             best_name    = name
 
     if verbose:
-        print(f"\n  Best model: {best_name}  val R²={best_val_r2:.4f}")
+        print(f"\n  Best model: {best_name}  val MAE={best_val_mae:.4f}")
 
     return {
         'model':               best_model,
@@ -4653,7 +4658,7 @@ def build_and_train_pipeline_exog(
         'feature_columns':     feature_columns,
         'feature_scaler':      feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
-        'val_r2':              best_val_r2,
+        'val_mae':             best_val_mae,
         'all_results':         all_results,
         'exog_cols':           exog_cols,
         'approach':            'exog',
@@ -4987,16 +4992,16 @@ def build_and_train_pipeline_amplitude_shape(
             except TypeError:
                 m = model_class()
         m.fit(X_amp_tr, amp_tr)
-        val_r2 = r2_score(amp_vl, m.predict(X_amp_vl))
-        amp_results[name] = {'model': m, 'val_r2': val_r2}
+        val_mae = mean_absolute_error(amp_vl, m.predict(X_amp_vl))
+        amp_results[name] = {'model': m, 'val_mae': val_mae}
         if verbose:
-            print(f"     {name}  val R²={val_r2:.4f}")
+            print(f"     {name}  val MAE={val_mae:.4f}")
 
-    best_amp_name  = max(amp_results, key=lambda k: amp_results[k]['val_r2'])
+    best_amp_name  = min(amp_results, key=lambda k: amp_results[k]['val_mae'])
     best_amp_model = amp_results[best_amp_name]['model']
     if verbose:
         print(f"  Best amplitude model: {best_amp_name}  "
-              f"(val R²={amp_results[best_amp_name]['val_r2']:.4f})")
+              f"(val MAE={amp_results[best_amp_name]['val_mae']:.4f})")
 
     # ── Stage B: shape predictor on z-score normalised curves ─────────────────
     if verbose:
@@ -5078,16 +5083,16 @@ def build_and_train_pipeline_amplitude_shape(
             except TypeError:
                 m = model_class()
         m.fit(X_sh_tr, y_sh_tr)
-        val_r2 = r2_score(y_sh_vl, m.predict(X_sh_vl))
-        shape_results[name] = {'model': m, 'val_r2': val_r2}
+        val_mae = mean_absolute_error(y_sh_vl, m.predict(X_sh_vl))
+        shape_results[name] = {'model': m, 'val_mae': val_mae}
         if verbose:
-            print(f"     {name}  val R²={val_r2:.4f}")
+            print(f"     {name}  val MAE={val_mae:.4f}")
 
-    best_shape_name  = max(shape_results, key=lambda k: shape_results[k]['val_r2'])
+    best_shape_name  = min(shape_results, key=lambda k: shape_results[k]['val_mae'])
     best_shape_model = shape_results[best_shape_name]['model']
     if verbose:
         print(f"  Best shape model: {best_shape_name}  "
-              f"(val R²={shape_results[best_shape_name]['val_r2']:.4f})")
+              f"(val MAE={shape_results[best_shape_name]['val_mae']:.4f})")
 
     return {
         'approach':           'amplitude_shape',
@@ -5108,7 +5113,7 @@ def build_and_train_pipeline_amplitude_shape(
         'shape_feat_cols':    shape_feat_cols,
         'shape_scaler':       shape_scaler,
         'shape_num_cols':     shape_num_cols,
-        'val_r2':             shape_results[best_shape_name]['val_r2'],
+        'val_mae':            shape_results[best_shape_name]['val_mae'],
     }
 
 
@@ -5352,16 +5357,16 @@ def build_and_train_pipeline_amplitude_shape_exog(
             except TypeError:
                 m = model_class()
         m.fit(X_amp_tr, amp_tr)
-        val_r2 = r2_score(amp_vl, m.predict(X_amp_vl))
-        amp_results[name] = {'model': m, 'val_r2': val_r2}
+        val_mae = mean_absolute_error(amp_vl, m.predict(X_amp_vl))
+        amp_results[name] = {'model': m, 'val_mae': val_mae}
         if verbose:
-            print(f"     {name}  val R²={val_r2:.4f}")
+            print(f"     {name}  val MAE={val_mae:.4f}")
 
-    best_amp_name  = max(amp_results, key=lambda k: amp_results[k]['val_r2'])
+    best_amp_name  = min(amp_results, key=lambda k: amp_results[k]['val_mae'])
     best_amp_model = amp_results[best_amp_name]['model']
     if verbose:
         print(f"  Best amplitude model: {best_amp_name}  "
-              f"(val R²={amp_results[best_amp_name]['val_r2']:.4f})")
+              f"(val MAE={amp_results[best_amp_name]['val_mae']:.4f})")
 
     # ── Stage B: shape predictor (z-score normalised + ef_* per position) ────
     if verbose:
@@ -5457,16 +5462,16 @@ def build_and_train_pipeline_amplitude_shape_exog(
             except TypeError:
                 m = model_class()
         m.fit(X_sh_tr, y_sh_tr)
-        val_r2 = r2_score(y_sh_vl, m.predict(X_sh_vl))
-        shape_results[name] = {'model': m, 'val_r2': val_r2}
+        val_mae = mean_absolute_error(y_sh_vl, m.predict(X_sh_vl))
+        shape_results[name] = {'model': m, 'val_mae': val_mae}
         if verbose:
-            print(f"     {name}  val R²={val_r2:.4f}")
+            print(f"     {name}  val MAE={val_mae:.4f}")
 
-    best_shape_name  = max(shape_results, key=lambda k: shape_results[k]['val_r2'])
+    best_shape_name  = min(shape_results, key=lambda k: shape_results[k]['val_mae'])
     best_shape_model = shape_results[best_shape_name]['model']
     if verbose:
         print(f"  Best shape model: {best_shape_name}  "
-              f"(val R²={shape_results[best_shape_name]['val_r2']:.4f})")
+              f"(val MAE={shape_results[best_shape_name]['val_mae']:.4f})")
 
     return {
         'approach':           'amplitude_shape_exog',
@@ -5488,7 +5493,7 @@ def build_and_train_pipeline_amplitude_shape_exog(
         'shape_feat_cols':    shape_feat_cols,
         'shape_scaler':       shape_scaler,
         'shape_num_cols':     shape_num_cols,
-        'val_r2':             shape_results[best_shape_name]['val_r2'],
+        'val_mae':            shape_results[best_shape_name]['val_mae'],
     }
 
 
@@ -7087,7 +7092,7 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 import optuna  # Assuming optuna is installed
@@ -7304,8 +7309,8 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
                 model = model_class(**params)
                 model.fit(X_train, y_train)
                 y_pred = model.predict(X_test)
-                return r2_score(y_test, y_pred)
-            
+                return -mean_absolute_error(y_test, y_pred)
+
             # Run Optuna study
             sampler = optuna.samplers.TPESampler(seed=random_state)
             study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -7345,28 +7350,28 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
         y_pred_train = model.predict(X_train)
         y_pred_test = model.predict(X_test)
         
-        train_r2 = r2_score(y_train, y_pred_train)
-        test_r2 = r2_score(y_test, y_pred_test)
+        train_mae  = mean_absolute_error(y_train, y_pred_train)
+        test_mae   = mean_absolute_error(y_test, y_pred_test)
         train_rmse = np.sqrt(mean_squared_error(y_train, y_pred_train))
-        test_rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
-        
+        test_rmse  = np.sqrt(mean_squared_error(y_test, y_pred_test))
+
         results_position[name] = {
             'model': model,
-            'train_r2': train_r2,
-            'test_r2': test_r2,
+            'train_mae':  train_mae,
+            'test_mae':   test_mae,
             'train_rmse': train_rmse,
-            'test_rmse': test_rmse
+            'test_rmse':  test_rmse
         }
-        
-        print(f"  Train R²={train_r2:.4f}, RMSE={train_rmse:.2f}")
-        print(f"  Test R²={test_r2:.4f}, RMSE={test_rmse:.2f}")
-    
+
+        print(f"  Train MAE={train_mae:.4f}, RMSE={train_rmse:.2f}")
+        print(f"  Test MAE={test_mae:.4f}, RMSE={test_rmse:.2f}")
+
     # Select best model
-    best_model_name_pos = max(results_position.keys(), key=lambda k: results_position[k]['test_r2'])
+    best_model_name_pos = min(results_position.keys(), key=lambda k: results_position[k]['test_mae'])
     best_model_pos = results_position[best_model_name_pos]['model']
-    
+
     print(f"\n✓ Best model: {best_model_name_pos}")
-    print(f"  Test R² = {results_position[best_model_name_pos]['test_r2']:.4f}")
+    print(f"  Test MAE = {results_position[best_model_name_pos]['test_mae']:.4f}")
     
     # Store for later use
     fixed_curve_length = fixed_length
