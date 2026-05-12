@@ -245,6 +245,8 @@ MODES_TO_COMPARE = [
     'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
     'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
     'petri_net_energy_direct',                  # ML predicts both directly per activity
+    # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
+    'petri_net_quantile_blend',
     #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
@@ -265,12 +267,17 @@ _ENERGY_AWARE_MODES = {
     'petri_net_energy_direct_duration_only',
     'petri_net_energy_direct_transition_only',
     'petri_net_energy_direct_global',
+    # Quantile-blend: ML predicts quantile of fitted dist + entropy-weighted transition blend
+    'petri_net_quantile_blend',
 }
 _ENERGY_DIRECT_MODES = {
     'petri_net_energy_direct',
     'petri_net_energy_direct_duration_only',
     'petri_net_energy_direct_transition_only',
     'petri_net_energy_direct_global',
+}
+_ENERGY_QUANTILE_MODES = {
+    'petri_net_quantile_blend',
 }
 
 # ── Duration modifier models ───────────────────────────────────────────────
@@ -1942,6 +1949,33 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 report(_direct_df.to_string(index=False))
                                 display(_direct_df)
 
+                        # ── Train quantile-blend models ────────────────────────────────
+                        _quantile_dur_mods, _quantile_tr_mods, _quantile_energy_state_cols = {}, {}, []
+                        _quantile_modes_requested = [
+                            m for m in _energy_modes_requested if m in _ENERGY_QUANTILE_MODES
+                        ]
+                        if _quantile_modes_requested:
+                            from sim_extractor import extract_energy_quantile_models
+                            _quantile_dur_mods, _quantile_tr_mods, _quantile_energy_state_cols, _quantile_report = \
+                                extract_energy_quantile_models(
+                                    df_expanded=_df_expanded_train,
+                                    sensors=_sensors,
+                                    stats_df=_best_base_stats,
+                                    duration_models=['ridge', 'lasso', 'xgboost', 'random_forest'],
+                                    transition_models=ENERGY_TRANSITION_MODELS,
+                                    min_samples=ENERGY_MIN_SAMPLES,
+                                    ef_cols=_ef_ep_cols,
+                                )
+                            if _quantile_report:
+                                report("\n" + "="*80)
+                                report(f"QUANTILE-BLEND MODEL TRACKING | Process: {process}")
+                                report("="*80)
+                                _q_df = pd.DataFrame.from_dict(_quantile_report, orient='index').reset_index()
+                                _q_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
+                                _q_df.insert(0, 'Dataset/Process', process)
+                                report(_q_df.to_string(index=False))
+                                display(_q_df)
+
                         # ── Train global direct model (one model, all activities pooled) ──
                         _global_dur_mods, _global_tr_mods, _global_energy_state_cols = {}, {}, []
                         _global_modes_requested = [
@@ -2097,13 +2131,18 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         return means
 
                     def _run_energy_sim(plan, stats_df, pm, exog_means=None):
-                        # Direct modes use the direct ML models; modifier modes use the modifier models
-                        _is_global  = _energy_mode == 'petri_net_energy_direct_global'
-                        _is_direct  = _energy_mode in _ENERGY_DIRECT_MODES
+                        # Route each mode to its own trained model set
+                        _is_global   = _energy_mode == 'petri_net_energy_direct_global'
+                        _is_direct   = _energy_mode in _ENERGY_DIRECT_MODES
+                        _is_quantile = _energy_mode in _ENERGY_QUANTILE_MODES
                         if _is_global:
                             _dur_mods   = _global_dur_mods
                             _tr_mods    = _global_tr_mods
                             _state_cols = _global_energy_state_cols
+                        elif _is_quantile:
+                            _dur_mods   = _quantile_dur_mods
+                            _tr_mods    = _quantile_tr_mods
+                            _state_cols = _quantile_energy_state_cols
                         elif _is_direct:
                             _dur_mods   = _energy_direct_dur_mods
                             _tr_mods    = _energy_direct_tr_mods

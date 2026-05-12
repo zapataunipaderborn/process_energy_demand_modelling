@@ -1793,6 +1793,212 @@ def extract_energy_direct_models_global(
     return dur_models_out, tr_models_out, energy_state_columns, report
 
 
+def extract_energy_quantile_models(
+    df_expanded,
+    sensors,
+    stats_df,
+    duration_models=None,
+    transition_models=None,
+    min_samples=30,
+    ef_cols=None,
+    jitter_std=0.15,
+):
+    """
+    Train per-activity models for the `petri_net_quantile_blend` method.
+
+    Duration model  — Ridge regression with target q_i = dist.cdf(actual_duration_i).
+    The stored model predicts a quantile in [0,1]; the simulator inverts the CDF at
+    inference time, preserving the fitted distribution shape exactly.
+
+    Transition model — CalibratedClassifierCV same as energy_direct.
+    """
+    from xgboost import XGBRegressor
+    from sklearn.linear_model import LinearRegression, Lasso, Ridge, LogisticRegression
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier,
+                                   GradientBoostingRegressor)
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import r2_score, balanced_accuracy_score
+    from collections import Counter
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+
+    if duration_models is None:
+        duration_models = ['ridge', 'lasso', 'random_forest']
+    if transition_models is None:
+        transition_models = ['logistic', 'random_forest', 'gradient_boosting']
+
+    def get_regressor(name):
+        if name == 'xgboost':       return XGBRegressor(n_estimators=100, max_depth=3, random_state=42, verbosity=0)
+        if name == 'linear':        return LinearRegression()
+        if name == 'lasso':         return Lasso(alpha=0.01, max_iter=2000)
+        if name == 'ridge':         return Ridge(alpha=1.0)
+        if name == 'mlp':           return MLPRegressor(hidden_layer_sizes=(32,), max_iter=300, random_state=42)
+        if name == 'random_forest': return GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
+        return Ridge(alpha=1.0)
+
+    def get_classifier(name):
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42)
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
+        return LogisticRegression(max_iter=1000, random_state=42)
+
+    # Build per-activity distribution lookup from stats_df
+    dist_lookup = {}
+    if stats_df is not None:
+        for _, row in stats_df.iterrows():
+            act = str(row.get('activity', '')).strip()
+            dn  = row.get('dist_name', 'norm')
+            dp  = row.get('dist_params')
+            if act and dn and dp is not None:
+                dist_lookup[act] = (dn, dp)
+
+    df_recs = _build_energy_state_matrix_with_next(
+        df_expanded, sensors,
+        timestamp_start_col='timestamp_start_log',
+        datetime_energy_col='datetime_energy',
+        ef_cols=ef_cols,
+    )
+
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
+    _ef_cols_present = [c for c in (ef_cols or []) if c in df_recs.columns]
+    for _efc in _ef_cols_present:
+        energy_state_columns += [f'{_efc}_mean', f'{_efc}_end', f'{_efc}_std']
+
+    # Add prev_activity one-hot (same as energy_direct)
+    if 'prev_activity' in df_recs.columns:
+        prev_dummies = pd.get_dummies(df_recs['prev_activity'], prefix='prev_act').astype(float)
+        df_recs = pd.concat([df_recs.reset_index(drop=True), prev_dummies.reset_index(drop=True)], axis=1)
+        energy_state_columns = energy_state_columns + [c for c in prev_dummies.columns
+                                                        if c not in energy_state_columns]
+
+    quantile_duration_models  = {}
+    transition_models_out     = {}
+    model_choices_report      = {}
+
+    for activity, grp in df_recs.groupby('activity'):
+        act_str = str(activity)
+        X       = grp[energy_state_columns].values
+        y_dur   = grp['duration'].values.clip(0.1)
+        y_tr    = grp['next_activity'].values
+        n       = len(grp)
+        n_classes = len(set(y_tr))
+
+        act_report = {
+            'Duration Approach':   f'Statistical (n={n}<{min_samples})',
+            'Transition Approach': f'Statistical (n={n}<{min_samples})',
+        }
+        train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+
+        if n < min_samples:
+            model_choices_report[act_str] = act_report
+            continue
+
+        X_tr, X_val, yd_tr, yd_val, yt_tr, yt_val = train_test_split(
+            X, y_dur, y_tr, test_size=0.2, random_state=42
+        )
+
+        # ── Duration: quantile regression ─────────────────────────────
+        dn, dp = dist_lookup.get(act_str, ('norm', None))
+        if dp is not None:
+            dist_obj = _DIST_MAP.get(dn, scipy_stats.norm)
+            try:
+                q_tr  = np.clip(dist_obj.cdf(yd_tr, *dp), 1e-4, 1 - 1e-4)
+                q_val = np.clip(dist_obj.cdf(yd_val, *dp), 1e-4, 1 - 1e-4)
+            except Exception:
+                dp = None  # distribution CDF failed — skip
+
+        if dp is not None:
+            best_dur_score = -float('inf')
+            best_dur_name  = None
+
+            for model_name in duration_models:
+                try:
+                    mdl = get_regressor(model_name)
+                    mdl.fit(X_tr, q_tr)
+                    score = r2_score(q_val, mdl.predict(X_val))
+                    if score > best_dur_score:
+                        best_dur_score = score
+                        best_dur_name  = model_name
+                except Exception:
+                    pass
+
+            if best_dur_name is not None and best_dur_score > 0.05:
+                try:
+                    best_mdl = get_regressor(best_dur_name)
+                    best_mdl.fit(X, np.clip(dist_obj.cdf(y_dur, *dp), 1e-4, 1 - 1e-4))
+                    best_mdl._is_quantile        = True
+                    best_mdl._dist_name          = dn
+                    best_mdl._dist_params        = dp
+                    best_mdl._jitter_std         = jitter_std
+                    best_mdl._train_feature_mean = train_feature_mean
+                    quantile_duration_models[act_str] = best_mdl
+                    act_report['Duration Approach'] = f'{best_dur_name} quantile (R²={best_dur_score:.3f})'
+                    print(f"  [{activity}] Duration -> quantile:{best_dur_name} "
+                          f"(val R²={best_dur_score:.3f}) ✓")
+                except Exception as exc:
+                    act_report['Duration Approach'] = f'Statistical (quantile fit failed: {exc})'
+            else:
+                act_report['Duration Approach'] = (
+                    f'Statistical (best quantile R²={best_dur_score:.3f} ≤ 0.05)'
+                )
+                print(f"  [{activity}] Duration -> statistical "
+                      f"(quantile R²={best_dur_score:.3f} ≤ 0.05)")
+        else:
+            act_report['Duration Approach'] = 'Statistical (no distribution params)'
+
+        # ── Transition: calibrated classifier (same as energy_direct) ──
+        if n_classes >= 2:
+            majority_class = Counter(yt_tr).most_common(1)[0][0]
+            majority_pred  = np.full(len(yt_val), majority_class)
+            majority_acc   = balanced_accuracy_score(yt_val, majority_pred)
+            best_tr_score  = -float('inf')
+            best_tr_name   = None
+
+            for model_name in transition_models:
+                try:
+                    clf   = CalibratedClassifierCV(get_classifier(model_name), cv=3, method='sigmoid')
+                    clf.fit(X_tr, yt_tr)
+                    score = balanced_accuracy_score(yt_val, clf.predict(X_val))
+                    if score > best_tr_score:
+                        best_tr_score = score
+                        best_tr_name  = model_name
+                except Exception:
+                    pass
+
+            if best_tr_name is not None and best_tr_score > majority_acc:
+                try:
+                    best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
+                    best_clf.fit(X, y_tr)
+                    best_clf._train_feature_mean = train_feature_mean
+                    transition_models_out[act_str] = best_clf
+                    act_report['Transition Approach'] = (
+                        f'{best_tr_name} calibrated (BalAcc={best_tr_score:.3f})'
+                    )
+                    print(f"  [{activity}] Transition -> ML:{best_tr_name} "
+                          f"(val BalAcc={best_tr_score:.3f}) > majority ({majority_acc:.3f}) ✓")
+                except Exception as exc:
+                    act_report['Transition Approach'] = f'Statistical (fit failed: {exc})'
+            else:
+                act_report['Transition Approach'] = (
+                    f'Statistical (best BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})'
+                )
+                print(f"  [{activity}] Transition -> statistical "
+                      f"(BalAcc={best_tr_score:.3f} ≤ majority {majority_acc:.3f})")
+        else:
+            act_report['Transition Approach'] = 'Statistical (1 class only)'
+
+        model_choices_report[act_str] = act_report
+
+    print(f"\n  Quantile duration models : {len(quantile_duration_models)} activities use ML")
+    print(f"  Transition models        : {len(transition_models_out)} activities use ML")
+    return quantile_duration_models, transition_models_out, energy_state_columns, model_choices_report
+
+
 def _build_energy_state_matrix_with_next(
     df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
     ef_cols=None,
