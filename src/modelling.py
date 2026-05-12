@@ -1798,13 +1798,13 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
     if combined_candidates:
         def _combined_selection_score(r):
-            """Overall 5-metric train error (0 = best)."""
-            evt   = abs(float(r.get('train_basic_metrics_event_count_ratio', np.nan)) - 1.0)
-            dur_w = float(r.get('train_duration_metrics_mean_duration_error', np.nan))
-            dur_a = float(r.get('train_duration_metrics_activity_duration_error', np.nan))
-            js    = float(r.get('train_activity_metrics_js_divergence', np.nan))
-            f1    = 1.0 - float(r.get('train_control_flow_metrics_edge_f1_score', np.nan))
-            vals  = [v for v in (evt, dur_w, dur_a, js, f1) if np.isfinite(v)]
+            """Process-structure train score (0 = best): EvtRatioErr + JS div + 1-EdgeF1.
+            Duration metrics excluded — PN selection should reflect structural quality,
+            not duration fit (which is the job of the statistical/ML layer on top)."""
+            evt = abs(float(r.get('train_basic_metrics_event_count_ratio', np.nan)) - 1.0)
+            js  = float(r.get('train_activity_metrics_js_divergence', np.nan))
+            f1  = 1.0 - float(r.get('train_control_flow_metrics_edge_f1_score', np.nan))
+            vals = [v for v in (evt, js, f1) if np.isfinite(v)]
             return float(np.mean(vals)) if vals else np.inf
 
         best_row = min(combined_candidates, key=_combined_selection_score)
