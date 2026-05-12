@@ -25,6 +25,14 @@ _DIST_MAP = {
     'weibull_min': scipy_stats.weibull_min,
 }
 
+# ML model acceptance thresholds.
+# Duration: ML is used only when CV MAE is at least this fraction below the
+#           mean-prediction baseline (e.g. 0.80 = must beat baseline by ≥20%).
+# Transition: ML is used only when CV F1 exceeds the majority-class baseline
+#             by at least this absolute margin (e.g. 0.05 = 5 percentage points).
+_DUR_ACCEPTANCE_RATIO = 0.80   # require ≥20% MAE improvement over baseline
+_TR_ACCEPTANCE_MARGIN = 0.05   # require ≥5 pp F1 improvement over baseline
+
 
 def fit_best_distribution(data):
     """
@@ -1317,7 +1325,7 @@ def extract_energy_modifiers(
                     except Exception:
                         pass
 
-                if best_dur_name is not None and best_dur_score < stat_baseline_mae:
+                if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
                     try:
                         best_mdl = get_regressor(best_dur_name)
                         best_mdl.fit(X, y_dur)
@@ -1366,7 +1374,7 @@ def extract_energy_modifiers(
                     except Exception:
                         pass
 
-                if best_tr_name is not None and best_tr_score > majority_baseline_f1:
+                if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
                     try:
                         best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                         best_clf.fit(X, y_tr)
@@ -1560,16 +1568,21 @@ def extract_energy_direct_models(
             except Exception:
                 pass
 
-        if best_dur_name is not None and best_dur_score < stat_baseline_mae:
+        if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
             try:
                 best_mdl = get_regressor(best_dur_name)
                 best_mdl.fit(X, y_dur)
+                # Mean recalibration: exp(log_pred) is the geometric mean; correct toward
+                # the arithmetic mean so DurErr(whole) is not systematically biased.
+                _pred_mean = float(np.mean(np.exp(best_mdl.predict(X))))
+                _true_mean = float(np.mean(np.exp(y_dur)))
+                best_mdl._mean_correction    = _true_mean / _pred_mean if _pred_mean > 0 else 1.0
                 best_mdl._mean_duration      = mean_dur
                 best_mdl._log_duration       = True
                 best_mdl._train_feature_mean = train_feature_mean
                 best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
                 duration_models_direct[str(activity)] = best_mdl
-                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f})'
+                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f})'
                 if best_mdl._feature_importance:
                     top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
                     act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
@@ -1607,7 +1620,7 @@ def extract_energy_direct_models(
                 except Exception:
                     pass
 
-            if best_tr_name is not None and best_tr_score > majority_baseline_f1:
+            if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)
@@ -1764,16 +1777,19 @@ def extract_energy_direct_models_global(
             pass
 
     dur_models_out = {}
-    if best_dur_name is not None and best_dur_score < stat_baseline_mae:
+    if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
         best_mdl = get_regressor(best_dur_name)
         best_mdl.fit(X, y_dur)
+        _pred_mean = float(np.mean(np.exp(best_mdl.predict(X))))
+        _true_mean = float(np.mean(np.exp(y_dur)))
+        best_mdl._mean_correction    = _true_mean / _pred_mean if _pred_mean > 0 else 1.0
         best_mdl._log_duration       = True
         best_mdl._mean_duration      = mean_dur
         best_mdl._train_feature_mean = train_feature_mean
         best_mdl._curr_act_columns   = curr_act_columns
         best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
         dur_models_out['__global__'] = best_mdl
-        report['Duration'] = f'GLOBAL {best_dur_name} (CV MAE={best_dur_score:.3f})'
+        report['Duration'] = f'GLOBAL {best_dur_name} (CV MAE={best_dur_score:.3f}, corr={best_mdl._mean_correction:.3f})'
         print(f"  Global duration -> {best_dur_name} (CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
     else:
         report['Duration'] = f'Statistical (best ML CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
@@ -1800,7 +1816,7 @@ def extract_energy_direct_models_global(
             except Exception:
                 pass
 
-        if best_tr_name is not None and best_tr_score > majority_baseline_f1:
+        if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
             best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
             best_clf.fit(X, y_tr)
             best_clf._train_feature_mean = train_feature_mean
@@ -1958,7 +1974,7 @@ def extract_energy_quantile_models(
                 except Exception:
                     pass
 
-            if best_dur_name is not None and best_dur_score < stat_baseline_mae:
+            if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
                 try:
                     best_mdl = get_regressor(best_dur_name)
                     best_mdl.fit(X, q_full)
@@ -2004,7 +2020,7 @@ def extract_energy_quantile_models(
                 except Exception:
                     pass
 
-            if best_tr_name is not None and best_tr_score > majority_baseline_f1:
+            if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)

@@ -1710,7 +1710,7 @@ class ProcessSimulation:
                         try:
                             _raw = float(mdl.predict([energy_vec])[0])
                             if getattr(mdl, '_log_duration', False):
-                                _raw = np.exp(_raw)
+                                _raw = np.exp(_raw) * getattr(mdl, '_mean_correction', 1.0)
                             activity_duration = max(0.1, _raw)
                             if self.verbose:
                                 print(f"    [{chosen_label}] direct ML duration: "
