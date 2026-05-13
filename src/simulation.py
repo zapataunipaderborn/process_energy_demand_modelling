@@ -109,6 +109,7 @@ class ProcessSimulation:
             'petri_net_energy_direct_transition_only',
             'petri_net_energy_direct_global',
             'petri_net_quantile_blend',
+            'petri_net_test_2',
         )
         if self.mode in _ENERGY_MODES:
             if self.process_models is None or len(self.process_models) == 0:
@@ -1529,6 +1530,7 @@ class ProcessSimulation:
         enable_duration=True, enable_transitions=True,
         use_distribution=False,
         use_shape_preserving=False,
+        use_entropy_blend=False,
     ):
         """
         Simulate one case using the Petri net for structure, but with ML models
@@ -1640,6 +1642,19 @@ class ProcessSimulation:
                         current_energy_state['ef_hour_of_day_mean'] = float(_ts_now.hour)
                     if 'ef_day_of_week_mean' in self.energy_state_columns:
                         current_energy_state['ef_day_of_week_mean'] = float(_ts_now.weekday())
+                    # Cyclical temporal features for petri_net_test_2
+                    if any(c in self.energy_state_columns
+                           for c in ('hour_sin', 'hour_cos', 'dow_sin', 'dow_cos')):
+                        _h = float(_ts_now.hour) + float(_ts_now.minute) / 60.0
+                        _d = float(_ts_now.weekday())
+                        if 'hour_sin' in self.energy_state_columns:
+                            current_energy_state['hour_sin'] = float(np.sin(2 * np.pi * _h / 24))
+                        if 'hour_cos' in self.energy_state_columns:
+                            current_energy_state['hour_cos'] = float(np.cos(2 * np.pi * _h / 24))
+                        if 'dow_sin' in self.energy_state_columns:
+                            current_energy_state['dow_sin'] = float(np.sin(2 * np.pi * _d / 7))
+                        if 'dow_cos' in self.energy_state_columns:
+                            current_energy_state['dow_cos'] = float(np.cos(2 * np.pi * _d / 7))
                     if 'ctx_prev_duration' in self.energy_state_columns:
                         current_energy_state['ctx_prev_duration'] = _last_activity_duration
                     if 'ctx_case_position' in self.energy_state_columns:
@@ -1722,7 +1737,14 @@ class ProcessSimulation:
                             return [w / s for w in ws] if s > 0 else [1.0 / len(ws)] * len(ws)
                         ml_p = _norm(ml_w)
                         pn_p = _norm(pn_w)
-                        alpha = float(getattr(clf, '_blend_alpha', 1.0))
+                        if use_entropy_blend:
+                            # Dynamic entropy-based weight: high-confidence predictions
+                            # lean ML; uncertain predictions fall back toward PN prior.
+                            _H     = -float(np.sum(proba_vec * np.log(proba_vec + 1e-10)))
+                            _H_max = np.log(max(len(proba_vec), 2))
+                            alpha  = float(np.clip(1.0 - _H / _H_max, 0.0, 1.0))
+                        else:
+                            alpha = float(getattr(clf, '_blend_alpha', 1.0))
                         weights = [alpha * m + (1.0 - alpha) * p for m, p in zip(ml_p, pn_p)]
 
                         total = sum(weights)
@@ -2286,6 +2308,17 @@ class ProcessSimulation:
         if self.mode == 'petri_net_quantile_blend':
             self._simulate_petri_net_quantile_blend_for_case(
                 case_id, object_attributes, start_time,
+            )
+            return
+
+        # ── Test-2: temporal features + shape-preserving + entropy-blended transitions
+        if self.mode == 'petri_net_test_2':
+            self._simulate_petri_net_energy_direct_for_case(
+                case_id, object_attributes, start_time,
+                enable_duration=True,
+                enable_transitions=True,
+                use_shape_preserving=True,
+                use_entropy_blend=True,
             )
             return
 

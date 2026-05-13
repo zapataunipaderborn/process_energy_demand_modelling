@@ -260,6 +260,8 @@ MODES_TO_COMPARE = [
     'petri_net_direct_test',                    # ML shifts mean; shape sampled from fitted per-activity distribution
     # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
     'petri_net_quantile_blend',
+    # Test-2: direct log-residual + temporal (hour/dow sin/cos) + shape-preserving + entropy blend
+    'petri_net_test_2',
     #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
@@ -284,6 +286,8 @@ _ENERGY_AWARE_MODES = {
     'petri_net_direct_test',
     # Quantile-blend: ML predicts quantile of fitted dist + entropy-weighted transition blend
     'petri_net_quantile_blend',
+    # Test-2: temporal features + shape-preserving + entropy blend
+    'petri_net_test_2',
 }
 _ENERGY_DIRECT_MODES = {
     'petri_net_energy_direct',
@@ -296,6 +300,9 @@ _ENERGY_DIRECT_MODES = {
 _ENERGY_QUANTILE_MODES = {
     'petri_net_quantile_blend',
 }
+_ENERGY_TEST2_MODES = {
+    'petri_net_test_2',
+}
 
 # ── Duration modifier models ───────────────────────────────────────────────
 # List of sklearn-compatible regressor types to compete per activity
@@ -307,7 +314,7 @@ ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
 
 ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
 ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_SAMPLES         = 5           # skip ML (use statistical) if n_samples < this
+ENERGY_MIN_SAMPLES         = 3           # skip ML (use statistical) if n_samples < this
 
 # Will be populated per process after energy modelling:
 energy_modifiers_by_process = {}
@@ -341,7 +348,7 @@ PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
 # MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
 #   Runs local per-group search during extraction and keeps best model.
 # ─────────────────────────────────────────────────────────────────────────────
-OPTIMIZE_MINING_HYPERPARAMS = False
+OPTIMIZE_MINING_HYPERPARAMS = True
 MINING_SEARCH_SPACE = {
     'inductive_noise_thresholds': [0.05, 0.10, 0.20, 0.30, 0.40],
     'heuristic_params_grid': [
@@ -1340,9 +1347,24 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
 
     report(f"QUALITY ASSESSMENT: {quality_assessment}")
 
+    # Overwrite the individual result-dict entries with per-case median values so
+    # the flattening → heatmap pipeline uses per-case medians everywhere.
+    if _pc:
+        # event_count_ratio is stored raw; heatmap computes abs(ratio-1), so set
+        # ratio = 1 + median_err so the heatmap recovers the correct median error.
+        results['basic_metrics']['event_count_ratio']              = 1.0 + _pc['evt_ratio_err']
+        results['basic_metrics']['event_count_error']              = _pc['evt_ratio_err']
+        results['duration_metrics']['mean_duration_error']         = _pc['dur_err_whole']
+        if pd.notna(_pc.get('dur_err_activ', np.nan)):
+            results['duration_metrics']['activity_duration_error'] = _pc['dur_err_activ']
+        if pd.notna(_pc.get('js_div', np.nan)):
+            results['activity_metrics']['js_divergence']           = _pc['js_div']
+        if pd.notna(_pc.get('edge_f1', np.nan)):
+            results['control_flow_metrics']['edge_f1_score']       = _pc['edge_f1']
+
     results['overall_error'] = overall_error
     results['quality_assessment'] = quality_assessment
-    
+
     return results
 
 
@@ -2016,6 +2038,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     _quantile_dur_mods         = {}
                     _quantile_tr_mods          = {}
                     _quantile_energy_state_cols = []
+                    _test2_dur_mods            = {}
+                    _test2_tr_mods             = {}
+                    _test2_energy_state_cols   = []
                     _global_dur_mods           = {}
                     _global_tr_mods            = {}
                     _global_energy_state_cols  = []
@@ -2047,17 +2072,18 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             report(_choices_df.to_string(index=False))
                             display(_choices_df)
 
+                        # Flatten activity_config to {activity_str: stats} — shared by direct + test2
+                        _act_dur_config = {}
+                        for (_act, _obj, _otype, _higher), _stats in _best_base_stats.items():
+                            _ak = str(_act)
+                            if _ak not in _act_dur_config:
+                                _act_dur_config[_ak] = _stats
+
                         # ── Train direct ML models (if any direct modes requested) ──
                         _direct_modes_requested = [
                             m for m in _energy_modes_requested if m in _ENERGY_DIRECT_MODES
                         ]
                         if _direct_modes_requested:
-                            # Flatten activity_config to {activity_str: stats} for direct models
-                            _act_dur_config = {}
-                            for (_act, _obj, _otype, _higher), _stats in _best_base_stats.items():
-                                _ak = str(_act)
-                                if _ak not in _act_dur_config:
-                                    _act_dur_config[_ak] = _stats
                             _energy_direct_dur_mods, _energy_direct_tr_mods, _direct_energy_state_cols, _direct_report = \
                                 extract_energy_direct_models(
                                     df_expanded=_df_expanded_train,
@@ -2104,6 +2130,33 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 _q_df.insert(0, 'Dataset/Process', process)
                                 report(_q_df.to_string(index=False))
                                 display(_q_df)
+
+                        # ── Train test-2 models (direct + temporal features) ──────────────
+                        _test2_dur_mods, _test2_tr_mods, _test2_energy_state_cols = {}, {}, []
+                        _test2_modes_requested = [
+                            m for m in _energy_modes_requested if m in _ENERGY_TEST2_MODES
+                        ]
+                        if _test2_modes_requested:
+                            from sim_extractor import extract_energy_test2_models
+                            _test2_dur_mods, _test2_tr_mods, _test2_energy_state_cols, _test2_report = \
+                                extract_energy_test2_models(
+                                    df_expanded=_df_expanded_train,
+                                    sensors=_sensors,
+                                    duration_models=ENERGY_DURATION_MODELS,
+                                    transition_models=ENERGY_TRANSITION_MODELS,
+                                    min_samples=ENERGY_MIN_SAMPLES,
+                                    ef_cols=_ef_ep_cols,
+                                    activity_config=_act_dur_config,
+                                )
+                            if _test2_report:
+                                report("\n" + "="*80)
+                                report(f"TEST-2 MODEL TRACKING | Process: {process}")
+                                report("="*80)
+                                _t2_df = pd.DataFrame.from_dict(_test2_report, orient='index').reset_index()
+                                _t2_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
+                                _t2_df.insert(0, 'Dataset/Process', process)
+                                report(_t2_df.to_string(index=False))
+                                display(_t2_df)
 
                         # ── Train global direct model (one model, all activities pooled) ──
                         _global_dur_mods, _global_tr_mods, _global_energy_state_cols = {}, {}, []
@@ -2264,10 +2317,15 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         _is_global   = _energy_mode == 'petri_net_energy_direct_global'
                         _is_direct   = _energy_mode in _ENERGY_DIRECT_MODES
                         _is_quantile = _energy_mode in _ENERGY_QUANTILE_MODES
+                        _is_test2    = _energy_mode in _ENERGY_TEST2_MODES
                         if _is_global:
                             _dur_mods   = _global_dur_mods
                             _tr_mods    = _global_tr_mods
                             _state_cols = _global_energy_state_cols
+                        elif _is_test2:
+                            _dur_mods   = _test2_dur_mods
+                            _tr_mods    = _test2_tr_mods
+                            _state_cols = _test2_energy_state_cols
                         elif _is_quantile:
                             _dur_mods   = _quantile_dur_mods
                             _tr_mods    = _quantile_tr_mods

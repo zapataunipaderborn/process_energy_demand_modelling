@@ -32,8 +32,8 @@ _DIST_MAP = {
 #             majority-class baseline by at least this absolute margin.
 # _TR_BLEND_FULL: lift over baseline at which the simulator uses fully-ML
 #             transition probabilities (linear interpolation below this).
-_DUR_ACCEPTANCE_RATIO = 0.80   # require ≥20% MAE improvement over baseline
-_TR_ACCEPTANCE_MARGIN = 0.01   # require ≥1 pp balanced-accuracy lift
+_DUR_ACCEPTANCE_RATIO = 0.95   # require ≥5% MAE improvement over baseline
+_TR_ACCEPTANCE_MARGIN = 0.0    # accept any balanced-accuracy lift over baseline
 _TR_BLEND_FULL        = 0.05   # ≥5 pp lift → α = 1.0 (pure ML routing)
 
 
@@ -1727,6 +1727,266 @@ def extract_energy_direct_models(
     return duration_models_direct, transition_models_direct, energy_state_columns, model_choices_report
 
 
+def extract_energy_test2_models(
+    df_expanded,
+    sensors,
+    activity_col='activity_log',
+    duration_models=None,
+    transition_models=None,
+    min_samples=30,
+    timestamp_start_col='timestamp_start_log',
+    datetime_energy_col='datetime_energy',
+    ef_cols=None,
+    activity_config=None,
+):
+    """
+    petri_net_test_2 extractor.
+
+    Identical to extract_energy_direct_models but with two additions:
+      1. Temporal features (hour_sin, hour_cos, dow_sin, dow_cos) extracted
+         from the activity start timestamp and added to the feature matrix.
+      2. Cumulative case duration, activity occurrence count, and case position
+         are already present via _build_energy_state_matrix_with_next.
+
+    At simulation time these features are updated each step from current_sim_time.
+    """
+    print("\n" + "=" * 70)
+    print("ENERGY TEST-2 MODEL EXTRACTION (direct + temporal)")
+    print("=" * 70)
+    print(f"  Sensors          : {sensors}")
+    print(f"  Duration models  : {duration_models}")
+    print(f"  Transition models: {transition_models}")
+
+    from xgboost import XGBRegressor
+    from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import KFold, cross_val_score
+    from sklearn.dummy import DummyRegressor, DummyClassifier
+    from sklearn.utils.class_weight import compute_class_weight
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+
+    if duration_models is None:   duration_models   = ['xgboost']
+    if transition_models is None: transition_models = ['logistic']
+
+    def get_regressor(name):
+        if name == 'xgboost':     return XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.1, subsample=0.8, verbosity=0, random_state=42)
+        if name == 'linear':      return LinearRegression()
+        if name == 'lasso':       return Lasso(alpha=0.1, random_state=42)
+        if name == 'mlp':         return MLPRegressor(hidden_layer_sizes=(50,), max_iter=500, random_state=42)
+        if name == 'statistical': return StatisticalDurationBaseline(log_ratio=False)
+        return XGBRegressor(n_estimators=100, random_state=42)
+
+    def get_classifier(name):
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced')
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42, class_weight='balanced')
+        if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
+        return LogisticRegression(max_iter=1000, random_state=42)
+
+    df_recs = _build_energy_state_matrix_with_next(
+        df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
+        ef_cols=ef_cols,
+        include_temporal=True,
+    )
+    print(f"  External factors : {[c for c in (ef_cols or []) if c in df_expanded.columns]}")
+
+    energy_state_columns = []
+    for s in sensors:
+        energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
+                                  f'{s}_start', f'{s}_delta', f'{s}_integral']
+    for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
+        energy_state_columns += [f'{_efc}_mean']
+    energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+    for _c in ['prev_act_mean', 'prev_act_std', 'prev_act_max', 'prev_act_end', 'prev_act_len']:
+        if _c in df_recs.columns and _c not in energy_state_columns:
+            energy_state_columns.append(_c)
+    for _ctx_c in ['ctx_prev_duration', 'ctx_case_position', 'ctx_time_in_case',
+                   'ctx_activity_occurrence_count']:
+        if _ctx_c in df_recs.columns and _ctx_c not in energy_state_columns:
+            energy_state_columns.append(_ctx_c)
+    for _tc in ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos']:
+        if _tc in df_recs.columns and _tc not in energy_state_columns:
+            energy_state_columns.append(_tc)
+    print(f"  Temporal features: hour_sin, hour_cos, dow_sin, dow_cos added")
+    print(f"  Total features   : {len(energy_state_columns)}")
+
+    if df_recs.empty:
+        print("  WARNING: no valid instances — returning empty models.")
+        return {}, {}, energy_state_columns, {}
+
+    print(f"  Total instances  : {len(df_recs)}")
+
+    if activity_config is not None and 'activity' in df_recs.columns:
+        df_recs['stat_log_dur'] = df_recs['activity'].apply(
+            lambda a: float(np.log(max(0.1, (activity_config or {}).get(str(a), {}).get('duration', 1.0))))
+        )
+        if 'stat_log_dur' not in energy_state_columns:
+            energy_state_columns.append('stat_log_dur')
+        print(f"  stat_log_dur     : added ({df_recs['stat_log_dur'].nunique()} unique values)")
+
+    if 'next_activity' in df_recs.columns and 'activity' in df_recs.columns:
+        _pn_all_classes = sorted(df_recs['next_activity'].dropna().unique())
+        for _cls in _pn_all_classes:
+            df_recs[f'pn_freq_{_cls}'] = 0.0
+        for _act_key, _act_grp in df_recs.groupby('activity'):
+            _cnts = _act_grp['next_activity'].value_counts(normalize=True)
+            for _nxt, _freq in _cnts.items():
+                df_recs.loc[_act_grp.index, f'pn_freq_{_nxt}'] = float(_freq)
+        _pn_freq_cols = [f'pn_freq_{c}' for c in _pn_all_classes]
+        energy_state_columns = energy_state_columns + [c for c in _pn_freq_cols
+                                                        if c not in energy_state_columns]
+        print(f"  PN-freq features : {len(_pn_freq_cols)} next-activity priors")
+
+    if 'prev_activity' in df_recs.columns:
+        prev_dummies = pd.get_dummies(df_recs['prev_activity'], prefix='prev_act').astype(float)
+        df_recs = pd.concat([df_recs.reset_index(drop=True), prev_dummies.reset_index(drop=True)], axis=1)
+        energy_state_columns = energy_state_columns + [c for c in prev_dummies.columns
+                                                        if c not in energy_state_columns]
+        print(f"  Prev-activity cols: {len(prev_dummies.columns)}")
+
+    duration_models_out   = {}
+    transition_models_out = {}
+    model_choices_report  = {}
+
+    for activity, grp in df_recs.groupby('activity'):
+        X       = grp[energy_state_columns].values
+        y_dur   = np.log(grp['duration'].values.clip(0.1))
+        y_tr    = grp['next_activity'].values
+        n       = len(grp)
+        n_classes = len(set(y_tr))
+
+        train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+        mean_dur           = float(y_dur.mean())
+
+        act_report = {
+            'Duration Approach':   f'Statistical (n={n}<{min_samples})',
+            'Transition Approach': f'Statistical (n={n}<{min_samples})',
+        }
+
+        if n < min_samples:
+            model_choices_report[str(activity)] = act_report
+            continue
+
+        n_splits = max(2, min(5, n // 5))
+        _kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        stat_baseline_mae = float(-cross_val_score(
+            DummyRegressor(strategy='mean'), X, y_dur,
+            cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
+        ).mean())
+        best_dur_score = float('inf')
+        best_dur_name  = None
+
+        for model_name in duration_models:
+            try:
+                cv_mae = float(-cross_val_score(
+                    get_regressor(model_name), X, y_dur,
+                    cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                    scoring='neg_mean_absolute_error', error_score=np.inf,
+                ).mean())
+                if cv_mae < best_dur_score:
+                    best_dur_score = cv_mae
+                    best_dur_name  = model_name
+            except Exception:
+                pass
+
+        if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
+            try:
+                best_mdl = get_regressor(best_dur_name)
+                _stat_dur = (activity_config or {}).get(str(activity), {}).get('duration')
+                _log_act_mean = float(np.log(max(0.1, _stat_dur))) if (_stat_dur and _stat_dur > 0) else float(np.mean(y_dur))
+                y_residual = y_dur - _log_act_mean
+                best_mdl.fit(X, y_residual)
+                _pred_residuals = best_mdl.predict(X)
+                _pred_durs = np.exp(_log_act_mean + _pred_residuals)
+                _pred_mean = float(np.mean(_pred_durs))
+                _true_mean = float(np.mean(np.exp(y_dur)))
+                best_mdl._mean_correction    = _true_mean / _pred_mean if _pred_mean > 0 else 1.0
+                _residual_std = float(np.std(y_residual - _pred_residuals))
+                best_mdl._log_std = max(_residual_std, 0.01)
+                _pred_lnorm_mean = _pred_mean * float(np.exp(0.5 * _residual_std ** 2))
+                best_mdl._mean_correction_dist = _true_mean / _pred_lnorm_mean if _pred_lnorm_mean > 0 else 1.0
+                best_mdl._mean_duration      = mean_dur
+                best_mdl._log_duration       = True
+                best_mdl._log_act_mean       = _log_act_mean
+                best_mdl._train_feature_mean = train_feature_mean
+                best_mdl._feature_importance = _extract_feature_importance(best_mdl, energy_state_columns)
+                duration_models_out[str(activity)] = best_mdl
+                act_report['Duration Approach'] = f'{best_dur_name} (CV MAE={best_dur_score:.3f}, α={best_mdl._mean_correction:.3f})'
+                if best_mdl._feature_importance:
+                    top = sorted(best_mdl._feature_importance.items(), key=lambda kv: -kv[1])[:3]
+                    act_report['Duration Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
+                print(f"  [{activity}] Duration -> {best_dur_name} (CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
+            except Exception as exc:
+                print(f"  [{activity}] Duration FAILED: {exc}")
+                act_report['Duration Approach'] = 'Statistical (ML fit failed)'
+        else:
+            act_report['Duration Approach'] = (
+                f'Statistical (best CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
+            )
+            print(f"  [{activity}] Duration -> statistical (CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
+
+        if n_classes >= 2:
+            majority_baseline_ba = float(cross_val_score(
+                DummyClassifier(strategy='most_frequent'), X, y_tr,
+                cv=_kf, scoring='balanced_accuracy', error_score=0.0,
+            ).mean())
+            best_tr_score = -float('inf')
+            best_tr_name  = None
+
+            for model_name in transition_models:
+                try:
+                    cv_ba = float(cross_val_score(
+                        get_classifier(model_name), X, y_tr,
+                        cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                        scoring='balanced_accuracy', error_score=0.0,
+                    ).mean())
+                    if cv_ba > best_tr_score:
+                        best_tr_score = cv_ba
+                        best_tr_name  = model_name
+                except Exception:
+                    pass
+
+            lift = best_tr_score - majority_baseline_ba
+            if best_tr_name is not None and lift > _TR_ACCEPTANCE_MARGIN:
+                try:
+                    best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
+                    _classes = np.unique(y_tr)
+                    _cw = compute_class_weight(class_weight='balanced', classes=_classes, y=y_tr)
+                    _sample_weight = np.array([dict(zip(_classes, _cw))[c] for c in y_tr])
+                    best_clf.fit(X, y_tr, sample_weight=_sample_weight)
+                    best_clf._train_feature_mean = train_feature_mean
+                    best_clf._feature_importance = _extract_feature_importance(best_clf, energy_state_columns)
+                    best_clf._blend_alpha = float(min(1.0, max(0.0, lift / _TR_BLEND_FULL)))
+                    transition_models_out[str(activity)] = best_clf
+                    act_report['Transition Approach'] = (
+                        f'{best_tr_name} (CV BA={best_tr_score:.3f}, lift={lift:+.3f}, α={best_clf._blend_alpha:.2f})'
+                    )
+                    if best_clf._feature_importance:
+                        top = sorted(best_clf._feature_importance.items(), key=lambda kv: -kv[1])[:3]
+                        act_report['Transition Top Features'] = ', '.join(f'{k}:{v:.3f}' for k, v in top)
+                    print(f"  [{activity}] Transition -> {best_tr_name} (CV BA={best_tr_score:.3f}, lift={lift:+.3f}, α={best_clf._blend_alpha:.2f}) ✓")
+                except Exception as exc:
+                    print(f"  [{activity}] Transition FAILED: {exc}")
+                    act_report['Transition Approach'] = 'Statistical (ML fit failed)'
+            else:
+                act_report['Transition Approach'] = (
+                    f'Statistical (CV BA={best_tr_score:.3f}, lift={lift:+.3f} ≤ {_TR_ACCEPTANCE_MARGIN})'
+                )
+                print(f"  [{activity}] Transition -> statistical (CV BA={best_tr_score:.3f}, lift={lift:+.3f})")
+        else:
+            act_report['Transition Approach'] = 'Statistical (1 class only)'
+
+        model_choices_report[str(activity)] = act_report
+
+    print(f"\n  Duration test2 models  : {len(duration_models_out)} activities use ML")
+    print(f"  Transition test2 models: {len(transition_models_out)} activities use ML")
+
+    return duration_models_out, transition_models_out, energy_state_columns, model_choices_report
+
+
 def extract_energy_direct_models_global(
     df_expanded,
     sensors,
@@ -2140,10 +2400,15 @@ def extract_energy_quantile_models(
 def _build_energy_state_matrix_with_next(
     df_expanded, sensors, activity_col, timestamp_start_col, datetime_energy_col,
     ef_cols=None,
+    include_temporal=False,
 ):
     """
     Like _build_energy_state_matrix but also resolves next_activity
     from the chronological order within each (case, object) group.
+
+    include_temporal: if True, adds hour_sin/cos and dow_sin/cos from the
+    activity start timestamp.  These are cyclically encoded so the model
+    sees continuity across midnight/Sunday boundaries.
     """
     records = []
 
@@ -2313,6 +2578,15 @@ def _build_energy_state_matrix_with_next(
             'ctx_activity_occurrence_count':  float(ctx_occ_map.get(instance_id, 0.0)),
         }
 
+        if include_temporal:
+            _ts = inst_row['ts']
+            _h  = float(_ts.hour) + float(_ts.minute) / 60.0
+            _d  = float(_ts.weekday())
+            row['hour_sin'] = float(np.sin(2 * np.pi * _h / 24))
+            row['hour_cos'] = float(np.cos(2 * np.pi * _h / 24))
+            row['dow_sin']  = float(np.sin(2 * np.pi * _d / 7))
+            row['dow_cos']  = float(np.cos(2 * np.pi * _d / 7))
+
         for k, v in base_summary.items():
             if not k.startswith('__primary_'):
                 row[k] = v
@@ -2330,7 +2604,7 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from dtw import dtw
 from tslearn.barycenters import dtw_barycenter_averaging
@@ -7312,7 +7586,7 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 import optuna  # Assuming optuna is installed
