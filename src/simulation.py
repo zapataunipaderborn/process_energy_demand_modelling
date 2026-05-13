@@ -109,6 +109,7 @@ class ProcessSimulation:
             'petri_net_energy_direct_transition_only',
             'petri_net_energy_direct_global',
             'petri_net_quantile_blend',
+            'petri_net_blend_duration',
             'petri_net_test_2',
         )
         if self.mode in _ENERGY_MODES:
@@ -433,7 +434,7 @@ class ProcessSimulation:
         return np.random.choice(enabled_list, p=probs)
 
     def _simulate_petri_net_for_case(self, case_id, object_attributes,
-                                     start_time):
+                                     start_time, use_median_duration=False):
         """
         Simulate one case using the Petri net token game.
 
@@ -529,14 +530,18 @@ class ProcessSimulation:
 
                     if act_key in self.activity_config:
                         config = self.activity_config[act_key]
-                        dist_name = config.get('dist_name', 'norm')
-                        dist_params = config.get('dist_params')
-                        if dist_params and any(p != 0 for p in dist_params[1:]):
-                            activity_duration = sample_from_dist(
-                                dist_name, dist_params
-                            )
-                        else:
+                        if use_median_duration:
+                            # Constant per-activity median — no sampling
                             activity_duration = max(0.1, config['duration'])
+                        else:
+                            dist_name = config.get('dist_name', 'norm')
+                            dist_params = config.get('dist_params')
+                            if dist_params and any(p != 0 for p in dist_params[1:]):
+                                activity_duration = sample_from_dist(
+                                    dist_name, dist_params
+                                )
+                            else:
+                                activity_duration = max(0.1, config['duration'])
                     elif activity_label in duration_map:
                         dn, dp = duration_map[activity_label]
                         activity_duration = sample_from_dist(dn, dp)
@@ -1531,6 +1536,7 @@ class ProcessSimulation:
         use_distribution=False,
         use_shape_preserving=False,
         use_entropy_blend=False,
+        use_alpha_blend=False,
     ):
         """
         Simulate one case using the Petri net for structure, but with ML models
@@ -1737,12 +1743,15 @@ class ProcessSimulation:
                             return [w / s for w in ws] if s > 0 else [1.0 / len(ws)] * len(ws)
                         ml_p = _norm(ml_w)
                         pn_p = _norm(pn_w)
-                        if use_entropy_blend:
-                            # Dynamic entropy-based weight: high-confidence predictions
-                            # lean ML; uncertain predictions fall back toward PN prior.
-                            _H     = -float(np.sum(proba_vec * np.log(proba_vec + 1e-10)))
-                            _H_max = np.log(max(len(proba_vec), 2))
-                            alpha  = float(np.clip(1.0 - _H / _H_max, 0.0, 1.0))
+                        _H     = -float(np.sum(proba_vec * np.log(proba_vec + 1e-10)))
+                        _H_max = np.log(max(len(proba_vec), 2))
+                        if use_alpha_blend:
+                            # Scale trained quality (_tr_alpha) by runtime entropy confidence
+                            _tr_alpha     = float(getattr(clf, '_tr_alpha', 1.0))
+                            _entropy_conf = float(np.clip(1.0 - _H / _H_max, 0.0, 1.0))
+                            alpha = _tr_alpha * _entropy_conf
+                        elif use_entropy_blend:
+                            alpha = float(np.clip(1.0 - _H / _H_max, 0.0, 1.0))
                         else:
                             alpha = float(getattr(clf, '_blend_alpha', 1.0))
                         weights = [alpha * m + (1.0 - alpha) * p for m, p in zip(ml_p, pn_p)]
@@ -1800,7 +1809,20 @@ class ProcessSimulation:
                             _raw = float(mdl.predict([energy_vec])[0])
                             if getattr(mdl, '_log_duration', False):
                                 _base = float(getattr(mdl, '_log_act_mean', 0.0))
-                                if use_shape_preserving:
+                                if use_alpha_blend:
+                                    # Continuous blend: log_dur = log(dist_sample) + alpha * ml_residual
+                                    # Cap at 0.2 so noisy CV estimates don't over-weight ML
+                                    _alpha_dur   = min(float(getattr(mdl, '_dur_alpha', 0.0)), 0.2)
+                                    _act_key_ab  = (chosen_label, object_name, object_type, higher_level_activity)
+                                    _act_cfg_ab  = self.activity_config.get(_act_key_ab, {})
+                                    _dn = _act_cfg_ab.get('dist_name', 'norm')
+                                    _dp = _act_cfg_ab.get('dist_params')
+                                    if _dp and any(p != 0 for p in _dp[1:]):
+                                        _stat = max(0.1, float(sample_from_dist(_dn, _dp)))
+                                    else:
+                                        _stat = float(_act_cfg_ab.get('duration', np.exp(_base)))
+                                    _raw = float(np.exp(np.log(max(0.1, _stat)) + _alpha_dur * _raw))
+                                elif use_shape_preserving:
                                     # Shape-preserving: ignore ML point estimate entirely;
                                     # sample from per-activity fitted distribution so
                                     # DurErr(activ) matches statistical quality.
@@ -2243,6 +2265,14 @@ class ProcessSimulation:
             )
             return
 
+        # ── Median-duration: same PN transitions, constant per-activity median
+        if self.mode == 'petri_net_median_duration':
+            self._simulate_petri_net_for_case(
+                case_id, object_attributes, start_time,
+                use_median_duration=True,
+            )
+            return
+
         # ── Petri net + statistical combined mode ─────────────────────
         if self.mode == 'petri_net_statistical':
             self._simulate_petri_net_statistical_for_case(
@@ -2304,10 +2334,23 @@ class ProcessSimulation:
             )
             return
 
-        # ── Quantile-blend: quantile-conditioned duration + entropy-blended transitions
+        # ── Quantile-blend: alpha-blend duration + alpha*entropy transition blend
         if self.mode == 'petri_net_quantile_blend':
-            self._simulate_petri_net_quantile_blend_for_case(
+            self._simulate_petri_net_energy_direct_for_case(
                 case_id, object_attributes, start_time,
+                enable_duration=True,
+                enable_transitions=True,
+                use_alpha_blend=True,
+            )
+            return
+
+        # ── Blend-duration: alpha-blend duration only; pure PN transitions
+        if self.mode == 'petri_net_blend_duration':
+            self._simulate_petri_net_energy_direct_for_case(
+                case_id, object_attributes, start_time,
+                enable_duration=True,
+                enable_transitions=False,
+                use_alpha_blend=True,
             )
             return
 

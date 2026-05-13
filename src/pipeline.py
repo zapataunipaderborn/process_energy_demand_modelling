@@ -18,7 +18,7 @@ from pathlib import Path
 EXPERIMENTS = [
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_87',
+        'run_name':              'experiment_88',
         'processes_to_run':      ['process_2', 'process_3', 'process_4'],
         'temporal_resolution':   '5min',
         'run_process_modelling': True,

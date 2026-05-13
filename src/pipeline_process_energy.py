@@ -344,6 +344,9 @@ METRICS_LOWER_IS_BETTER = {
     'duration_metrics_mean_duration_error',
     'duration_metrics_median_duration_error',
     'duration_metrics_std_duration_error',
+    'duration_metrics_activity_duration_error',
+    'duration_metrics_dur_js_whole',
+    'duration_metrics_dur_js_activ',
     'case_metrics_events_per_case_ks',
     'case_metrics_median_events_per_case_error',
 }
@@ -353,7 +356,10 @@ CORE_METRIC_BASES = [
     'overall_score',
     'basic_metrics_event_count_ratio',
     'duration_metrics_mean_duration_error',
-    'duration_metrics_median_duration_error', 
+    'duration_metrics_median_duration_error',
+    'duration_metrics_activity_duration_error',
+    'duration_metrics_dur_js_whole',
+    'duration_metrics_dur_js_activ',
     'conformance_metrics_fitness',
     'conformance_metrics_precision',
     'conformance_metrics_generalization',
@@ -457,6 +463,12 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None):
         'test_duration_metrics_mean_duration_error':  'MeanDurErr',
         'train_duration_metrics_median_duration_error': 'MedDurErr',
         'test_duration_metrics_median_duration_error':  'MedDurErr',
+        'train_duration_metrics_activity_duration_error': 'ActDurErr',
+        'test_duration_metrics_activity_duration_error':  'ActDurErr',
+        'train_duration_metrics_dur_js_whole': 'DurJS(W)',
+        'test_duration_metrics_dur_js_whole':  'DurJS(W)',
+        'train_duration_metrics_dur_js_activ': 'DurJS(A)',
+        'test_duration_metrics_dur_js_activ':  'DurJS(A)',
         'train_conformance_metrics_fitness': 'Fitness',
         'test_conformance_metrics_fitness':  'Fitness',
         'train_conformance_metrics_precision': 'Precision',
@@ -1293,8 +1305,30 @@ def _safe_simplicity(net):
     complexity = len(net.places) + len(net.transitions) + len(net.arcs)
     return float(1.0 / (1.0 + 0.005 * float(complexity)))
 
+def _dur_js(a, b, n_bins=20):
+    """JS divergence between two duration sample arrays using log-space histogram bins."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a) & (a > 0)]
+    b = b[np.isfinite(b) & (b > 0)]
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+    lo = max(np.percentile(np.concatenate([a, b]), 1), 1e-3)
+    hi = np.percentile(np.concatenate([a, b]), 99)
+    if lo >= hi:
+        return 0.0
+    bins = np.exp(np.linspace(np.log(lo), np.log(hi), n_bins + 1))
+    p, _ = np.histogram(a, bins=bins)
+    q, _ = np.histogram(b, bins=bins)
+    p = p.astype(float) + 1e-9
+    q = q.astype(float) + 1e-9
+    p /= p.sum()
+    q /= q.sum()
+    return float(jensenshannon(p, q))
+
+
 def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=None,
-                                       case_col='case_id', activity_col='activity', 
+                                       case_col='case_id', activity_col='activity',
                                        start_col='timestamp_start', end_col='timestamp_end'):
     """
     Comprehensive evaluation of simulation quality based on process mining literature
@@ -1422,14 +1456,45 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report(f"\nKolmogorov-Smirnov Test: KS={duration_ks_stat:.4f}, p-value={duration_ks_pvalue:.4f}")
     report(f"(p > 0.05 suggests distributions are similar)")
     
+    # Per-activity duration error
+    _real_act_dur = (real_df.assign(_d=(real_df[end_col] - real_df[start_col]).dt.total_seconds())
+                     .groupby(activity_col)['_d'].mean())
+    _sim_act_dur  = (simulated_df.assign(_d=(simulated_df[end_col] - simulated_df[start_col]).dt.total_seconds())
+                     .groupby(activity_col)['_d'].mean())
+    _common_acts  = _real_act_dur.index.intersection(_sim_act_dur.index)
+    _act_dur_errs = [abs(_sim_act_dur[a] - _real_act_dur[a]) / _real_act_dur[a]
+                     for a in _common_acts if _real_act_dur[a] != 0]
+    activity_duration_error = float(np.mean(_act_dur_errs)) if _act_dur_errs else np.nan
+    report(f"Per-activity mean duration error: {activity_duration_error:.4f} (0=perfect)")
+
+    # Duration distribution JS divergence
+    dur_js_whole = _dur_js(sim_durations.values, real_durations.values)
+    _act_dur_js = []
+    for _act in _common_acts:
+        _r = (real_df[real_df[activity_col] == _act]
+              .pipe(lambda d: (d[end_col] - d[start_col]).dt.total_seconds() / 60.0)
+              .replace([np.inf, -np.inf], np.nan).dropna())
+        _s = (simulated_df[simulated_df[activity_col] == _act]
+              .pipe(lambda d: (d[end_col] - d[start_col]).dt.total_seconds() / 60.0)
+              .replace([np.inf, -np.inf], np.nan).dropna())
+        _js = _dur_js(_r.values, _s.values)
+        if pd.notna(_js):
+            _act_dur_js.append(_js)
+    dur_js_activ = float(np.mean(_act_dur_js)) if _act_dur_js else np.nan
+    report(f"Duration JS divergence (whole): {dur_js_whole:.4f} (0=perfect)")
+    report(f"Duration JS divergence (per-activity mean): {dur_js_activ:.4f} (0=perfect)")
+
     results['duration_metrics'] = {
         'ks_statistic': duration_ks_stat,
         'ks_pvalue': duration_ks_pvalue,
         'mean_duration_error': duration_stats.loc['Mean', 'Error'],
         'median_duration_error': duration_stats.loc['Median', 'Error'],
-        'std_duration_error': duration_stats.loc['Std', 'Error']
+        'std_duration_error': duration_stats.loc['Std', 'Error'],
+        'activity_duration_error': activity_duration_error,
+        'dur_js_whole': dur_js_whole,
+        'dur_js_activ': dur_js_activ,
     }
-    
+
     # ========== 4. CASE-LEVEL ANALYSIS ==========
     report("\n4. CASE-LEVEL ANALYSIS")
     report("-" * 40)

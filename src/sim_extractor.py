@@ -2185,21 +2185,26 @@ def extract_energy_direct_models_global(
 def extract_energy_quantile_models(
     df_expanded,
     sensors,
-    stats_df,
+    stats_df=None,
     duration_models=None,
     transition_models=None,
-    min_samples=30,
+    min_samples=3,
     ef_cols=None,
-    jitter_std=0.15,
+    activity_col='activity_log',
+    activity_config=None,
+    jitter_std=0.15,  # kept for back-compat, unused
 ):
     """
-    Train per-activity models for the `petri_net_quantile_blend` method.
+    Train per-activity alpha-blend models for petri_net_quantile_blend.
 
-    Duration model  — Ridge regression with target q_i = dist.cdf(actual_duration_i).
-    The stored model predicts a quantile in [0,1]; the simulator inverts the CDF at
-    inference time, preserving the fitted distribution shape exactly.
+    Duration:   log-duration residual target.  Stores _dur_alpha = fraction of
+                MAE improvement over a dummy baseline (0=no gain, 1=perfect).
+                Simulation: log_dur = log(dist_sample) + _dur_alpha * ml_residual
+                When _dur_alpha=0 the result is pure statistical sampling.
 
-    Transition model — CalibratedClassifierCV same as energy_direct.
+    Transition: calibrated classifier with _tr_alpha = fraction of F1 improvement
+                over majority-class baseline, combined with entropy confidence at
+                runtime: effective_alpha = _tr_alpha * entropy_conf.
     """
     from xgboost import XGBRegressor
     from sklearn.linear_model import LinearRegression, Lasso, Ridge, LogisticRegression
@@ -2210,12 +2215,12 @@ def extract_energy_quantile_models(
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
     from sklearn.metrics import mean_absolute_error, f1_score
-    from collections import Counter
+    from sklearn.utils.class_weight import compute_class_weight
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
 
     if duration_models is None:
-        duration_models = ['ridge', 'lasso', 'random_forest']
+        duration_models = ['ridge', 'lasso', 'xgboost', 'random_forest']
     if transition_models is None:
         transition_models = ['logistic', 'random_forest', 'gradient_boosting']
 
@@ -2229,132 +2234,147 @@ def extract_energy_quantile_models(
         return Ridge(alpha=1.0)
 
     def get_classifier(name):
-        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42)
-        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        if name == 'logistic':          return LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced')
+        if name == 'random_forest':     return RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42, class_weight='balanced')
         if name == 'gradient_boosting': return GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42)
         return LogisticRegression(max_iter=1000, random_state=42)
 
-    # Build per-activity distribution lookup from stats_df
-    dist_lookup = {}
-    if stats_df is not None:
-        for _, row in stats_df.iterrows():
-            act = str(row.get('activity', '')).strip()
-            dn  = row.get('dist_name', 'norm')
-            dp  = row.get('dist_params')
-            if act and dn and dp is not None:
-                dist_lookup[act] = (dn, dp)
-
     df_recs = _build_energy_state_matrix_with_next(
         df_expanded, sensors,
+        activity_col=activity_col,
         timestamp_start_col='timestamp_start_log',
         datetime_energy_col='datetime_energy',
         ef_cols=ef_cols,
     )
 
+    # Build energy_state_columns matching extract_energy_direct_models pattern
     energy_state_columns = []
     for s in sensors:
         energy_state_columns += [f'{s}_mean', f'{s}_end', f'{s}_std',
                                   f'{s}_start', f'{s}_delta', f'{s}_integral']
-    _ef_cols_present = [c for c in (ef_cols or []) if c in df_recs.columns]
-    for _efc in _ef_cols_present:
+    for _efc in [c for c in (ef_cols or []) if c in df_expanded.columns]:
         energy_state_columns += [f'{_efc}_mean']
+    energy_state_columns = [c for c in energy_state_columns if c in df_recs.columns]
+    for _c in ['prev_act_mean', 'prev_act_std', 'prev_act_max', 'prev_act_end', 'prev_act_len']:
+        if _c in df_recs.columns and _c not in energy_state_columns:
+            energy_state_columns.append(_c)
+    for _c in ['ctx_prev_duration', 'ctx_case_position', 'ctx_time_in_case',
+               'ctx_activity_occurrence_count']:
+        if _c in df_recs.columns and _c not in energy_state_columns:
+            energy_state_columns.append(_c)
 
-    # Add prev_activity one-hot (same as energy_direct)
-    if 'prev_activity' in df_recs.columns:
-        prev_dummies = pd.get_dummies(df_recs['prev_activity'], prefix='prev_act').astype(float)
-        df_recs = pd.concat([df_recs.reset_index(drop=True), prev_dummies.reset_index(drop=True)], axis=1)
-        energy_state_columns = energy_state_columns + [c for c in prev_dummies.columns
-                                                        if c not in energy_state_columns]
+    if df_recs.empty:
+        print("  WARNING: no valid instances — returning empty models.")
+        return {}, {}, energy_state_columns, {}
 
-    quantile_duration_models  = {}
-    transition_models_out     = {}
-    model_choices_report      = {}
+    # stat_log_dur: log of per-activity mean duration from fitted distribution
+    if activity_config is not None and 'activity' in df_recs.columns:
+        df_recs['stat_log_dur'] = df_recs['activity'].apply(
+            lambda a: float(np.log(max(0.1, (activity_config or {}).get(str(a), {}).get('duration', 1.0))))
+        )
+        if 'stat_log_dur' not in energy_state_columns:
+            energy_state_columns.append('stat_log_dur')
+
+    # pn_freq_*: empirical transition frequencies per activity
+    if 'next_activity' in df_recs.columns and 'activity' in df_recs.columns:
+        _pn_classes = sorted(df_recs['next_activity'].dropna().unique())
+        for _cls in _pn_classes:
+            df_recs[f'pn_freq_{_cls}'] = 0.0
+        for _ak, _ag in df_recs.groupby('activity'):
+            _cnts = _ag['next_activity'].value_counts(normalize=True)
+            for _nxt, _freq in _cnts.items():
+                df_recs.loc[_ag.index, f'pn_freq_{_nxt}'] = float(_freq)
+        _pn_freq_cols = [f'pn_freq_{c}' for c in _pn_classes]
+        energy_state_columns += [c for c in _pn_freq_cols if c not in energy_state_columns]
+
+    alpha_duration_models = {}
+    transition_models_out = {}
+    model_choices_report  = {}
 
     for activity, grp in df_recs.groupby('activity'):
-        act_str = str(activity)
-        X       = grp[energy_state_columns].values
-        y_dur   = grp['duration'].values.clip(0.1)
-        y_tr    = grp['next_activity'].values
-        n       = len(grp)
+        act_str   = str(activity)
+        feat_cols = [c for c in energy_state_columns if c in grp.columns]
+        X         = grp[feat_cols].fillna(0.0).values
+        y_dur     = grp['duration'].values.clip(0.1)
+        y_tr      = grp['next_activity'].values
+        n         = len(grp)
         n_classes = len(set(y_tr))
 
         act_report = {
             'Duration Approach':   f'Statistical (n={n}<{min_samples})',
             'Transition Approach': f'Statistical (n={n}<{min_samples})',
         }
-        train_feature_mean = dict(zip(energy_state_columns, X.mean(axis=0)))
+        train_feature_mean = dict(zip(feat_cols, X.mean(axis=0))) if len(X) > 0 else {}
 
         if n < min_samples:
             model_choices_report[act_str] = act_report
             continue
 
-        # CV-based model selection — more stable than a single 80/20 split
         n_splits = max(2, min(5, n // 5))
         _kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-        # ── Duration: quantile regression ─────────────────────────────
-        dn, dp = dist_lookup.get(act_str, ('norm', None))
-        if dp is not None:
-            dist_obj = _DIST_MAP.get(dn, scipy_stats.norm)
+        # ── Duration: log-residual target, continuous alpha blend ─────
+        _log_act_mean = float(np.mean(np.log(np.clip(y_dur, 0.1, None))))
+        y_residual    = np.log(np.clip(y_dur, 0.1, None)) - _log_act_mean
+
+        stat_baseline_mae = float(-cross_val_score(
+            DummyRegressor(strategy='mean'), X, y_residual,
+            cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
+        ).mean())
+
+        best_dur_score = float('inf')
+        best_dur_name  = None
+        for model_name in duration_models:
             try:
-                q_full = np.clip(dist_obj.cdf(y_dur, *dp), 1e-4, 1 - 1e-4)
+                cv_mae = float(-cross_val_score(
+                    get_regressor(model_name), X, y_residual,
+                    cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
+                    scoring='neg_mean_absolute_error', error_score=np.inf,
+                ).mean())
+                if cv_mae < best_dur_score:
+                    best_dur_score = cv_mae
+                    best_dur_name  = model_name
             except Exception:
-                dp = None  # distribution CDF failed — skip
+                pass
 
-        if dp is not None:
-            stat_baseline_mae = float(-cross_val_score(
-                DummyRegressor(strategy='mean'), X, q_full,
-                cv=_kf, scoring='neg_mean_absolute_error', error_score=np.inf,
-            ).mean())
-            best_dur_score = float('inf')
-            best_dur_name  = None
+        _dur_alpha = float(np.clip(
+            1.0 - best_dur_score / max(stat_baseline_mae, 1e-9),
+            0.0, 1.0
+        )) if best_dur_name is not None else 0.0
 
-            for model_name in duration_models:
-                try:
-                    cv_mae = float(-cross_val_score(
-                        get_regressor(model_name), X, q_full,
-                        cv=KFold(n_splits=n_splits, shuffle=True, random_state=42),
-                        scoring='neg_mean_absolute_error', error_score=np.inf,
-                    ).mean())
-                    if cv_mae < best_dur_score:
-                        best_dur_score = cv_mae
-                        best_dur_name  = model_name
-                except Exception:
-                    pass
-
-            if best_dur_name is not None and best_dur_score < _DUR_ACCEPTANCE_RATIO * stat_baseline_mae:
-                try:
-                    best_mdl = get_regressor(best_dur_name)
-                    best_mdl.fit(X, q_full)
-                    best_mdl._is_quantile        = True
-                    best_mdl._dist_name          = dn
-                    best_mdl._dist_params        = dp
-                    best_mdl._jitter_std         = jitter_std
-                    best_mdl._train_feature_mean = train_feature_mean
-                    quantile_duration_models[act_str] = best_mdl
-                    act_report['Duration Approach'] = f'{best_dur_name} quantile (CV MAE={best_dur_score:.3f})'
-                    print(f"  [{activity}] Duration -> quantile:{best_dur_name} "
-                          f"(CV MAE={best_dur_score:.3f}) < baseline ({stat_baseline_mae:.3f}) ✓")
-                except Exception as exc:
-                    act_report['Duration Approach'] = f'Statistical (quantile fit failed: {exc})'
-            else:
+        if best_dur_name is not None and _dur_alpha > 0.01:
+            try:
+                best_mdl = get_regressor(best_dur_name)
+                best_mdl.fit(X, y_residual)
+                best_mdl._log_duration       = True
+                best_mdl._log_act_mean       = _log_act_mean
+                best_mdl._dur_alpha          = _dur_alpha
+                best_mdl._train_feature_mean = train_feature_mean
+                alpha_duration_models[act_str] = best_mdl
                 act_report['Duration Approach'] = (
-                    f'Statistical (best quantile CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})'
+                    f'{best_dur_name} α={_dur_alpha:.3f} '
+                    f'(CV MAE={best_dur_score:.3f} vs baseline {stat_baseline_mae:.3f})'
                 )
-                print(f"  [{activity}] Duration -> statistical "
-                      f"(quantile CV MAE={best_dur_score:.3f} ≥ baseline {stat_baseline_mae:.3f})")
+                print(f"  [{activity}] Duration -> α-blend:{best_dur_name} "
+                      f"(α={_dur_alpha:.3f}, CV MAE={best_dur_score:.3f} < baseline {stat_baseline_mae:.3f}) ✓")
+            except Exception as exc:
+                act_report['Duration Approach'] = f'Statistical (fit failed: {exc})'
         else:
-            act_report['Duration Approach'] = 'Statistical (no distribution params)'
+            act_report['Duration Approach'] = (
+                f'Statistical (α={_dur_alpha:.3f}, '
+                f'CV MAE={best_dur_score:.3f} vs baseline {stat_baseline_mae:.3f})'
+            )
+            print(f"  [{activity}] Duration -> statistical "
+                  f"(α={_dur_alpha:.3f}, no meaningful improvement)")
 
-        # ── Transition: calibrated classifier (same as energy_direct) ──
+        # ── Transition: calibrated classifier with _tr_alpha ──────────
         if n_classes >= 2:
             majority_baseline_f1 = float(cross_val_score(
                 DummyClassifier(strategy='most_frequent'), X, y_tr,
                 cv=_kf, scoring='f1_weighted', error_score=0.0,
             ).mean())
-            best_tr_score  = -float('inf')
-            best_tr_name   = None
-
+            best_tr_score = -float('inf')
+            best_tr_name  = None
             for model_name in transition_models:
                 try:
                     cv_f1 = float(cross_val_score(
@@ -2368,33 +2388,42 @@ def extract_energy_quantile_models(
                 except Exception:
                     pass
 
-            if best_tr_name is not None and best_tr_score > majority_baseline_f1 + _TR_ACCEPTANCE_MARGIN:
+            _max_possible = max(1.0 - majority_baseline_f1, 0.01)
+            _tr_alpha = float(np.clip(
+                (best_tr_score - majority_baseline_f1) / _max_possible,
+                0.0, 1.0
+            )) if best_tr_name is not None else 0.0
+
+            if best_tr_name is not None and _tr_alpha > 0.01:
                 try:
                     best_clf = CalibratedClassifierCV(get_classifier(best_tr_name), cv=5, method='sigmoid')
                     best_clf.fit(X, y_tr)
+                    best_clf._tr_alpha           = _tr_alpha
                     best_clf._train_feature_mean = train_feature_mean
                     transition_models_out[act_str] = best_clf
                     act_report['Transition Approach'] = (
-                        f'{best_tr_name} calibrated (CV F1={best_tr_score:.3f})'
+                        f'{best_tr_name} α={_tr_alpha:.3f} '
+                        f'(CV F1={best_tr_score:.3f} vs baseline {majority_baseline_f1:.3f})'
                     )
-                    print(f"  [{activity}] Transition -> ML:{best_tr_name} "
-                          f"(CV F1={best_tr_score:.3f}) > majority baseline ({majority_baseline_f1:.3f}) ✓")
+                    print(f"  [{activity}] Transition -> α-blend:{best_tr_name} "
+                          f"(α={_tr_alpha:.3f}, CV F1={best_tr_score:.3f} > baseline {majority_baseline_f1:.3f}) ✓")
                 except Exception as exc:
                     act_report['Transition Approach'] = f'Statistical (fit failed: {exc})'
             else:
                 act_report['Transition Approach'] = (
-                    f'Statistical (best CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})'
+                    f'Statistical (α={_tr_alpha:.3f}, '
+                    f'CV F1={best_tr_score:.3f} vs baseline {majority_baseline_f1:.3f})'
                 )
                 print(f"  [{activity}] Transition -> statistical "
-                      f"(CV F1={best_tr_score:.3f} ≤ majority baseline {majority_baseline_f1:.3f})")
+                      f"(α={_tr_alpha:.3f}, no meaningful improvement)")
         else:
             act_report['Transition Approach'] = 'Statistical (1 class only)'
 
         model_choices_report[act_str] = act_report
 
-    print(f"\n  Quantile duration models : {len(quantile_duration_models)} activities use ML")
-    print(f"  Transition models        : {len(transition_models_out)} activities use ML")
-    return quantile_duration_models, transition_models_out, energy_state_columns, model_choices_report
+    print(f"\n  Alpha-blend duration models : {len(alpha_duration_models)} activities use ML")
+    print(f"  Alpha-blend transition models: {len(transition_models_out)} activities use ML")
+    return alpha_duration_models, transition_models_out, energy_state_columns, model_choices_report
 
 
 def _build_energy_state_matrix_with_next(

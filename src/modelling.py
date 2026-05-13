@@ -246,6 +246,7 @@ MODES_TO_COMPARE = [
     'petri_net_heuristic',
     'petri_net_inductive',
     'petri_net_combined',
+    'petri_net_median_duration',  # baseline: constant per-activity median, PN transitions
     'petri_net_ilp',
     # ── energy-aware Petri-net variants ──────────────────────────────
     # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
@@ -260,6 +261,8 @@ MODES_TO_COMPARE = [
     'petri_net_direct_test',                    # ML shifts mean; shape sampled from fitted per-activity distribution
     # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
     'petri_net_quantile_blend',
+    # Blend-duration: alpha-blend duration only; pure PN transitions
+    'petri_net_blend_duration',
     # Test-2: direct log-residual + temporal (hour/dow sin/cos) + shape-preserving + entropy blend
     'petri_net_test_2',
     #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
@@ -286,6 +289,8 @@ _ENERGY_AWARE_MODES = {
     'petri_net_direct_test',
     # Quantile-blend: ML predicts quantile of fitted dist + entropy-weighted transition blend
     'petri_net_quantile_blend',
+    # Blend-duration: alpha-blend duration only; pure PN transitions
+    'petri_net_blend_duration',
     # Test-2: temporal features + shape-preserving + entropy blend
     'petri_net_test_2',
 }
@@ -299,6 +304,9 @@ _ENERGY_DIRECT_MODES = {
 }
 _ENERGY_QUANTILE_MODES = {
     'petri_net_quantile_blend',
+}
+_ENERGY_BLEND_DUR_MODES = {
+    'petri_net_blend_duration',
 }
 _ENERGY_TEST2_MODES = {
     'petri_net_test_2',
@@ -495,6 +503,8 @@ METRICS_LOWER_IS_BETTER = {
     'duration_metrics_median_duration_error',
     'duration_metrics_std_duration_error',
     'duration_metrics_activity_duration_error',
+    'duration_metrics_dur_js_whole',
+    'duration_metrics_dur_js_activ',
     'case_metrics_events_per_case_ks',
     'case_metrics_median_events_per_case_error',
     'overall_error',
@@ -506,6 +516,8 @@ CORE_METRIC_BASES = [
     'basic_metrics_event_count_ratio',        # displayed as |ratio-1|
     'duration_metrics_mean_duration_error',
     'duration_metrics_activity_duration_error',
+    'duration_metrics_dur_js_whole',
+    'duration_metrics_dur_js_activ',
     'activity_metrics_js_divergence',
     'control_flow_metrics_edge_f1_score',     # displayed as 1-EdgeF1
 ]
@@ -611,6 +623,10 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
         'test_duration_metrics_median_duration_error':  '1-MedDurErr',
         'train_duration_metrics_activity_duration_error': '1-ActDurErr',
         'test_duration_metrics_activity_duration_error':  '1-ActDurErr',
+        'train_duration_metrics_dur_js_whole':         '1-DurJS(W)',
+        'test_duration_metrics_dur_js_whole':          '1-DurJS(W)',
+        'train_duration_metrics_dur_js_activ':         '1-DurJS(A)',
+        'test_duration_metrics_dur_js_activ':          '1-DurJS(A)',
         'train_activity_metrics_js_divergence':       '1-JS div',
         'test_activity_metrics_js_divergence':        '1-JS div',
         'train_control_flow_metrics_edge_precision':  'EdgePrec',
@@ -682,47 +698,54 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
 
 
 def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='test'):
-    """Short heatmap: 5 error metrics (0=best) + Overall. Works for train or test split."""
+    """Short heatmap: 7 error metrics (0=best) + Overall. Works for train or test split."""
     if target_df is None or target_df.empty or 'mode' not in target_df.columns:
         return
 
-    _col_evt   = f'{split}_basic_metrics_event_count_ratio'
-    _col_dur_w = f'{split}_duration_metrics_mean_duration_error'
-    _col_dur_a = f'{split}_duration_metrics_activity_duration_error'
-    _col_js    = f'{split}_activity_metrics_js_divergence'
-    _col_f1    = f'{split}_control_flow_metrics_edge_f1_score'
-    _col_ov    = f'{split}_overall_error'
+    _col_evt    = f'{split}_basic_metrics_event_count_ratio'
+    _col_dur_w  = f'{split}_duration_metrics_mean_duration_error'
+    _col_dur_a  = f'{split}_duration_metrics_activity_duration_error'
+    _col_dur_jw = f'{split}_duration_metrics_dur_js_whole'
+    _col_dur_ja = f'{split}_duration_metrics_dur_js_activ'
+    _col_js     = f'{split}_activity_metrics_js_divergence'
+    _col_f1     = f'{split}_control_flow_metrics_edge_f1_score'
+    _col_ov     = f'{split}_overall_error'
 
+    all_metric_cols = [_col_evt, _col_dur_w, _col_dur_a, _col_dur_jw, _col_dur_ja,
+                       _col_js, _col_f1, _col_ov]
     needed = [_col_evt, _col_dur_w, _col_js, _col_f1, _col_ov]
     available = [c for c in needed if c in target_df.columns]
     if not available:
         return
 
+    agg_cols = [c for c in all_metric_cols if c in target_df.columns]
     if agg == 'median':
-        mode_avg = target_df.groupby('mode')[[c for c in [_col_evt, _col_dur_w, _col_dur_a,
-                                                           _col_js, _col_f1, _col_ov]
-                                              if c in target_df.columns]].median()
+        mode_avg = target_df.groupby('mode')[agg_cols].median()
     else:
-        mode_avg = target_df.groupby('mode')[[c for c in [_col_evt, _col_dur_w, _col_dur_a,
-                                                           _col_js, _col_f1, _col_ov]
-                                              if c in target_df.columns]].mean()
+        mode_avg = target_df.groupby('mode')[agg_cols].mean()
 
     hm = pd.DataFrame(index=mode_avg.index)
 
     if _col_evt in mode_avg.columns:
-        hm['EvtRatioErr']   = (mode_avg[_col_evt] - 1.0).abs()
+        hm['EvtRatioErr']    = (mode_avg[_col_evt] - 1.0).abs()
     if _col_dur_w in mode_avg.columns:
-        hm['DurErr(whole)'] = mode_avg[_col_dur_w]
+        hm['DurErr(whole)']  = mode_avg[_col_dur_w]
     if _col_dur_a in mode_avg.columns:
-        hm['DurErr(activ)'] = mode_avg[_col_dur_a]
+        hm['DurErr(activ)']  = mode_avg[_col_dur_a]
+    if _col_dur_jw in mode_avg.columns:
+        hm['DurJS(whole)']   = mode_avg[_col_dur_jw]
+    if _col_dur_ja in mode_avg.columns:
+        hm['DurJS(activ)']   = mode_avg[_col_dur_ja]
     if _col_js in mode_avg.columns:
-        hm['JS div']        = mode_avg[_col_js]
+        hm['JS div']         = mode_avg[_col_js]
     if _col_f1 in mode_avg.columns:
-        hm['1-EdgeF1']      = 1.0 - mode_avg[_col_f1]
+        hm['1-EdgeF1']       = 1.0 - mode_avg[_col_f1]
     if _col_ov in mode_avg.columns:
-        hm['Overall']       = mode_avg[_col_ov]
+        hm['Overall']        = mode_avg[_col_ov]
 
-    err_cols = [c for c in ['EvtRatioErr', 'DurErr(whole)', 'DurErr(activ)', 'JS div', '1-EdgeF1'] if c in hm.columns]
+    err_cols = [c for c in ['EvtRatioErr', 'DurErr(whole)', 'DurErr(activ)',
+                             'DurJS(whole)', 'DurJS(activ)', 'JS div', '1-EdgeF1']
+                if c in hm.columns]
     if 'Overall' not in hm.columns and err_cols:
         hm['Overall'] = hm[err_cols].mean(axis=1)
 
@@ -820,6 +843,28 @@ def _safe_simplicity(net):
 
     complexity = len(net.places) + len(net.transitions) + len(net.arcs)
     return float(1.0 / (1.0 + 0.005 * float(complexity)))
+
+def _dur_js(a, b, n_bins=20):
+    """JS divergence between two duration sample arrays using log-space histogram bins."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a) & (a > 0)]
+    b = b[np.isfinite(b) & (b > 0)]
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+    lo = max(np.percentile(np.concatenate([a, b]), 1), 1e-3)
+    hi = np.percentile(np.concatenate([a, b]), 99)
+    if lo >= hi:
+        return 0.0
+    bins = np.exp(np.linspace(np.log(lo), np.log(hi), n_bins + 1))
+    p, _ = np.histogram(a, bins=bins)
+    q, _ = np.histogram(b, bins=bins)
+    p = p.astype(float) + 1e-9
+    q = q.astype(float) + 1e-9
+    p /= p.sum()
+    q /= q.sum()
+    return float(jensenshannon(p, q))
+
 
 def _per_case_median_metrics(simulated_df, real_df,
                              case_col='case_id', activity_col='activity',
@@ -1047,6 +1092,26 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     activity_duration_error = float(np.mean(_act_dur_errs)) if _act_dur_errs else np.nan
     report(f"Per-activity mean duration error: {activity_duration_error:.4f} (0=perfect)")
 
+    # Duration distribution JS divergence (whole): JS between all-event duration histograms
+    dur_js_whole = _dur_js(sim_durations.values, real_durations.values)
+
+    # Duration distribution JS divergence (per-activity): mean JS across activity types
+    _act_dur_js = []
+    for _act in _common_acts:
+        _r = (real_df[real_df[activity_col] == _act]
+              .pipe(lambda d: (d[end_col] - d[start_col]).dt.total_seconds() / 60.0)
+              .replace([np.inf, -np.inf], np.nan).dropna())
+        _s = (simulated_df[simulated_df[activity_col] == _act]
+              .pipe(lambda d: (d[end_col] - d[start_col]).dt.total_seconds() / 60.0)
+              .replace([np.inf, -np.inf], np.nan).dropna())
+        _js = _dur_js(_r.values, _s.values)
+        if pd.notna(_js):
+            _act_dur_js.append(_js)
+    dur_js_activ = float(np.mean(_act_dur_js)) if _act_dur_js else np.nan
+
+    report(f"Duration JS divergence (whole): {dur_js_whole:.4f} (0=perfect)")
+    report(f"Duration JS divergence (per-activity mean): {dur_js_activ:.4f} (0=perfect)")
+
     results['duration_metrics'] = {
         'ks_statistic': duration_ks_stat,
         'ks_pvalue': duration_ks_pvalue,
@@ -1054,6 +1119,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         'median_duration_error': duration_stats.loc['Median', 'Error'],
         'std_duration_error': duration_stats.loc['Std', 'Error'],
         'activity_duration_error': activity_duration_error,
+        'dur_js_whole': dur_js_whole,
+        'dur_js_activ': dur_js_activ,
     }
     
     # ========== 4. CASE-LEVEL ANALYSIS ==========
@@ -1322,6 +1389,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         'js_div':              _pc.get('js_div', _js_div_global),
         'edge_err (1-EdgeF1)': (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
                                ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan),
+        'dur_js_whole':        results['duration_metrics'].get('dur_js_whole', np.nan),
+        'dur_js_activ':        results['duration_metrics'].get('dur_js_activ', np.nan),
     }
 
     report("\nShort-heatmap error components (0 = best):")
@@ -1606,7 +1675,7 @@ for _mode_name in MODES_TO_COMPARE:
         continue
     if _mode_name.startswith('petri_net_'):
         _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
-        if _mode_alg == 'combined':
+        if _mode_alg in ('combined', 'median_duration'):
             _filtered_modes.append(_mode_name)
             continue
         if _mode_alg not in PETRI_NET_ALGORITHMS:
@@ -1776,8 +1845,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     process_mode_results = []
 
     for sim_mode in MODES_TO_COMPARE:
-        if sim_mode == 'petri_net_combined':
-            # Combined mode is derived after all explicit modes are evaluated.
+        if sim_mode in ('petri_net_combined', 'petri_net_median_duration'):
+            # Derived after all explicit modes are evaluated.
             continue
 
         if sim_mode in _ENERGY_AWARE_MODES:
@@ -1925,12 +1994,14 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             if np.isfinite(ov):
                 return ov
             # Fallback if overall_error missing: compute from components
-            evt = abs(float(r.get('train_basic_metrics_event_count_ratio', np.nan)) - 1.0)
-            js  = float(r.get('train_activity_metrics_js_divergence', np.nan))
-            f1  = 1.0 - float(r.get('train_control_flow_metrics_edge_f1_score', np.nan))
-            dur_w = float(r.get('train_duration_metrics_mean_duration_error', np.nan))
-            dur_a = float(r.get('train_duration_metrics_activity_duration_error', np.nan))
-            vals = [v for v in (evt, js, f1, dur_w, dur_a) if np.isfinite(v)]
+            evt    = abs(float(r.get('train_basic_metrics_event_count_ratio', np.nan)) - 1.0)
+            js     = float(r.get('train_activity_metrics_js_divergence', np.nan))
+            f1     = 1.0 - float(r.get('train_control_flow_metrics_edge_f1_score', np.nan))
+            dur_w  = float(r.get('train_duration_metrics_mean_duration_error', np.nan))
+            dur_a  = float(r.get('train_duration_metrics_activity_duration_error', np.nan))
+            dur_jw = float(r.get('train_duration_metrics_dur_js_whole', np.nan))
+            dur_ja = float(r.get('train_duration_metrics_dur_js_activ', np.nan))
+            vals = [v for v in (evt, js, f1, dur_w, dur_a, dur_jw, dur_ja) if np.isfinite(v)]
             return float(np.mean(vals)) if vals else np.inf
 
         best_row = min(combined_candidates, key=_combined_selection_score)
@@ -1951,6 +2022,63 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
         process_mode_results.append(combined_row)
         evaluation_results_list.append(combined_row)
+
+        # ── Median-duration: same best-base PN, but use per-activity median ──
+        if 'petri_net_median_duration' in MODES_TO_COMPARE:
+            print("\n" + "─"*80)
+            print("  ▶ SIMULATION MODE: PETRI_NET_MEDIAN_DURATION")
+            print("─"*80)
+            _med_alg   = best_row.get('mining_algorithm')
+            _med_pm    = extraction_by_algorithm[_med_alg]['process_models']
+            _med_stats = extraction_by_algorithm[_med_alg]['activity_stats_df']
+
+            sim_med_train = ProcessSimulation(
+                _med_stats, production_plan,
+                mode='petri_net_median_duration',
+                process_models=_med_pm,
+            ).run()
+            print(f"\n  Simulated log TRAIN (petri_net_median_duration): {len(sim_med_train)} events")
+
+            eval_med_train = comprehensive_simulation_evaluation(
+                sim_med_train, df_train, process_models=_med_pm
+            )
+
+            flattened_med = {
+                'process':           process,
+                'mode':              'petri_net_median_duration',
+                'simulation_mode':   'petri_net_median_duration',
+                'mining_algorithm':  _med_alg,
+                'split':             split_label,
+            }
+            for _cat, _mets in eval_med_train.items():
+                if isinstance(_mets, dict):
+                    for _mn, _mv in _mets.items():
+                        flattened_med[f"train_{_cat}_{_mn}"] = _mv
+                else:
+                    flattened_med[f"train_{_cat}"] = _mets
+
+            _df_test_med = test_datasets[process]['event_log'] if test_datasets else None
+            if TEMPORAL_SPLIT and _df_test_med is not None and len(_df_test_med) > 0:
+                _pp_test_med = test_datasets[process]['production_plan']
+                sim_med_test = ProcessSimulation(
+                    _med_stats, _pp_test_med,
+                    mode='petri_net_median_duration',
+                    process_models=_med_pm,
+                ).run()
+                print(f"\n  Simulated log TEST  (petri_net_median_duration): {len(sim_med_test)} events")
+
+                eval_med_test = comprehensive_simulation_evaluation(
+                    sim_med_test, _df_test_med, process_models=_med_pm
+                )
+                for _cat, _mets in eval_med_test.items():
+                    if isinstance(_mets, dict):
+                        for _mn, _mv in _mets.items():
+                            flattened_med[f"test_{_cat}_{_mn}"] = _mv
+                    else:
+                        flattened_med[f"test_{_cat}"] = _mets
+
+            process_mode_results.append(flattened_med)
+            evaluation_results_list.append(flattened_med)
 
     # ── Energy-aware Petri-net modes ─────────────────────────────────────────
     # These run AFTER all base modes (including petri_net_combined) so the
@@ -2111,7 +2239,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         # ── Train quantile-blend models ────────────────────────────────
                         _quantile_dur_mods, _quantile_tr_mods, _quantile_energy_state_cols = {}, {}, []
                         _quantile_modes_requested = [
-                            m for m in _energy_modes_requested if m in _ENERGY_QUANTILE_MODES
+                            m for m in _energy_modes_requested
+                            if m in _ENERGY_QUANTILE_MODES | _ENERGY_BLEND_DUR_MODES
                         ]
                         if _quantile_modes_requested:
                             from sim_extractor import extract_energy_quantile_models
@@ -2120,10 +2249,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                     df_expanded=_df_expanded_train,
                                     sensors=_sensors,
                                     stats_df=_best_base_stats,
-                                    duration_models=['ridge', 'lasso', 'xgboost', 'random_forest'],
+                                    duration_models=ENERGY_DURATION_MODELS,
                                     transition_models=ENERGY_TRANSITION_MODELS,
                                     min_samples=ENERGY_MIN_SAMPLES,
                                     ef_cols=_ef_ep_cols,
+                                    activity_col='activity_log',
+                                    activity_config=_act_dur_config,
                                 )
                             if _quantile_report:
                                 report("\n" + "="*80)
@@ -2318,10 +2449,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
                     def _run_energy_sim(plan, stats_df, pm, exog_means=None):
                         # Route each mode to its own trained model set
-                        _is_global   = _energy_mode == 'petri_net_energy_direct_global'
-                        _is_direct   = _energy_mode in _ENERGY_DIRECT_MODES
-                        _is_quantile = _energy_mode in _ENERGY_QUANTILE_MODES
-                        _is_test2    = _energy_mode in _ENERGY_TEST2_MODES
+                        _is_global    = _energy_mode == 'petri_net_energy_direct_global'
+                        _is_direct    = _energy_mode in _ENERGY_DIRECT_MODES
+                        _is_quantile  = _energy_mode in _ENERGY_QUANTILE_MODES
+                        _is_blend_dur = _energy_mode in _ENERGY_BLEND_DUR_MODES
+                        _is_test2     = _energy_mode in _ENERGY_TEST2_MODES
                         if _is_global:
                             _dur_mods   = _global_dur_mods
                             _tr_mods    = _global_tr_mods
@@ -2330,6 +2462,10 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             _dur_mods   = _test2_dur_mods
                             _tr_mods    = _test2_tr_mods
                             _state_cols = _test2_energy_state_cols
+                        elif _is_blend_dur:
+                            _dur_mods   = _quantile_dur_mods
+                            _tr_mods    = {}   # pure PN transitions — no ML
+                            _state_cols = _quantile_energy_state_cols
                         elif _is_quantile:
                             _dur_mods   = _quantile_dur_mods
                             _tr_mods    = _quantile_tr_mods
