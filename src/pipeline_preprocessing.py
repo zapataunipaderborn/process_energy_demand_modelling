@@ -1,9 +1,14 @@
 
+# %%
 import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import json
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 
 
@@ -34,10 +39,7 @@ with open(json_path, 'w') as f:
 
 ## %% functions 
 
-import numpy as np
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
+# %%
 
 def plot_activity_sensor_curves_by_index(df_expanded, activity_col='activity_log'):
     energy_cols = [
@@ -814,3 +816,164 @@ display(df_expanded)
 
 
 #%%
+
+######## Process 5 ########
+
+process = 5
+
+# Define the folder path
+files_folder_silver = folder_silver_base / f'process_{process}'
+files_folder_gold = folder_gold_base / f'process_{process}'
+files_folder_gold.mkdir(parents=True, exist_ok=True)
+
+
+df = pd.read_parquet(files_folder_silver / "data_prepared_for_analysis.parquet")
+
+relevant_columns = ['datetime', 
+        
+        'f11_speise_den_kg/m3', '(10)_abluft_temp_c',
+       'f10_speise_den_kg/m3', '(12)_mpt_fb(mpt?)_kg/h', 'f11_speise_mas_kg/h',
+       'f11_speise_vol_l/h', '(6)_nach_recu_reg_temp_c',
+       'dampf_nassmischbereich', '(3)_zuluft_nach_entfeuchter_kon_g/kg',
+       'f10_speise_vol_l/h', '(9)_abluft_kon_g/kg',
+       '(16)_konditionierung_mas_kg/h', '(14)_filter_mas_kg/h', 
+       #'(1)_status',
+       'f10_speise_mas_kg/h', '(5)_vor_vent_hauptzuluft_temp_c',
+       '(7)_zuluft_turm_temp_c', '(2)_zuluft_vor_entfeuchter_kon_g/kg',
+       '(13)_lanzen_mas_kg/h', '(8)_abluft_vol_m3/h',
+       '(17)_leistung_turmF_luftentfeuchter_kw', 
+        
+        '(8)_abluft_mas_kg/h',
+       '(21)_zuluft_turm_mas_kg/h', '(31)_q_waerme_recu_kw',
+       '(22)_t_waermereg_c', '(29)_q_lufterwearmung_von_T6_nach_T7_kw',
+       '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw',
+       '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw',
+       '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw',
+       '(35)_speise_max_kg/h',
+       
+       'temperature_2m',
+       'relative_humidity_2m', 
+       
+       'status_name'
+       
+       ]
+
+display(df)
+print(df.columns)
+
+df = df[relevant_columns].copy()
+
+status_to_keep = ['Produktion', 
+        #'Stopp Produkt HPPx', 
+        'zurück speisen',
+       'Stabilisiert und angepasst', 
+       #'Grundstellung',
+       #'Start Produkt HPPx', 
+       'Feed vorwärts',
+       'Fließbett starten für Produktion', 
+       #'Wasserlaufphase deaktivieren',
+       #None, #'Starten Wasserfahrt', 
+       #'HPPx für Produkt anpassen'
+       ]
+
+df = df[df['status_name'].isin(status_to_keep)].copy()
+
+df['status_name'].value_counts()
+
+
+### Build event log: one case_id per day, detect consecutive activity spans
+
+df['datetime'] = pd.to_datetime(df['datetime'])
+df = df.sort_values('datetime').reset_index(drop=True)
+
+df['case_id'] = df['datetime'].dt.date.astype(str)
+
+# Detect consecutive runs of the same status within a day
+df['_activity_change'] = (
+    (df['status_name'] != df['status_name'].shift()) |
+    (df['case_id'] != df['case_id'].shift())
+).cumsum()
+
+span_info = df.groupby('_activity_change').agg(
+    timestamp_start=('datetime', 'min'),
+    timestamp_end=('datetime', 'max')
+).reset_index()
+
+df = df.merge(span_info, on='_activity_change')
+df = df.drop(columns='_activity_change')
+
+# Event log: one row per consecutive activity span
+df_event_log = (
+    df.groupby(['case_id', 'status_name', 'timestamp_start', 'timestamp_end'])
+    .size()
+    .reset_index(drop=True)
+    .pipe(lambda _: df[['case_id', 'status_name', 'timestamp_start', 'timestamp_end']]
+          .drop_duplicates()
+          .rename(columns={'status_name': 'activity'})
+          .sort_values('timestamp_start')
+          .reset_index(drop=True))
+)
+
+print("Event log")
+print(df_event_log)
+
+
+### Build df_expanded: flat timeseries with log info attached
+
+energy_cols = [c for c in df.columns if c not in [
+    'datetime', 'status_name', 'case_id', 'temperature_2m', 'relative_humidity_2m',
+    'timestamp_start', 'timestamp_end'
+]]
+ef_cols = ['temperature_2m', 'relative_humidity_2m']
+
+df_expanded = df.rename(columns={
+    'status_name': 'activity_log',
+    'case_id': 'case_id_log',
+    'datetime': 'datetime_energy',
+    'timestamp_start': 'timestamp_start_log',
+    'timestamp_end': 'timestamp_end_log',
+})
+df_expanded = df_expanded.rename(columns={col: f'{col}_energy' for col in energy_cols + ef_cols})
+
+print("Expanded df with sensor data")
+print(df_expanded)
+
+
+### Build production plan: one row per case_id (day)
+
+df_production_plan = (
+    df_event_log.groupby('case_id')
+    .agg(timestamp_start=('timestamp_start', 'min'),
+         timestamp_end=('timestamp_end', 'max'))
+    .reset_index()
+)
+
+print("Production plan")
+print(df_production_plan)
+
+
+### Select relevant columns for df_expanded
+
+energy_cols_energy = [f'{c}_energy' for c in energy_cols]
+ef_cols_energy = [f'{c}_energy' for c in ef_cols]
+
+relevant_columns_p5 = (
+    ['case_id_log', 'activity_log', 'timestamp_start_log', 'timestamp_end_log', 'datetime_energy']
+    + energy_cols_energy
+    + ef_cols_energy
+)
+
+df_expanded = df_expanded[relevant_columns_p5].copy()
+
+
+### Save datasets
+
+files_folder_gold_datasets = files_folder_gold / 'datasets'
+files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
+
+df_expanded.to_parquet(files_folder_gold_datasets / "df_expanded.parquet", index=False)
+df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", index=False)
+df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
+
+
+# %%
