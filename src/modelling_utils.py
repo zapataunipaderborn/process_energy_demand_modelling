@@ -86,6 +86,7 @@ METRICS_LOWER_IS_BETTER = {
     'case_metrics_events_per_case_ks',
     'case_metrics_median_events_per_case_error',
     'overall_error',
+    'control_flow_metrics_edge_f1_error',
 }
 
 METRICS_HIGHER_IS_BETTER = {
@@ -107,13 +108,13 @@ METRICS_HIGHER_IS_BETTER = {
 
 CORE_METRIC_BASES = [
     'overall_error',
-    'basic_metrics_event_count_ratio',
+    'basic_metrics_event_count_error',
     'duration_metrics_mean_duration_error',
     'duration_metrics_activity_duration_error',
     'duration_metrics_dur_js_whole',
     'duration_metrics_dur_js_activ',
     'activity_metrics_js_divergence',
-    'control_flow_metrics_edge_f1_score',
+    'control_flow_metrics_edge_f1_error',
 ]
 
 

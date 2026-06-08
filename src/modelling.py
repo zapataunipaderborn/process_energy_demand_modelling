@@ -192,9 +192,12 @@ process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
 process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
+
 # process_datasets_to_model_sensors['process_3']['objects_to_model'] = ['tower_1']
 # process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
 # process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
+
+process_datasets_to_model_sensors['process_5'] = process_datasets_to_model_sensors.get('process_5', {})
 
 print(process_datasets_to_model_sensors)
 # display(process_datasets_to_model_sensors['process_3']['expanded'])
@@ -246,25 +249,25 @@ MODES_TO_COMPARE = [
     'petri_net_heuristic',
     'petri_net_inductive',
     'petri_net_combined',
-    'petri_net_median_duration',  # baseline: constant per-activity median, PN transitions
+    # 'petri_net_median_duration',  # baseline: constant per-activity median, PN transitions
     'petri_net_ilp',
-    # ── energy-aware Petri-net variants ──────────────────────────────
-    # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
-    'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
-    'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
-    'petri_net_energy_aware',             # best duration + best transition independently per activity
-    # Direct approach: ML IS the prediction (energy_state → duration or next_activity directly)
-    'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
-    'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
-    'petri_net_energy_direct',                  # ML predicts both directly per activity
-    'petri_net_energy_dist',                    # ML predicts log-mean; sample from LogNormal(predicted_μ, residual_σ)
-    'petri_net_direct_test',                    # ML shifts mean; shape sampled from fitted per-activity distribution
-    # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
-    'petri_net_quantile_blend',
-    # Blend-duration: alpha-blend duration only; pure PN transitions
-    'petri_net_blend_duration',
-    # Test-2: direct log-residual + temporal (hour/dow sin/cos) + shape-preserving + entropy blend
-    'petri_net_test_2',
+    # # ── energy-aware Petri-net variants ──────────────────────────────
+    # # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
+    # 'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
+    # 'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
+    # 'petri_net_energy_aware',             # best duration + best transition independently per activity
+    # # Direct approach: ML IS the prediction (energy_state → duration or next_activity directly)
+    # 'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
+    # 'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
+    # 'petri_net_energy_direct',                  # ML predicts both directly per activity
+    # 'petri_net_energy_dist',                    # ML predicts log-mean; sample from LogNormal(predicted_μ, residual_σ)
+    # 'petri_net_direct_test',                    # ML shifts mean; shape sampled from fitted per-activity distribution
+    # # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
+    # 'petri_net_quantile_blend',
+    # # Blend-duration: alpha-blend duration only; pure PN transitions
+    # 'petri_net_blend_duration',
+    # # Test-2: direct log-residual + temporal (hour/dow sin/cos) + shape-preserving + entropy blend
+    # 'petri_net_test_2',
     #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
@@ -508,18 +511,19 @@ METRICS_LOWER_IS_BETTER = {
     'case_metrics_events_per_case_ks',
     'case_metrics_median_events_per_case_error',
     'overall_error',
+    'control_flow_metrics_edge_f1_error',
 }
 
 # The 5 short metrics + overall shown in the main heatmap (all 0 = best)
 CORE_METRIC_BASES = [
     'overall_error',
-    'basic_metrics_event_count_ratio',        # displayed as |ratio-1|
+    'basic_metrics_event_count_error',
     'duration_metrics_mean_duration_error',
     'duration_metrics_activity_duration_error',
     'duration_metrics_dur_js_whole',
     'duration_metrics_dur_js_activ',
     'activity_metrics_js_divergence',
-    'control_flow_metrics_edge_f1_score',     # displayed as 1-EdgeF1
+    'control_flow_metrics_edge_f1_error',
 ]
 
 # Default definitions to avoid NameError when testing is skipped
@@ -615,8 +619,10 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
         'train_overall_error': 'Overall',
         'test_overall_error':  'Overall',
         # Direct sim-vs-real
-        'train_basic_metrics_event_count_ratio':      '1/EvtRatio',
-        'test_basic_metrics_event_count_ratio':       '1/EvtRatio',
+        'train_basic_metrics_event_count_error':      'EvtRatioErr',
+        'test_basic_metrics_event_count_error':       'EvtRatioErr',
+        'train_basic_metrics_event_count_ratio':      'EvtRatio',
+        'test_basic_metrics_event_count_ratio':       'EvtRatio',
         'train_duration_metrics_mean_duration_error': '1-MeanDurErr',
         'test_duration_metrics_mean_duration_error':  '1-MeanDurErr',
         'train_duration_metrics_median_duration_error': '1-MedDurErr',
@@ -633,6 +639,8 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
         'test_control_flow_metrics_edge_precision':   'EdgePrec',
         'train_control_flow_metrics_edge_recall':     'EdgeRec',
         'test_control_flow_metrics_edge_recall':      'EdgeRec',
+        'train_control_flow_metrics_edge_f1_error':   'EdgeF1Err',
+        'test_control_flow_metrics_edge_f1_error':    'EdgeF1Err',
         'train_control_flow_metrics_edge_f1_score':   'EdgeF1',
         'test_control_flow_metrics_edge_f1_score':    'EdgeF1',
         # Process model quality
@@ -662,19 +670,8 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
     plot_df = mode_avg_norm[valid_cols].copy()
     plot_df.columns = disp_cols
 
-    # Annotation values: transform so 1 = best for every metric
-    annot_df = mode_avg[valid_cols].reindex(mode_avg_norm.index).copy()
-    for c in valid_cols:
-        clean_c = c.replace('test_', '').replace('train_', '')
-        is_lower = clean_c in METRICS_LOWER_IS_BETTER or any(m in clean_c for m in ['MAE', 'RMSE', 'WAPE'])
-        if is_lower:
-            annot_df[c] = (1.0 - annot_df[c]).clip(0, 1)
-        elif clean_c == 'basic_metrics_event_count_ratio':
-            # 1.0 = perfect; above 1 or below 1 both worse
-            annot_df[c] = annot_df[c].apply(
-                lambda r: (1.0 / r if r > 1 else r) if pd.notna(r) and r > 0 else np.nan
-            ).clip(0, 1)
-    annot_df = annot_df.round(3)
+    # Annotation shows raw metric values; colour encodes quality (1 = best)
+    annot_df = mode_avg[valid_cols].reindex(mode_avg_norm.index).copy().round(3)
     annot_df.columns = disp_cols
 
     fig, ax = plt.subplots(figsize=(max(10, len(valid_cols) * 1.2), max(3, len(mode_avg_norm) * 0.8)))
@@ -702,13 +699,13 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     if target_df is None or target_df.empty or 'mode' not in target_df.columns:
         return
 
-    _col_evt    = f'{split}_basic_metrics_event_count_ratio'
+    _col_evt    = f'{split}_basic_metrics_event_count_error'
     _col_dur_w  = f'{split}_duration_metrics_mean_duration_error'
     _col_dur_a  = f'{split}_duration_metrics_activity_duration_error'
     _col_dur_jw = f'{split}_duration_metrics_dur_js_whole'
     _col_dur_ja = f'{split}_duration_metrics_dur_js_activ'
     _col_js     = f'{split}_activity_metrics_js_divergence'
-    _col_f1     = f'{split}_control_flow_metrics_edge_f1_score'
+    _col_f1     = f'{split}_control_flow_metrics_edge_f1_error'
     _col_ov     = f'{split}_overall_error'
 
     all_metric_cols = [_col_evt, _col_dur_w, _col_dur_a, _col_dur_jw, _col_dur_ja,
@@ -727,7 +724,7 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     hm = pd.DataFrame(index=mode_avg.index)
 
     if _col_evt in mode_avg.columns:
-        hm['EvtRatioErr']    = (mode_avg[_col_evt] - 1.0).abs()
+        hm['EvtRatioErr']    = mode_avg[_col_evt]
     if _col_dur_w in mode_avg.columns:
         hm['DurErr(whole)']  = mode_avg[_col_dur_w]
     if _col_dur_a in mode_avg.columns:
@@ -739,12 +736,12 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     if _col_js in mode_avg.columns:
         hm['JS div']         = mode_avg[_col_js]
     if _col_f1 in mode_avg.columns:
-        hm['1-EdgeF1']       = 1.0 - mode_avg[_col_f1]
+        hm['EdgeF1Err']      = mode_avg[_col_f1]
     if _col_ov in mode_avg.columns:
         hm['Overall']        = mode_avg[_col_ov]
 
     err_cols = [c for c in ['EvtRatioErr', 'DurErr(whole)', 'DurErr(activ)',
-                             'DurJS(whole)', 'DurJS(activ)', 'JS div', '1-EdgeF1']
+                             'DurJS(whole)', 'DurJS(activ)', 'JS div', 'EdgeF1Err']
                 if c in hm.columns]
     if 'Overall' not in hm.columns and err_cols:
         hm['Overall'] = hm[err_cols].mean(axis=1)
@@ -1214,6 +1211,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         'edge_precision': edge_precision,
         'edge_recall': edge_recall,
         'edge_f1_score': edge_f1,
+        'edge_f1_error': 1.0 - edge_f1,
         'start_activities_jaccard': start_jaccard,
         'end_activities_jaccard': end_jaccard
     }
@@ -1430,6 +1428,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
             results['activity_metrics']['js_divergence']           = _pc['js_div']
         if pd.notna(_pc.get('edge_f1', np.nan)):
             results['control_flow_metrics']['edge_f1_score']       = _pc['edge_f1']
+            results['control_flow_metrics']['edge_f1_error']       = 1.0 - _pc['edge_f1']
 
     results['overall_error'] = overall_error
     results['quality_assessment'] = quality_assessment
@@ -1994,9 +1993,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             if np.isfinite(ov):
                 return ov
             # Fallback if overall_error missing: compute from components
-            evt    = abs(float(r.get('train_basic_metrics_event_count_ratio', np.nan)) - 1.0)
+            evt    = float(r.get('train_basic_metrics_event_count_error', np.nan))
             js     = float(r.get('train_activity_metrics_js_divergence', np.nan))
-            f1     = 1.0 - float(r.get('train_control_flow_metrics_edge_f1_score', np.nan))
+            f1     = float(r.get('train_control_flow_metrics_edge_f1_error', np.nan))
             dur_w  = float(r.get('train_duration_metrics_mean_duration_error', np.nan))
             dur_a  = float(r.get('train_duration_metrics_activity_duration_error', np.nan))
             dur_jw = float(r.get('train_duration_metrics_dur_js_whole', np.nan))

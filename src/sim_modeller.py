@@ -1042,6 +1042,10 @@ class SimModeller:
             return None
 
         tr_model, le, feature_cols, _mtype = self.transition_models[key]
+
+        if not hasattr(tr_model, 'predict_proba'):
+            return None
+
         features = self._attrs_to_features(object_attributes, feature_cols)
         X = pd.DataFrame([features])[feature_cols]
         for col in X.columns:

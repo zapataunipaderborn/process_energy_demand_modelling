@@ -264,6 +264,19 @@ df_expanded['timestamp_end_log'] = pd.to_datetime(df_expanded['timestamp_end_log
 df_expanded = df_expanded.drop(columns=['schritt__energy'], errors='ignore')
 df_expanded.columns = [col.replace('__', '_') for col in df_expanded.columns]
 
+# Total material per case: integrate flow rate over actual measurement intervals
+_vol = df_expanded[['case_id_log', 'datetime_energy', 'pro_volstrom_l/h_energy']].copy()
+_vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
+_vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
+_vol['_dt_h'] = _vol['_dt_h'].fillna(0)
+_vol['_liters'] = _vol['pro_volstrom_l/h_energy'] * _vol['_dt_h']
+_case_total = _vol.groupby('case_id_log')['_liters'].sum()
+df_expanded['object_attributes_log'] = df_expanded.apply(
+    lambda row: {**row['object_attributes_log'], 'total_material': _case_total.get(row['case_id_log'], None)}
+    if isinstance(row['object_attributes_log'], dict) else row['object_attributes_log'],
+    axis=1
+)
+
 print(f"Expanded df")
 print(df_expanded)
 
@@ -311,7 +324,7 @@ relevant_columns = [
        'ef_global_tilted_irradiance_energy',
     #    'ef_apparent_temperature_energy'
 
-       'pro_menge_kg_energy', 
+       'pro_menge_kg_energy',
        'pro_volstrom_l/h_energy',
        'dampfmenge_kg/h_nmb+cip_energy',
 
@@ -353,7 +366,10 @@ display(df_expanded)
 
 # %%
 
+# }
+display(df_event_log)
 
+# %%
 # df_expanded['activity_log'].value_counts()
 
 # print(df_expanded['activity_log'].unique())
@@ -480,6 +496,22 @@ df_expanded['timestamp_end_log'] = pd.to_datetime(df_expanded['timestamp_end_log
 
 df_expanded.columns = [col.replace('__', '_') for col in df_expanded.columns]
 
+# Combine f10/f11 feed rates: take element-wise maximum
+df_expanded['speise_current_kg/h_energy'] = df_expanded[['f10_speise_kg/h_energy', 'f11_speise_kg/h_energy']].max(axis=1)
+
+# Total material per case: integrate feed rate over actual measurement intervals
+_vol = df_expanded[['case_id_log', 'datetime_energy', 'speise_current_kg/h_energy']].copy()
+_vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
+_vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
+_vol['_dt_h'] = _vol['_dt_h'].fillna(0)
+_vol['_kg'] = _vol['speise_current_kg/h_energy'] * _vol['_dt_h']
+_case_total = _vol.groupby('case_id_log')['_kg'].sum()
+df_expanded['object_attributes_log'] = df_expanded.apply(
+    lambda row: {**row['object_attributes_log'], 'total_material': _case_total.get(row['case_id_log'], None)}
+    if isinstance(row['object_attributes_log'], dict) else row['object_attributes_log'],
+    axis=1
+)
+
 print(f"Expanded df")
 print(df_expanded)
 
@@ -509,13 +541,13 @@ df = df[['case_id', 'activity', 'timestamp_start', 'timestamp_end', 'object_attr
 # Only leave the case ids, the orders
 df = df.drop_duplicates(subset=['case_id'])
 
-production_plan = df.copy()
+df_production_plan = df.copy()
 
 print(f"production plan")
-print(production_plan)
+print(df_production_plan)
 
-relevant_columns = ['datetime_energy', 
-                    
+relevant_columns = ['datetime_energy',
+
         '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
        '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
        #'(4)_frostschutz_%_energy', 
@@ -534,10 +566,12 @@ relevant_columns = ['datetime_energy',
        '(19)_zuluft_vor_entfeuchter_temp_c_energy', 'dampf_nmb_energy',
        'nach_nt_(c)_energy', 
        
-       #'f10_speise_kg/h_energy',
-    #    'f11_speise_kg/h_energy', 'f10_speise_kg/m³_energy',
+       'speise_current_kg/h_energy',
+    #    'f10_speise_kg/h_energy',
+    #    'f11_speise_kg/h_energy',
+    #    'f10_speise_kg/m³_energy',
     #    'f11_speise_kg/m³_energy', 'f10_speise_l/h_energy',
-    #    'f11_speise_l/h_energy', 
+    #    'f11_speise_l/h_energy',
        
        '(6)_nach_recu_reg_temp_c_old_energy',
        '(18)_leistung_turmF_lufterhitzer_kw_energy',
@@ -739,6 +773,26 @@ df_expanded = expand_activities_to_timeseries(df_activites, df_energys)
 print("Expanded df with sensor data")
 print(df_expanded)
 
+# Total material per case: integrate Vorlaufpumpe flow rate (l/h) over actual measurement intervals
+_vol = df_expanded[['case_id_log', 'datetime_energy', 'Vorlaufpumpe_30110FT301_5s_energy']].copy()
+_vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
+_vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
+_vol['_dt_h'] = _vol['_dt_h'].fillna(0)
+_vol['_liters'] = _vol['Vorlaufpumpe_30110FT301_5s_energy'] * _vol['_dt_h']
+_case_total = _vol.groupby('case_id_log')['_liters'].sum()
+df_expanded['object_attributes_log'] = df_expanded.apply(
+    lambda row: {**row['object_attributes_log'], 'total_material': _case_total.get(row['case_id_log'], None)}
+    if isinstance(row['object_attributes_log'], dict) else row['object_attributes_log'],
+    axis=1
+)
+
+# Propagate total_material back into df_event_log (built before df_expanded)
+df_event_log['object_attributes'] = df_event_log.apply(
+    lambda row: {**row['object_attributes'], 'total_material': _case_total.get(row['case_id'], None)}
+    if isinstance(row['object_attributes'], dict) else {'total_material': _case_total.get(row['case_id'], None)},
+    axis=1
+)
+
 
 ## Get the production plan
 df = df_event_log.copy()
@@ -751,10 +805,10 @@ df = df.dropna(subset=['case_id'])
 
 df = df.drop_duplicates(subset=['case_id'])
 
-production_plan = df.copy()
+df_production_plan = df.copy()
 
 print("Expanded production plan")
-print(production_plan)
+print(df_production_plan)
 
 
 relevant_columns = ['case_id_log', 'activity_log', 'timestamp_start_log',
@@ -938,6 +992,27 @@ df_expanded = df_expanded.rename(columns={col: f'{col}_energy' for col in energy
 print("Expanded df with sensor data")
 print(df_expanded)
 
+# Combine f10/f11 feed rates: element-wise max
+df_expanded['speise_current_kg/h_energy'] = df_expanded[['f10_speise_mas_kg/h_energy', 'f11_speise_mas_kg/h_energy']].max(axis=1)
+
+# Total material per case: integrate feed rate (kg/h) over actual measurement intervals
+_vol = df_expanded[['case_id_log', 'datetime_energy', 'speise_current_kg/h_energy']].copy()
+_vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
+_vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
+_vol['_dt_h'] = _vol['_dt_h'].fillna(0)
+_vol['_kg'] = _vol['speise_current_kg/h_energy'] * _vol['_dt_h']
+_case_total = _vol.groupby('case_id_log')['_kg'].sum()
+
+# Inject total_material into df_expanded as object_attributes_log
+df_expanded['object_attributes_log'] = df_expanded['case_id_log'].map(
+    lambda cid: {'total_material': _case_total.get(cid, None)}
+)
+
+# Propagate to event log so extract_process() sees attr_total_material
+df_event_log['object_attributes'] = df_event_log['case_id'].map(
+    lambda cid: {'total_material': _case_total.get(cid, None)}
+)
+
 
 ### Build production plan: one row per case_id (day)
 
@@ -947,6 +1022,8 @@ df_production_plan = (
          timestamp_end=('timestamp_end', 'max'))
     .reset_index()
 )
+_attrs_map = df_event_log.groupby('case_id')['object_attributes'].first()
+df_production_plan['object_attributes'] = df_production_plan['case_id'].map(_attrs_map)
 
 print("Production plan")
 print(df_production_plan)
@@ -958,7 +1035,8 @@ energy_cols_energy = [f'{c}_energy' for c in energy_cols]
 ef_cols_energy = [f'{c}_energy' for c in ef_cols]
 
 relevant_columns_p5 = (
-    ['case_id_log', 'activity_log', 'timestamp_start_log', 'timestamp_end_log', 'datetime_energy']
+    ['case_id_log', 'activity_log', 'timestamp_start_log', 'timestamp_end_log', 'datetime_energy',
+     'object_attributes_log', 'speise_current_kg/h_energy']
     + energy_cols_energy
     + ef_cols_energy
 )
