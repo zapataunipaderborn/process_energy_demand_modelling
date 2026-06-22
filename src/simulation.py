@@ -52,7 +52,12 @@ class ProcessSimulation:
                  duration_scale_clip=None,
                  logit_bias_clip=None,
                  temporal_resolution_minutes=15.0,
-                 verbose=True):
+                 verbose=True,
+                 mlp_global_tuple=None,
+                 mlp_per_act_tuples=None,
+                 mlp_feat_cols=None,
+                 mlp_activity_means=None,
+                 mlp_global_mean=0.0):
         # Backward-compatible input handling: extract_process now returns
         # (stats_df, raw_df, process_models), while older callers pass stats_df only.
         if isinstance(activity_stats_df, (tuple, list)):
@@ -76,6 +81,11 @@ class ProcessSimulation:
         self.base_simulation_mode = base_simulation_mode
         self.ml_models = ml_models
         self.process_models = process_models  # Petri nets from sim_extractor
+        self.mlp_global_tuple   = mlp_global_tuple
+        self.mlp_per_act_tuples = mlp_per_act_tuples or {}
+        self.mlp_feat_cols      = mlp_feat_cols or []
+        self.mlp_activity_means = mlp_activity_means or {}
+        self.mlp_global_mean    = float(mlp_global_mean) if mlp_global_mean else 0.0
         print(f"[DEBUG __init__] mode={self.mode}, "
               f"process_models is None: {process_models is None}, "
               f"process_models len: {len(process_models) if process_models else 'N/A'}")
@@ -134,6 +144,16 @@ class ProcessSimulation:
         self.logit_bias_clip              = logit_bias_clip
         self.temporal_resolution_minutes  = float(temporal_resolution_minutes) if temporal_resolution_minutes else 15.0
 
+        # Validation for ML+ Petri-net modes
+        _MLP_PN_MODES = ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act')
+        if self.mode in _MLP_PN_MODES:
+            if self.process_models is None or len(self.process_models) == 0:
+                raise ValueError(f"mode='{self.mode}' requires process_models.")
+            if not self.mlp_feat_cols:
+                print(f"[ProcessSimulation] WARNING: mode='{self.mode}' but no "
+                      "mlp_feat_cols — falling back to statistical.")
+                self.mode = 'statistical'
+
         # Verification: confirm global model is loaded for ml_global_model
         if self.mode == 'ml_global_model' and self.ml_models is not None:
             has_global = self.ml_models.global_duration_model is not None
@@ -175,7 +195,46 @@ class ProcessSimulation:
             print(f"  Config: {key}")
             print(f"    Transitions: {row['transition']}")
             print(f"    Start: {row['is_start']}")
-    
+
+    def _build_mlp_feature_vector(self, activity, object_attributes,
+                                   activity_history, activity_index,
+                                   current_sim_ts, case_start_ts):
+        """Build a feature vector in self.mlp_feat_cols order for ML+ prediction."""
+        ts = datetime.fromtimestamp(current_sim_ts) if current_sim_ts else datetime.now()
+        prev_dur  = activity_history[0][1] if len(activity_history) >= 1 else 0.0
+        prev_dur2 = activity_history[1][1] if len(activity_history) >= 2 else 0.0
+        elapsed   = (current_sim_ts - case_start_ts) / 60.0 if case_start_ts else 0.0
+        act_mean  = self.mlp_activity_means.get(activity, self.mlp_global_mean)
+
+        feat_dict = {
+            'feat_hour':         float(ts.hour),
+            'feat_dayofweek':    float(ts.weekday()),
+            'feat_month':        float(ts.month),
+            'feat_act_pos':      float(activity_index),
+            'feat_prev_dur':     float(prev_dur),
+            'feat_prev_dur2':    float(prev_dur2),
+            'feat_case_elapsed': float(elapsed),
+            'feat_act_mean_dur': float(act_mean),
+        }
+        obj_attrs = object_attributes or {}
+        for k, v in obj_attrs.items():
+            feat_dict[f'attr_{k}'] = v
+
+        row = []
+        for col in self.mlp_feat_cols:
+            val = feat_dict.get(col, 0.0)
+            try:
+                row.append(float(val))
+            except (TypeError, ValueError):
+                row.append(0.0)
+        return row
+
+    def _predict_mlp_duration(self, model_tuple, feature_vec):
+        """Predict duration in minutes from ML+ (model, scaler, name) tuple."""
+        m, sc = model_tuple[0], model_tuple[1]
+        X = np.array(feature_vec, dtype=float).reshape(1, -1)
+        return float(np.clip(np.expm1(m.predict(sc.transform(X))), 0, None)[0])
+
     def _get_activity_duration(self, activity, object_name, object_type,
                                higher_level_activity, object_attributes=None,
                                activity_history=None, activity_index=0):
@@ -195,11 +254,15 @@ class ProcessSimulation:
                                object_attributes=None,
                                activity_history=None,
                                activity_index=0,
-                               override_mode=None):
+                               override_mode=None,
+                               current_sim_ts=None,
+                               case_start_ts=None):
         """
         Sample the duration.
 
         If `override_mode` is provided, it uses that instead of `self.mode`.
+        current_sim_ts / case_start_ts are Unix timestamps used by ML+ modes
+        to compute temporal features (hour, elapsed time, etc.).
         """
         eval_mode = override_mode if override_mode else self.mode
         activity              = str(activity).strip()
@@ -259,6 +322,26 @@ class ProcessSimulation:
             )
             if global_pred is not None:
                 return global_pred
+            # else: fall through to statistical
+
+        # ── ML+ Petri-net paths (PN transitions, ML+ duration prediction) ───
+        _MLP_PN_MODES = ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act')
+        if eval_mode in _MLP_PN_MODES and self.mlp_feat_cols:
+            feat_vec = self._build_mlp_feature_vector(
+                activity, object_attributes, activity_history or [],
+                activity_index,
+                current_sim_ts or 0.0,
+                case_start_ts  or 0.0,
+            )
+            if eval_mode == 'petri_net_ml_plus_global' and self.mlp_global_tuple is not None:
+                return max(0.1, self._predict_mlp_duration(self.mlp_global_tuple, feat_vec))
+            if eval_mode == 'petri_net_ml_plus_per_act':
+                tpl = self.mlp_per_act_tuples.get(activity)
+                if tpl is not None:
+                    return max(0.1, self._predict_mlp_duration(tpl, feat_vec))
+                # fallback: per-activity mean (no model trained for this activity)
+                fallback = self.mlp_activity_means.get(activity, self.mlp_global_mean or 10.0)
+                return max(0.1, float(fallback))
             # else: fall through to statistical
 
         # ── Statistical path ──────────────────────────────────────────────
@@ -416,10 +499,14 @@ class ProcessSimulation:
             new_marking[arc.target] += 1
         return new_marking
 
-    def _choose_transition(self, enabled, stochastic_map):
+    def _choose_transition(self, enabled, stochastic_map, rng=None):
         """
         Given a set of enabled transitions, pick one using stochastic
         weights.  Falls back to uniform random if no weights available.
+
+        rng: optional np.random.Generator. When provided, all random draws
+             use this isolated generator instead of the global numpy state,
+             so duration-sampling code cannot shift the transition sequence.
         """
         # Sort to make sampling independent from set iteration order.
         enabled_list = sorted(
@@ -429,8 +516,12 @@ class ProcessSimulation:
         weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
         total = sum(weights)
         if total <= 0:
+            if rng is not None:
+                return enabled_list[int(rng.integers(len(enabled_list)))]
             return random.choice(enabled_list)
         probs = [w / total for w in weights]
+        if rng is not None:
+            return rng.choice(enabled_list, p=probs)
         return np.random.choice(enabled_list, p=probs)
 
     def _simulate_petri_net_for_case(self, case_id, object_attributes,
@@ -450,6 +541,12 @@ class ProcessSimulation:
              are enabled.
         """
         current_sim_time = start_time.timestamp()
+        # Isolated RNG for transition choices — seeded from case_id so the
+        # transition sequence is identical regardless of how durations are
+        # sampled (statistical vs ML+), since ML predictions consume zero
+        # numpy random draws while scipy/numpy sampling would.
+        _pn_rng = np.random.default_rng(abs(hash(str(case_id))) % (2**32))
+
         unique_objects = (
             self.activity_stats[['object', 'object_type',
                                  'higher_level_activity']]
@@ -485,6 +582,8 @@ class ProcessSimulation:
             activity_count = 0
             max_steps = max(max_case_length * 2, 50)  # guard from training data
             step = 0
+            case_start_ts  = current_sim_time          # Unix timestamp at case start
+            activity_history = []                       # [(name, duration), ...] most-recent first
 
             print(f"\nCase {case_id}: Petri net simulation for {object_name} "
                   f"({object_type})")
@@ -514,8 +613,10 @@ class ProcessSimulation:
                           f"{activity_count} activities.")
                     break
 
-                # Choose which transition to fire
-                chosen = self._choose_transition(enabled, stochastic_map)
+                # Choose which transition to fire (isolated RNG — independent
+                # of duration sampling so ML+ and statistical produce the same
+                # transition sequence for the same case_id)
+                chosen = self._choose_transition(enabled, stochastic_map, rng=_pn_rng)
 
                 # Fire the transition (update marking)
                 marking = self._fire_transition(marking, chosen)
@@ -524,31 +625,41 @@ class ProcessSimulation:
                 if chosen.label is not None:
                     activity_label = str(chosen.label).strip()
 
-                    # Get duration from the duration map or activity config
-                    act_key = (activity_label, object_name, object_type,
-                               higher_level_activity)
-
-                    if act_key in self.activity_config:
-                        config = self.activity_config[act_key]
-                        if use_median_duration:
-                            # Constant per-activity median — no sampling
-                            activity_duration = max(0.1, config['duration'])
-                        else:
-                            dist_name = config.get('dist_name', 'norm')
-                            dist_params = config.get('dist_params')
-                            if dist_params and any(p != 0 for p in dist_params[1:]):
-                                activity_duration = sample_from_dist(
-                                    dist_name, dist_params
-                                )
-                            else:
-                                activity_duration = max(0.1, config['duration'])
-                    elif activity_label in duration_map:
-                        dn, dp = duration_map[activity_label]
-                        activity_duration = sample_from_dist(dn, dp)
+                    # ── Duration sampling ─────────────────────────────────
+                    _MLP_PN_MODES = ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act')
+                    if not use_median_duration and self.mode in _MLP_PN_MODES:
+                        activity_duration = self._get_activity_duration(
+                            activity_label, object_name, object_type,
+                            higher_level_activity,
+                            object_attributes=object_attributes,
+                            activity_history=activity_history,
+                            activity_index=activity_count,
+                            current_sim_ts=current_sim_time,
+                            case_start_ts=case_start_ts,
+                        )
                     else:
-                        print(f"    WARNING: No duration info for "
-                              f"'{activity_label}' — using 10 min default.")
-                        activity_duration = 10.0
+                        act_key = (activity_label, object_name, object_type,
+                                   higher_level_activity)
+                        if act_key in self.activity_config:
+                            config = self.activity_config[act_key]
+                            if use_median_duration:
+                                activity_duration = max(0.1, config['duration'])
+                            else:
+                                dist_name = config.get('dist_name', 'norm')
+                                dist_params = config.get('dist_params')
+                                if dist_params and any(p != 0 for p in dist_params[1:]):
+                                    activity_duration = sample_from_dist(
+                                        dist_name, dist_params
+                                    )
+                                else:
+                                    activity_duration = max(0.1, config['duration'])
+                        elif activity_label in duration_map:
+                            dn, dp = duration_map[activity_label]
+                            activity_duration = sample_from_dist(dn, dp)
+                        else:
+                            print(f"    WARNING: No duration info for "
+                                  f"'{activity_label}' — using 10 min default.")
+                            activity_duration = 10.0
 
                     # Calculate timestamps
                     start_time_obj = datetime.fromtimestamp(current_sim_time)
@@ -569,6 +680,10 @@ class ProcessSimulation:
 
                     activity_count += 1
                     current_sim_time += 1  # 1 second gap
+
+                    # Update history (most recent first, keep last 2)
+                    activity_history.insert(0, (activity_label, activity_duration))
+                    activity_history = activity_history[:2]
 
                     print(f"    [{activity_count}] Fired '{activity_label}' "
                           f"(dur={activity_duration:.1f} min)")
@@ -2260,6 +2375,13 @@ class ProcessSimulation:
         print(f"[DEBUG _simulate_process_for_case] self.mode = '{self.mode}'")
         # ── Petri net mode delegates to its own method ────────────────
         if self.mode == 'petri_net':
+            self._simulate_petri_net_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── ML+ Petri-net: PN transitions, ML+ duration prediction ───
+        if self.mode in ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act'):
             self._simulate_petri_net_for_case(
                 case_id, object_attributes, start_time
             )

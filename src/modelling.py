@@ -243,12 +243,159 @@ process_datasets_to_model_sensors = process_datasets_to_model.copy()
 #     energy_state → ML → sample next activity directly from predict_proba
 #     Same ML-vs-statistical auto-selection applies per activity
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── ML+ helpers (mirrors duration_prediction_benchmark.ipynb) ─────────────────
+_MLP_ENG_COLS = [
+    'feat_hour', 'feat_dayofweek', 'feat_month',
+    'feat_act_pos', 'feat_prev_dur', 'feat_prev_dur2', 'feat_case_elapsed',
+]
+
+
+def _mlp_flatten_object_attributes(df):
+    if 'object_attributes' not in df.columns:
+        return df
+    import ast as _ast
+    def _parse(x):
+        if isinstance(x, dict): return x
+        if isinstance(x, str):
+            try: return _ast.literal_eval(x)
+            except: return {}
+        return {}
+    attrs   = df['object_attributes'].apply(_parse)
+    attr_df = pd.json_normalize(attrs.tolist()).add_prefix('attr_')
+    attr_df.index = df.index
+    return pd.concat([df.drop(columns=['object_attributes']), attr_df], axis=1)
+
+
+def _mlp_add_features(df):
+    out = df.sort_values(['case_id', 'timestamp_start']).copy()
+    out['feat_hour']      = out['timestamp_start'].dt.hour
+    out['feat_dayofweek'] = out['timestamp_start'].dt.dayofweek
+    out['feat_month']     = out['timestamp_start'].dt.month
+    out['feat_act_pos']   = out.groupby('case_id').cumcount()
+    out['feat_prev_dur']  = out.groupby('case_id')['duration'].shift(1).fillna(0.0)
+    out['feat_prev_dur2'] = out.groupby('case_id')['duration'].shift(2).fillna(0.0)
+    out['feat_case_elapsed'] = (
+        out['timestamp_start']
+        - out.groupby('case_id')['timestamp_start'].transform('min')
+    ).dt.total_seconds() / 60.0
+    return out
+
+
+def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
+    """Select best sklearn model by CV MAE on log1p(duration). Returns (model, scaler, name), oof_resid."""
+    from sklearn.model_selection import KFold
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import Ridge, HuberRegressor
+    from sklearn.ensemble import RandomForestRegressor
+
+    if len(sub) < 5 or not feat_cols:
+        return None, None
+
+    X     = sub[feat_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values
+    y     = sub['duration'].values
+    y_log = np.log1p(y)
+    n     = len(sub)
+    k     = min(n_splits, n // 2)
+    if k < 2:
+        return None, None
+
+    candidates = {
+        'ridge': lambda: Ridge(alpha=1.0),
+        'huber': lambda: HuberRegressor(epsilon=1.35, max_iter=300),
+        'rf':    lambda: RandomForestRegressor(n_estimators=50, max_depth=5,
+                                               min_samples_leaf=3, random_state=42),
+        'xgb':   lambda: XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05,
+                                       subsample=0.8, random_state=42, verbosity=0),
+    }
+    folds = list(KFold(n_splits=k, shuffle=False).split(X))
+    cand_scores, cand_oofs = {}, {}
+
+    for name, make_m in candidates.items():
+        oof, scores = np.full(n, np.nan), []
+        for tr_idx, val_idx in folds:
+            if len(tr_idx) < 2:
+                continue
+            sc_f, m_f = StandardScaler(), make_m()
+            try:
+                m_f.fit(sc_f.fit_transform(X[tr_idx]), y_log[tr_idx])
+                pred_log = m_f.predict(sc_f.transform(X[val_idx]))
+                scores.append(np.mean(np.abs(pred_log - y_log[val_idx])))
+                oof[val_idx] = y[val_idx] - np.clip(np.expm1(pred_log), 0, None)
+            except Exception:
+                pass
+        if scores:
+            cand_scores[name] = np.mean(scores)
+            cand_oofs[name]   = oof
+
+    if not cand_scores:
+        return None, None
+
+    best_name   = min(cand_scores, key=cand_scores.get)
+    valid_resid = cand_oofs[best_name][~np.isnan(cand_oofs[best_name])]
+
+    from sklearn.preprocessing import StandardScaler as _SS
+    sc = _SS()
+    m  = candidates[best_name]()
+    m.fit(sc.fit_transform(X), y_log)
+
+    oof_out = valid_resid if len(valid_resid) >= 5 else None
+    return (m, sc, best_name), oof_out
+
+
+def _mlp_train_models(df_train):
+    """Train ML+ global and per-act models from the training event log.
+
+    Returns:
+        global_mlp_tuple: (model, scaler, name) or None
+        act_mlp_models:   {activity: (model, scaler, name)}
+        mlp_feat_cols:    ordered feature column list
+        activity_means:   {activity: mean_duration}
+        global_mean:      float
+    """
+    df = df_train.copy()
+    df['timestamp_start'] = pd.to_datetime(df['timestamp_start'])
+    df['timestamp_end']   = pd.to_datetime(df['timestamp_end'])
+    df['duration'] = (df['timestamp_end'] - df['timestamp_start']).dt.total_seconds() / 60.0
+    df = df[df['duration'] > 0].copy()
+
+    df = _mlp_flatten_object_attributes(df)
+    df = _mlp_add_features(df)
+
+    activity_means = df.groupby('activity')['duration'].mean().to_dict()
+    global_mean    = float(df['duration'].mean())
+
+    df['feat_act_mean_dur'] = df['activity'].map(activity_means).fillna(global_mean)
+
+    attr_cols = [c for c in df.columns if c.startswith('attr_')]
+    numeric_attr_cols = [
+        c for c in attr_cols
+        if pd.to_numeric(df[c], errors='coerce').notna().mean() > 0.5
+    ]
+    mlp_feat_cols = [
+        c for c in (numeric_attr_cols + _MLP_ENG_COLS + ['feat_act_mean_dur'])
+        if c in df.columns
+    ]
+
+    global_mlp_tuple, _ = _mlp_fit_model_with_oof(df, mlp_feat_cols)
+
+    act_mlp_models = {}
+    for act, sub in df.groupby('activity'):
+        tpl, _ = _mlp_fit_model_with_oof(sub, mlp_feat_cols)
+        if tpl is not None:
+            act_mlp_models[act] = tpl
+
+    return global_mlp_tuple, act_mlp_models, mlp_feat_cols, activity_means, global_mean
+
+
 MODES_TO_COMPARE = [
     'statistical',
     'petri_net_alpha',
     'petri_net_heuristic',
     'petri_net_inductive',
     'petri_net_combined',
+    'petri_net_combined_ml_plus_global',
+    'petri_net_combined_ml_plus_per_act',
     # 'petri_net_median_duration',  # baseline: constant per-activity median, PN transitions
     'petri_net_ilp',
     # # ── energy-aware Petri-net variants ──────────────────────────────
@@ -512,6 +659,8 @@ METRICS_LOWER_IS_BETTER = {
     'case_metrics_median_events_per_case_error',
     'overall_error',
     'control_flow_metrics_edge_f1_error',
+    'conformance_metrics_fitness_error',
+    'conformance_metrics_precision_error',
 }
 
 # The 5 short metrics + overall shown in the main heatmap (all 0 = best)
@@ -520,10 +669,10 @@ CORE_METRIC_BASES = [
     'basic_metrics_event_count_error',
     'duration_metrics_mean_duration_error',
     'duration_metrics_activity_duration_error',
-    'duration_metrics_dur_js_whole',
-    'duration_metrics_dur_js_activ',
     'activity_metrics_js_divergence',
     'control_flow_metrics_edge_f1_error',
+    'conformance_metrics_fitness_error',
+    'conformance_metrics_precision_error',
 ]
 
 # Default definitions to avoid NameError when testing is skipped
@@ -702,14 +851,14 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     _col_evt    = f'{split}_basic_metrics_event_count_error'
     _col_dur_w  = f'{split}_duration_metrics_mean_duration_error'
     _col_dur_a  = f'{split}_duration_metrics_activity_duration_error'
-    _col_dur_jw = f'{split}_duration_metrics_dur_js_whole'
-    _col_dur_ja = f'{split}_duration_metrics_dur_js_activ'
     _col_js     = f'{split}_activity_metrics_js_divergence'
     _col_f1     = f'{split}_control_flow_metrics_edge_f1_error'
+    _col_fit    = f'{split}_conformance_metrics_fitness_error'
+    _col_prec   = f'{split}_conformance_metrics_precision_error'
     _col_ov     = f'{split}_overall_error'
 
-    all_metric_cols = [_col_evt, _col_dur_w, _col_dur_a, _col_dur_jw, _col_dur_ja,
-                       _col_js, _col_f1, _col_ov]
+    all_metric_cols = [_col_evt, _col_dur_w, _col_dur_a, _col_js, _col_f1,
+                       _col_fit, _col_prec, _col_ov]
     needed = [_col_evt, _col_dur_w, _col_js, _col_f1, _col_ov]
     available = [c for c in needed if c in target_df.columns]
     if not available:
@@ -729,19 +878,19 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         hm['DurErr(whole)']  = mode_avg[_col_dur_w]
     if _col_dur_a in mode_avg.columns:
         hm['DurErr(activ)']  = mode_avg[_col_dur_a]
-    if _col_dur_jw in mode_avg.columns:
-        hm['DurJS(whole)']   = mode_avg[_col_dur_jw]
-    if _col_dur_ja in mode_avg.columns:
-        hm['DurJS(activ)']   = mode_avg[_col_dur_ja]
     if _col_js in mode_avg.columns:
         hm['JS div']         = mode_avg[_col_js]
     if _col_f1 in mode_avg.columns:
         hm['EdgeF1Err']      = mode_avg[_col_f1]
+    if _col_fit in mode_avg.columns:
+        hm['FitnessErr']     = mode_avg[_col_fit]
+    if _col_prec in mode_avg.columns:
+        hm['PrecisionErr']   = mode_avg[_col_prec]
     if _col_ov in mode_avg.columns:
         hm['Overall']        = mode_avg[_col_ov]
 
     err_cols = [c for c in ['EvtRatioErr', 'DurErr(whole)', 'DurErr(activ)',
-                             'DurJS(whole)', 'DurJS(activ)', 'JS div', 'EdgeF1Err']
+                             'JS div', 'EdgeF1Err', 'FitnessErr', 'PrecisionErr']
                 if c in hm.columns]
     if 'Overall' not in hm.columns and err_cols:
         hm['Overall'] = hm[err_cols].mean(axis=1)
@@ -1274,6 +1423,14 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         else:
             report(f"{m_name:35}: {m_val:.4f}")
 
+    # Store error variants (1 - score) so they flow through the heatmap as lower-is-better
+    for _cm_key in ('fitness', 'precision'):
+        _cm_val = conformance_metrics.get(_cm_key, np.nan)
+        if pd.notna(_cm_val):
+            conformance_metrics[f'{_cm_key}_error'] = 1.0 - _cm_val
+        else:
+            conformance_metrics[f'{_cm_key}_error'] = np.nan
+
     results['conformance_metrics'] = conformance_metrics
 
     # ========== 7. ENERGY PROFILE METRICS ==========
@@ -1380,15 +1537,15 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     _dur_activ_global = results['duration_metrics'].get('activity_duration_error', np.nan)
 
     short_components = {
-        'evt_ratio_err':       _pc.get('evt_ratio_err',
-                                       abs(_evt_ratio_global - 1.0) if pd.notna(_evt_ratio_global) else np.nan),
-        'dur_err_whole':       _pc.get('dur_err_whole', _dur_whole_global),
-        'dur_err_activ':       _pc.get('dur_err_activ', _dur_activ_global),
-        'js_div':              _pc.get('js_div', _js_div_global),
-        'edge_err (1-EdgeF1)': (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
-                               ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan),
-        'dur_js_whole':        results['duration_metrics'].get('dur_js_whole', np.nan),
-        'dur_js_activ':        results['duration_metrics'].get('dur_js_activ', np.nan),
+        'evt_ratio_err':          _pc.get('evt_ratio_err',
+                                          abs(_evt_ratio_global - 1.0) if pd.notna(_evt_ratio_global) else np.nan),
+        'dur_err_whole':          _pc.get('dur_err_whole', _dur_whole_global),
+        'dur_err_activ':          _pc.get('dur_err_activ', _dur_activ_global),
+        'js_div':                 _pc.get('js_div', _js_div_global),
+        'edge_err (1-EdgeF1)':    (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
+                                  ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan),
+        'fitness_err (1-Fitness)':    results['conformance_metrics'].get('fitness_error', np.nan),
+        'precision_err (1-Prec)':     results['conformance_metrics'].get('precision_error', np.nan),
     }
 
     report("\nShort-heatmap error components (0 = best):")
@@ -1674,7 +1831,8 @@ for _mode_name in MODES_TO_COMPARE:
         continue
     if _mode_name.startswith('petri_net_'):
         _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
-        if _mode_alg in ('combined', 'median_duration'):
+        if _mode_alg in ('combined', 'median_duration',
+                         'combined_ml_plus_global', 'combined_ml_plus_per_act'):
             _filtered_modes.append(_mode_name)
             continue
         if _mode_alg not in PETRI_NET_ALGORITHMS:
@@ -1844,7 +2002,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     process_mode_results = []
 
     for sim_mode in MODES_TO_COMPARE:
-        if sim_mode in ('petri_net_combined', 'petri_net_median_duration'):
+        if sim_mode in ('petri_net_combined', 'petri_net_median_duration',
+                        'petri_net_combined_ml_plus_global', 'petri_net_combined_ml_plus_per_act'):
             # Derived after all explicit modes are evaluated.
             continue
 
@@ -2021,6 +2180,110 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
         process_mode_results.append(combined_row)
         evaluation_results_list.append(combined_row)
+
+        # ── ML+ combined variants (best PN transitions, ML+ duration prediction) ──
+        _mlp_modes_requested = [
+            m for m in MODES_TO_COMPARE
+            if m in ('petri_net_combined_ml_plus_global', 'petri_net_combined_ml_plus_per_act')
+        ]
+        if _mlp_modes_requested:
+            print("\n" + "─"*80)
+            print("  TRAINING ML+ MODELS FOR petri_net_combined_ml_plus_* MODES MODES")
+            print("─"*80)
+
+            _best_alg   = best_row.get('mining_algorithm')
+            _best_pm    = extraction_by_algorithm[_best_alg]['process_models']
+            _best_stats = extraction_by_algorithm[_best_alg]['activity_stats_df']
+
+            _glb_tpl, _pa_tpls, _mlp_feat_cols, _act_means, _glb_mean = \
+                _mlp_train_models(df_train)
+
+            print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
+            print(f"  Global model: {_glb_tpl[2] if _glb_tpl else 'None'}")
+            print(f"  Per-act models trained: {len(_pa_tpls)} activities")
+
+            for _mlp_mode in _mlp_modes_requested:
+                _use_global  = _mlp_mode == 'petri_net_combined_ml_plus_global'
+                _sim_mode    = 'petri_net_ml_plus_global' if _use_global else 'petri_net_ml_plus_per_act'
+                _g_arg       = _glb_tpl if _use_global else None
+                _pa_arg      = None     if _use_global else _pa_tpls
+
+                print("\n" + "─"*80)
+                print(f"  ▶ SIMULATION MODE: {_mlp_mode.upper()}")
+                print("─"*80)
+
+                sim_mlp_train = ProcessSimulation(
+                    _best_stats, production_plan,
+                    mode=_sim_mode,
+                    process_models=_best_pm,
+                    mlp_global_tuple=_g_arg,
+                    mlp_per_act_tuples=_pa_arg,
+                    mlp_feat_cols=_mlp_feat_cols,
+                    mlp_activity_means=_act_means,
+                    mlp_global_mean=_glb_mean,
+                ).run()
+                print(f"\n  Simulated log TRAIN ({_mlp_mode}): {len(sim_mlp_train)} events")
+
+                eval_mlp_train = comprehensive_simulation_evaluation(
+                    sim_mlp_train, df_train, process_models=_best_pm
+                )
+
+                flattened_mlp = {
+                    'process':          process,
+                    'mode':             _mlp_mode,
+                    'simulation_mode':  _sim_mode,
+                    'mining_algorithm': _best_alg,
+                    'split':            split_label,
+                    'selected_mode':    best_row.get('mode'),
+                }
+                for _cat, _mets in eval_mlp_train.items():
+                    if isinstance(_mets, dict):
+                        for _mn, _mv in _mets.items():
+                            flattened_mlp[f"train_{_cat}_{_mn}"] = _mv
+                    else:
+                        flattened_mlp[f"train_{_cat}"] = _mets
+
+                _df_test_mlp = test_datasets[process]['event_log'] if test_datasets else None
+                if TEMPORAL_SPLIT and _df_test_mlp is not None and len(_df_test_mlp) > 0:
+                    _pp_test_mlp = test_datasets[process]['production_plan']
+                    sim_mlp_test = ProcessSimulation(
+                        _best_stats, _pp_test_mlp,
+                        mode=_sim_mode,
+                        process_models=_best_pm,
+                        mlp_global_tuple=_g_arg,
+                        mlp_per_act_tuples=_pa_arg,
+                        mlp_feat_cols=_mlp_feat_cols,
+                        mlp_activity_means=_act_means,
+                        mlp_global_mean=_glb_mean,
+                    ).run()
+                    print(f"\n  Simulated log TEST  ({_mlp_mode}): {len(sim_mlp_test)} events")
+
+                    if EXPORT_RESULTS:
+                        _safe_process = str(process).replace(' ', '_').replace('/', '_')
+                        _safe_mode    = str(_mlp_mode).replace(' ', '_').replace('/', '_')
+                        _pred_df = sim_mlp_test.drop(
+                            columns=[c for c in sim_mlp_test.columns
+                                     if c == 'simulated_energy_curves'],
+                            errors='ignore',
+                        )
+                        _pred_path = os.path.join(
+                            _predicted_logs_dir, f'{_safe_process}_{_safe_mode}.parquet'
+                        )
+                        _pred_df.to_parquet(_pred_path, index=False)
+                        print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
+
+                    eval_mlp_test = comprehensive_simulation_evaluation(
+                        sim_mlp_test, _df_test_mlp, process_models=_best_pm
+                    )
+                    for _cat, _mets in eval_mlp_test.items():
+                        if isinstance(_mets, dict):
+                            for _mn, _mv in _mets.items():
+                                flattened_mlp[f"test_{_cat}_{_mn}"] = _mv
+                        else:
+                            flattened_mlp[f"test_{_cat}"] = _mets
+
+                process_mode_results.append(flattened_mlp)
+                evaluation_results_list.append(flattened_mlp)
 
         # ── Median-duration: same best-base PN, but use per-activity median ──
         if 'petri_net_median_duration' in MODES_TO_COMPARE:
