@@ -947,6 +947,11 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
     all_raw_rows = []
     process_models = {} if use_pm4py else None
 
+    # Ensure higher_level_activity exists; if missing treat the whole log as one group
+    if 'higher_level_activity' not in df.columns:
+        df = df.copy()
+        df['higher_level_activity'] = 'process'
+
     # Group by higher_level_activity only — one Petri net per process group
     grouped = df.groupby('higher_level_activity')
 

@@ -16,11 +16,18 @@ from pathlib import Path
 
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_200',
+    #     'processes_to_run':      ['process_2'], #['process_2', 'process_3', 'process_4']
+    #     'temporal_resolution':   '15min',
+    #     'run_process_modelling': True,
+    # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_100',
-        'processes_to_run':      ['process_2'], #['process_2', 'process_3', 'process_4']
-        'temporal_resolution':   '15min',
+        'run_name':              'experiment_200',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
+        'temporal_resolution':   '30min',
         'run_process_modelling': True,
     },
     # {
