@@ -858,9 +858,9 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     _col_prec   = f'{split}_conformance_metrics_precision_error'
     _col_ov     = f'{split}_overall_error'
 
-    all_metric_cols = [_col_evt, _col_dur_w, _col_dur_a, _col_f1,
+    all_metric_cols = [_col_evt, _col_dur_a, _col_f1,
                        _col_fit, _col_prec, _col_ov]
-    needed = [_col_evt, _col_dur_w, _col_f1, _col_ov]
+    needed = [_col_evt, _col_f1, _col_ov]
     available = [c for c in needed if c in target_df.columns]
     if not available:
         return
@@ -875,8 +875,6 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
 
     if _col_evt in mode_avg.columns:
         hm['EvtRatioErr']    = mode_avg[_col_evt]
-    if _col_dur_w in mode_avg.columns:
-        hm['DurErr(whole)']  = mode_avg[_col_dur_w]
     if _col_dur_a in mode_avg.columns:
         hm['DurErr(activ)']  = mode_avg[_col_dur_a]
     if _col_f1 in mode_avg.columns:
@@ -885,13 +883,10 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         hm['FitnessErr']     = mode_avg[_col_fit]
     if _col_prec in mode_avg.columns:
         hm['PrecisionErr']   = mode_avg[_col_prec]
-    if _col_ov in mode_avg.columns:
-        hm['Overall']        = mode_avg[_col_ov]
-
-    err_cols = [c for c in ['EvtRatioErr', 'DurErr(whole)', 'DurErr(activ)',
+    err_cols = [c for c in ['EvtRatioErr', 'DurErr(activ)',
                              'EdgeF1Err', 'FitnessErr', 'PrecisionErr']
                 if c in hm.columns]
-    if 'Overall' not in hm.columns and err_cols:
+    if err_cols:
         hm['Overall'] = hm[err_cols].mean(axis=1)
 
     # Rename row labels: "petri_net_combined_ml_plus_global" → "best_petri_net / ml_global"
@@ -1557,7 +1552,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     short_components = {
         'evt_ratio_err':          _pc.get('evt_ratio_err',
                                           abs(_evt_ratio_global - 1.0) if pd.notna(_evt_ratio_global) else np.nan),
-        'dur_err_whole':          _pc.get('dur_err_whole', _dur_whole_global),
         'dur_err_activ':          _pc.get('dur_err_activ', _dur_activ_global),
         'js_div':                 _pc.get('js_div', _js_div_global),
         'edge_err (1-EdgeF1)':    (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else

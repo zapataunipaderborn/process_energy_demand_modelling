@@ -625,7 +625,6 @@ def comprehensive_simulation_evaluation(
     short_components = {
         'evt_ratio_err':   _pc.get('evt_ratio_err',
                                    abs(_evt_ratio_global - 1.0) if pd.notna(_evt_ratio_global) else np.nan),
-        'dur_err_whole':   _pc.get('dur_err_whole', _dur_whole_global),
         'dur_err_activ':   _pc.get('dur_err_activ', _dur_activ_global),
         'js_div':          _pc.get('js_div', _js_div_global),
         'edge_err':        ((1.0 - _pc['edge_f1']) if 'edge_f1' in _pc
@@ -764,7 +763,7 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     _col_f1     = f'{split}_control_flow_metrics_edge_f1_score'
     _col_ov     = f'{split}_overall_error'
 
-    all_metric_cols = [_col_evt, _col_dur_w, _col_dur_a, _col_dur_jw,
+    all_metric_cols = [_col_evt, _col_dur_a, _col_dur_jw,
                        _col_dur_ja, _col_js, _col_f1, _col_ov]
     agg_cols = [c for c in all_metric_cols if c in target_df.columns]
     if not agg_cols:
@@ -774,14 +773,12 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
                 if agg == 'median' else target_df.groupby('mode')[agg_cols].mean())
     hm = pd.DataFrame(index=mode_avg.index)
     if _col_evt  in mode_avg.columns: hm['EvtRatioErr']  = (mode_avg[_col_evt] - 1.0).abs()
-    if _col_dur_w  in mode_avg.columns: hm['DurErr(whole)'] = mode_avg[_col_dur_w]
     if _col_dur_a  in mode_avg.columns: hm['DurErr(activ)'] = mode_avg[_col_dur_a]
     if _col_dur_jw in mode_avg.columns: hm['DurJS(whole)']  = mode_avg[_col_dur_jw]
     if _col_dur_ja in mode_avg.columns: hm['DurJS(activ)']  = mode_avg[_col_dur_ja]
     if _col_js   in mode_avg.columns: hm['JS div']        = mode_avg[_col_js]
     if _col_f1   in mode_avg.columns: hm['1-EdgeF1']      = 1.0 - mode_avg[_col_f1]
-    if _col_ov   in mode_avg.columns: hm['Overall']       = mode_avg[_col_ov]
-    elif hm.shape[1] > 0:
+    if hm.shape[1] > 0:
         hm['Overall'] = hm.mean(axis=1)
     hm = hm.sort_values('Overall', ascending=True) if 'Overall' in hm.columns else hm
 

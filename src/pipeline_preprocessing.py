@@ -361,259 +361,259 @@ df_expanded.to_parquet(files_folder_gold_datasets / "df_expanded.parquet", index
 df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", index=False)
 df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
 
-# %%
-display(df_expanded)
+# # %%
+# display(df_expanded)
 
-# %%
+# # %%
 
-# }
-display(df_event_log)
+# # }
+# display(df_event_log)
 
-# %%
-# df_expanded['activity_log'].value_counts()
+# # %%
+# # df_expanded['activity_log'].value_counts()
 
-# print(df_expanded['activity_log'].unique())
-
-
-# plot_activity_sensor_curves_by_index(df_expanded)
-
-# process_datasets['process_2'] = {
-#     'expanded': df_expanded,
-#     'event_log': df_event_log,
-#     'production_plan': production_plan
-# }
-display(df_expanded)
-
-# %%
-
-######## Process 3 ########
-
-process = 3
-
-# Define the path to the current file's location
+# # print(df_expanded['activity_log'].unique())
 
 
-# Define the path to the current file's location
-current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
+# # plot_activity_sensor_curves_by_index(df_expanded)
 
-# Define the folder path
-files_folder_silver = folder_silver_base / f'process_{process}'
-files_folder_gold = folder_gold_base / f'process_{process}'
-files_folder_gold.mkdir(parents=True, exist_ok=True)
+# # process_datasets['process_2'] = {
+# #     'expanded': df_expanded,
+# #     'event_log': df_event_log,
+# #     'production_plan': production_plan
+# # }
+# display(df_expanded)
 
-# Load the Parquet file
-df = pd.read_parquet(files_folder_silver / "df_combined_legend.parquet")
+# # %%
 
-# Sort by temp_object and datetime to ensure proper ordering
-df['temp_object'] = 'tower_1'  # Assign 'tower_1' to the new column first
-df_expanded = df.sort_values(['temp_object', 'datetime']).reset_index(drop=True)
+# ######## Process 3 ########
 
-df_expanded['activity'] = df_expanded['status_name']
+# process = 3
 
-# Identify activity changes: group consecutive rows with the same status_name per object
-df_expanded['activity_change'] = (df_expanded['status_name'] != df_expanded['status_name'].shift()).cumsum()
+# # Define the path to the current file's location
 
-# Group by temp_object and activity_change to create activity intervals
-activity_groups = df_expanded.groupby(['temp_object', 'activity_change'])
 
-# Create a new DataFrame for activities
-activity_rows = []
-for (obj, change), group in activity_groups:
-    group = group.sort_values('datetime')
-    start_time = group['datetime'].min()
-    end_time = group['datetime'].max()
-    status = group['status_name'].iloc[0]
+# # Define the path to the current file's location
+# current_path = Path(__file__).resolve().parent if '__file__' in globals() else Path().resolve()
 
-    row = group.iloc[0].copy()
-    row['timestamp_start'] = start_time
-    row['timestamp_end'] = end_time
-    row['activity'] = status
-    row['object_attributes'] = {"none": "none"}  # Add the "none": "none" key-value pairk
-    activity_rows.append(row)
+# # Define the folder path
+# files_folder_silver = folder_silver_base / f'process_{process}'
+# files_folder_gold = folder_gold_base / f'process_{process}'
+# files_folder_gold.mkdir(parents=True, exist_ok=True)
 
-df_activities = pd.DataFrame(activity_rows)
+# # Load the Parquet file
+# df = pd.read_parquet(files_folder_silver / "df_combined_legend.parquet")
 
-# Now set the required columns on df_activities
-df_activities['higher_level_activity'] = 'tower'#'shift'
-df_activities['object_type'] = 'tower'
-df_activities['object'] = df_activities['temp_object']
+# # Sort by temp_object and datetime to ensure proper ordering
+# df['temp_object'] = 'tower_1'  # Assign 'tower_1' to the new column first
+# df_expanded = df.sort_values(['temp_object', 'datetime']).reset_index(drop=True)
 
-# Define a function to determine the shift based on datetime hour
-def get_shift(dt):
-    hour = dt.hour
-    if 6 <= hour < 14:
-        return '1'
-    elif 14 <= hour < 22:
-        return '2'
-    else:
-        return '3'
+# df_expanded['activity'] = df_expanded['status_name']
 
-df_activities['case_id'] = 'shift_' + df_activities['timestamp_start'].apply(get_shift) + '_' + df_activities['timestamp_start'].dt.date.astype(str)
+# # Identify activity changes: group consecutive rows with the same status_name per object
+# df_expanded['activity_change'] = (df_expanded['status_name'] != df_expanded['status_name'].shift()).cumsum()
 
-# Add _log suffix to activity columns
-activity_cols = ['case_id', 'activity', 'timestamp_start', 'timestamp_end', 'object', 'object_type', 'higher_level_activity', 'object_attributes']
-df_activities = df_activities.rename(columns={col: col + '_log' for col in activity_cols if col in df_activities.columns})
+# # Group by temp_object and activity_change to create activity intervals
+# activity_groups = df_expanded.groupby(['temp_object', 'activity_change'])
 
-# Add _energy suffix to remaining sensor/datetime columns
-sensor_cols = [col for col in df_activities.columns if not col.endswith('_log')]
-df_activities = df_activities.rename(columns={col: col + '_energy' for col in sensor_cols if col in df_activities.columns})
+# # Create a new DataFrame for activities
+# activity_rows = []
+# for (obj, change), group in activity_groups:
+#     group = group.sort_values('datetime')
+#     start_time = group['datetime'].min()
+#     end_time = group['datetime'].max()
+#     status = group['status_name'].iloc[0]
 
-# Initialize log columns in df_expanded with None
-log_columns = [col for col in df_activities.columns if col.endswith('_log')]
-for col in log_columns:
-    df_expanded[col] = None
+#     row = group.iloc[0].copy()
+#     row['timestamp_start'] = start_time
+#     row['timestamp_end'] = end_time
+#     row['activity'] = status
+#     row['object_attributes'] = {"none": "none"}  # Add the "none": "none" key-value pairk
+#     activity_rows.append(row)
 
-# FIX 2: When assigning dict values, wrap in a list to prevent pandas unpacking the dict into columns
-for obj in df_expanded['temp_object'].unique():
-    df_obj = df_expanded[df_expanded['temp_object'] == obj]
-    df_act_obj = df_activities[df_activities['object_log'] == obj]
+# df_activities = pd.DataFrame(activity_rows)
 
-    for _, act_row in df_act_obj.iterrows():
-        mask = (
-            (df_obj['datetime'] >= act_row['timestamp_start_log']) &
-            (df_obj['datetime'] <= act_row['timestamp_end_log'])
-        )
-        matched_index = df_obj[mask].index
-        for col in log_columns:
-            val = act_row[col]
-            if isinstance(val, dict):
-                # Wrap in list to stop pandas unpacking the dict across columns
-                df_expanded.loc[matched_index, col] = [val] * len(matched_index)
-            else:
-                df_expanded.loc[matched_index, col] = val
+# # Now set the required columns on df_activities
+# df_activities['higher_level_activity'] = 'tower'#'shift'
+# df_activities['object_type'] = 'tower'
+# df_activities['object'] = df_activities['temp_object']
 
-# Drop temp_object, activity_change, and mat_id columns (now stored in object_attributes_log)
-df_expanded = df_expanded.drop(columns=['temp_object', 'activity_change'] +
-    [col for col in df_expanded.columns if
-     '(1)_status' in col or 'status_name' in col], errors='ignore')
+# # Define a function to determine the shift based on datetime hour
+# def get_shift(dt):
+#     hour = dt.hour
+#     if 6 <= hour < 14:
+#         return '1'
+#     elif 14 <= hour < 22:
+#         return '2'
+#     else:
+#         return '3'
 
-# Rename all non-log columns (sensor + datetime) to _energy
-sensor_cols_combined = [col for col in df_expanded.columns if not col.endswith('_log')]
-df_expanded = df_expanded.rename(columns={col: col + '_energy' for col in sensor_cols_combined})
+# df_activities['case_id'] = 'shift_' + df_activities['timestamp_start'].apply(get_shift) + '_' + df_activities['timestamp_start'].dt.date.astype(str)
 
-df_expanded['timestamp_start_log'] = pd.to_datetime(df_expanded['timestamp_start_log'])
-df_expanded['timestamp_end_log'] = pd.to_datetime(df_expanded['timestamp_end_log'])
+# # Add _log suffix to activity columns
+# activity_cols = ['case_id', 'activity', 'timestamp_start', 'timestamp_end', 'object', 'object_type', 'higher_level_activity', 'object_attributes']
+# df_activities = df_activities.rename(columns={col: col + '_log' for col in activity_cols if col in df_activities.columns})
 
-df_expanded.columns = [col.replace('__', '_') for col in df_expanded.columns]
+# # Add _energy suffix to remaining sensor/datetime columns
+# sensor_cols = [col for col in df_activities.columns if not col.endswith('_log')]
+# df_activities = df_activities.rename(columns={col: col + '_energy' for col in sensor_cols if col in df_activities.columns})
 
-# Combine f10/f11 feed rates: take element-wise maximum
-df_expanded['speise_current_kg/h_energy'] = df_expanded[['f10_speise_kg/h_energy', 'f11_speise_kg/h_energy']].max(axis=1)
+# # Initialize log columns in df_expanded with None
+# log_columns = [col for col in df_activities.columns if col.endswith('_log')]
+# for col in log_columns:
+#     df_expanded[col] = None
 
-# Total material per case: integrate feed rate over actual measurement intervals
-_vol = df_expanded[['case_id_log', 'datetime_energy', 'speise_current_kg/h_energy']].copy()
-_vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
-_vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
-_vol['_dt_h'] = _vol['_dt_h'].fillna(0)
-_vol['_kg'] = _vol['speise_current_kg/h_energy'] * _vol['_dt_h']
-_case_total = _vol.groupby('case_id_log')['_kg'].sum()
-df_expanded['object_attributes_log'] = df_expanded.apply(
-    lambda row: {**row['object_attributes_log'], 'total_material': _case_total.get(row['case_id_log'], None)}
-    if isinstance(row['object_attributes_log'], dict) else row['object_attributes_log'],
-    axis=1
-)
+# # FIX 2: When assigning dict values, wrap in a list to prevent pandas unpacking the dict into columns
+# for obj in df_expanded['temp_object'].unique():
+#     df_obj = df_expanded[df_expanded['temp_object'] == obj]
+#     df_act_obj = df_activities[df_activities['object_log'] == obj]
 
-print(f"Expanded df")
-print(df_expanded)
+#     for _, act_row in df_act_obj.iterrows():
+#         mask = (
+#             (df_obj['datetime'] >= act_row['timestamp_start_log']) &
+#             (df_obj['datetime'] <= act_row['timestamp_end_log'])
+#         )
+#         matched_index = df_obj[mask].index
+#         for col in log_columns:
+#             val = act_row[col]
+#             if isinstance(val, dict):
+#                 # Wrap in list to stop pandas unpacking the dict across columns
+#                 df_expanded.loc[matched_index, col] = [val] * len(matched_index)
+#             else:
+#                 df_expanded.loc[matched_index, col] = val
 
-# Extract only the event log
-df = df_expanded.copy()
+# # Drop temp_object, activity_change, and mat_id columns (now stored in object_attributes_log)
+# df_expanded = df_expanded.drop(columns=['temp_object', 'activity_change'] +
+#     [col for col in df_expanded.columns if
+#      '(1)_status' in col or 'status_name' in col], errors='ignore')
 
-# Keep only columns ending with '_log'
-df = df[[col for col in df.columns if col.endswith('_log')]]
+# # Rename all non-log columns (sensor + datetime) to _energy
+# sensor_cols_combined = [col for col in df_expanded.columns if not col.endswith('_log')]
+# df_expanded = df_expanded.rename(columns={col: col + '_energy' for col in sensor_cols_combined})
 
-# Remove '_log' suffix
-df.columns = [col.replace('_log', '') for col in df.columns]
+# df_expanded['timestamp_start_log'] = pd.to_datetime(df_expanded['timestamp_start_log'])
+# df_expanded['timestamp_end_log'] = pd.to_datetime(df_expanded['timestamp_end_log'])
 
-df_event_log = df.copy()
+# df_expanded.columns = [col.replace('__', '_') for col in df_expanded.columns]
 
-# Remove duplicate rows where all values are the same, excluding dict columns
-# (drop_duplicates can't handle dicts, so exclude 'object_attributes' column)
-subset_cols = [col for col in df_event_log.columns if col != 'object_attributes']
-df_event_log = df_event_log.drop_duplicates(subset=subset_cols)
+# # Combine f10/f11 feed rates: take element-wise maximum
+# df_expanded['speise_current_kg/h_energy'] = df_expanded[['f10_speise_kg/h_energy', 'f11_speise_kg/h_energy']].max(axis=1)
 
-print(f"Event log")
-print(df_event_log)
+# # Total material per case: integrate feed rate over actual measurement intervals
+# _vol = df_expanded[['case_id_log', 'datetime_energy', 'speise_current_kg/h_energy']].copy()
+# _vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
+# _vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
+# _vol['_dt_h'] = _vol['_dt_h'].fillna(0)
+# _vol['_kg'] = _vol['speise_current_kg/h_energy'] * _vol['_dt_h']
+# _case_total = _vol.groupby('case_id_log')['_kg'].sum()
+# df_expanded['object_attributes_log'] = df_expanded.apply(
+#     lambda row: {**row['object_attributes_log'], 'total_material': _case_total.get(row['case_id_log'], None)}
+#     if isinstance(row['object_attributes_log'], dict) else row['object_attributes_log'],
+#     axis=1
+# )
 
-### Production plan
-df = df_event_log.copy()
-df = df[['case_id', 'activity', 'timestamp_start', 'timestamp_end', 'object_attributes']]
+# print(f"Expanded df")
+# print(df_expanded)
 
-# Only leave the case ids, the orders
-df = df.drop_duplicates(subset=['case_id'])
+# # Extract only the event log
+# df = df_expanded.copy()
 
-df_production_plan = df.copy()
+# # Keep only columns ending with '_log'
+# df = df[[col for col in df.columns if col.endswith('_log')]]
 
-print(f"production plan")
-print(df_production_plan)
+# # Remove '_log' suffix
+# df.columns = [col.replace('_log', '') for col in df.columns]
 
-relevant_columns = ['datetime_energy',
+# df_event_log = df.copy()
 
-        '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
-       '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
-       #'(4)_frostschutz_%_energy', 
+# # Remove duplicate rows where all values are the same, excluding dict columns
+# # (drop_duplicates can't handle dicts, so exclude 'object_attributes' column)
+# subset_cols = [col for col in df_event_log.columns if col != 'object_attributes']
+# df_event_log = df_event_log.drop_duplicates(subset=subset_cols)
+
+# print(f"Event log")
+# print(df_event_log)
+
+# ### Production plan
+# df = df_event_log.copy()
+# df = df[['case_id', 'activity', 'timestamp_start', 'timestamp_end', 'object_attributes']]
+
+# # Only leave the case ids, the orders
+# df = df.drop_duplicates(subset=['case_id'])
+
+# df_production_plan = df.copy()
+
+# print(f"production plan")
+# print(df_production_plan)
+
+# relevant_columns = ['datetime_energy',
+
+#         '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
+#        '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
+#        #'(4)_frostschutz_%_energy', 
        
-       '(5)_vor_vent_hauptzuluft_temp_c_energy',
-       '(7)_zuluft_turmt_temp_c_energy', '(9)_abluft2_kon_g/kg_energy',
+#        '(5)_vor_vent_hauptzuluft_temp_c_energy',
+#        '(7)_zuluft_turmt_temp_c_energy', '(9)_abluft2_kon_g/kg_energy',
 
-    #    '(11)_wm_mas_kg/h_energy', 
+#     #    '(11)_wm_mas_kg/h_energy', 
 
-       '(12)_mpt_fb(mpt?)_kg/h_energy',
-       '(13)_lanzen_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
-       #'(15)_filter_mas_kg/h_energy', 
-       '(16)_konditionierung_mas_kg/h_energy',
-       '(8)_abluft_vol_m3/h_energy', '(23)_f10_speise_temp_c_energy',
-       '(23)_f11_speise_temp_c_energy',
-       '(19)_zuluft_vor_entfeuchter_temp_c_energy', 'dampf_nmb_energy',
-       'nach_nt_(c)_energy', 
+#        '(12)_mpt_fb(mpt?)_kg/h_energy',
+#        '(13)_lanzen_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
+#        #'(15)_filter_mas_kg/h_energy', 
+#        '(16)_konditionierung_mas_kg/h_energy',
+#        '(8)_abluft_vol_m3/h_energy', '(23)_f10_speise_temp_c_energy',
+#        '(23)_f11_speise_temp_c_energy',
+#        '(19)_zuluft_vor_entfeuchter_temp_c_energy', 'dampf_nmb_energy',
+#        'nach_nt_(c)_energy', 
        
-       'speise_current_kg/h_energy',
-    #    'f10_speise_kg/h_energy',
-    #    'f11_speise_kg/h_energy',
-    #    'f10_speise_kg/m³_energy',
-    #    'f11_speise_kg/m³_energy', 'f10_speise_l/h_energy',
-    #    'f11_speise_l/h_energy',
+#        'speise_current_kg/h_energy',
+#     #    'f10_speise_kg/h_energy',
+#     #    'f11_speise_kg/h_energy',
+#     #    'f10_speise_kg/m³_energy',
+#     #    'f11_speise_kg/m³_energy', 'f10_speise_l/h_energy',
+#     #    'f11_speise_l/h_energy',
        
-       '(6)_nach_recu_reg_temp_c_old_energy',
-       '(18)_leistung_turmF_lufterhitzer_kw_energy',
-       '(17)_leistung_turmF_luftentfeuchter_kw_energy',
-       '(6)_nach_recu_reg_temp_c_energy', 
-       #'id_original_energy',
-       '(10)_abluft_temp_c_energy', '(8)_abluft_mas_kg/h_energy',
+#        '(6)_nach_recu_reg_temp_c_old_energy',
+#        '(18)_leistung_turmF_lufterhitzer_kw_energy',
+#        '(17)_leistung_turmF_luftentfeuchter_kw_energy',
+#        '(6)_nach_recu_reg_temp_c_energy', 
+#        #'id_original_energy',
+#        '(10)_abluft_temp_c_energy', '(8)_abluft_mas_kg/h_energy',
 
-       'ef_temperature_2m_energy', 'ef_relative_humidity_2m_energy',
-       #'ef_apparent_temperature_energy', 'ef_precipitation_energy',
-       #'ef_wind_speed_10m_energy', 'ef_wind_direction_100m_energy',
-       'ef_global_tilted_irradiance_energy',
+#        'ef_temperature_2m_energy', 'ef_relative_humidity_2m_energy',
+#        #'ef_apparent_temperature_energy', 'ef_precipitation_energy',
+#        #'ef_wind_speed_10m_energy', 'ef_wind_direction_100m_energy',
+#        'ef_global_tilted_irradiance_energy',
        
-    #    '(21)_zuluft_turm_mas_kg/h_energy', '(31)_q_waerme_recu_kw_energy',
-    #    '(22)_t_waermereg_c_energy',
-    #    '(29)_q_lufterwearmung_von_T6_nach_T7_kw_energy',
-    #    '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw_energy',
-    #    '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw_energy',
-    #    '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw_energy',
+#     #    '(21)_zuluft_turm_mas_kg/h_energy', '(31)_q_waerme_recu_kw_energy',
+#     #    '(22)_t_waermereg_c_energy',
+#     #    '(29)_q_lufterwearmung_von_T6_nach_T7_kw_energy',
+#     #    '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw_energy',
+#     #    '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw_energy',
+#     #    '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw_energy',
 
-       'activity_energy', 'activity_log', 'timestamp_start_log',
-       'timestamp_end_log', 'object_attributes_log',
-       'higher_level_activity_log', 'object_type_log', 'object_log',
-       'case_id_log']
+#        'activity_energy', 'activity_log', 'timestamp_start_log',
+#        'timestamp_end_log', 'object_attributes_log',
+#        'higher_level_activity_log', 'object_type_log', 'object_log',
+#        'case_id_log']
 
-df_expanded = df_expanded[relevant_columns].copy()
+# df_expanded = df_expanded[relevant_columns].copy()
 
-files_folder_gold_datasets = files_folder_gold / 'datasets'
-files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
+# files_folder_gold_datasets = files_folder_gold / 'datasets'
+# files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
 
-df_expanded.to_parquet(files_folder_gold_datasets / "df_expanded.parquet", index=False)
-df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", index=False)
-df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
-# %%
-display(df_expanded['activity_log'].value_counts())
+# df_expanded.to_parquet(files_folder_gold_datasets / "df_expanded.parquet", index=False)
+# df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", index=False)
+# df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
+# # %%
+# display(df_expanded['activity_log'].value_counts())
 
-display(df_expanded['activity_log'].unique())
+# display(df_expanded['activity_log'].unique())
 
-#plot_activity_sensor_curves_by_index(df_expanded)
+# #plot_activity_sensor_curves_by_index(df_expanded)
 
-display(df_expanded.columns)
-display(df_expanded)
+# display(df_expanded.columns)
+# display(df_expanded)
 
 # %%
 
@@ -871,9 +871,9 @@ display(df_expanded)
 
 #%%
 
-######## Process 5 ########
+######## Process 3 ########
 
-process = 5
+process = 3
 
 # Define the folder path
 files_folder_silver = folder_silver_base / f'process_{process}'
