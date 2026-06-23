@@ -958,7 +958,8 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
     for higher_level_activity, group in grouped:
         object_type = group['object_type'].iloc[0] if 'object_type' in group.columns else 'unknown'
         object_name = higher_level_activity  # synthetic key: whole process represented by its group name
-        print(f"\nProcessing: {higher_level_activity} ({group['object'].nunique()} objects, one whole-process net)")
+        n_objects = group['object'].nunique() if 'object' in group.columns else 'N/A'
+        print(f"\nProcessing: {higher_level_activity} ({n_objects} objects, one whole-process net)")
         print(f"  Mining algorithm: {mining_algorithm}")
 
         activities = group['activity'].unique()
