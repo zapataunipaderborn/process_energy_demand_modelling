@@ -393,9 +393,9 @@ MODES_TO_COMPARE = [
     'petri_net_alpha',
     'petri_net_heuristic',
     'petri_net_inductive',
-    'petri_net_combined',
-    'petri_net_combined_ml_plus_global',
-    'petri_net_combined_ml_plus_per_act',
+    # 'petri_net_combined',
+    # 'petri_net_combined_ml_plus_global',
+    # 'petri_net_combined_ml_plus_per_act',
     'petri_net_heuristic_ml_plus_global',
     'petri_net_heuristic_ml_plus_per_act',
     # 'petri_net_median_duration',  # baseline: constant per-activity median, PN transitions
@@ -889,7 +889,6 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     if err_cols:
         hm['Overall'] = hm[err_cols].mean(axis=1)
 
-    # Rename row labels: "petri_net_combined_ml_plus_global" → "best_petri_net / ml_global"
     def _display_mode(m):
         m = str(m)
         if not m.startswith('petri_net_'):
@@ -897,14 +896,10 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         rest = m[len('petri_net_'):]
         if rest.endswith('_ml_plus_global'):
             base = rest[:-len('_ml_plus_global')]
-            base = 'best_petri_net' if base == 'combined' else base
             return base + ' / ml_global'
         if rest.endswith('_ml_plus_per_act'):
             base = rest[:-len('_ml_plus_per_act')]
-            base = 'best_petri_net' if base == 'combined' else base
             return base + ' / ml_local'
-        if rest == 'combined':
-            return 'best_petri_net / statistical'
         return rest + ' / statistical'
     hm.index = [_display_mode(m) for m in hm.index]
 
