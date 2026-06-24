@@ -577,16 +577,16 @@ RUN_PROCESS_MODELLING     = True#os.environ.get('PIPELINE_RUN_PROCESS_MODELLING'
 #    'seq2seq_exog'      DTW + LSTM encoder-decoder + external factors
 APPROACHES = [
     'baseline',
-    'instance_stats',
-    'istats_leakfree',
+    # 'instance_stats',
+    # 'istats_leakfree',
     # 'dtw_phase',
     # 'basis',
-    'exog',
+    # 'exog',
     'exog_prev_activity',
     #'amplitude_shape',
 
     'seq2seq',
-    'seq2seq_only',
+    # 'seq2seq_only',
     # 'seq2seq_exog',
     'seq2seq_prev_activity',
 ]
@@ -3766,19 +3766,11 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown(f"## Split: {_split_label}"))
 
         for _approach_label, _pipelines in [
-            ('Mean Baseline',               all_energy_pipelines_mean),
-            ('DTW + pos',        all_energy_pipelines),
-            ('Instance Stats (leaky)',      all_energy_pipelines_instance_stats),
-            ('Instance Stats (leak-free)',  all_energy_pipelines_istats_leakfree),
-            ('Approach 2 (B-spline)',       all_energy_pipelines_basis),
-            ('Approach 3 (DTW-phase)',      all_energy_pipelines_dtw_phase),
-            ('DTW + Ext. Factors',          all_energy_pipelines_exog),
+            ('Baseline',                      all_energy_pipelines_mean),
+            ('DTW + pos',                     all_energy_pipelines),
             ('DTW + Ext. Factors + Prev Act', all_energy_pipelines_exog_prev_activity),
-            ('Amplitude + Shape',           all_energy_pipelines_amplitude_shape),
 
             ('DTW + Seq2Seq',               all_energy_pipelines_seq2seq),
-            ('Seq2Seq only',                all_energy_pipelines_seq2seq_only),
-            ('DTW + Seq2Seq + Ext. Factors', all_energy_pipelines_seq2seq_exog),
             ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_prev_activity),
         ]:
             if not _pipelines:
@@ -4037,21 +4029,14 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 display(Markdown("## 5 Best & 5 Worst Curve Fits per Approach — TEST set"))
 
                 _APPROACH_PIPELINES = {
-                    'Mean Baseline':                  all_energy_pipelines_mean
+                    'Baseline':                       all_energy_pipelines_mean
                         if 'all_energy_pipelines_mean' in dir() else {},
-                    'DTW + pos':           all_energy_pipelines
+                    'DTW + pos':                      all_energy_pipelines
                         if 'all_energy_pipelines' in dir() else {},
                     'DTW + Ext. Factors + Prev Act':  all_energy_pipelines_exog_prev_activity
                         if 'all_energy_pipelines_exog_prev_activity' in dir() else {},
-                    'Amplitude + Shape':              all_energy_pipelines_amplitude_shape
-                        if 'all_energy_pipelines_amplitude_shape' in dir() else {},
-
                     'DTW + Seq2Seq':                  all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
-                    'Seq2Seq only':                   all_energy_pipelines_seq2seq_only
-                        if 'all_energy_pipelines_seq2seq_only' in dir() else {},
-                    'DTW + Seq2Seq + Ext. Factors':   all_energy_pipelines_seq2seq_exog
-                        if 'all_energy_pipelines_seq2seq_exog' in dir() else {},
                     'DTW + Seq2Seq + Ext. Factors + Prev Act': all_energy_pipelines_seq2seq_prev_activity
                         if 'all_energy_pipelines_seq2seq_prev_activity' in dir() else {},
                 }
