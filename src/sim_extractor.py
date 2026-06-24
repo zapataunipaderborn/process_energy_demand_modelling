@@ -3434,7 +3434,7 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
         row = {
             'position_idx': ref_pos,
             'relative_pos': ref_pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity': activity,
         }
         for key in all_keys:
@@ -3825,7 +3825,7 @@ def predict_raw_curve_instance_stats(raw_values, activity, attributes, pipeline)
         row = {
             'position_idx': pos,
             'relative_pos': pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'curve_mean':   stats['curve_mean'],
             'curve_std':    stats['curve_std'],
             'curve_min':    stats['curve_min'],
@@ -4178,7 +4178,7 @@ def predict_raw_curve_istats_leakfree(raw_values, activity, attributes, pipeline
     sp_categorical_cols = pipeline.get('sp_categorical_cols', [])
 
     # ── Stage 1: predict curve stats from metadata only ──────────────────────
-    sp_row = {'curve_length': len(raw_values), 'activity': activity}
+    sp_row = {'curve_length': attributes.get('_pred_curve_length', len(raw_values)), 'activity': activity}
     for key in all_keys:
         value = attributes.get(key, None)
         if key_types[key] == 'numeric':
@@ -4214,7 +4214,7 @@ def predict_raw_curve_istats_leakfree(raw_values, activity, attributes, pipeline
         row = {
             'position_idx': pos,
             'relative_pos': pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'curve_mean':   predicted_stats['curve_mean'],
             'curve_std':    predicted_stats['curve_std'],
             'curve_min':    predicted_stats['curve_min'],
@@ -4617,7 +4617,7 @@ def predict_raw_curve_dtw_phase(raw_values, activity, attributes, pipeline):
         row = {
             'position_idx':     pos,
             'relative_pos':     pos / _rel_denom,
-            'curve_length':     len(raw_values),
+            'curve_length':     attributes.get('_pred_curve_length', len(raw_values)),
             'activity':         activity,
             'phase_norm':       ref_feats['phase_norm'][pos],
             'local_slope':      ref_feats['local_slope'][pos],
@@ -4984,7 +4984,7 @@ def predict_raw_curve_basis(raw_values, activity, attributes, pipeline):
     fixed_length         = pipeline['fixed_length']
 
     row = {
-        'curve_length': len(raw_values),
+        'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
         'activity':     activity,
     }
     for key in all_keys:
@@ -5284,7 +5284,7 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
         row = {
             'position_idx': ref_pos,
             'relative_pos': ref_pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity':     activity,
         }
         for key in all_keys:
@@ -5727,7 +5727,7 @@ def predict_raw_curve_amplitude_shape(raw_values, activity, attributes, pipeline
         return str(v) if v is not None else 'None'
 
     # ── Stage A: predict amplitude ────────────────────────────────────────────
-    meta_row = {'curve_length': len(raw_values), 'activity': activity}
+    meta_row = {'curve_length': attributes.get('_pred_curve_length', len(raw_values)), 'activity': activity}
     for key in all_keys:
         meta_row[key] = _attr_val(key)
 
@@ -5752,7 +5752,7 @@ def predict_raw_curve_amplitude_shape(raw_values, activity, attributes, pipeline
         row = {
             'position_idx': pos,
             'relative_pos': pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity':     activity,
         }
         for key in all_keys:
@@ -6112,7 +6112,7 @@ def predict_raw_curve_amplitude_shape_exog(raw_values, activity, attributes, pip
         return str(v) if v is not None else 'None'
 
     # ── Stage A: predict amplitude ────────────────────────────────────────────
-    meta_row = {'curve_length': len(raw_values), 'activity': activity}
+    meta_row = {'curve_length': attributes.get('_pred_curve_length', len(raw_values)), 'activity': activity}
     for key in all_keys:
         meta_row[key] = _attr_val(key)
 
@@ -6150,7 +6150,7 @@ def predict_raw_curve_amplitude_shape_exog(raw_values, activity, attributes, pip
         row = {
             'position_idx': pos,
             'relative_pos': pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity':     activity,
         }
         for key in all_keys:
@@ -6528,7 +6528,7 @@ def predict_raw_curve_seq2seq(raw_values, activity, attributes, pipeline):
         row = {
             'position_idx': pos,
             'relative_pos': pos / _rel_denom,
-            'curve_length': len(raw_values),
+            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity':     activity,
         }
         for key in all_keys:
@@ -6754,7 +6754,7 @@ def predict_raw_curve_seq2seq_only(raw_values, activity, attributes, pipeline):
     rows = []
     for pos in range(fixed_length):
         row = {'position_idx': pos, 'relative_pos': pos / _rel_denom,
-               'curve_length': len(raw_values), 'activity': activity}
+               'curve_length': attributes.get('_pred_curve_length', len(raw_values)), 'activity': activity}
         for key in all_keys:
             v = attributes.get(key, None)
             if key_types[key] == 'numeric':
@@ -7084,7 +7084,7 @@ def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
     rows = []
     for pos in range(fixed_length):
         row = {'position_idx': pos, 'relative_pos': pos / _rel_denom,
-               'curve_length': len(raw_values), 'activity': activity}
+               'curve_length': attributes.get('_pred_curve_length', len(raw_values)), 'activity': activity}
         for key in all_keys:
             v = attributes.get(key, None)
             if key_types[key] == 'numeric':

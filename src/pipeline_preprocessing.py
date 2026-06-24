@@ -352,7 +352,42 @@ relevant_activites = [
 
 df_expanded = df_expanded[relevant_columns].copy()
 
+#%% Define curves to model
 
+
+columns_to_model =  [
+    #    'datetime_energy',
+    #    'status_name_energy', 
+
+    #    'ef_wind_speed_10m_energy',
+    #    'ef_precipitation_energy', 
+    #    'ef_wind_direction_100m_energy', 
+    #    'ef_temperature_2m_energy',
+    #    'ef_relative_humidity_2m_energy', 
+    #    'ef_global_tilted_irradiance_energy',
+    #    'ef_apparent_temperature_energy'
+
+       'pro_menge_kg_energy',
+       'pro_volstrom_l/h_energy',
+       'dampfmenge_kg/h_nmb+cip_energy',
+
+    #    'cip_turm_f_energy',
+    #    'cip_turm_g_energy',
+
+       'pro_power_kW_energy',
+    #    'pro_temp_out_energy', 
+       'medium_power_kW_energy'
+       ]
+
+columns_to_model_original = columns_to_model.copy()
+
+df_expanded = df_expanded.rename(
+    columns={col: f"{col}_to_model" for col in columns_to_model_original if col in df_expanded.columns}
+)
+print(df_expanded.columns)
+
+
+#%%
 
 files_folder_gold_datasets = files_folder_gold / 'datasets'
 files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
@@ -850,6 +885,58 @@ relevant_columns = ['case_id_log', 'activity_log', 'timestamp_start_log',
 
 df_expanded = df_expanded[relevant_columns].copy()
 
+
+
+# %%
+
+columns_to_model = [
+    
+    #    'case_id_log', 'activity_log', 'timestamp_start_log',
+    #    'timestamp_end_log', 'object_log', 'object_type_log',
+    #    'higher_level_activity_log', 'object_attributes_log', 
+    #    'datetime_energy',
+
+       'temp_Auslauf_EG_(WT2)_5s_energy', 'temp_Einlauf_EG_(WT_2)_5s_energy',
+       'flow_Kuehlturmwasser_30120FT701_5s_energy',
+       'flow_Kaltwasser_(WT7)_5s_energy', 'Vorlaufpumpe_30110FT301_5s_energy',
+    #    'Produkt_Einlauf_30110TT001_5s_energy',
+       'vor_Vorwärmer_(WT_2)_5s_energy', 'Kuehlturmwassertemp_(WT6)_5s_energy',
+       'Kaltwassertemp_(WT_7)_5s_energy', 'nach_Kuehler_(WT7)_5s_energy',
+       'temp_nach_Kuehlturmkuehler_(WT6)_5s_energy',
+       'Fuellstand_Steriltank_30140LT001_5s_energy',
+       'Fuellstand_Steriltank_30141LT001_5s_energy',
+       'flow_Dampf_WT3a/5a)_5s_energy',
+       'flow_Heisswasser_30120FT721(WT5a)_5s_energy',
+       'temp_nach_WR2,_vor_Druckerhoehungspumpe_(WT4)_5s_energy',
+       'temp_nach_Erhitzer_(WT5)_5s_energy', 'temp_nach_WR2_(WT2)_5s_energy',
+       'temp_nach_Austauscher_2_(WT4)_5s_energy',
+       'Druck_HW_Anwaermer_(WT3a)_5s_energy',
+       'temp_HW_Anwaermer_(WT3a)_5s_energy',
+       'temp_Produkt_Einlauf_30110TT001_1h_energy',
+       'flow_Vorlaufpumpe_30110FT301_1h_energy',
+       'temp_vor_Vorwärmer_(WT_2)_1h_energy', 'strom_PERT2_KZE_5s_energy',
+       'dampf_PET2_KZE_5s_energy', 
+       #'strom_gesamt_PERT2_KZE_15m_energy',
+       #'dampf_gesamt_PET2_KZE_15m_energy',
+       'A016_temp_vor_Vorwärmer_30121TT001_(WT_2)_5s_energy',
+       'A047_temp_Produkt_Einlauf_30110TT001_5s_energy',
+       'A054_flow_Vorlaufpumpe_30110FT301_5s_energy',
+
+    #    'ef_temperature_2m_energy', 'ef_relative_humidity_2m_energy',
+    #    #'ef_apparent_temperature_energy', 'ef_precipitation_energy',
+    #    #'ef_wind_speed_10m_energy', 'ef_wind_direction_100m_energy',
+    #    'ef_global_tilted_irradiance_energy'
+       ]
+
+columns_to_model_original = columns_to_model.copy()
+
+df_expanded = df_expanded.rename(
+    columns={col: f"{col}_to_model" for col in columns_to_model_original if col in df_expanded.columns}
+)
+print(df_expanded.columns)
+
+# %%
+
 files_folder_gold_datasets = files_folder_gold / 'datasets'
 files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
 
@@ -875,112 +962,99 @@ display(df_expanded)
 
 process = 3
 
-# Define the folder path
+# Define folder paths
 files_folder_silver = folder_silver_base / f'process_{process}'
 files_folder_gold = folder_gold_base / f'process_{process}'
 files_folder_gold.mkdir(parents=True, exist_ok=True)
 
-
 df = pd.read_parquet(files_folder_silver / "data_prepared_for_analysis.parquet")
 
-# df["datetime"] = pd.to_datetime(df["datetime"])
-# df = df[df["datetime"] < "2025-09-30"]
+relevant_columns = [
+    'datetime',
 
-relevant_columns = ['datetime', 
-        
-        'f11_speise_den_kg/m3', '(10)_abluft_temp_c',
-       'f10_speise_den_kg/m3', '(12)_mpt_fb(mpt?)_kg/h', 'f11_speise_mas_kg/h',
-       'f11_speise_vol_l/h', '(6)_nach_recu_reg_temp_c',
-       'dampf_nassmischbereich', '(3)_zuluft_nach_entfeuchter_kon_g/kg',
-       'f10_speise_vol_l/h', '(9)_abluft_kon_g/kg',
-       '(16)_konditionierung_mas_kg/h', '(14)_filter_mas_kg/h', 
-       #'(1)_status',
-       'f10_speise_mas_kg/h', '(5)_vor_vent_hauptzuluft_temp_c',
-       '(7)_zuluft_turm_temp_c', '(2)_zuluft_vor_entfeuchter_kon_g/kg',
-       '(13)_lanzen_mas_kg/h', '(8)_abluft_vol_m3/h',
-       '(17)_leistung_turmF_luftentfeuchter_kw', 
-        
-        '(8)_abluft_mas_kg/h',
-       '(21)_zuluft_turm_mas_kg/h', '(31)_q_waerme_recu_kw',
-       '(22)_t_waermereg_c', '(29)_q_lufterwearmung_von_T6_nach_T7_kw',
-       '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw',
-       '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw',
-       '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw',
-       '(35)_speise_max_kg/h',
-       
-       'temperature_2m',
-       'relative_humidity_2m', 
-       
-       'status_name'
-       
-       ]
+    'f11_speise_den_kg/m3', '(10)_abluft_temp_c',
+    'f10_speise_den_kg/m3', '(12)_mpt_fb(mpt?)_kg/h', 'f11_speise_mas_kg/h',
+    'f11_speise_vol_l/h', '(6)_nach_recu_reg_temp_c',
+    'dampf_nassmischbereich', '(3)_zuluft_nach_entfeuchter_kon_g/kg',
+    'f10_speise_vol_l/h', '(9)_abluft_kon_g/kg',
+    '(16)_konditionierung_mas_kg/h', '(14)_filter_mas_kg/h',
+    'f10_speise_mas_kg/h', '(5)_vor_vent_hauptzuluft_temp_c',
+    '(7)_zuluft_turm_temp_c', '(2)_zuluft_vor_entfeuchter_kon_g/kg',
+    '(13)_lanzen_mas_kg/h', '(8)_abluft_vol_m3/h',
+    '(17)_leistung_turmF_luftentfeuchter_kw',
 
-display(df)
-print(df.columns)
+    '(8)_abluft_mas_kg/h',
+    '(21)_zuluft_turm_mas_kg/h', '(31)_q_waerme_recu_kw',
+    '(22)_t_waermereg_c', '(29)_q_lufterwearmung_von_T6_nach_T7_kw',
+    '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw',
+    '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw',
+    '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw',
+    '(35)_speise_max_kg/h',
+
+    'temperature_2m',
+    'relative_humidity_2m',
+
+    'status_name'
+]
 
 df = df[relevant_columns].copy()
 
-status_to_keep = ['Produktion', 
-        #'Stopp Produkt HPPx', 
-        'zurück speisen',
-       'Stabilisiert und angepasst', 
-       #'Grundstellung',
-       #'Start Produkt HPPx', 
-       'Feed vorwärts',
-       'Fließbett starten für Produktion', 
-       #'Wasserlaufphase deaktivieren',
-       #None, #'Starten Wasserfahrt', 
-       #'HPPx für Produkt anpassen'
-       ]
+status_to_keep = [
+    'Produktion',
+    'zurück speisen',
+    'Stabilisiert und angepasst',
+    'Feed vorwärts',
+    'Fließbett starten für Produktion'
+]
 
 df = df[df['status_name'].isin(status_to_keep)].copy()
 
-df['status_name'].value_counts()
-
-
-### Build event log: one case_id per day, detect consecutive activity spans
-
+# Build event log: one case_id per day, detect consecutive activity spans
 df['datetime'] = pd.to_datetime(df['datetime'])
 df = df.sort_values('datetime').reset_index(drop=True)
 
 df['case_id'] = df['datetime'].dt.date.astype(str)
 
-# Detect consecutive runs of the same status within a day
 df['_activity_change'] = (
     (df['status_name'] != df['status_name'].shift()) |
     (df['case_id'] != df['case_id'].shift())
 ).cumsum()
 
-span_info = df.groupby('_activity_change').agg(
-    timestamp_start=('datetime', 'min'),
-    timestamp_end=('datetime', 'max')
-).reset_index()
+span_info = (
+    df.groupby('_activity_change')
+    .agg(
+        timestamp_start=('datetime', 'min'),
+        timestamp_end=('datetime', 'max')
+    )
+    .reset_index()
+)
 
 df = df.merge(span_info, on='_activity_change')
 df = df.drop(columns='_activity_change')
 
-# Event log: one row per consecutive activity span
 df_event_log = (
-    df.groupby(['case_id', 'status_name', 'timestamp_start', 'timestamp_end'])
-    .size()
+    df[['case_id', 'status_name', 'timestamp_start', 'timestamp_end']]
+    .drop_duplicates()
+    .rename(columns={'status_name': 'activity'})
+    .sort_values('timestamp_start')
     .reset_index(drop=True)
-    .pipe(lambda _: df[['case_id', 'status_name', 'timestamp_start', 'timestamp_end']]
-          .drop_duplicates()
-          .rename(columns={'status_name': 'activity'})
-          .sort_values('timestamp_start')
-          .reset_index(drop=True))
 )
 
 print("Event log")
 print(df_event_log)
 
+# Build df_expanded: flat time series with log info attached
+exclude_cols = [
+    'datetime',
+    'status_name',
+    'case_id',
+    'temperature_2m',
+    'relative_humidity_2m',
+    'timestamp_start',
+    'timestamp_end'
+]
 
-### Build df_expanded: flat timeseries with log info attached
-
-energy_cols = [c for c in df.columns if c not in [
-    'datetime', 'status_name', 'case_id', 'temperature_2m', 'relative_humidity_2m',
-    'timestamp_start', 'timestamp_end'
-]]
+energy_cols = [c for c in df.columns if c not in exclude_cols]
 ef_cols = ['temperature_2m', 'relative_humidity_2m']
 
 df_expanded = df.rename(columns={
@@ -989,72 +1063,155 @@ df_expanded = df.rename(columns={
     'datetime': 'datetime_energy',
     'timestamp_start': 'timestamp_start_log',
     'timestamp_end': 'timestamp_end_log',
+    **{col: f'{col}_energy' for col in energy_cols},
+    **{col: f'ef_{col}_energy' for col in ef_cols}
 })
-df_expanded = df_expanded.rename(columns={col: f'{col}_energy' for col in energy_cols + ef_cols})
+
+print(df_expanded.columns)
 
 print("Expanded df with sensor data")
 print(df_expanded)
 
 # Combine f10/f11 feed rates: element-wise max
-df_expanded['speise_current_kg/h_energy'] = df_expanded[['f10_speise_mas_kg/h_energy', 'f11_speise_mas_kg/h_energy']].max(axis=1)
+df_expanded['speise_current_kg/h_energy'] = df_expanded[
+    ['f10_speise_mas_kg/h_energy', 'f11_speise_mas_kg/h_energy']
+].max(axis=1)
 
-# Total material per case: integrate feed rate (kg/h) over actual measurement intervals
-_vol = df_expanded[['case_id_log', 'datetime_energy', 'speise_current_kg/h_energy']].copy()
+# Total material per case: integrate feed rate in kg/h over measurement intervals
+_vol = df_expanded[
+    ['case_id_log', 'datetime_energy', 'speise_current_kg/h_energy']
+].copy()
+
 _vol = _vol.sort_values(['case_id_log', 'datetime_energy'])
-_vol['_dt_h'] = _vol.groupby('case_id_log')['datetime_energy'].diff().dt.total_seconds() / 3600
+_vol['_dt_h'] = (
+    _vol.groupby('case_id_log')['datetime_energy']
+    .diff()
+    .dt.total_seconds()
+    / 3600
+)
+
 _vol['_dt_h'] = _vol['_dt_h'].fillna(0)
 _vol['_kg'] = _vol['speise_current_kg/h_energy'] * _vol['_dt_h']
+
 _case_total = _vol.groupby('case_id_log')['_kg'].sum()
 
-# Inject total_material into df_expanded as object_attributes_log
+# Add total material to df_expanded
 df_expanded['object_attributes_log'] = df_expanded['case_id_log'].map(
     lambda cid: {'total_material': _case_total.get(cid, None)}
 )
 
-# Propagate to event log so extract_process() sees attr_total_material
+# Add total material to event log
 df_event_log['object_attributes'] = df_event_log['case_id'].map(
     lambda cid: {'total_material': _case_total.get(cid, None)}
 )
 
-
-### Build production plan: one row per case_id (day)
-
+# Build production plan: one row per case_id
 df_production_plan = (
     df_event_log.groupby('case_id')
-    .agg(timestamp_start=('timestamp_start', 'min'),
-         timestamp_end=('timestamp_end', 'max'))
+    .agg(
+        timestamp_start=('timestamp_start', 'min'),
+        timestamp_end=('timestamp_end', 'max')
+    )
     .reset_index()
 )
+
 _attrs_map = df_event_log.groupby('case_id')['object_attributes'].first()
+
 df_production_plan['object_attributes'] = df_production_plan['case_id'].map(_attrs_map)
 
 print("Production plan")
 print(df_production_plan)
 
-
-### Select relevant columns for df_expanded
-
+# Select relevant columns for df_expanded
 energy_cols_energy = [f'{c}_energy' for c in energy_cols]
-ef_cols_energy = [f'{c}_energy' for c in ef_cols]
+ef_cols_energy = [f'ef_{c}_energy' for c in ef_cols]
 
 relevant_columns_p5 = (
-    ['case_id_log', 'activity_log', 'timestamp_start_log', 'timestamp_end_log', 'datetime_energy',
-     'object_attributes_log', 'speise_current_kg/h_energy']
+    [
+        'case_id_log',
+        'activity_log',
+        'timestamp_start_log',
+        'timestamp_end_log',
+        'datetime_energy',
+        'object_attributes_log',
+        'speise_current_kg/h_energy'
+    ]
     + energy_cols_energy
     + ef_cols_energy
 )
 
+
+
+
+
+# Remove possible duplicate column names while preserving order
+relevant_columns_p5 = list(dict.fromkeys(relevant_columns_p5))
+
 df_expanded = df_expanded[relevant_columns_p5].copy()
 
+# %%
 
-### Save datasets
+print(df_expanded.columns)
 
+
+# %%
+columns_to_model = [
+    #    'case_id_log', 'activity_log', 'timestamp_start_log',
+    #    'timestamp_end_log', 'datetime_energy', 'object_attributes_log',
+    #    'speise_current_kg/h_energy', 'f11_speise_den_kg/m3_energy',
+       '(10)_abluft_temp_c_energy', 'f10_speise_den_kg/m3_energy',
+       '(12)_mpt_fb(mpt?)_kg/h_energy', 'f11_speise_mas_kg/h_energy',
+       'f11_speise_vol_l/h_energy', '(6)_nach_recu_reg_temp_c_energy',
+       'dampf_nassmischbereich_energy',
+       '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
+       'f10_speise_vol_l/h_energy', '(9)_abluft_kon_g/kg_energy',
+       '(16)_konditionierung_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
+       'f10_speise_mas_kg/h_energy', '(5)_vor_vent_hauptzuluft_temp_c_energy',
+       '(7)_zuluft_turm_temp_c_energy',
+       '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
+       '(13)_lanzen_mas_kg/h_energy', '(8)_abluft_vol_m3/h_energy',
+       '(17)_leistung_turmF_luftentfeuchter_kw_energy',
+       '(8)_abluft_mas_kg/h_energy', '(21)_zuluft_turm_mas_kg/h_energy',
+    #    '(31)_q_waerme_recu_kw_energy', '(22)_t_waermereg_c_energy',
+    #    '(29)_q_lufterwearmung_von_T6_nach_T7_kw_energy',
+    #    '(30)_q_lufterwearmung_brechenet_T5_T6_und_T6_T7_und_berechnete_recu_kw_energy',
+       '(33)_q_lufterwearmung_dampgemessen_und_berechnete_recu_kw_energy',
+       '(34)_q_lufterwearmung_berechnet_nach_temp_in_out_kw_energy',
+    #    '(35)_speise_max_kg/h_energy', 
+    #    'ef_temperature_2m_energy',
+    #    'ef_relative_humidity_2m_energy'
+       ]
+
+columns_to_model_original = columns_to_model.copy()
+
+df_expanded = df_expanded.rename(
+    columns={col: f"{col}_to_model" for col in columns_to_model_original if col in df_expanded.columns}
+)
+print(df_expanded.columns)
+
+
+# %%
+
+
+
+# Save datasets
 files_folder_gold_datasets = files_folder_gold / 'datasets'
 files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
 
-df_expanded.to_parquet(files_folder_gold_datasets / "df_expanded.parquet", index=False)
-df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", index=False)
-df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
+df_expanded.to_parquet(
+    files_folder_gold_datasets / "df_expanded.parquet",
+    index=False
+)
+
+df_event_log.to_parquet(
+    files_folder_gold_datasets / "df_event_log.parquet",
+    index=False
+)
+
+df_production_plan.to_parquet(
+    files_folder_gold_datasets / "df_production_plan.parquet",
+    index=False
+)
 
 
 
@@ -1062,7 +1219,7 @@ df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.p
 # %%
 # display(df_expanded)
 
-
+print(df_expanded.columns)
 
 
 # # %%
@@ -1116,3 +1273,4 @@ df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.p
 # # plt.tight_layout()
 # # plt.show()
 # %%
+print(df_expanded.columns)

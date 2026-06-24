@@ -2599,13 +2599,10 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 if _sensors_from_config:
                     _sensors = _sensors_from_config
                 else:
-                    # Fall back: all *_energy columns that are numeric, not log columns,
-                    # and not external-factor columns (ef_* are inputs, not prediction targets)
+                    # Fall back: all *_to_model columns that are numeric
                     _sensors = [
                         c for c in _df_expanded_train.columns
-                        if c.endswith('_energy')
-                        and not c.endswith('_log')
-                        and not c.startswith('ef_')
+                        if c.endswith('_to_model')
                         and _df_expanded_train[c].dtype in ('float64', 'float32', 'int64', 'int32')
                     ]
                     if _sensors:
@@ -3224,8 +3221,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         if not _sensors:
             _sensors = [
                 c for c in _df_train_exp.columns
-                if c.endswith('_energy')
-                and not c.endswith('_log')
+                if c.endswith('_to_model')
                 and _df_train_exp[c].dtype in ('float64', 'float32', 'int64', 'int32')
             ]
         if not _sensors:
@@ -3602,6 +3598,16 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
             _proc_acts = _df['activity_log'].dropna().unique().tolist()
         if not _proc_objs and 'object_log' in _df.columns:
             _proc_objs = _df['object_log'].dropna().unique().tolist()
+
+        # sentinel: mirror split_curves behaviour for processes with no object_log
+        if 'object_log' not in _df.columns:
+            _df = _df.copy()
+            _df['object_log'] = '_all_'
+            _proc_objs = ['_all_']
+        elif not _proc_objs or _df['object_log'].isna().all():
+            _df = _df.copy()
+            _df['object_log'] = _df['object_log'].fillna('_all_')
+            _proc_objs = ['_all_']
 
         for _sensor, _act_pipes in _sensor_pipelines.items():
             if _sensor not in _df.columns:
@@ -4474,6 +4480,339 @@ if RUN_TEST_EVALUATION:
                         verbose=1,
                         save_dir=_gallery_dir,
                     )
+
+# %%
+# ══════════════════════════════════════════════════════════════════════════════
+# JOINT DURATION + PROFILE EVALUATION
+# Real test curves, but curve_length feature replaced with the predicted duration
+# from the best process model, matched per (case_order_idx, activity, occurrence_rank).
+# Only curves with a matched simulated counterpart are evaluated.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_jdur_ready = (
+    globals().get('RUN_CURVE_ONLY_EVALUATION', False)
+    and bool(globals().get('_combined_sim_store'))
+    and 'evaluation_results_df' in globals()
+    and not globals()['evaluation_results_df'].empty
+    and globals().get('TEMPORAL_SPLIT', False)
+    and 'test_datasets' in globals()
+)
+
+if _jdur_ready:
+    display(Markdown("---"))
+    display(Markdown("# Joint Duration + Profile Evaluation"))
+    display(Markdown(
+        "Predicted durations from the best process model replace `curve_length` "
+        "for matched *(case_rank, activity, occurrence)* pairs in the TEST set only."
+    ))
+
+    # ── Pick best process mode per process (lowest test duration WAPE) ──────
+    _jw_col = next(
+        (c for c in ['test_duration_metrics_activity_duration_wape',
+                     'test_duration_metrics_activity_duration_mae']
+         if c in evaluation_results_df.columns),
+        None
+    )
+    _jdur_best_modes = {}
+    if _jw_col:
+        for _jp, _jg in evaluation_results_df.groupby('process'):
+            _jv = _jg.dropna(subset=[_jw_col])
+            if not _jv.empty:
+                _jdur_best_modes[_jp] = _jv.loc[_jv[_jw_col].idxmin(), 'mode']
+
+    print("Best modes for joint eval:")
+    for _jp, _jm in _jdur_best_modes.items():
+        print(f"  {_jp}: {_jm}")
+
+    # ── Build per-process duration override lookup ───────────────────────────
+    # _jdur_override[proc][real_case_id] = {(activity_str, rank_int): sim_dur_sec}
+    _jdur_override = {}
+
+    for _jp, _jbm in _jdur_best_modes.items():
+        _jentries = [e for e in _combined_sim_store
+                     if e['process'] == _jp and e['mode'] == _jbm]
+        if not _jentries:
+            print(f"  [WARN joint] No sim_df found for {_jp}/{_jbm}")
+            continue
+
+        _jsim = _jentries[0]['sim_df'].copy()
+        _jsim['timestamp_start'] = pd.to_datetime(_jsim['timestamp_start'], errors='coerce')
+        _jsim['timestamp_end']   = pd.to_datetime(_jsim['timestamp_end'],   errors='coerce')
+        _jsim = _jsim.dropna(subset=['case_id', 'activity', 'timestamp_start', 'timestamp_end'])
+        _jsim['_dur_sec'] = (_jsim['timestamp_end'] - _jsim['timestamp_start']).dt.total_seconds()
+        _jsim = _jsim[_jsim['_dur_sec'] > 0].copy()
+        if _jsim.empty:
+            print(f"  [WARN joint] Empty sim_df for {_jp}/{_jbm}")
+            continue
+
+        _jrel = test_datasets[_jp]['event_log'].copy()
+        _jrel['timestamp_start'] = pd.to_datetime(_jrel['timestamp_start'], errors='coerce')
+        _jrel = _jrel.dropna(subset=['case_id', 'activity', 'timestamp_start'])
+
+        # Sort cases by first event time → deterministic order index
+        _jreal_order = (
+            _jrel.groupby('case_id')['timestamp_start'].min()
+            .sort_values().index.tolist()
+        )
+        _jsim_order = (
+            _jsim.groupby('case_id')['timestamp_start'].min()
+            .sort_values().index.tolist()
+        )
+        _n_pairs = min(len(_jreal_order), len(_jsim_order))
+        _n_skip  = abs(len(_jreal_order) - len(_jsim_order))
+        print(f"  {_jp}: {len(_jreal_order)} real / {len(_jsim_order)} sim → "
+              f"{_n_pairs} matched, {_n_skip} skipped")
+
+        _jsim = _jsim.sort_values('timestamp_start')
+        _jsim['_rank'] = _jsim.groupby(['case_id', 'activity']).cumcount()
+
+        _jproc_override = {}
+        for _ji in range(_n_pairs):
+            _jrcid = _jreal_order[_ji]
+            _jscid = _jsim_order[_ji]
+            _jsc   = _jsim[_jsim['case_id'] == _jscid]
+            _jproc_override[str(_jrcid)] = {
+                (str(_r['activity']), int(_r['_rank'])): float(_r['_dur_sec'])
+                for _, _r in _jsc.iterrows()
+            }
+        _jdur_override[_jp] = _jproc_override
+
+    # ── Joint eval function ──────────────────────────────────────────────────
+    def _run_curve_eval_joint_duration(pipelines_dict, approach_label,
+                                       df_lookup, act_map, obj_map,
+                                       dur_override, best_modes):
+        import importlib, sim_extractor as _se
+        importlib.reload(_se)
+        from sim_extractor import (split_curves, split_curves_with_prev_activity,
+                                   evaluate_pipeline_on_test)
+        records = []
+        for _proc, _sensors in pipelines_dict.items():
+            _df = df_lookup.get(_proc, {}).get('expanded')
+            if _df is None or _df.empty:
+                continue
+            _proc_ov = dur_override.get(_proc, {})
+            if not _proc_ov:
+                continue
+
+            # Real test event log: (case_id, activity, ts_floor) → (real_dur_sec, rank)
+            _jrel = test_datasets[_proc]['event_log'].copy()
+            _jrel['timestamp_start'] = pd.to_datetime(_jrel['timestamp_start'], errors='coerce')
+            _jrel['timestamp_end']   = pd.to_datetime(_jrel['timestamp_end'],   errors='coerce')
+            _jrel = _jrel.dropna(subset=['case_id', 'activity', 'timestamp_start', 'timestamp_end'])
+            _jrel['_dur_sec'] = (_jrel['timestamp_end'] - _jrel['timestamp_start']).dt.total_seconds()
+            _jrel = _jrel[_jrel['_dur_sec'] > 0].sort_values('timestamp_start')
+            _jrel['_rank'] = _jrel.groupby(['case_id', 'activity']).cumcount()
+            _jrel['_tsf']  = _jrel['timestamp_start'].dt.floor('s')
+            _jel_lkp = {}
+            for _, _r in _jrel.iterrows():
+                _jel_lkp[(str(_r['case_id']), str(_r['activity']), _r['_tsf'])] = \
+                    (float(_r['_dur_sec']), int(_r['_rank']))
+
+            # Rebuild instance_id → (case_id, activity, ts_floor) from expanded df
+            # Must mirror the groupby in split_curves exactly.
+            _dfx = _df.copy()
+            if 'object_log' not in _dfx.columns:
+                _dfx['object_log'] = '_all_'
+            _dfx['object_log'] = _dfx['object_log'].fillna('_all_')
+            _dfx['_tsf'] = pd.to_datetime(
+                _dfx['timestamp_start_log'], errors='coerce'
+            ).dt.floor('s')
+
+            _acts = act_map.get(_proc, [])
+            _objs = obj_map.get(_proc, [])
+            if not _acts and 'activity_log' in _df.columns:
+                _acts = _df['activity_log'].dropna().unique().tolist()
+            if not _objs and 'object_log' in _df.columns:
+                _objs = _df['object_log'].dropna().unique().tolist()
+            if not _objs:
+                _objs = ['_all_']
+
+            for _sensor, _sensor_val in _sensors.items():
+                _leaf_eps = [
+                    ([_a], [_o], _ep)
+                    for _a, _obj_d in _sensor_val.items()
+                    for _o, _ep in _obj_d.items()
+                ]
+                if not _leaf_eps:
+                    continue
+
+                for _leaf_acts, _leaf_objs, _ep in _leaf_eps:
+                    _fp = _ep.get('full_pipeline', {})
+                    _appr = _fp.get('approach', 'baseline')
+                    _exog = (
+                        _fp.get('exog_cols', [])
+                        if _appr in ('exog', 'seq2seq_exog',
+                                     'exog_prev_activity', 'seq2seq_prev_activity')
+                        else None
+                    )
+                    if _appr in ('exog_prev_activity', 'seq2seq_prev_activity'):
+                        _curves, _ = split_curves_with_prev_activity(
+                            _df, _sensor, _leaf_acts, _leaf_objs,
+                            test_size=0.0, verbose=0, exog_columns=_exog,
+                        )
+                    else:
+                        _curves, _ = split_curves(
+                            _df, _sensor, _leaf_acts, _leaf_objs,
+                            test_size=0.0, verbose=0,
+                        )
+                    if not _curves:
+                        continue
+
+                    # Build instance_id → (case_id, ts_floor) with same filters as split_curves
+                    _dfx_f = _dfx[_dfx['activity_log'].isin(_leaf_acts)].copy()
+                    if '_all_' not in _leaf_objs:
+                        _dfx_f = _dfx_f[_dfx_f['object_log'].isin(_leaf_objs)]
+                    _uniq = (
+                        _dfx_f[['case_id_log', 'object_log', 'activity_log',
+                                 'timestamp_start_log', '_tsf']]
+                        .drop_duplicates()
+                    )
+                    _uniq = _uniq.copy()
+                    _uniq['_iid'] = _uniq.groupby(
+                        ['case_id_log', 'object_log', 'activity_log', 'timestamp_start_log']
+                    ).ngroup()
+                    _iid_cid = dict(zip(_uniq['_iid'], _uniq['case_id_log'].astype(str)))
+                    _iid_act = dict(zip(_uniq['_iid'], _uniq['activity_log'].astype(str)))
+                    _iid_tsf = dict(zip(_uniq['_iid'], _uniq['_tsf']))
+
+                    # Match curves to simulated durations and inject override
+                    _matched = []
+                    for _cv in _curves:
+                        _iid = _cv['instance_id']
+                        _cid = _iid_cid.get(_iid)
+                        _act = _iid_act.get(_iid)
+                        _tsf = _iid_tsf.get(_iid)
+                        if _cid is None or _tsf is None:
+                            continue
+                        _el_key = (_cid, _act, _tsf)
+                        _el_info = _jel_lkp.get(_el_key)
+                        if _el_info is None:
+                            continue
+                        _real_dur, _rank = _el_info
+                        if _real_dur <= 0:
+                            continue
+                        _sim_dur = _proc_ov.get(_cid, {}).get((_act, _rank))
+                        if _sim_dur is None:
+                            continue
+                        _pred_cl = max(2, int(round(
+                            _cv['original_length'] * _sim_dur / _real_dur
+                        )))
+                        _cv2 = dict(_cv)
+                        _cv2['attributes'] = {**_cv['attributes'],
+                                              '_pred_curve_length': _pred_cl}
+                        _matched.append(_cv2)
+
+                    if not _matched:
+                        continue
+                    try:
+                        _mdf, _ = evaluate_pipeline_on_test(
+                            _matched, _fp,
+                            max_plot_curves=0, verbose=0,
+                        )
+                        for _, _r in _mdf.iterrows():
+                            records.append({
+                                'Approach':  approach_label,
+                                'Process':   _proc,
+                                'Sensor':    _sensor,
+                                'Activity':  _r['activity'],
+                                'N':         _r['n_points'],
+                                'MAE':       _r['MAE'],
+                                'RMSE':      _r['RMSE'],
+                                'WAPE':      _r['WAPE (%)'],
+                                'R2':        _r['R2'],
+                                'sMAE':      _r.get('sMAE'),
+                                'sRMSE':     _r.get('sRMSE'),
+                                'BestMode':  best_modes.get(_proc, ''),
+                                'NMatched':  len(_matched),
+                            })
+                    except Exception as _je:
+                        print(f"  [ERROR joint] {approach_label}|{_proc}|{_sensor}: {_je}")
+        return records
+
+    # ── Run for all active approaches ────────────────────────────────────────
+    _jall_records = []
+    for _jlabel, _jpips in [
+        ('Baseline',                                all_energy_pipelines_mean),
+        ('DTW + pos',                               all_energy_pipelines),
+        ('DTW + Ext. Factors + Prev Act',           all_energy_pipelines_exog_prev_activity),
+        ('DTW + Seq2Seq',                           all_energy_pipelines_seq2seq),
+        ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_prev_activity),
+    ]:
+        if not _jpips:
+            continue
+        display(Markdown(f"### Joint — {_jlabel}"))
+        _jrecs = _run_curve_eval_joint_duration(
+            _jpips, _jlabel,
+            test_datasets, _activities_map, _objects_map,
+            _jdur_override, _jdur_best_modes,
+        )
+        _jall_records.extend(_jrecs)
+        print(f"  → {len(_jrecs)} records collected")
+
+    # ── Save parquet + heatmaps ──────────────────────────────────────────────
+    if _jall_records and EXPORT_RESULTS and '_run_dir' in dir():
+        _jdf = pd.DataFrame(_jall_records)
+        _jparquet = os.path.join(_run_dir, 'curve_joint_duration_eval_results.parquet')
+        _jdf.to_parquet(_jparquet, index=False)
+        print(f"\nSaved joint eval → {_jparquet}")
+
+        # Summary tables
+        display(Markdown("## Joint Eval — Median by Approach × Process × Sensor × Activity"))
+        _jmetrics = [m for m in ['sMAE', 'sRMSE', 'WAPE', 'R2', 'MAE', 'RMSE'] if m in _jdf.columns]
+        _jsumm = (
+            _jdf.groupby(['Approach', 'Process', 'Sensor', 'Activity'])[_jmetrics]
+            .median().round(4)
+        )
+        display(_jsumm)
+        _jsumm.reset_index().to_parquet(
+            os.path.join(_run_dir, 'curve_joint_duration_summary.parquet'), index=False
+        )
+
+        display(Markdown("## Joint Eval — Median by Approach (all processes/sensors)"))
+        _jsumm_appr = _jdf.groupby('Approach')[_jmetrics].median().round(4)
+        display(_jsumm_appr)
+
+        # Heatmaps
+        _jhm_dir = os.path.join(_run_dir, 'joint_duration_eval_heatmaps')
+        os.makedirs(_jhm_dir, exist_ok=True)
+
+        def _plot_joint_hm(df, title, save_dir):
+            _hm_metrics = [m for m in ['sMAE', 'sRMSE', 'WAPE'] if m in df.columns]
+            if not _hm_metrics or df.empty:
+                return
+            _agg = df.groupby('Approach')[_hm_metrics].median()
+            # Normalise 0-1 (lower is better for all three)
+            _norm = _agg.copy()
+            for _c in _hm_metrics:
+                _mn, _mx = _agg[_c].min(), _agg[_c].max()
+                _norm[_c] = (_agg[_c] - _mn) / (_mx - _mn + 1e-12)
+            _norm = _norm.loc[_norm.mean(axis=1).sort_values(ascending=True).index]
+            _annot = _agg.reindex(_norm.index).round(3)
+            _fig, _ax = plt.subplots(
+                figsize=(max(5, len(_hm_metrics) * 2.5), max(3, len(_norm) * 0.7))
+            )
+            sns.heatmap(_norm, annot=_annot, fmt='', cmap='RdYlGn_r',
+                        vmin=0, vmax=1, linewidths=0.5, ax=_ax,
+                        cbar_kws={'label': 'Normalised score (0=best)'})
+            _ax.set_title(title, fontsize=11, fontweight='bold')
+            plt.tight_layout()
+            _fp2 = os.path.join(save_dir,
+                                title.replace(' ', '_').replace('/', '-')
+                                     .replace('|', '-') + '.png')
+            plt.savefig(_fp2, dpi=150, bbox_inches='tight')
+            plt.show()
+
+        _plot_joint_hm(_jdf, 'Joint_Duration_Eval — All_Processes', _jhm_dir)
+        for _jp2, _jpsub in _jdf.groupby('Process'):
+            _plot_joint_hm(_jpsub, f'Joint_Duration_Eval — {_jp2}', _jhm_dir)
+            for _js2, _jssub in _jpsub.groupby('Sensor'):
+                if len(_jssub['Approach'].unique()) < 2:
+                    continue
+                _plot_joint_hm(_jssub, f'Joint_Duration_Eval — {_jp2} — {_js2}', _jhm_dir)
+
+        print(f"Saved heatmaps → {_jhm_dir}")
+    elif not _jall_records:
+        print("[WARN joint] No records collected — check WARN/ERROR messages above.")
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════

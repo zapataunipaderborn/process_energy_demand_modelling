@@ -355,12 +355,12 @@ def build_expanded(df_event_log: pd.DataFrame,
                 'ef_temperature_2m_energy':     T_i,
                 'ef_relative_humidity_2m_energy': RH_i,
                 # All sensors default to 0 (only the active one is filled)
-                'destillation_steam_demand_kW_energy':          0.0,
-                'autoclave_steam_demand_kW_energy':             0.0,
-                'autoclave_cooling_water_demand_kW_energy':     0.0,
-                'bottling_power_kW_energy':                     0.0,
-                'packaging_power_kW_energy':                    0.0,
-                'water_supply_power_kW_energy':                 0.0,
+                'destillation_steam_demand_kW_energy_to_model':          0.0,
+                'autoclave_steam_demand_kW_energy_to_model':             0.0,
+                'autoclave_cooling_water_demand_kW_energy_to_model':     0.0,
+                'bottling_power_kW_energy_to_model':                     0.0,
+                'packaging_power_kW_energy_to_model':                    0.0,
+                'water_supply_power_kW_energy_to_model':                 0.0,
                 # Log columns
                 'timestamp_start_log':          ev['timestamp_start'],
                 'timestamp_end_log':            ev['timestamp_end'],
@@ -376,17 +376,17 @@ def build_expanded(df_event_log: pd.DataFrame,
             # Fill the correct sensor column
             val = max(0.0, float(curve[i]))
             if station == 'Destillation':
-                row['destillation_steam_demand_kW_energy'] = val
+                row['destillation_steam_demand_kW_energy_to_model'] = val
             elif station == 'Autoclaving' and act_short in ('heat', 'hold', 'prepare'):
-                row['autoclave_steam_demand_kW_energy'] = val
+                row['autoclave_steam_demand_kW_energy_to_model'] = val
             elif station == 'Autoclaving' and act_short == 'cool':
-                row['autoclave_cooling_water_demand_kW_energy'] = val
+                row['autoclave_cooling_water_demand_kW_energy_to_model'] = val
             elif station == 'Bottling':
-                row['bottling_power_kW_energy'] = val
+                row['bottling_power_kW_energy_to_model'] = val
             elif station == 'Packaging':
-                row['packaging_power_kW_energy'] = val
+                row['packaging_power_kW_energy_to_model'] = val
             elif station == 'Water_supply':
-                row['water_supply_power_kW_energy'] = val
+                row['water_supply_power_kW_energy_to_model'] = val
 
             rows.append(row)
 
