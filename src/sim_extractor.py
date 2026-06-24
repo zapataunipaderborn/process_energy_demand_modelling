@@ -100,7 +100,7 @@ def sample_from_dist(dist_name, dist_params):
 # ---------------------------------------------------------------------------
 
 def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
-                    heuristic_params=None):
+                    heuristic_params=None, ilp_variant_coverage=1.0):
     """
     Mine a Petri net from a pm4py-formatted event log sub-group.
 
@@ -115,6 +115,9 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
         Higher values produce stricter models that filter out infrequent paths.
     heuristic_params : dict or None
         Optional parameter dict for Heuristics Miner.
+    ilp_variant_coverage : float
+        For ILP: fraction of traces to retain (by most-frequent variants first).
+        1.0 = keep all variants; 0.8 = keep variants covering 80% of traces.
 
     Returns
     -------
@@ -139,7 +142,13 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
     elif algorithm == 'alpha':
         net, im, fm = pm4py.discover_petri_net_alpha(sub_log)
     elif algorithm == 'ilp':
-        net, im, fm = pm4py.discover_petri_net_ilp(sub_log)
+        _log_to_mine = sub_log
+        cov = float(ilp_variant_coverage)
+        if cov < 1.0 and len(sub_log) > 0:
+            _filtered = pm4py.filter_variants_by_coverage_percentage(sub_log, cov)
+            if len(_filtered) > 0:
+                _log_to_mine = _filtered
+        net, im, fm = pm4py.discover_petri_net_ilp(_log_to_mine)
     else:
         raise ValueError(f"Unknown mining algorithm: {algorithm}")
 
@@ -218,11 +227,12 @@ def _build_mining_candidates(algorithm, noise_threshold=0.2,
                              mining_search_space=None):
     """Build candidate miner parameter sets for local tuning."""
     base = {
-        'noise_threshold': float(noise_threshold),
-        'heuristic_params': dict(heuristic_params or {}),
+        'noise_threshold':       float(noise_threshold),
+        'heuristic_params':      dict(heuristic_params or {}),
+        'ilp_variant_coverage':  1.0,
     }
 
-    if not optimize_mining_hyperparams or algorithm not in ('inductive', 'heuristic'):
+    if not optimize_mining_hyperparams or algorithm not in ('inductive', 'heuristic', 'ilp'):
         return [base]
 
     search_space = mining_search_space or {}
@@ -233,7 +243,7 @@ def _build_mining_candidates(algorithm, noise_threshold=0.2,
         noise_grid = search_space.get('inductive_noise_thresholds', default_grid)
         for n in noise_grid:
             n = float(max(0.0, min(1.0, n)))
-            candidates.append({'noise_threshold': n, 'heuristic_params': {}})
+            candidates.append({'noise_threshold': n, 'heuristic_params': {}, 'ilp_variant_coverage': 1.0})
 
     elif algorithm == 'heuristic':
         default_grid = [
@@ -246,7 +256,15 @@ def _build_mining_candidates(algorithm, noise_threshold=0.2,
         h_grid = search_space.get('heuristic_params_grid', default_grid)
         for params in h_grid:
             candidates.append({'noise_threshold': float(noise_threshold),
-                               'heuristic_params': dict(params or {})})
+                               'heuristic_params': dict(params or {}),
+                               'ilp_variant_coverage': 1.0})
+
+    elif algorithm == 'ilp':
+        default_grid = [0.80, 0.90, 0.95, 1.0]
+        cov_grid = search_space.get('ilp_variant_coverages', default_grid)
+        for cov in cov_grid:
+            cov = float(max(0.0, min(1.0, cov)))
+            candidates.append({'noise_threshold': 0.0, 'heuristic_params': {}, 'ilp_variant_coverage': cov})
 
     if not candidates:
         candidates = [base]
@@ -258,6 +276,7 @@ def _build_mining_candidates(algorithm, noise_threshold=0.2,
         key = (
             round(float(cand.get('noise_threshold', 0.0)), 6),
             tuple(sorted((cand.get('heuristic_params') or {}).items())),
+            round(float(cand.get('ilp_variant_coverage', 1.0)), 6),
         )
         if key in seen:
             continue
@@ -749,10 +768,11 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
     for idx, cand in enumerate(candidates, start=1):
         cand_noise = cand.get('noise_threshold', noise_threshold)
         cand_heur = cand.get('heuristic_params', {})
+        cand_cov  = cand.get('ilp_variant_coverage', 1.0)
         print(
             f"    Mining Petri net with '{algorithm}' "
             f"(candidate {idx}/{len(candidates)}): "
-            f"noise={cand_noise}, heur={cand_heur}"
+            f"noise={cand_noise}, heur={cand_heur}, ilp_cov={cand_cov}"
         )
 
         net_i, im_i, fm_i = _mine_petri_net(
@@ -760,6 +780,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
             algorithm,
             noise_threshold=cand_noise,
             heuristic_params=cand_heur,
+            ilp_variant_coverage=cand_cov,
         )
         eval_i = _evaluate_mined_model(sub_log, net_i, im_i, fm_i)
         print(
@@ -872,6 +893,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
             'algorithm': algorithm,
             'noise_threshold': best['cand'].get('noise_threshold'),
             'heuristic_params': best['cand'].get('heuristic_params', {}),
+            'ilp_variant_coverage': best['cand'].get('ilp_variant_coverage', 1.0),
             'optimization_metrics': best['eval'],
         },
         'bigram_transitions': bigram_transitions,
@@ -2717,8 +2739,17 @@ def split_curves(df_expanded, variable, activities, objects,
     df = df_expanded.copy()
     keep_cols = ['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log',
                  'datetime_energy', variable, 'object_attributes_log'] + exog_cols_present
+    keep_cols = [c for c in keep_cols if c in df.columns]
     df = df[keep_cols]
-    df = df[df['object_log'].isin(objects)]
+    if 'object_log' not in df.columns:
+        df['object_log'] = '_all_'
+    if 'object_attributes_log' not in df.columns:
+        df['object_attributes_log'] = [{} for _ in range(len(df))]
+    # '_all_' sentinel means no object dimension — match every row
+    if '_all_' in objects:
+        df['object_log'] = df['object_log'].fillna('_all_')
+    else:
+        df = df[df['object_log'].isin(objects)]
     df = df[df['activity_log'].isin(activities)]
     df['timestamp_start'] = pd.to_datetime(df['timestamp_start_log'])
     df['datetime_energy'] = pd.to_datetime(df['datetime_energy'])
@@ -2814,6 +2845,14 @@ def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
 
     exog_cols_present = [c for c in (exog_columns or []) if c in df_expanded.columns]
 
+    # Normalise object_log: inject '_all_' sentinel for processes with no object dimension
+    if 'object_log' not in df_expanded.columns or ('_all_' in objects and df_expanded['object_log'].isna().all()):
+        df_expanded = df_expanded.copy()
+        if 'object_log' not in df_expanded.columns:
+            df_expanded['object_log'] = '_all_'
+        else:
+            df_expanded['object_log'] = df_expanded['object_log'].fillna('_all_')
+
     # ── Build per-case activity timeline from the full df_expanded ────────────
     # Groups every (case, activity, object, ts_start) instance and pre-computes
     # stats on the target variable. Covers ALL activities, not just the target ones,
@@ -2871,7 +2910,15 @@ def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
                  'datetime_energy', variable, 'object_attributes_log'] + exog_cols_present
     keep_cols = [c for c in keep_cols if c in df.columns]
     df = df[keep_cols]
-    df = df[df['object_log'].isin(objects)]
+    if 'object_log' not in df.columns:
+        df['object_log'] = '_all_'
+    if 'object_attributes_log' not in df.columns:
+        df['object_attributes_log'] = [{} for _ in range(len(df))]
+    # '_all_' sentinel means no object dimension — match every row
+    if '_all_' in objects:
+        df['object_log'] = df['object_log'].fillna('_all_')
+    else:
+        df = df[df['object_log'].isin(objects)]
     df = df[df['activity_log'].isin(activities)]
     df['timestamp_start_log'] = pd.to_datetime(df['timestamp_start_log'])
     df['datetime_energy']     = pd.to_datetime(df['datetime_energy'])

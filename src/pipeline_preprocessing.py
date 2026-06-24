@@ -883,6 +883,9 @@ files_folder_gold.mkdir(parents=True, exist_ok=True)
 
 df = pd.read_parquet(files_folder_silver / "data_prepared_for_analysis.parquet")
 
+# df["datetime"] = pd.to_datetime(df["datetime"])
+# df = df[df["datetime"] < "2025-09-30"]
+
 relevant_columns = ['datetime', 
         
         'f11_speise_den_kg/m3', '(10)_abluft_temp_c',
@@ -1054,4 +1057,62 @@ df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", ind
 df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
 
 
+
+
+# %%
+# display(df_expanded)
+
+
+
+
+# # %%
+
+# import pandas as pd
+# import matplotlib.pyplot as plt
+
+# # Select only numeric columns
+# numeric_cols = df_expanded.select_dtypes(include="number").columns
+
+# # Create boxplots for all numeric variables
+# if len(numeric_cols) > 0:
+#     df_expanded[numeric_cols].boxplot(figsize=(14, 6), rot=45)
+#     plt.title("Boxplots of Numeric Variables")
+#     plt.ylabel("Value")
+#     plt.tight_layout()
+#     plt.show()
+# else:
+#     print("No numeric columns found in df_expanded.")
+# # %%
+
+
+# df_event_log
+# # %%
+
+# # import pandas as pd
+# # import matplotlib.pyplot as plt
+# # import seaborn as sns
+
+# # # Make sure timestamps are in datetime format
+# # df_event_log["timestamp_start"] = pd.to_datetime(df_event_log["timestamp_start"])
+# # df_event_log["timestamp_end"] = pd.to_datetime(df_event_log["timestamp_end"])
+
+# # # Create duration column
+# # df_event_log["duration"] = df_event_log["timestamp_end"] - df_event_log["timestamp_start"]
+
+# # # Optional: convert duration to minutes (easier to plot)
+# # df_event_log["duration_minutes"] = df_event_log["duration"].dt.total_seconds() / 60
+
+# # # Boxplot of duration by activity
+# # plt.figure(figsize=(12, 8))
+# # sns.boxplot(
+# #     data=df_event_log,
+# #     x="duration_minutes",
+# #     y="activity"
+# # )
+
+# # plt.title("Distribution of Activity Durations")
+# # plt.xlabel("Duration (minutes)")
+# # plt.ylabel("Activity")
+# # plt.tight_layout()
+# # plt.show()
 # %%
