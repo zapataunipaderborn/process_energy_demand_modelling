@@ -399,9 +399,11 @@ MODES_TO_COMPARE = [
     'petri_net_inductive',
     'petri_net_inductive_ml_plus_global',
     'petri_net_inductive_ml_plus_per_act',
-    'petri_net_ilp',
-    'petri_net_ilp_ml_plus_global',
-    'petri_net_ilp_ml_plus_per_act',
+    # 'petri_net_ilp',
+    # 'petri_net_ilp_ml_plus_global',
+    # 'petri_net_ilp_ml_plus_per_act',
+
+
     # 'petri_net_combined',
     # 'petri_net_combined_ml_plus_global',
     # 'petri_net_combined_ml_plus_per_act',
@@ -508,7 +510,7 @@ MINING_ALGORITHM = 'heuristic'
 #MINING_ALGORITHM = 'ilp'
 
 # Petri-net miner variants to compare when mode names include the algorithm.
-PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive', 'ilp']
+PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
