@@ -14,7 +14,7 @@ from pathlib import Path
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-N_BATCHES      = 500
+N_BATCHES      = 2190   # one batch every 4 h × 365 days = 1 year of production
 START_DATE     = datetime(2024, 1, 15)
 RANDOM_SEED    = 42
 VOLUME_RANGE_L = (200, 800)   # uniform per batch
@@ -199,7 +199,7 @@ def simulate(n_batches: int = N_BATCHES,
         obj_attrs = {'recipe': str(recipe), 'volume_L': round(float(volume_L), 1)}
 
         # Batch clock: when the batch is ready to enter the next station
-        batch_ready = start_date + timedelta(minutes=b * 15)  # stagger starts
+        batch_ready = start_date + timedelta(minutes=b * 240)  # 4-h stagger → ~1 year for 2190 batches
 
         for station in PROCESS_SEQUENCE:
             cfg         = PROCESS_CONFIG[station]

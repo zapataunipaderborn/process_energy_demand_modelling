@@ -2768,7 +2768,7 @@ def split_curves(df_expanded, variable, activities, objects,
         values = np.asarray(group[variable].dropna().values).squeeze()
         if values.ndim != 1:
             continue
-        if len(values) >= 5:
+        if len(values) >= 2:
             _raw_attrs = (
                 group['object_attributes_log'].iloc[0]
                 if not group['object_attributes_log'].empty else {}
@@ -7735,7 +7735,7 @@ def train_position_based_regression(df_expanded, variable, activities, fixed_len
         group = group.sort_values('datetime_energy').reset_index(drop=True)
         values = group[variable].dropna().values
         
-        if len(values) >= 5:
+        if len(values) >= 2:
             # Get attributes from the first row (assuming same per instance)
             attributes = group['object_attributes_log'].iloc[0] if not group['object_attributes_log'].empty else {}
             

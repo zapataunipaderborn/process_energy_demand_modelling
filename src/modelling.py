@@ -1107,7 +1107,7 @@ def _per_case_median_metrics(simulated_df, real_df,
             dur_mae  = float(np.mean(_abs_min))
             dur_rmse = float(np.sqrt(np.mean(_abs_min ** 2)))
             _wden    = float(np.sum(_real_min))
-            dur_wape = float(np.sum(_abs_min) / _wden) if _wden > 0 else np.nan
+            dur_wape = float(np.sum(_abs_min) / _wden) * 100 if _wden > 0 else np.nan
         else:
             dur_mae = dur_rmse = dur_wape = np.nan
 
@@ -1309,7 +1309,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         activity_duration_mae  = float(np.mean(_abs_diffs_min))
         activity_duration_rmse = float(np.sqrt(np.mean(_abs_diffs_min ** 2)))
         _wape_den = float(np.sum(_real_min))
-        activity_duration_wape = float(np.sum(_abs_diffs_min) / _wape_den) if _wape_den > 0 else np.nan
+        activity_duration_wape = float(np.sum(_abs_diffs_min) / _wape_den) * 100 if _wape_den > 0 else np.nan
     else:
         activity_duration_mae  = np.nan
         activity_duration_rmse = np.nan
@@ -2223,6 +2223,19 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 else:
                     flattened[f"test_{category}"] = metrics
 
+            # Feed the simulated test log into the store so the joint
+            # duration + profile evaluation can use predicted durations
+            # (energy-aware modes add their own entries later; this covers
+            # all plain petri_net_* and statistical modes).
+            _combined_sim_store.append({
+                'process':     process,
+                'mode':        sim_mode,
+                'sim_df':      simulated_log_test,
+                'exp_df':      test_datasets[process].get('expanded'),
+                'sensors':     [],   # no energy curves for plain modes
+                'act_metrics': {},
+            })
+
         process_mode_results.append(flattened)
         evaluation_results_list.append(flattened)
 
@@ -2365,6 +2378,15 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 flattened_mlp[f"test_{_cat}_{_mn}"] = _mv
                         else:
                             flattened_mlp[f"test_{_cat}"] = _mets
+
+                    _combined_sim_store.append({
+                        'process':     process,
+                        'mode':        _mlp_mode,
+                        'sim_df':      sim_mlp_test,
+                        'exp_df':      test_datasets[process].get('expanded'),
+                        'sensors':     [],
+                        'act_metrics': {},
+                    })
 
                 process_mode_results.append(flattened_mlp)
                 evaluation_results_list.append(flattened_mlp)
@@ -2534,6 +2556,15 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                 flattened_amlp[f"test_{_cat}_{_mn}"] = _mv
                         else:
                             flattened_amlp[f"test_{_cat}"] = _mets
+
+                    _combined_sim_store.append({
+                        'process':     process,
+                        'mode':        _algo_mode,
+                        'sim_df':      sim_amlp_test,
+                        'exp_df':      test_datasets[process].get('expanded'),
+                        'sensors':     [],
+                        'act_metrics': {},
+                    })
 
                 process_mode_results.append(flattened_amlp)
                 evaluation_results_list.append(flattened_amlp)
