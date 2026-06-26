@@ -30,13 +30,13 @@ EXPERIMENTS = [
         'temporal_resolution':   '5min',
         'run_process_modelling': True,
     },
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_305',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':   '5min',
-    #     'run_process_modelling': True,
-    # },
+    {
+        'data_experiment':       '1',
+        'run_name':              'experiment_401',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4'],
+        'temporal_resolution':   '1min',
+        'run_process_modelling': True,
+    },
     # {
     #     'data_experiment':       '1',
     #     'run_name':              'experiment_301',
