@@ -339,7 +339,7 @@ class ProcessSimulation:
                 tpl = self.mlp_per_act_tuples.get(activity)
                 if tpl is not None:
                     return max(0.1, self._predict_mlp_duration(tpl, feat_vec))
-                # fallback: per-activity mean (no model trained for this activity)
+                # fallback: per-activity median (no model for this activity or n < 20)
                 fallback = self.mlp_activity_means.get(activity, self.mlp_global_mean or 10.0)
                 return max(0.1, float(fallback))
             # else: fall through to statistical

@@ -289,7 +289,7 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     from sklearn.linear_model import Ridge, HuberRegressor
     from sklearn.ensemble import RandomForestRegressor
 
-    if len(sub) < 5 or not feat_cols:
+    if len(sub) < 20 or not feat_cols:
         return None, None
 
     X     = sub[feat_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values
@@ -362,8 +362,8 @@ def _mlp_train_models(df_train):
     df = _mlp_flatten_object_attributes(df)
     df = _mlp_add_features(df)
 
-    activity_means = df.groupby('activity')['duration'].mean().to_dict()
-    global_mean    = float(df['duration'].mean())
+    activity_means = df.groupby('activity')['duration'].median().to_dict()
+    global_mean    = float(df['duration'].median())
 
     df['feat_act_mean_dur'] = df['activity'].map(activity_means).fillna(global_mean)
 
