@@ -4849,6 +4849,196 @@ if _jdur_ready:
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
+# JOINT DURATION + PROFILE EVALUATION — PER SIMULATION MODE
+#
+# Same evaluation as above but repeated for every simulation mode so we can
+# see how curve reconstruction degrades as duration model quality drops.
+# Rows in each heatmap = simulation modes sorted by their test duration WAPE
+# (best mode at top).  Columns = sMAE / sRMSE / WAPE of the curve model.
+# One heatmap per (process × curve approach).
+# ══════════════════════════════════════════════════════════════════════════════
+
+if _jdur_ready:
+    display(Markdown("---"))
+    display(Markdown("# Joint Duration + Profile Evaluation — Per Simulation Mode"))
+    display(Markdown(
+        "Repeated for **every** simulation mode.  "
+        "Rows = simulation modes sorted by duration WAPE (best first); "
+        "columns = curve metrics.  Shows how curve quality degrades "
+        "as duration accuracy drops."
+    ))
+
+    # ── Collect test-duration WAPE per (process, mode) for row ordering ───────
+    _jpm_wape_col = next(
+        (c for c in ['test_duration_metrics_activity_duration_wape',
+                     'test_duration_metrics_activity_duration_mae']
+         if c in evaluation_results_df.columns),
+        None
+    )
+    _jpm_mode_wape = {}   # {(proc, mode): wape}
+    if _jpm_wape_col:
+        for (_jpp, _jpm_), _jgv in evaluation_results_df.groupby(['process', 'mode']):
+            _jvv = _jgv[_jpm_wape_col].dropna()
+            if not _jvv.empty:
+                _jpm_mode_wape[(_jpp, _jpm_)] = float(_jvv.min())
+
+    # ── Build duration override for every (process, mode) pair ───────────────
+    # Same matching logic as the single-best-mode block above.
+    _jdur_override_by_mode = {}   # {proc: {mode: {case_id: {(act, rank): dur_sec}}}}
+
+    for _jentry in _combined_sim_store:
+        _jp_pm  = _jentry['process']
+        _jm_pm  = _jentry['mode']
+        if _jp_pm not in test_datasets:
+            continue
+
+        _jsim_pm = _jentry['sim_df'].copy()
+        _jsim_pm['timestamp_start'] = pd.to_datetime(_jsim_pm['timestamp_start'], errors='coerce')
+        _jsim_pm['timestamp_end']   = pd.to_datetime(_jsim_pm['timestamp_end'],   errors='coerce')
+        _jsim_pm = _jsim_pm.dropna(subset=['case_id', 'activity', 'timestamp_start', 'timestamp_end'])
+        _jsim_pm['_dur_sec'] = (_jsim_pm['timestamp_end'] - _jsim_pm['timestamp_start']).dt.total_seconds()
+        _jsim_pm = _jsim_pm[_jsim_pm['_dur_sec'] > 0].copy()
+        if _jsim_pm.empty:
+            continue
+
+        _jrel_pm = test_datasets[_jp_pm]['event_log'].copy()
+        _jrel_pm['timestamp_start'] = pd.to_datetime(_jrel_pm['timestamp_start'], errors='coerce')
+        _jrel_pm = _jrel_pm.dropna(subset=['case_id', 'activity', 'timestamp_start'])
+
+        _jreal_ord_pm = (
+            _jrel_pm.groupby('case_id')['timestamp_start'].min()
+            .sort_values().index.tolist()
+        )
+        _jsim_ord_pm = (
+            _jsim_pm.groupby('case_id')['timestamp_start'].min()
+            .sort_values().index.tolist()
+        )
+        _n_pairs_pm = min(len(_jreal_ord_pm), len(_jsim_ord_pm))
+        if _n_pairs_pm == 0:
+            continue
+
+        _jsim_pm = _jsim_pm.sort_values('timestamp_start')
+        _jsim_pm['_rank'] = _jsim_pm.groupby(['case_id', 'activity']).cumcount()
+
+        _jov_pm = {}
+        for _ji_pm in range(_n_pairs_pm):
+            _jrcid_pm = _jreal_ord_pm[_ji_pm]
+            _jscid_pm = _jsim_ord_pm[_ji_pm]
+            _jsc_pm   = _jsim_pm[_jsim_pm['case_id'] == _jscid_pm]
+            _jov_pm[str(_jrcid_pm)] = {
+                (str(_r_pm['activity']), int(_r_pm['_rank'])): float(_r_pm['_dur_sec'])
+                for _, _r_pm in _jsc_pm.iterrows()
+            }
+
+        _jdur_override_by_mode.setdefault(_jp_pm, {})[_jm_pm] = _jov_pm
+
+    _n_pairs_total = sum(len(v) for v in _jdur_override_by_mode.values())
+    print(f"Built overrides for {_n_pairs_total} (process, mode) pairs")
+
+    # ── Run eval for every (process, mode) × curve approach ──────────────────
+    _jpm_all_records = []
+
+    _jpm_curve_approaches = [
+        ('Baseline',                                globals().get('all_energy_pipelines_mean',           {})),
+        ('DTW + pos',                               globals().get('all_energy_pipelines',                {})),
+        ('DTW + Ext. Factors + Prev Act',           globals().get('all_energy_pipelines_exog_prev_activity', {})),
+        ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
+        ('DTW + Seq2Seq + Ext. Factors + Prev Act', globals().get('all_energy_pipelines_seq2seq_prev_activity', {})),
+    ]
+
+    for _jp_run, _jmodes_run in _jdur_override_by_mode.items():
+        for _jm_run, _jov_run in _jmodes_run.items():
+            _jov_wrapped  = {_jp_run: _jov_run}
+            _jbm_wrapped  = {_jp_run: _jm_run}
+
+            for _jlabel_run, _jpips_run in _jpm_curve_approaches:
+                if not _jpips_run or _jp_run not in _jpips_run:
+                    continue
+                _jrecs_run = _run_curve_eval_joint_duration(
+                    {_jp_run: _jpips_run[_jp_run]}, _jlabel_run,
+                    test_datasets, _activities_map, _objects_map,
+                    _jov_wrapped, _jbm_wrapped,
+                )
+                for _r_run in _jrecs_run:
+                    _r_run['SimMode'] = _jm_run
+                _jpm_all_records.extend(_jrecs_run)
+
+        print(f"  {_jp_run}: done ({len(_jmodes_run)} modes)")
+
+    # ── Save + heatmaps ───────────────────────────────────────────────────────
+    if _jpm_all_records and EXPORT_RESULTS and '_run_dir' in dir():
+        _jpmdf = pd.DataFrame(_jpm_all_records)
+        _jpm_parquet = os.path.join(_run_dir, 'curve_joint_duration_eval_per_mode.parquet')
+        _jpmdf.to_parquet(_jpm_parquet, index=False)
+        print(f"Saved per-mode joint eval → {_jpm_parquet}")
+
+        _jpm_hm_dir = os.path.join(_run_dir, 'joint_duration_eval_heatmaps')
+        os.makedirs(_jpm_hm_dir, exist_ok=True)
+        _jpm_metrics = [m for m in ['sMAE', 'sRMSE', 'WAPE'] if m in _jpmdf.columns]
+
+        def _display_sim_mode(m):
+            m = str(m)
+            if not m.startswith('petri_net_'):
+                return m
+            rest = m[len('petri_net_'):]
+            if rest.endswith('_ml_plus_global'):
+                return rest[:-len('_ml_plus_global')] + ' / ml_global'
+            if rest.endswith('_ml_plus_per_act'):
+                return rest[:-len('_ml_plus_per_act')] + ' / ml_local'
+            return rest + ' / baseline'
+
+        def _plot_per_mode_hm(df, proc, approach, save_dir):
+            if df.empty or not _jpm_metrics:
+                return
+            _agg_pm = df.groupby('SimMode')[_jpm_metrics].median()
+            # Sort rows by duration WAPE (best = lowest = top)
+            _wape_key = {m: _jpm_mode_wape.get((proc, m), 999) for m in _agg_pm.index}
+            _agg_pm = _agg_pm.loc[sorted(_agg_pm.index, key=lambda m: _wape_key.get(m, 999))]
+            _agg_pm.index = [_display_sim_mode(m) for m in _agg_pm.index]
+
+            _norm_pm = _agg_pm.copy().astype(float)
+            for _c_pm in _jpm_metrics:
+                _mn_pm, _mx_pm = _agg_pm[_c_pm].min(), _agg_pm[_c_pm].max()
+                _norm_pm[_c_pm] = (_agg_pm[_c_pm] - _mn_pm) / (_mx_pm - _mn_pm + 1e-12)
+
+            _title_pm = f'Per-Mode Joint Eval — {proc} — {approach}'
+            _fig_pm, _ax_pm = plt.subplots(
+                figsize=(max(5, len(_jpm_metrics) * 2.5), max(3, len(_norm_pm) * 0.7 + 1.5))
+            )
+            sns.heatmap(_norm_pm, annot=_agg_pm.round(3), fmt='', cmap='RdYlGn_r',
+                        vmin=0, vmax=1, linewidths=0.5, ax=_ax_pm,
+                        cbar_kws={'label': 'Normalised (0 = best)'})
+            _ax_pm.set_title(_title_pm, fontsize=11, fontweight='bold')
+            _ax_pm.set_ylabel('Simulation mode (sorted by duration WAPE, best first)')
+            _ax_pm.set_xticklabels(_ax_pm.get_xticklabels(), rotation=0)
+            _ax_pm.set_yticklabels(_ax_pm.get_yticklabels(), rotation=0, fontsize=8)
+            plt.tight_layout()
+            _fp_pm = os.path.join(
+                save_dir,
+                _title_pm.replace(' ', '_').replace('/', '-').replace('|', '-') + '.png'
+            )
+            plt.savefig(_fp_pm, dpi=150, bbox_inches='tight')
+            plt.show()
+
+        display(Markdown("## Per-Mode Joint Eval — Heatmaps by Process × Curve Approach"))
+        for _jp_hm, _jpsub_hm in _jpmdf.groupby('Process'):
+            display(Markdown(f"### {_jp_hm}"))
+            for _jappr_hm, _japsub_hm in _jpsub_hm.groupby('Approach'):
+                _plot_per_mode_hm(_japsub_hm, _jp_hm, _jappr_hm, _jpm_hm_dir)
+
+        display(Markdown("## Per-Mode Joint Eval — Median across all processes"))
+        _jpm_summ = (
+            _jpmdf.groupby(['SimMode', 'Approach'])[_jpm_metrics]
+            .median().round(4)
+        )
+        display(_jpm_summ)
+
+        print(f"Saved per-mode heatmaps → {_jpm_hm_dir}")
+    elif not _jpm_all_records:
+        print("[WARN per-mode joint] No records — check WARN/ERROR messages above.")
+
+# %%
+# ══════════════════════════════════════════════════════════════════════════════
 # RESULTS EXPORT — parquet table + HTML notebook snapshot
 # ══════════════════════════════════════════════════════════════════════════════
 import subprocess
