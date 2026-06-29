@@ -282,8 +282,11 @@ def _mlp_add_features(df):
     return out
 
 
-def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
-    """Select best sklearn model by CV MAE on log1p(duration). Returns (model, scaler, name), oof_resid."""
+def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5, target_transform='log'):
+    """Select best sklearn model by CV MAE. Returns (model, scaler, name), oof_resid.
+
+    target_transform: 'log' (log1p — default) or 'direct' (no transform, original scale).
+    """
     from sklearn.model_selection import KFold
     from sklearn.preprocessing import StandardScaler
     from sklearn.linear_model import Ridge, HuberRegressor
@@ -292,13 +295,19 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     if len(sub) < 20 or not feat_cols:
         return None, None
 
-    X     = sub[feat_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values
-    y     = sub['duration'].values
-    y_log = np.log1p(y)
-    n     = len(sub)
-    k     = min(n_splits, n // 2)
+    X = sub[feat_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values
+    y = sub['duration'].values
+    n = len(sub)
+    k = min(n_splits, n // 2)
     if k < 2:
         return None, None
+
+    if target_transform == 'log':
+        y_t = np.log1p(y)
+        inv = lambda p: np.clip(np.expm1(p), 0, None)
+    else:   # 'direct'
+        y_t = y.copy()
+        inv = lambda p: np.clip(p, 0, None)
 
     candidates = {
         'ridge': lambda: Ridge(alpha=1.0),
@@ -318,10 +327,10 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
                 continue
             sc_f, m_f = StandardScaler(), make_m()
             try:
-                m_f.fit(sc_f.fit_transform(X[tr_idx]), y_log[tr_idx])
-                pred_log = m_f.predict(sc_f.transform(X[val_idx]))
-                scores.append(np.mean(np.abs(pred_log - y_log[val_idx])))
-                oof[val_idx] = y[val_idx] - np.clip(np.expm1(pred_log), 0, None)
+                m_f.fit(sc_f.fit_transform(X[tr_idx]), y_t[tr_idx])
+                pred_t = m_f.predict(sc_f.transform(X[val_idx]))
+                scores.append(np.mean(np.abs(pred_t - y_t[val_idx])))
+                oof[val_idx] = y[val_idx] - inv(pred_t)
             except Exception:
                 pass
         if scores:
@@ -337,15 +346,17 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     from sklearn.preprocessing import StandardScaler as _SS
     sc = _SS()
     m  = candidates[best_name]()
-    m.fit(sc.fit_transform(X), y_log)
+    m.fit(sc.fit_transform(X), y_t)
 
     oof_out = valid_resid if len(valid_resid) >= 5 else None
     return (m, sc, best_name), oof_out
 
 
-def _mlp_train_models(df_train):
+def _mlp_train_models(df_train, target_transform=None):
     """Train ML+ global and per-act models from the training event log.
 
+    target_transform: 'log' (log1p — default) or 'direct' (no transform).
+                      Falls back to MLP_TARGET_TRANSFORM config if None.
     Returns:
         global_mlp_tuple: (model, scaler, name) or None
         act_mlp_models:   {activity: (model, scaler, name)}
@@ -353,6 +364,8 @@ def _mlp_train_models(df_train):
         activity_means:   {activity: mean_duration}
         global_mean:      float
     """
+    if target_transform is None:
+        target_transform = globals().get('MLP_TARGET_TRANSFORM', 'log')
     df = df_train.copy()
     df['timestamp_start'] = pd.to_datetime(df['timestamp_start'])
     df['timestamp_end']   = pd.to_datetime(df['timestamp_end'])
@@ -377,11 +390,13 @@ def _mlp_train_models(df_train):
         if c in df.columns
     ]
 
-    global_mlp_tuple, _ = _mlp_fit_model_with_oof(df, mlp_feat_cols)
+    global_mlp_tuple, _ = _mlp_fit_model_with_oof(df, mlp_feat_cols,
+                                                   target_transform=target_transform)
 
     act_mlp_models = {}
     for act, sub in df.groupby('activity'):
-        tpl, _ = _mlp_fit_model_with_oof(sub, mlp_feat_cols)
+        tpl, _ = _mlp_fit_model_with_oof(sub, mlp_feat_cols,
+                                          target_transform=target_transform)
         if tpl is not None:
             act_mlp_models[act] = tpl
 
@@ -541,6 +556,9 @@ ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all
 ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
 ML_OPTIMIZE_HYPERPARAMS = True    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
+
+# ML+ duration model target transform: 'log' (log1p — default) or 'direct' (no transform)
+MLP_TARGET_TRANSFORM    = 'log'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CURVE MODELLING HYPERPARAMETER OPTIMIZATION
