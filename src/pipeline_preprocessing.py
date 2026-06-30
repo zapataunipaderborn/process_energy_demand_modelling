@@ -389,12 +389,23 @@ print(df_expanded.columns)
 
 #%%
 
-files_folder_gold_datasets = files_folder_gold / 'datasets'
-files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
+# ── Save process_2 split into process_2 (l01) and process_3 (l02) ────────────
+for _obj, _proc_num in [('l01', 2), ('l02', 3)]:
+    _el_obj  = df_event_log[df_event_log['object'] == _obj].copy()
+    _exp_obj = df_expanded[df_expanded['object_log'] == _obj].copy()
+    _pp_obj  = (
+        _el_obj[['case_id', 'activity', 'timestamp_start', 'timestamp_end', 'object_attributes']]
+        .drop_duplicates(subset=['case_id'])
+        .copy()
+    )
 
-df_expanded.to_parquet(files_folder_gold_datasets / "df_expanded.parquet", index=False)
-df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", index=False)
-df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
+    _gold_dir = folder_gold_base / f'process_{_proc_num}' / 'datasets'
+    _gold_dir.mkdir(parents=True, exist_ok=True)
+    _exp_obj.to_parquet(_gold_dir / "df_expanded.parquet",        index=False)
+    _el_obj.to_parquet( _gold_dir / "df_event_log.parquet",       index=False)
+    _pp_obj.to_parquet( _gold_dir / "df_production_plan.parquet", index=False)
+    print(f"  Saved process_{_proc_num} ({_obj}): {_el_obj['case_id'].nunique()} cases, "
+          f"{len(_el_obj)} events")
 
 # # %%
 # display(df_expanded)
@@ -652,13 +663,13 @@ df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.p
 
 # %%
 
-######## Process 4 ########
+######## Process 5 (formerly process_4 — Erhitzer) ########
 
-process = 4
+process = 4  # silver data still lives in process_4/
 
 # Define the folder path
 files_folder_silver = folder_silver_base / f'process_{process}'
-files_folder_gold = folder_gold_base / f'process_{process}'
+files_folder_gold = folder_gold_base / 'process_5'   # saved as process_5 in gold
 files_folder_gold.mkdir(parents=True, exist_ok=True)
 
 objects_to_analyze = ['Erhitzer']
@@ -958,13 +969,13 @@ display(df_expanded)
 
 #%%
 
-######## Process 3 ########
+######## Process 4 (formerly process_3 — tower) ########
 
-process = 3
+process = 3  # silver data still lives in process_3/
 
 # Define folder paths
 files_folder_silver = folder_silver_base / f'process_{process}'
-files_folder_gold = folder_gold_base / f'process_{process}'
+files_folder_gold = folder_gold_base / 'process_4'   # saved as process_4 in gold
 files_folder_gold.mkdir(parents=True, exist_ok=True)
 
 df = pd.read_parquet(files_folder_silver / "data_prepared_for_analysis.parquet")
