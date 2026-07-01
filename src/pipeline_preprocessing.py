@@ -956,14 +956,14 @@ df_event_log.to_parquet(files_folder_gold_datasets / "df_event_log.parquet", ind
 df_production_plan.to_parquet(files_folder_gold_datasets / "df_production_plan.parquet", index=False)
 
 # %%
-display(df_expanded['activity_log'].value_counts())
+# display(df_expanded['activity_log'].value_counts())
 
-display(df_expanded['activity_log'].unique())
+# display(df_expanded['activity_log'].unique())
 
-#plot_activity_sensor_curves_by_index(df_expanded)
+# #plot_activity_sensor_curves_by_index(df_expanded)
 
-display(df_expanded.columns)
-display(df_expanded)
+# display(df_expanded.columns)
+# display(df_expanded)
 
 
 

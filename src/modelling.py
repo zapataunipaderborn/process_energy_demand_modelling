@@ -597,8 +597,11 @@ RUN_PROCESS_MODELLING     = True#os.environ.get('PIPELINE_RUN_PROCESS_MODELLING'
 #    'amplitude_shape'   Separate amplitude (curve_mean) from shape (z-score);
 #                        stage A predicts amplitude from metadata, stage B shape
 #    'seq2seq'           DTW + LSTM encoder-decoder
-#    'seq2seq_only'      LSTM encoder-decoder, no DTW
-#    'seq2seq_exog'      DTW + LSTM encoder-decoder + external factors
+#    'seq2seq_only'              LSTM encoder-decoder, no DTW
+#    'seq2seq_exog'              DTW + LSTM encoder-decoder + external factors
+#    'ml_linear'                 ML (GBM/RF), linear resample encode+decode (no DTW)
+#    'ml_dtw_linear_decode'      ML trained with DTW alignment, linear decode
+#    'seq2seq_dtw_linear_decode' Seq2Seq trained with DTW alignment, linear decode
 APPROACHES = [
     'baseline',
     # 'instance_stats',
@@ -608,11 +611,14 @@ APPROACHES = [
     # 'exog',
     'exog_prev_activity',
     #'amplitude_shape',
+    'ml_linear',
+    'ml_dtw_linear_decode',
 
     'seq2seq',
-    # 'seq2seq_only',
+    'seq2seq_only',
     # 'seq2seq_exog',
     'seq2seq_prev_activity',
+    'seq2seq_dtw_linear_decode',
 ]
 
 # ── Seq2Seq hyperparameters ───────────────────────────────────────────────────
@@ -3232,11 +3238,14 @@ if RUN_CURVE_ONLY_EVALUATION:
         build_and_train_pipeline_exog,            predict_raw_curve_exog,
         build_and_train_pipeline_exog_prev_activity, predict_raw_curve_exog_prev_activity,
         build_and_train_pipeline_amplitude_shape, predict_raw_curve_amplitude_shape,
+        build_and_train_pipeline_ml_linear,           predict_raw_curve_ml_linear,
+        build_and_train_pipeline_ml_dtw_linear_decode, predict_raw_curve_ml_dtw_linear_decode,
         # amplitude_shape_exog removed
         build_and_train_pipeline_seq2seq,         predict_raw_curve_seq2seq,
         build_and_train_pipeline_seq2seq_only,    predict_raw_curve_seq2seq_only,
         build_and_train_pipeline_seq2seq_exog,    predict_raw_curve_seq2seq_exog,
         build_and_train_pipeline_seq2seq_prev_activity, predict_raw_curve_seq2seq_prev_activity,
+        build_and_train_pipeline_seq2seq_dtw_linear_decode, predict_raw_curve_seq2seq_dtw_linear_decode,
     )
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import GradientBoostingRegressor
@@ -3255,6 +3264,9 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_exog         = {}   # DTW + Seq2Seq + Ext. Factors
     all_energy_pipelines_seq2seq_prev_activity = {}  # DTW + Seq2Seq + Ext. Factors + Prev Act
+    all_energy_pipelines_ml_linear                  = {}   # ML, linear resample encode+decode
+    all_energy_pipelines_ml_dtw_linear_decode       = {}   # ML, DTW train + linear decode
+    all_energy_pipelines_seq2seq_dtw_linear_decode  = {}   # Seq2Seq, DTW train + linear decode
 
     _CURVE_MODELS = {
         'Linear Regression': LinearRegression,
@@ -3327,6 +3339,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_seq2seq_only             = {}
         _pipelines_seq2seq_exog             = {}
         _pipelines_seq2seq_prev_activity    = {}
+        _pipelines_ml_linear                = {}
+        _pipelines_ml_dtw_linear_decode     = {}
+        _pipelines_seq2seq_dtw_linear_decode = {}
 
         # ── Parallel training for all sklearn-based approaches ───────────────
         # One worker per (sensor, activity, object) combo — each trains its own
@@ -3336,9 +3351,11 @@ if RUN_CURVE_ONLY_EVALUATION:
         import concurrent.futures, os as _os
 
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','exog_prev_activity','amplitude_shape'}]
+                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','exog_prev_activity','amplitude_shape',
+                                        'ml_linear','ml_dtw_linear_decode'}]
         _seq2seq_approaches = [a for a in APPROACHES
-                               if a in {'seq2seq','seq2seq_only','seq2seq_exog','seq2seq_prev_activity'}]
+                               if a in {'seq2seq','seq2seq_only','seq2seq_exog','seq2seq_prev_activity',
+                                        'seq2seq_dtw_linear_decode'}]
 
         _combos    = [(s, a, o) for s in _sensors for a in _activities for o in _objects]
         _n_workers = min(len(_combos), _os.cpu_count() or 4)
@@ -3417,6 +3434,18 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exog_prev_activity']),
                         'full_pipeline':   _r['exog_prev_activity'],
                     }
+                if 'ml_linear' in _r:
+                    _pipelines_ml_linear.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': None,
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_linear(rv, act, attrs, pipeline=ep))(_r['ml_linear']),
+                        'full_pipeline':   _r['ml_linear'],
+                    }
+                if 'ml_dtw_linear_decode' in _r:
+                    _pipelines_ml_dtw_linear_decode.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_dtw_linear_decode']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_dtw_linear_decode(rv, act, attrs, pipeline=ep))(_r['ml_dtw_linear_decode']),
+                        'full_pipeline':   _r['ml_dtw_linear_decode'],
+                    }
 
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
         if _seq2seq_approaches and _combos:
@@ -3489,6 +3518,15 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'full_pipeline':   _ep,
                     }
                     print(f"  [{_s}|{_a}|{_o}] seq2seq_prev_activity  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
+                if 'seq2seq_dtw_linear_decode' in _r2:
+                    _ep = _r2['seq2seq_dtw_linear_decode']
+                    _ep['variable_name'] = _s
+                    _pipelines_seq2seq_dtw_linear_decode.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _ep['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq_dtw_linear_decode(rv, act, attrs, pipeline=ep))(_ep),
+                        'full_pipeline':   _ep,
+                    }
+                    print(f"  [{_s}|{_a}|{_o}] seq2seq_dtw_linear_decode  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
 
         # ── Mean baseline: predict training mean at every timestep ──────────
         _pipelines_mean = {}
@@ -3529,6 +3567,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_seq2seq_only[_proc]          = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_exog[_proc]          = _pipelines_seq2seq_exog
         all_energy_pipelines_seq2seq_prev_activity[_proc] = _pipelines_seq2seq_prev_activity
+        all_energy_pipelines_ml_linear[_proc]                 = _pipelines_ml_linear
+        all_energy_pipelines_ml_dtw_linear_decode[_proc]     = _pipelines_ml_dtw_linear_decode
+        all_energy_pipelines_seq2seq_dtw_linear_decode[_proc] = _pipelines_seq2seq_dtw_linear_decode
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3614,7 +3655,6 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                             'MAE':      _r['MAE'],
                             'RMSE':     _r['RMSE'],
                             'WAPE':     _r['WAPE (%)'],
-                            'R2':       _r['R2'],
                             'sMAE':     _r.get('sMAE'),
                             'sRMSE':    _r.get('sRMSE'),
                         })
@@ -3639,7 +3679,7 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
     import importlib, sim_extractor as _se
     importlib.reload(_se)
     from sim_extractor import _dispatch_predict
-    from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+    from sklearn.metrics import mean_squared_error, mean_absolute_error
 
     records = []
     for _proc, _sensor_pipelines in pipelines_dict.items():
@@ -3753,7 +3793,6 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
 
                     _mae  = float(mean_absolute_error(_raw_values, _yp))
                     _rmse = float(np.sqrt(mean_squared_error(_raw_values, _yp)))
-                    _r2   = float(r2_score(_raw_values, _yp))
                     _den  = float(np.sum(np.abs(_raw_values)))
                     _wape = float(np.sum(np.abs(_raw_values - _yp))) / _den * 100 if _den != 0 else np.nan
 
@@ -3777,7 +3816,6 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
                         'MAE':      _mae,
                         'RMSE':     _rmse,
                         'WAPE':     _wape,
-                        'R2':       _r2,
                         'sMAE':     _smae_ar,
                         'sRMSE':    _srmse_ar,
                     })
@@ -3827,12 +3865,16 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown(f"## Split: {_split_label}"))
 
         for _approach_label, _pipelines in [
-            ('Baseline',                      all_energy_pipelines_mean),
-            ('DTW + pos',                     all_energy_pipelines),
-            ('DTW + Ext. Factors + Prev Act', all_energy_pipelines_exog_prev_activity),
+            ('Baseline',                          all_energy_pipelines_mean),
+            ('DTW + pos',                         all_energy_pipelines),
+            ('DTW + Ext. Factors + Prev Act',     all_energy_pipelines_exog_prev_activity),
+            ('ML Linear (no DTW)',                all_energy_pipelines_ml_linear),
+            ('ML DTW + Linear Decode',            all_energy_pipelines_ml_dtw_linear_decode),
 
-            ('DTW + Seq2Seq',               all_energy_pipelines_seq2seq),
+            ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
+            ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
             ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_prev_activity),
+            ('Seq2Seq DTW + Linear Decode',       all_energy_pipelines_seq2seq_dtw_linear_decode),
         ]:
             if not _pipelines:
                 continue
@@ -3879,7 +3921,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown("## Approach Comparison — Train & Test (median over ALL sensors, processes, curves)"))
         _appr_summary = (
             _all_df
-            .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+            .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
             .median()
             .round(4)
             .unstack('Split')
@@ -3897,7 +3939,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown("## Model Summary — Train & Test metrics per Process / Sensor / Approach (median over curves)"))
         _summary = (
             _all_df
-            .groupby(['Process', 'Sensor', 'Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+            .groupby(['Process', 'Sensor', 'Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
             .median()
             .round(4)
         )
@@ -3920,7 +3962,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         if not _test_df.empty:
             _compare = (
                 _test_df
-                .groupby(['Approach', 'Process', 'Sensor'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+                .groupby(['Approach', 'Process', 'Sensor'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
                 .median()
                 .round(4)
             )
@@ -3932,7 +3974,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             display(Markdown("### Per-activity breakdown (TEST) — median over curves"))
             _act_compare = (
                 _test_df
-                .groupby(['Approach', 'Process', 'Sensor', 'Activity'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+                .groupby(['Approach', 'Process', 'Sensor', 'Activity'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
                 .median()
                 .round(4)
             )
@@ -4012,7 +4054,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             except Exception as _e:
                 print(f"[WARN] Plotly WAPE distribution failed: {_e}")
 
-            # ── R² heatmap — one subplot per approach ────────────────────────
+            # ── sMAE heatmap — one subplot per approach ───────────────────────
             try:
                 _approaches = _test_df['Approach'].unique()
                 fig_h, axes_h = plt.subplots(
@@ -4026,80 +4068,87 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     _sub = _test_df[_test_df['Approach'] == _appr]
                     _ph = _sub.pivot_table(
                         index=['Process', 'Sensor'], columns='Activity',
-                        values='R2', aggfunc='median'
+                        values='sMAE', aggfunc='median'
                     )
                     sns.heatmap(
-                        _ph, annot=True, fmt='.3f', cmap='RdYlGn',
-                        vmin=0, vmax=1, linewidths=0.5, ax=ax_h,
-                        cbar_kws={'label': 'R²'}
+                        _ph, annot=True, fmt='.3f', cmap='RdYlGn_r',
+                        linewidths=0.5, ax=ax_h,
+                        cbar_kws={'label': 'sMAE'}
                     )
-                    ax_h.set_title(f'R² — {_appr}', fontsize=11, fontweight='bold')
+                    ax_h.set_title(f'sMAE — {_appr}', fontsize=11, fontweight='bold')
                     ax_h.set_xticklabels(ax_h.get_xticklabels(), rotation=30, ha='right', fontsize=8)
 
-                plt.suptitle('Curve R² per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
+                plt.suptitle('Curve sMAE per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
                 plt.tight_layout()
                 if EXPORT_RESULTS and '_run_dir' in dir():
-                    _savefig('r2_heatmap_all_approaches')
+                    _savefig('smae_heatmap_all_approaches')
                 plt.show()
             except Exception as _e:
-                print(f"[WARN] R² heatmap failed: {_e}")
+                print(f"[WARN] sMAE heatmap failed: {_e}")
 
-            # ── Delta heatmaps: each new approach minus baseline ─────────────
+            # ── Delta-sMAE heatmaps: each approach vs baseline ───────────────
             try:
                 _base_pivot = _test_df[_test_df['Approach'] == 'DTW + pos'].pivot_table(
-                    index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='median'
+                    index=['Process', 'Sensor'], columns='Activity', values='sMAE', aggfunc='median'
                 )
                 for _delta_label, _delta_appr in [
-                    ('Instance Stats',         'Instance Stats'),
-                    ('Approach 2 (B-spline)', 'Approach 2 (B-spline)'),
-                    ('Approach 3 (DTW-phase)', 'Approach 3 (DTW-phase)'),
-                    ('DTW + Ext. Factors',           'DTW + Ext. Factors'),
-                    ('DTW + Seq2Seq',                'DTW + Seq2Seq'),
-                    ('Seq2Seq only',                 'Seq2Seq only'),
-                    ('DTW + Seq2Seq + Ext. Factors', 'DTW + Seq2Seq + Ext. Factors'),
+                    ('ML Linear',              'ML Linear (no DTW)'),
+                    ('ML DTW+Linear Decode',   'ML DTW + Linear Decode'),
+                    ('Seq2Seq only',            'Seq2Seq only (no DTW)'),
+                    ('Seq2Seq DTW+Lin Decode', 'Seq2Seq DTW + Linear Decode'),
+                    ('DTW + Seq2Seq',          'DTW + Seq2Seq'),
+                    ('DTW + Ext. Factors + Prev Act', 'DTW + Ext. Factors + Prev Act'),
                 ]:
                     _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
-                        index=['Process', 'Sensor'], columns='Activity', values='R2', aggfunc='median'
+                        index=['Process', 'Sensor'], columns='Activity', values='sMAE', aggfunc='median'
                     )
                     if _base_pivot.empty or _new_pivot.empty:
                         continue
-                    _delta = (_new_pivot - _base_pivot).reindex_like(_base_pivot)
+                    _delta = (_base_pivot - _new_pivot).reindex_like(_base_pivot)  # positive = improvement
                     fig_d, ax_d = plt.subplots(figsize=(max(8, len(_base_pivot.columns) * 1.4),
                                                          max(3, len(_base_pivot) * 1.2)))
                     sns.heatmap(
                         _delta, annot=True, fmt='.3f', cmap='RdYlGn',
                         center=0, linewidths=0.5, ax=ax_d,
-                        cbar_kws={'label': f'ΔR² ({_delta_label} − Baseline)'}
+                        cbar_kws={'label': f'ΔsMAE (Baseline − {_delta_label})'}
                     )
                     ax_d.set_title(
-                        f'ΔR² {_delta_label} vs Baseline — green = {_delta_label} better',
+                        f'ΔsMAE {_delta_label} vs Baseline — green = {_delta_label} better',
                         fontsize=11, fontweight='bold'
                     )
                     ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
                     plt.tight_layout()
                     if EXPORT_RESULTS and '_run_dir' in dir():
-                        _savefig(f'delta_r2_{_delta_label.replace(" ", "_").replace("/", "-")}')
+                        _savefig(f'delta_smae_{_delta_label.replace(" ", "_").replace("/", "-")}')
                     plt.show()
             except Exception as _e:
-                print(f"[WARN] Delta heatmaps failed: {_e}")
+                print(f"[WARN] Delta sMAE heatmaps failed: {_e}")
 
-            # ── 5 BEST / 5 WORST curves per approach (TEST R²) ──────────────────
+            # ── 5 BEST / 5 WORST curves per approach (TEST WAPE) ────────────────
             try:
-                from sklearn.metrics import r2_score, mean_absolute_error
+                from sklearn.metrics import mean_absolute_error
                 display(Markdown("---"))
                 display(Markdown("## 5 Best & 5 Worst Curve Fits per Approach — TEST set"))
 
                 _APPROACH_PIPELINES = {
-                    'Baseline':                       all_energy_pipelines_mean
+                    'Baseline':                           all_energy_pipelines_mean
                         if 'all_energy_pipelines_mean' in dir() else {},
-                    'DTW + pos':                      all_energy_pipelines
+                    'DTW + pos':                          all_energy_pipelines
                         if 'all_energy_pipelines' in dir() else {},
-                    'DTW + Ext. Factors + Prev Act':  all_energy_pipelines_exog_prev_activity
+                    'DTW + Ext. Factors + Prev Act':      all_energy_pipelines_exog_prev_activity
                         if 'all_energy_pipelines_exog_prev_activity' in dir() else {},
-                    'DTW + Seq2Seq':                  all_energy_pipelines_seq2seq
+                    'ML Linear (no DTW)':                 all_energy_pipelines_ml_linear
+                        if 'all_energy_pipelines_ml_linear' in dir() else {},
+                    'ML DTW + Linear Decode':             all_energy_pipelines_ml_dtw_linear_decode
+                        if 'all_energy_pipelines_ml_dtw_linear_decode' in dir() else {},
+                    'DTW + Seq2Seq':                      all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
+                    'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
+                        if 'all_energy_pipelines_seq2seq_only' in dir() else {},
                     'DTW + Seq2Seq + Ext. Factors + Prev Act': all_energy_pipelines_seq2seq_prev_activity
                         if 'all_energy_pipelines_seq2seq_prev_activity' in dir() else {},
+                    'Seq2Seq DTW + Linear Decode':        all_energy_pipelines_seq2seq_dtw_linear_decode
+                        if 'all_energy_pipelines_seq2seq_dtw_linear_decode' in dir() else {},
                 }
 
                 _ranked_bw = (
@@ -4192,13 +4241,13 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                                 )
                                 _denom_c = np.sum(np.abs(_rv_bw))
                                 _wape_c  = np.sum(np.abs(_rv_bw - _yp_bw)) / _denom_c * 100 if _denom_c != 0 else np.nan
-                                _r2_c    = r2_score(_rv_bw, _yp_bw)
+                                _mae_c   = mean_absolute_error(_rv_bw, _yp_bw)
                                 _ax.plot(_rv_bw, label='Actual', color='steelblue', linewidth=2)
                                 _ax.plot(_yp_bw, label='Predicted', color='tomato',
                                          linewidth=2, linestyle='--')
                                 _ax.set_title(
                                     f"{_act_bw[:28]} | {_sensor_bw[:20]}\n"
-                                    f"WAPE={_wape_c:.1f}%  R²={_r2_c:.3f}  "
+                                    f"WAPE={_wape_c:.1f}%  MAE={_mae_c:.4f}  "
                                     f"(bucket median WAPE={_wape_bw:.1f}%)",
                                     fontsize=8
                                 )
@@ -4270,7 +4319,8 @@ if 'process_datasets_to_model_sensors' in dir():
                                 'MAE':       _row['MAE'],
                                 'RMSE':      _row['RMSE'],
                                 'WAPE':      _row['WAPE (%)'],
-                                'R2':        _row['R2'],
+                                'sMAE':      _row.get('sMAE'),
+                                'sRMSE':     _row.get('sRMSE'),
                             })
 
 if profile_summary_records:
@@ -4280,7 +4330,7 @@ if profile_summary_records:
     report("="*80)
     _psummary = (
         profile_summary_df
-        .groupby(['Process', 'Sensor', 'Activity', 'Object', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+        .groupby(['Process', 'Sensor', 'Activity', 'Object', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
         .median()
         .round(4)
     )
@@ -4639,7 +4689,7 @@ if _jdur_ready:
         import importlib, sim_extractor as _se
         importlib.reload(_se)
         from sim_extractor import (split_curves, split_curves_with_prev_activity,
-                                   evaluate_pipeline_on_test)
+                                   evaluate_pipeline_joint_duration)
         records = []
         for _proc, _sensors in pipelines_dict.items():
             _df = df_lookup.get(_proc, {}).get('expanded')
@@ -4760,9 +4810,8 @@ if _jdur_ready:
                     if not _matched:
                         continue
                     try:
-                        _mdf, _ = evaluate_pipeline_on_test(
+                        _mdf, _ = evaluate_pipeline_joint_duration(
                             _matched, _fp,
-                            max_plot_curves=0, verbose=0,
                         )
                         for _, _r in _mdf.iterrows():
                             records.append({
@@ -4774,7 +4823,6 @@ if _jdur_ready:
                                 'MAE':       _r['MAE'],
                                 'RMSE':      _r['RMSE'],
                                 'WAPE':      _r['WAPE (%)'],
-                                'R2':        _r['R2'],
                                 'sMAE':      _r.get('sMAE'),
                                 'sRMSE':     _r.get('sRMSE'),
                                 'BestMode':  best_modes.get(_proc, ''),
@@ -4790,8 +4838,12 @@ if _jdur_ready:
         ('Baseline',                                all_energy_pipelines_mean),
         ('DTW + pos',                               all_energy_pipelines),
         ('DTW + Ext. Factors + Prev Act',           all_energy_pipelines_exog_prev_activity),
+        ('ML Linear (no DTW)',                      all_energy_pipelines_ml_linear),
+        ('ML DTW + Linear Decode',                  all_energy_pipelines_ml_dtw_linear_decode),
         ('DTW + Seq2Seq',                           all_energy_pipelines_seq2seq),
+        ('Seq2Seq only (no DTW)',                   all_energy_pipelines_seq2seq_only),
         ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_prev_activity),
+        ('Seq2Seq DTW + Linear Decode',             all_energy_pipelines_seq2seq_dtw_linear_decode),
     ]:
         if not _jpips:
             continue
@@ -4813,7 +4865,7 @@ if _jdur_ready:
 
         # Summary tables
         display(Markdown("## Joint Eval — Median by Approach × Process × Sensor × Activity"))
-        _jmetrics = [m for m in ['sMAE', 'sRMSE', 'WAPE', 'R2', 'MAE', 'RMSE'] if m in _jdf.columns]
+        _jmetrics = [m for m in ['sMAE', 'sRMSE', 'WAPE', 'MAE', 'RMSE'] if m in _jdf.columns]
         _jsumm = (
             _jdf.groupby(['Approach', 'Process', 'Sensor', 'Activity'])[_jmetrics]
             .median().round(4)
@@ -5108,7 +5160,7 @@ else:
                 _mn, _mx = _vals.min(), _vals.max()
                 if _mn == _mx:
                     _agg_norm[_m] = 0.5
-                elif _m == 'R2':
+                elif False:  # R2 removed
                     _agg_norm[_m] = (_vals - _mn) / (_mx - _mn)
                 else:
                     _agg_norm[_m] = 1 - (_vals - _mn) / (_mx - _mn)
@@ -5157,7 +5209,7 @@ else:
             # rebuild from raw records if the display block didn't produce it
             _as_raw = (
                 _export_df
-                .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'R2']]
+                .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
                 .median()
                 .round(4)
                 .unstack('Split')
