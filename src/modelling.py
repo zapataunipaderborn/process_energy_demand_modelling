@@ -4086,6 +4086,40 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             except Exception as _e:
                 print(f"[WARN] sMAE heatmap failed: {_e}")
 
+            # ── sMAE heatmap — one file per process → energy_results ─────────
+            try:
+                for _proc_hm in sorted(_test_df['Process'].unique()):
+                    _pdf = _test_df[_test_df['Process'] == _proc_hm]
+                    _appr_hm = _pdf['Approach'].unique()
+                    _fig_p, _axes_p = plt.subplots(
+                        1, len(_appr_hm),
+                        figsize=(max(8, _pdf['Activity'].nunique() * 1.4) * len(_appr_hm),
+                                 max(3, _pdf['Sensor'].nunique() * 1.2))
+                    )
+                    _axes_p = np.array(_axes_p).reshape(-1)
+                    for _ax_p, _appr in zip(_axes_p, _appr_hm):
+                        _sub_p = _pdf[_pdf['Approach'] == _appr]
+                        _ph_p = _sub_p.pivot_table(
+                            index='Sensor', columns='Activity',
+                            values='sMAE', aggfunc='median'
+                        )
+                        sns.heatmap(
+                            _ph_p, annot=True, fmt='.3f', cmap='RdYlGn_r',
+                            linewidths=0.5, ax=_ax_p,
+                            cbar_kws={'label': 'sMAE'}
+                        )
+                        _ax_p.set_title(f'sMAE — {_appr}', fontsize=11, fontweight='bold')
+                        _ax_p.set_xticklabels(_ax_p.get_xticklabels(), rotation=30, ha='right', fontsize=8)
+                    _fig_p.suptitle(f'Curve sMAE — {_proc_hm} — TEST set', fontsize=13, fontweight='bold', y=1.02)
+                    plt.tight_layout()
+                    if EXPORT_RESULTS and '_energy_results_dir' in dir():
+                        _ep = os.path.join(_energy_results_dir, f'smae_heatmap_{_proc_hm}.png')
+                        _fig_p.savefig(_ep, dpi=150, bbox_inches='tight')
+                    plt.show()
+                    plt.close(_fig_p)
+            except Exception as _e:
+                print(f"[WARN] Per-process sMAE heatmaps failed: {_e}")
+
             # ── Delta-sMAE heatmaps: each approach vs baseline ───────────────
             try:
                 _base_pivot = _test_df[_test_df['Approach'] == 'DTW + pos'].pivot_table(
@@ -4835,15 +4869,8 @@ if _jdur_ready:
     # ── Run for all active approaches ────────────────────────────────────────
     _jall_records = []
     for _jlabel, _jpips in [
-        ('Baseline',                                all_energy_pipelines_mean),
-        ('DTW + pos',                               all_energy_pipelines),
-        ('DTW + Ext. Factors + Prev Act',           all_energy_pipelines_exog_prev_activity),
-        ('ML Linear (no DTW)',                      all_energy_pipelines_ml_linear),
-        ('ML DTW + Linear Decode',                  all_energy_pipelines_ml_dtw_linear_decode),
-        ('DTW + Seq2Seq',                           all_energy_pipelines_seq2seq),
-        ('Seq2Seq only (no DTW)',                   all_energy_pipelines_seq2seq_only),
-        ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_prev_activity),
-        ('Seq2Seq DTW + Linear Decode',             all_energy_pipelines_seq2seq_dtw_linear_decode),
+        ('Baseline',                      all_energy_pipelines_mean),
+        ('DTW + Ext. Factors + Prev Act', all_energy_pipelines_exog_prev_activity),
     ]:
         if not _jpips:
             continue

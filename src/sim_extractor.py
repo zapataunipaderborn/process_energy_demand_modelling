@@ -7996,7 +7996,10 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
 
         _mu  = raw_values.mean()
         _sig = raw_values.std()
-        if _sig > 1e-10:
+        # NaN when curve is essentially constant (CV < 1%) — z-scoring a flat
+        # signal produces astronomically large sMAE/sRMSE that are meaningless.
+        _cv_ok = _sig > 1e-10 and (_mu == 0 or (_sig / abs(_mu)) > 0.01)
+        if _cv_ok:
             _zt = (raw_values - _mu) / _sig
             _zp = (y_pred    - _mu) / _sig
             smae  = float(np.mean(np.abs(_zt - _zp)))
@@ -8188,7 +8191,8 @@ def evaluate_pipeline_joint_duration(test_curves, pipeline):
 
         _mu  = orig_values.mean()
         _sig = orig_values.std()
-        if _sig > 1e-10:
+        _cv_ok = _sig > 1e-10 and (_mu == 0 or (_sig / abs(_mu)) > 0.01)
+        if _cv_ok:
             _zt   = (orig_values - _mu) / _sig
             _zp   = (y_pred      - _mu) / _sig
             smae  = float(np.mean(np.abs(_zt - _zp)))
