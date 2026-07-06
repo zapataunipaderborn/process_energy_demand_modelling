@@ -18,7 +18,7 @@ N_BATCHES      = 2190   # one batch every 4 h × 365 days = 1 year of production
 START_DATE     = datetime(2024, 1, 15)
 RANDOM_SEED    = 42
 VOLUME_RANGE_L = (200, 800)   # uniform per batch
-RECIPE_WEIGHTS = {'standard': 0.8, 'cleaning': 0.2}
+RECIPE_WEIGHTS = {'standard': 1.0}
 
 # Process sequence (ordered)
 PROCESS_SEQUENCE = [
@@ -26,7 +26,7 @@ PROCESS_SEQUENCE = [
     'Destillation',
     'Bottling',
     'Autoclaving',
-    'Packaging',
+    'Individual_packaging',
     'Warehousing',
 ]
 
@@ -36,7 +36,7 @@ NUM_RESOURCES = {
     'Destillation': 1,
     'Bottling':     1,
     'Autoclaving':  3,
-    'Packaging':    1,
+    'Individual_packaging':    1,
     'Warehousing':  1,
 }
 
@@ -93,7 +93,7 @@ PROCESS_CONFIG = {
                 'cleaning': {'duration': 15.0,  'variability': 0.02}}},
         ],
     },
-    'Packaging': {
+    'Individual_packaging': {
         'volume_affected': False,
         'events': [
             {'name': 'prepare', 'recipes': {
@@ -140,7 +140,7 @@ ENERGY_PARAMS = {
         'noise_std':   5.0,
     },
     'bottling':   {'base_kW': 35.0,  'noise_std': 2.0},
-    'packaging':  {'base_kW': 25.0,  'noise_std': 1.5},
+    'individual_packaging':  {'base_kW': 25.0,  'noise_std': 1.5},
     'water_supply': {'base_kW': 8.0, 'noise_std': 0.5},
 }
 
@@ -201,7 +201,15 @@ def simulate(n_batches: int = N_BATCHES,
         # Batch clock: when the batch is ready to enter the next station
         batch_ready = start_date + timedelta(minutes=b * 240)  # 4-h stagger → ~1 year for 2190 batches
 
-        for station in PROCESS_SEQUENCE:
+        stations_queue = list(PROCESS_SEQUENCE)
+        
+        # Dynamic Skipping: 20% chance to skip Individual_packaging and go straight to Warehousing
+        if rng.random() < 0.20:
+            stations_queue = [s for s in stations_queue if s != 'Individual_packaging']
+
+        while stations_queue:
+            station = stations_queue.pop(0)
+
             cfg         = PROCESS_CONFIG[station]
             vol_affected = cfg['volume_affected']
             n_res        = NUM_RESOURCES[station]
@@ -221,13 +229,35 @@ def simulate(n_batches: int = N_BATCHES,
             object_type = 'sterilization_line'
 
             current_time = station_start
-            for event_def in cfg['events']:
+            
+            events_to_process = list(cfg['events'])
+            idx = 0
+            
+            while idx < len(events_to_process):
+                event_def = events_to_process[idx]
                 act_name = event_def['name']
                 rec_cfg  = event_def['recipes'][recipe]
                 dur      = sample_duration(
                     rec_cfg['duration'], rec_cfg['variability'],
                     volume_L, vol_affected, rng
                 )
+                
+                # Machine Breakdowns: 5% chance before working/heat
+                if act_name in ('working', 'heat') and rng.random() < 0.05:
+                    breakdown_dur = float(rng.uniform(60.0, 120.0))
+                    events.append({
+                        'case_id':               case_id,
+                        'activity':              f'{resource_name}_maintenance',
+                        'timestamp_start':       current_time,
+                        'timestamp_end':         current_time + timedelta(minutes=breakdown_dur),
+                        'higher_level_activity': 'sterilization_process',
+                        'station':               station,
+                        'object_type':           object_type,
+                        'object':                resource_name,
+                        'object_attributes':     obj_attrs,
+                    })
+                    current_time += timedelta(minutes=breakdown_dur) + timedelta(seconds=1)
+
                 ts_start = current_time
                 ts_end   = current_time + timedelta(minutes=dur)
 
@@ -243,10 +273,24 @@ def simulate(n_batches: int = N_BATCHES,
                     'object_attributes':     obj_attrs,
                 })
                 current_time = ts_end + timedelta(seconds=1)
+                
+                # Microscopic rework inside Autoclave
+                if station == 'Autoclaving' and act_name == 'cool':
+                    if rng.random() < 0.15:  # 15% chance to rework
+                        rework_events = [e for e in cfg['events'] if e['name'] in ('heat', 'hold', 'cool')]
+                        events_to_process = events_to_process[:idx+1] + rework_events + events_to_process[idx+1:]
+                
+                idx += 1
 
             # Update resource and batch clocks
             res_times[best_slot] = current_time
             batch_ready          = current_time
+            
+            # Macroscopic rework: Warehousing -> Packaging
+            if station == 'Warehousing':
+                if rng.random() < 0.40: # 10% chance to fail QA and go back to Packaging
+                    stations_queue.append('Individual_packaging')
+                    stations_queue.append('Warehousing')
 
     df_event_log = pd.DataFrame(events)
     df_event_log['timestamp_start'] = pd.to_datetime(df_event_log['timestamp_start'])
@@ -309,10 +353,10 @@ def _power_curve(activity: str, station: str, duration_min: float,
         if activity in ('prepare', 'cool'):
             return noisy(5.0, 0.5)
 
-    if station == 'Packaging' and activity == 'working':
-        p = ENERGY_PARAMS['packaging']
+    if station == 'Individual_packaging' and activity == 'working':
+        p = ENERGY_PARAMS['individual_packaging']
         return noisy(p['base_kW'], p['noise_std'])
-    if station == 'Packaging' and activity == 'prepare':
+    if station == 'Individual_packaging' and activity == 'prepare':
         return noisy(3.0, 0.3)
 
     if station == 'Water_supply' and activity == 'working':
@@ -359,7 +403,7 @@ def build_expanded(df_event_log: pd.DataFrame,
                 'autoclave_steam_demand_kW_energy_to_model':             0.0,
                 'autoclave_cooling_water_demand_kW_energy_to_model':     0.0,
                 'bottling_power_kW_energy_to_model':                     0.0,
-                'packaging_power_kW_energy_to_model':                    0.0,
+                'individual_packaging_power_kW_energy_to_model':                    0.0,
                 'water_supply_power_kW_energy_to_model':                 0.0,
                 # Log columns
                 'timestamp_start_log':          ev['timestamp_start'],
@@ -383,8 +427,8 @@ def build_expanded(df_event_log: pd.DataFrame,
                 row['autoclave_cooling_water_demand_kW_energy_to_model'] = val
             elif station == 'Bottling':
                 row['bottling_power_kW_energy_to_model'] = val
-            elif station == 'Packaging':
-                row['packaging_power_kW_energy_to_model'] = val
+            elif station == 'Individual_packaging':
+                row['individual_packaging_power_kW_energy_to_model'] = val
             elif station == 'Water_supply':
                 row['water_supply_power_kW_energy_to_model'] = val
 
