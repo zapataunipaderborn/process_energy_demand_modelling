@@ -89,6 +89,7 @@ from sim_modeller import SimModeller
 
 from sklearn.linear_model import Lasso, LogisticRegression
 from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
+from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from xgboost import XGBRegressor
 
 # %%
@@ -657,10 +658,12 @@ _plots_dir           = os.path.join(_run_dir, 'plots')
 _process_results_dir = os.path.join(_run_dir, 'process_results')
 _energy_results_dir  = os.path.join(_run_dir, 'energy_results')
 _predicted_logs_dir  = os.path.join(_run_dir, 'predicted_logs')
+_energy_distribution_dir = os.path.join(_run_dir, 'energy_distribution_results')
 os.makedirs(_plots_dir, exist_ok=True)
 os.makedirs(_process_results_dir, exist_ok=True)
 os.makedirs(_energy_results_dir, exist_ok=True)
 os.makedirs(_predicted_logs_dir, exist_ok=True)
+os.makedirs(_energy_distribution_dir, exist_ok=True)
 
 LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
 
@@ -729,6 +732,87 @@ CORE_METRIC_BASES = [
     'conformance_metrics_fitness_error',
     'conformance_metrics_precision_error',
 ]
+
+
+def _detect_sensors_for_energy_distribution(process, expanded_df):
+    """
+    Self-contained sensor auto-detection (mirrors the logic already used
+    inside the energy-aware modes block, duplicated here so the
+    energy-distribution metrics don't depend on that block having run —
+    it must work for ANY simulation mode, not just petri_net_energy_*).
+    """
+    if expanded_df is None or expanded_df.empty:
+        return []
+    sensors_from_config = (
+        globals()['process_datasets_to_model_sensors'].get(process, {}).get('sensors_to_model', [])
+        if 'process_datasets_to_model_sensors' in globals() else []
+    )
+    if sensors_from_config:
+        return sensors_from_config
+    return [
+        c for c in expanded_df.columns
+        if c.endswith('_to_model')
+        and expanded_df[c].dtype in ('float64', 'float32', 'int64', 'int32')
+    ]
+
+
+def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_expanded_df,
+                                      core_metrics_row, output_root):
+    """
+    Compute and save the case/activity/sensor and case/sensor energy-distribution
+    comparison (compare_energy_distributions — no curve/instance matching) for
+    one (process, mode), alongside the already-computed CORE_METRIC_BASES scalar
+    values for that same mode, into output_root/<process>/<safe_mode>/.
+
+    Silently no-ops (with a short note) when there's nothing to compare against —
+    e.g. no trained energy_pipelines for this process (requires
+    run_energy_modelling=True for at least one prior run), no detectable sensor
+    columns, or an empty simulated/real curve-stats result.
+    """
+    pipelines_for_process = (
+        globals()['all_energy_pipelines'].get(process)
+        if 'all_energy_pipelines' in globals() else None
+    )
+    if not pipelines_for_process:
+        return
+    sensors = _detect_sensors_for_energy_distribution(process, real_expanded_df)
+    if not sensors or simulated_df is None or simulated_df.empty:
+        return
+
+    try:
+        sim_stats = annotate_simulated_curve_stats(
+            simulated_df, pipelines_for_process, sensors,
+            activity_exog_means=globals().get('_activity_exog_means', {}),
+        )
+        real_stats = extract_real_curve_stats(real_expanded_df, sensors)
+        if sim_stats.empty or real_stats.empty:
+            return
+        result_total = compare_energy_distributions(real_stats, sim_stats, statistic='total_value')
+        result_mean  = compare_energy_distributions(real_stats, sim_stats, statistic='mean_value')
+    except Exception as exc:
+        print(f"  ⚠️ Energy-distribution metrics failed for {process}/{mode_name}: {exc}")
+        return
+
+    safe_mode = str(mode_name).replace(' ', '_').replace('/', '_')
+    out_dir = os.path.join(output_root, process, safe_mode)
+    os.makedirs(out_dir, exist_ok=True)
+
+    result_total['per_activity_sensor'].to_csv(os.path.join(out_dir, 'per_activity_sensor_total.csv'), index=False)
+    result_total['per_case_sensor'].to_csv(os.path.join(out_dir, 'per_case_sensor_total.csv'), index=False)
+    result_mean['per_activity_sensor'].to_csv(os.path.join(out_dir, 'per_activity_sensor_mean.csv'), index=False)
+    result_mean['per_case_sensor'].to_csv(os.path.join(out_dir, 'per_case_sensor_mean.csv'), index=False)
+
+    core_row = {
+        k: v for k, v in core_metrics_row.items()
+        if any(k == f"test_{base}" or k == f"train_{base}" for base in CORE_METRIC_BASES)
+    }
+    core_row['process'] = process
+    core_row['mode'] = mode_name
+    pd.DataFrame([core_row]).to_csv(os.path.join(out_dir, 'core_metrics.csv'), index=False)
+
+    print(f"  💾 Energy-distribution metrics saved → "
+          f"energy_distribution_results/{process}/{safe_mode}/")
+
 
 # Default definitions to avoid NameError when testing is skipped
 process_test_cols = []
@@ -1979,6 +2063,12 @@ MODES_TO_COMPARE = _filtered_modes
 # Initialize a list to store results for each process × mode
 evaluation_results_list = []
 _combined_sim_store = []  # stores (process, mode, sim_df, exp_df, sensors) for curve plotting
+# Energy-distribution metrics can't be computed yet here — all_energy_pipelines
+# is only populated later, by the module-level "CURVE-ONLY TRAINING" section
+# (RUN_CURVE_ONLY_EVALUATION), which runs AFTER this entire per-process loop
+# finishes for every process. So we collect what we need now and defer the
+# actual computation until after that section runs (see below).
+_energy_distribution_pending = []  # (process, mode, sim_df, real_expanded_df, core_metrics_row)
 
 if not RUN_PROCESS_MODELLING:
     print("RUN_PROCESS_MODELLING=False — skipping process modelling loop.")
@@ -2301,6 +2391,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 'sensors':     [],   # no energy curves for plain modes
                 'act_metrics': {},
             })
+
+            _energy_distribution_pending.append((
+                process, sim_mode, simulated_log_test,
+                test_datasets[process].get('expanded'),
+                dict(flattened),
+            ))
 
         process_mode_results.append(flattened)
         evaluation_results_list.append(flattened)
@@ -2632,6 +2728,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         'act_metrics': {},
                     })
 
+                    _energy_distribution_pending.append((
+                        process, _algo_mode, sim_amlp_test,
+                        test_datasets[process].get('expanded'),
+                        dict(flattened_amlp),
+                    ))
+
                 process_mode_results.append(flattened_amlp)
                 evaluation_results_list.append(flattened_amlp)
 
@@ -2728,6 +2830,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     'sensors':     [],
                     'act_metrics': {},
                 })
+
+                _energy_distribution_pending.append((
+                    process, _wip_mlp_mode, sim_wipmlp_test,
+                    test_datasets[process].get('expanded'),
+                    dict(flattened_wipmlp),
+                ))
 
             process_mode_results.append(flattened_wipmlp)
             evaluation_results_list.append(flattened_wipmlp)
@@ -3967,6 +4075,22 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
     return records
 
 
+# ── Energy-distribution metrics (deferred) ─────────────────────────────────
+# Every (process, mode) simulated log was collected into
+# _energy_distribution_pending during the per-process loop above, but
+# all_energy_pipelines only exists from here onward (populated by the
+# CURVE-ONLY TRAINING section just above). Compute + save now that the
+# curve pipelines actually exist.
+if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribution_pending:
+    print("\n" + "="*50)
+    print(f"ENERGY-DISTRIBUTION METRICS ({len(_energy_distribution_pending)} process/mode combos)")
+    print("="*50)
+    for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
+        _save_energy_distribution_metrics(
+            _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
+        )
+
+
 if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_pipelines:
     import importlib, sim_extractor as _se
     importlib.reload(_se)
@@ -4410,7 +4534,10 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                                 )
                                 _denom_c = np.sum(np.abs(_rv_bw))
                                 _wape_c  = np.sum(np.abs(_rv_bw - _yp_bw)) / _denom_c * 100 if _denom_c != 0 else np.nan
-                                _mae_c   = mean_absolute_error(_rv_bw, _yp_bw)
+                                # mean_absolute_error rejects NaN outright; nanmean matches its
+                                # result when there's nothing to skip, and degrades gracefully
+                                # (like _wape_c already does) instead of crashing this plot.
+                                _mae_c   = float(np.nanmean(np.abs(np.asarray(_rv_bw) - np.asarray(_yp_bw))))
                                 _ax.plot(_rv_bw, label='Actual', color='steelblue', linewidth=2)
                                 _ax.plot(_yp_bw, label='Predicted', color='tomato',
                                          linewidth=2, linestyle='--')

@@ -23,22 +23,24 @@ from pathlib import Path
 
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_512',
+    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
+    #     'temporal_resolution':   '15min',
+    #     'run_process_modelling': True,
+    #     'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+    #     'run_energy_modelling':  False,   # set False to skip energy profile/curve modelling
+    # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_511',
-        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
+        'run_name':              'experiment_600',
+        'processes_to_run':      ['process_2'],
         'temporal_resolution':   '15min',
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-        'run_energy_modelling':  False,   # set False to skip energy profile/curve modelling
+        'run_energy_modelling':  True,   # set False to skip energy profile/curve modelling
     },
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_510',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-    #     'temporal_resolution':   '1min',
-    #     'run_process_modelling': True,
-    # },
     # {
     #     'data_experiment':       '1',
     #     'run_name':              'experiment_401',

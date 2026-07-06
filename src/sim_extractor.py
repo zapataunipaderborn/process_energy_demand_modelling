@@ -8270,6 +8270,210 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
     return metrics_df, agg_metrics
 
 
+# ---------------------------------------------------------------------------
+# Energy-distribution evaluation — no curve/instance matching required.
+#
+# Instead of pairing a specific simulated activity instance with a specific
+# real one (which breaks down once cases start/end at different times, or a
+# stochastic sim produces a different number of activities per case than
+# reality), this reduces every instance's curve to a summary statistic and
+# compares the *distributions* of that statistic between real and simulated,
+# pooled at two granularities:
+#   - per (activity, sensor)  — pools across all cases
+#   - per sensor              — pools per-case totals across all cases
+# ---------------------------------------------------------------------------
+
+def predict_curve_for_instance(activity, object_name, duration_minutes,
+                               object_attributes, energy_pipelines, sensor,
+                               activity_exog_means=None,
+                               temporal_resolution_minutes=15.0):
+    """
+    Predict one sensor's curve for a single (activity, object) instance of a
+    given duration, using a trained `energy_pipelines` dict — the same
+    prediction mechanism ProcessSimulation's energy-aware modes use
+    internally (see simulation.py's "Update energy state" step), exposed
+    standalone so it can be applied *after the fact* to the output of any
+    simulation mode, not just petri_net_energy_*/petri_net_energy_direct*.
+
+    Returns None when no pipeline exists for (sensor, activity, object).
+    """
+    obj_map = energy_pipelines.get(sensor, {}).get(activity, {})
+    ep = obj_map.get(object_name) or (next(iter(obj_map.values())) if obj_map else None)
+    if ep is None:
+        return None
+    ref_curve = ep.get('reference_curve')
+    if ref_curve is None or len(ref_curve) == 0:
+        return None
+
+    predict_fn = ep.get('predict_fn')
+    exog_vals = {}
+    if ep.get('exog_cols') and activity_exog_means:
+        act_means = activity_exog_means.get(activity, {})
+        exog_vals = {
+            col: np.array([v]) for col, v in act_means.items()
+            if col in ep['exog_cols']
+        }
+
+    n_ts = max(2, round(duration_minutes / temporal_resolution_minutes))
+    input_curve = np.interp(
+        np.linspace(0, 1, n_ts),
+        np.linspace(0, 1, len(ref_curve)),
+        ref_curve,
+    )
+    if predict_fn is None:
+        return input_curve
+
+    # energy_pipelines is populated by two different producers with
+    # incompatible predict_fn signatures: the energy-aware simulation modes
+    # use keyword args (raw_values=, activity=, object_attributes=, exog=),
+    # while the Curve-Only Evaluation section's pipelines use positional
+    # (rv, act, attrs) with no exog support at all. Try the keyword form
+    # first, fall back to positional on a signature mismatch.
+    try:
+        return predict_fn(
+            raw_values=input_curve, activity=activity,
+            object_attributes=object_attributes,
+            exog=exog_vals if exog_vals else None,
+        )
+    except TypeError:
+        return predict_fn(input_curve, activity, object_attributes)
+
+
+def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
+                                   activity_exog_means=None,
+                                   temporal_resolution_minutes=15.0,
+                                   case_col='case_id', activity_col='activity',
+                                   object_col='object'):
+    """
+    For every activity instance in `simulated_df`, predict each sensor's
+    curve (via predict_curve_for_instance) and reduce it to summary stats.
+
+    Returns a long-format DataFrame with columns
+    ['case_id', 'activity', 'sensor', 'mean_value', 'total_value'] — one row
+    per (instance, sensor) pair that had a usable pipeline. No curve storage,
+    no case/activity matching against a real log — this is computed purely
+    from the simulated log's own activities/durations/attributes.
+    """
+    records = []
+    for _, row in simulated_df.iterrows():
+        duration_minutes = (
+            (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60.0
+        )
+        object_attributes = row.get('object_attributes', {}) or {}
+        for sensor in sensors:
+            curve = predict_curve_for_instance(
+                row[activity_col], row[object_col], duration_minutes,
+                object_attributes, energy_pipelines, sensor,
+                activity_exog_means, temporal_resolution_minutes,
+            )
+            if curve is None or len(curve) == 0:
+                continue
+            records.append({
+                'case_id':    row[case_col],
+                'activity':   row[activity_col],
+                'sensor':     sensor,
+                'mean_value': float(np.mean(curve)),
+                'total_value': float(np.sum(curve)),
+            })
+    return pd.DataFrame(records)
+
+
+def extract_real_curve_stats(real_expanded_df, sensors,
+                             case_col='case_id_log', activity_col='activity_log'):
+    """
+    Same output shape as annotate_simulated_curve_stats
+    (['case_id', 'activity', 'sensor', 'mean_value', 'total_value']), computed
+    directly from the real per-timestep sensor dataframe by grouping on
+    (case_id, activity) and reducing each sensor's readings to mean/total.
+    """
+    records = []
+    for (cid, act), g in real_expanded_df.groupby([case_col, activity_col]):
+        for sensor in sensors:
+            if sensor not in g.columns:
+                continue
+            vals = g[sensor].dropna().values
+            if len(vals) == 0:
+                continue
+            records.append({
+                'case_id':     cid,
+                'activity':    act,
+                'sensor':      sensor,
+                'mean_value':  float(np.mean(vals)),
+                'total_value': float(np.sum(vals)),
+            })
+    return pd.DataFrame(records)
+
+
+def compare_energy_distributions(real_stats_df, sim_stats_df, statistic='mean_value'):
+    """
+    Two-level distributional comparison between real and simulated per-instance
+    energy summary stats (from extract_real_curve_stats / annotate_simulated_curve_stats).
+    Uses Earth Mover's Distance (Wasserstein) — no case/activity/instance
+    matching, only pooled distributions.
+
+    statistic : 'mean_value' or 'total_value'
+        Which per-instance summary to compare. 'total_value' surfaces
+        magnitude differences (a case using 2x the energy shows up
+        directly); 'mean_value' is closer to a shape/intensity comparison.
+
+    Returns
+    -------
+    dict with two DataFrames:
+      'per_activity_sensor' — one row per (activity, sensor): pools the
+          per-instance statistic across all cases, real vs simulated.
+      'per_case_sensor' — one row per sensor: first aggregates each case's
+          activities up to one number per case (sum for 'total_value', mean
+          for 'mean_value'), then pools across cases, real vs simulated.
+    """
+    from scipy.stats import wasserstein_distance
+
+    rows_a = []
+    for (act, sensor), real_g in real_stats_df.groupby(['activity', 'sensor']):
+        sim_g = sim_stats_df[
+            (sim_stats_df['activity'] == act) & (sim_stats_df['sensor'] == sensor)
+        ]
+        if sim_g.empty or real_g.empty:
+            continue
+        real_vals = real_g[statistic].values
+        sim_vals  = sim_g[statistic].values
+        rows_a.append({
+            'activity':    act,
+            'sensor':      sensor,
+            'n_real':      len(real_vals),
+            'n_sim':       len(sim_vals),
+            'real_median': float(np.median(real_vals)),
+            'sim_median':  float(np.median(sim_vals)),
+            'wasserstein': float(wasserstein_distance(real_vals, sim_vals)),
+        })
+    per_activity_sensor = pd.DataFrame(rows_a)
+
+    def _per_case(df):
+        agg = 'sum' if statistic == 'total_value' else 'mean'
+        return df.groupby(['case_id', 'sensor'])[statistic].agg(agg).reset_index()
+
+    real_case = _per_case(real_stats_df)
+    sim_case  = _per_case(sim_stats_df)
+
+    rows_b = []
+    for sensor, real_g in real_case.groupby('sensor'):
+        sim_g = sim_case[sim_case['sensor'] == sensor]
+        if sim_g.empty or real_g.empty:
+            continue
+        real_vals = real_g[statistic].values
+        sim_vals  = sim_g[statistic].values
+        rows_b.append({
+            'sensor':        sensor,
+            'n_real_cases':  len(real_vals),
+            'n_sim_cases':   len(sim_vals),
+            'real_median':   float(np.median(real_vals)),
+            'sim_median':    float(np.median(sim_vals)),
+            'wasserstein':   float(wasserstein_distance(real_vals, sim_vals)),
+        })
+    per_case_sensor = pd.DataFrame(rows_b)
+
+    return {'per_activity_sensor': per_activity_sensor, 'per_case_sensor': per_case_sensor}
+
+
 def evaluate_pipeline_joint_duration(test_curves, pipeline):
     """
     Timing-aware evaluation for joint duration experiments.
