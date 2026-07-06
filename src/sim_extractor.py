@@ -14,6 +14,82 @@ from pm4py.algo.evaluation.generalization import algorithm as generalization_eva
 from pm4py.algo.evaluation.simplicity import algorithm as simplicity_evaluator
 
 # ---------------------------------------------------------------------------
+# WIP / resource-occupation load profile
+# ---------------------------------------------------------------------------
+
+class LoadProfile:
+    """
+    Precomputed workload snapshot built from an event log (real or simulated).
+
+    Exposes two lookups, both defined as "how many *other* things were
+    active at instant t":
+      - ``wip_at(t)``          — case-level Work-In-Progress: cases started
+                                  but not yet finished.
+      - ``ro_at(t, resource)`` — Resource-Occupation: activity instances
+                                  running on the same ``resource`` (the
+                                  ``object`` column, e.g. a machine id).
+
+    ``df`` must have columns: case_id, activity, timestamp_start,
+    timestamp_end, plus a resource column (``resource_col``, default
+    ``'object'`` — the true machine/resource id; NOT the same as
+    ``ProcessSimulation``'s synthetic per-group ``object`` field on
+    *simulated* logs, which is why ``resource_col`` is configurable).
+    An internal per-row id is used so a row's own instance can be
+    excluded from its own WIP/RO count (``exclude_case_id`` /
+    ``exclude_instance_id``).
+    """
+
+    def __init__(self, df: pd.DataFrame, resource_col: str = 'object'):
+        d = df.reset_index(drop=True).copy()
+        if '_row_uid' not in d.columns:
+            d['_row_uid'] = np.arange(len(d))
+        # Every caller computes its query `t` via pandas Timestamp.timestamp()
+        # (columns are always datetime64[ns]), which — like .astype('int64') —
+        # treats naive timestamps as UTC. Keep the same convention here.
+        d['_start_ts'] = d['timestamp_start'].astype('int64') / 1e9
+        d['_end_ts']   = d['timestamp_end'].astype('int64') / 1e9
+
+        case_g = d.groupby('case_id').agg(
+            _start_ts=('_start_ts', 'min'), _end_ts=('_end_ts', 'max')
+        )
+        self._case_ids    = case_g.index.to_numpy()
+        self._case_starts = case_g['_start_ts'].to_numpy()
+        self._case_ends   = case_g['_end_ts'].to_numpy()
+
+        # Some event logs (e.g. process_4) don't carry a resource/machine
+        # column at all. Without one, per-resource occupancy is undefined —
+        # fall back to a per-row unique id so ro_at() always resolves to 0
+        # rather than raising.
+        if resource_col in d.columns:
+            self._res_names = d[resource_col].to_numpy()
+        else:
+            self._res_names = d['_row_uid'].astype(str).to_numpy()
+        self._res_starts   = d['_start_ts'].to_numpy()
+        self._res_ends     = d['_end_ts'].to_numpy()
+        self._res_instance = d['_row_uid'].to_numpy()
+
+    def wip_at(self, t, exclude_case_id=None) -> float:
+        t = float(t)
+        active = (self._case_starts <= t) & (self._case_ends > t)
+        if exclude_case_id is not None:
+            active &= (self._case_ids != exclude_case_id)
+        return float(active.sum())
+
+    def ro_at(self, t, resource, exclude_instance_id=None) -> float:
+        if resource is None:
+            return 0.0
+        t = float(t)
+        mask = (
+            (self._res_names == resource)
+            & (self._res_starts <= t)
+            & (self._res_ends > t)
+        )
+        if exclude_instance_id is not None:
+            mask &= (self._res_instance != exclude_instance_id)
+        return float(mask.sum())
+
+
+# ---------------------------------------------------------------------------
 # Distribution helpers
 # ---------------------------------------------------------------------------
 
@@ -546,7 +622,8 @@ def _extract_history_weights(case_sorted):
 # ---------------------------------------------------------------------------
 
 def _extract_duration_and_raw(group, object_name, object_type,
-                              higher_level_activity, case_sorted):
+                              higher_level_activity, case_sorted,
+                              load_profile=None):
     """
     For every activity in *group*, compute duration stats and collect
     per-instance raw rows for ML training.
@@ -554,9 +631,20 @@ def _extract_duration_and_raw(group, object_name, object_type,
     This is shared between 'manual' and pm4py modes — the duration
     fitting and raw-row collection are independent of the process model.
 
+    Parameters
+    ----------
+    load_profile : LoadProfile or None
+        When provided, each raw row also gets ``wip`` (case-level
+        Work-In-Progress) and ``ro`` (Resource-Occupation of the row's
+        own ``resource_id``) computed at the activity's start time,
+        excluding the row's own case/instance. Also adds ``waiting_time``
+        — the gap since the previous activity in the same case ended
+        (0 for the first activity of a case).
+
     Returns
     -------
-    duration_info : dict  {activity: {duration, duration_std, dist_name, dist_params, n_events}}
+    duration_info : dict  {activity: {duration, duration_std, dist_name,
+                           dist_params, n_events, resource_id}}
     raw_rows : list[dict]
     """
     activities = group['activity'].unique()
@@ -578,12 +666,19 @@ def _extract_duration_and_raw(group, object_name, object_type,
         dist_name, dist_params = fit_best_distribution(durations.values)
         print(f"    {activity}: best fit = {dist_name} {dist_params}")
 
+        # ── Majority resource (machine/object) this activity runs on ──
+        resource_id = None
+        if 'object' in activity_data.columns and len(activity_data) > 0:
+            modes = activity_data['object'].mode()
+            resource_id = modes.iloc[0] if len(modes) > 0 else None
+
         duration_info[activity] = {
             'duration':     duration_median,
             'duration_std': duration_std,
             'dist_name':    dist_name,
             'dist_params':  dist_params,
             'n_events':     n_events,
+            'resource_id':  resource_id,
         }
 
         # ── Raw rows for ML training ──────────────────────────────────
@@ -609,6 +704,7 @@ def _extract_duration_and_raw(group, object_name, object_type,
                 # ── lag features: last 2 activities & durations ────────
                 prev_act_1, prev_dur_1 = '__NONE__', 0.0
                 prev_act_2, prev_dur_2 = '__NONE__', 0.0
+                waiting_time = 0.0
                 if idx >= 1:
                     prev_row = case_acts.iloc[idx - 1]
                     prev_act_1 = prev_row['activity']
@@ -616,12 +712,30 @@ def _extract_duration_and_raw(group, object_name, object_type,
                         (prev_row['timestamp_end'] - prev_row['timestamp_start'])
                         .total_seconds() / 60
                     )
+                    # Waiting time: gap since the previous activity in this
+                    # case ended (a proxy for queueing/contention delay).
+                    gap = (
+                        (row_here['timestamp_start'] - prev_row['timestamp_end'])
+                        .total_seconds() / 60
+                    )
+                    waiting_time = max(0.0, gap)
                 if idx >= 2:
                     prev_row2 = case_acts.iloc[idx - 2]
                     prev_act_2 = prev_row2['activity']
                     prev_dur_2 = (
                         (prev_row2['timestamp_end'] - prev_row2['timestamp_start'])
                         .total_seconds() / 60
+                    )
+
+                # ── WIP / resource-occupation at this activity's start ──
+                resource_id = row_here.get('object', None)
+                wip, ro = 0.0, 0.0
+                if load_profile is not None:
+                    t = row_here['timestamp_start'].timestamp()
+                    wip = load_profile.wip_at(t, exclude_case_id=case_id)
+                    ro = load_profile.ro_at(
+                        t, resource_id,
+                        exclude_instance_id=row_here.get('_row_uid'),
                     )
 
                 raw_rows.append({
@@ -631,6 +745,10 @@ def _extract_duration_and_raw(group, object_name, object_type,
                     'object_type':           object_type,
                     'higher_level_activity': higher_level_activity,
                     'duration':              inst_duration,
+                    'waiting_time':          waiting_time,
+                    'wip':                   wip,
+                    'ro':                    ro,
+                    'resource_id':           resource_id,
                     'next_activity':         next_act,
                     'timestamp_start':       row_here['timestamp_start'],
                     'activity_index':        idx,
@@ -711,6 +829,7 @@ def _extract_manual(group, object_name, object_type, higher_level_activity,
             'transition':            transitions,
             'is_start':              is_start,
             'is_end':                is_end,
+            'resource_id':           d.get('resource_id'),
         })
 
     return stats, None  # No process_model for manual
@@ -868,6 +987,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
             'transition':            transitions,
             'is_start':              is_start,
             'is_end':                is_end,
+            'resource_id':           d.get('resource_id'),
         })
 
     # ── Build label-level stochastic weights for blending ───────────
@@ -974,6 +1094,15 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
         df = df.copy()
         df['higher_level_activity'] = 'process'
 
+    # Stable global row id (survives groupby/sort/reset_index) so the WIP/RO
+    # load profile can exclude a row's own case/instance from its own count.
+    df = df.copy()
+    df['_row_uid'] = np.arange(len(df))
+
+    # Ground-truth workload profile computed once over the whole log — used
+    # to attach 'wip'/'ro' features to every raw training row.
+    load_profile = LoadProfile(df)
+
     # Group by higher_level_activity only — one Petri net per process group
     grouped = df.groupby('higher_level_activity')
 
@@ -998,7 +1127,8 @@ def extract_process(df, mining_algorithm='inductive', noise_threshold=0.2,
 
         # ── Duration + raw row extraction (shared by all modes) ───────
         duration_info, raw_rows = _extract_duration_and_raw(
-            group, object_name, object_type, higher_level_activity, case_sorted
+            group, object_name, object_type, higher_level_activity, case_sorted,
+            load_profile=load_profile,
         )
         all_raw_rows.extend(raw_rows)
 

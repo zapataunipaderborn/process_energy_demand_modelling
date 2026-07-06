@@ -2,11 +2,18 @@
 pipeline.py — Orchestrate multiple modelling.py runs with different configurations.
 
 Each entry in EXPERIMENTS defines one run. Fields:
-  data_experiment      str   which gold data folder to load  (e.g. '1' → data/gold/experiment_1)
-  run_name             str   label stored in info.json and used as the results sub-folder suffix
-  processes_to_run     list  process folders to include
-  temporal_resolution  str   'original' | '1min' | '5min' | '15min'
-  run_process_modelling bool  whether to run the process modelling loop (default: False)
+  data_experiment       str        which gold data folder to load  (e.g. '1' → data/gold/experiment_1)
+  run_name              str        label stored in info.json and used as the results sub-folder suffix
+  processes_to_run      list       process folders to include
+  temporal_resolution   str        'original' | '1min' | '5min' | '15min'
+  run_process_modelling bool       whether to run the process modelling loop (default: False)
+  mining_algorithms     list|None  which pm4py process-discovery algorithms to test/compare,
+                                   e.g. ['heuristic', 'inductive']. Subset of
+                                   'alpha' | 'heuristic' | 'inductive' | 'ilp'.
+                                   None (default) → use modelling.py's own default list.
+  run_energy_modelling  bool       whether to run energy profile/curve modelling
+                                   (sensor curve fitting + curve-quality benchmark).
+                                   Set False to run process modelling only. Default: True.
 """
 
 import os
@@ -20,8 +27,10 @@ EXPERIMENTS = [
         'data_experiment':       '1',
         'run_name':              'experiment_511',
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-        'temporal_resolution':   '1min',
+        'temporal_resolution':   '15min',
         'run_process_modelling': True,
+        'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+        'run_energy_modelling':  False,   # set False to skip energy profile/curve modelling
     },
     # {
     #     'data_experiment':       '1',
@@ -87,12 +96,17 @@ EXPERIMENTS = [
 modelling_script = Path(__file__).parent / 'modelling.py'
 
 for i, exp in enumerate(EXPERIMENTS, start=1):
+    mining_algorithms = exp.get('mining_algorithms')
+    run_energy_modelling = exp.get('run_energy_modelling', True)
+
     print(f"\n{'='*60}")
     print(f"  Running experiment {i}/{len(EXPERIMENTS)}: {exp['run_name']}")
     print(f"  data_experiment={exp['data_experiment']}  "
           f"temporal_resolution={exp['temporal_resolution']}  "
           f"processes={exp['processes_to_run']}  "
-          f"run_process_modelling={exp.get('run_process_modelling', False)}")
+          f"run_process_modelling={exp.get('run_process_modelling', False)}  "
+          f"mining_algorithms={mining_algorithms or '(default)'}  "
+          f"run_energy_modelling={run_energy_modelling}")
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
@@ -101,6 +115,9 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_PROCESSES_TO_RUN']      = ','.join(exp['processes_to_run'])
     env['PIPELINE_TEMPORAL_RESOLUTION']   = exp['temporal_resolution']
     env['PIPELINE_RUN_PROCESS_MODELLING'] = 'true' if exp.get('run_process_modelling', False) else 'false'
+    env['PIPELINE_RUN_ENERGY_MODELLING']  = 'true' if run_energy_modelling else 'false'
+    if mining_algorithms:
+        env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
 
     result = subprocess.run(
         [sys.executable, str(modelling_script)],

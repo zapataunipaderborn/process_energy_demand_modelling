@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.petri_net import semantics as pn_semantics
 
-from sim_extractor import sample_from_dist
+from sim_extractor import sample_from_dist, LoadProfile
 
 
 class ProcessSimulation:
@@ -57,7 +57,8 @@ class ProcessSimulation:
                  mlp_per_act_tuples=None,
                  mlp_feat_cols=None,
                  mlp_activity_means=None,
-                 mlp_global_mean=0.0):
+                 mlp_global_mean=0.0,
+                 load_profile=None):
         # Backward-compatible input handling: extract_process now returns
         # (stats_df, raw_df, process_models), while older callers pass stats_df only.
         if isinstance(activity_stats_df, (tuple, list)):
@@ -86,6 +87,7 @@ class ProcessSimulation:
         self.mlp_feat_cols      = mlp_feat_cols or []
         self.mlp_activity_means = mlp_activity_means or {}
         self.mlp_global_mean    = float(mlp_global_mean) if mlp_global_mean else 0.0
+        self.load_profile       = load_profile  # LoadProfile for WIP/RO lookups
         print(f"[DEBUG __init__] mode={self.mode}, "
               f"process_models is None: {process_models is None}, "
               f"process_models len: {len(process_models) if process_models else 'N/A'}")
@@ -108,6 +110,47 @@ class ProcessSimulation:
             raise ValueError(
                 f"mode='{self.mode}' requires process_models but none were provided "
                 f"or all failed to mine. Check sim_extractor output.")
+
+        # WIP/RO-aware mode validation (plain, combined with ML+ duration, and
+        # branching-aware)
+        _WIP_AWARE_MODES = (
+            'petri_net_wip_aware',
+            'petri_net_wip_aware_ml_plus_global',
+            'petri_net_wip_aware_ml_plus_per_act',
+            'petri_net_wip_branching_aware',
+        )
+        if self.mode in _WIP_AWARE_MODES:
+            if self.process_models is None or len(self.process_models) == 0:
+                raise ValueError(
+                    f"mode='{self.mode}' requires process_models but none "
+                    "were provided or all failed to mine.")
+            if self.load_profile is None:
+                raise ValueError(
+                    f"mode='{self.mode}' requires a load_profile "
+                    "(a LoadProfile built from a reference simulation pass — "
+                    "see simulate_with_wip_ro())."
+                )
+            if self.mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
+                if self.ml_models is None:
+                    raise ValueError(
+                        f"mode='{self.mode}' requires ml_models trained with "
+                        "'wip'/'ro' features and waiting-time models (see SimModeller). "
+                        "petri_net_wip_branching_aware additionally uses "
+                        "ml_models.transition_wip_models when available (see "
+                        "SimModeller.train_wip_transitions), falling back to the "
+                        "statistical transitions otherwise.")
+            else:
+                # ML+ variants: duration comes from mlp_global_tuple/mlp_per_act_tuples;
+                # waiting time still comes from ml_models's waiting-time models.
+                if self.ml_models is None:
+                    raise ValueError(
+                        f"mode='{self.mode}' requires ml_models trained with "
+                        "waiting-time models (see SimModeller) for the waiting component.")
+                if not self.mlp_feat_cols:
+                    raise ValueError(
+                        f"mode='{self.mode}' requires mlp_feat_cols/mlp_global_tuple/"
+                        "mlp_per_act_tuples (see _mlp_train_models())."
+                    )
 
         # Energy-aware mode validation
         _ENERGY_MODES = (
@@ -190,6 +233,9 @@ class ProcessSimulation:
                 'is_start':     row['is_start'],
                 'is_end':       row['is_end'],
                 'n_events':     row['n_events'],
+                # True machine/resource this activity runs on (for RO lookups);
+                # None when the stats_df predates this field.
+                'resource_id':  row.get('resource_id'),
             }
             
             print(f"  Config: {key}")
@@ -256,13 +302,16 @@ class ProcessSimulation:
                                activity_index=0,
                                override_mode=None,
                                current_sim_ts=None,
-                               case_start_ts=None):
+                               case_start_ts=None,
+                               wip=0.0,
+                               ro=0.0):
         """
         Sample the duration.
 
         If `override_mode` is provided, it uses that instead of `self.mode`.
         current_sim_ts / case_start_ts are Unix timestamps used by ML+ modes
         to compute temporal features (hour, elapsed time, etc.).
+        wip / ro are live LoadProfile lookups used by the 'ml_wip_aware' path.
         """
         eval_mode = override_mode if override_mode else self.mode
         activity              = str(activity).strip()
@@ -309,6 +358,22 @@ class ProcessSimulation:
                     sampled = np.random.normal(ml_median, stat_std)
                 else:
                     sampled = ml_median
+                return max(0.1, float(sampled))
+            # else: fall through to statistical
+
+        # ── WIP/RO-aware path (point estimate + statistical std noise) ────
+        if eval_mode == 'ml_wip_aware' and self.ml_models is not None:
+            wip_pred = self.ml_models.predict_duration_wip_aware(
+                activity, object_name, object_type,
+                higher_level_activity, object_attributes,
+                wip=wip, ro=ro,
+            )
+            if wip_pred is not None:
+                stat_std = 0.0
+                if key in self.activity_config:
+                    stat_std = self.activity_config[key].get('duration_std', 0.0)
+                sampled = (np.random.normal(wip_pred, stat_std)
+                           if stat_std > 0 else wip_pred)
                 return max(0.1, float(sampled))
             # else: fall through to statistical
 
@@ -453,9 +518,19 @@ class ProcessSimulation:
         
         return start_activities
     
-    def _log_event(self, case_id, activity, timestamp_start, timestamp_end, 
+    def _log_event(self, case_id, activity, timestamp_start, timestamp_end,
                    object_name, object_type, higher_level_activity, object_attributes):
         """Log a simulation event"""
+        # 'object' here is the synthetic per-process-group label (equal to
+        # higher_level_activity) — NOT the true machine/resource. Resolve
+        # the true resource id (for RO lookups) from activity_config, which
+        # carries it from stats_df's 'resource_id' column.
+        act_key = (
+            str(activity).strip(), str(object_name).strip(), str(object_type).strip(),
+            str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None,
+        )
+        resource_id = self.activity_config.get(act_key, {}).get('resource_id')
+
         self.events.append({
             'case_id': str(case_id).strip(),
             'activity': str(activity).strip(),
@@ -464,7 +539,8 @@ class ProcessSimulation:
             'object': str(object_name).strip(),
             'object_type': str(object_type).strip(),
             'higher_level_activity': str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None,
-            'object_attributes': object_attributes
+            'object_attributes': object_attributes,
+            'resource_id': resource_id,
         })
     
     # ------------------------------------------------------------------
@@ -696,6 +772,376 @@ class ProcessSimulation:
                       f"{object_name} — stopping.")
 
             print(f"  Completed {object_name} Petri net simulation with "
+                  f"{activity_count} activities")
+
+    # ------------------------------------------------------------------
+    # WIP/RO-aware: Petri net token game + waiting-time model, both fed
+    # by a precomputed LoadProfile (cheap approximation — see
+    # simulate_with_wip_ro() for how the profile is built).
+    # ------------------------------------------------------------------
+
+    def _simulate_petri_net_wip_aware_for_case(self, case_id, object_attributes,
+                                               start_time):
+        """
+        Simulate one case using the Petri net token game where, before each
+        visible transition's duration is sampled, we look up:
+          - wip: how many *other* cases are in progress right now
+                 (self.load_profile.wip_at, excluding this case_id)
+          - ro:  how many other activity instances are running on this
+                 activity's resource (machine) right now
+
+        These feed a waiting-time model (queueing/contention delay before
+        the activity starts) and a WIP/RO-aware duration model. Both are
+        approximate: wip/ro come from a reference profile built from a
+        *prior* simulation pass, not a live closed loop across this run.
+        """
+        current_sim_time = start_time.timestamp()
+        _pn_rng = np.random.default_rng(abs(hash(str(case_id))) % (2**32))
+
+        # Duration source: this mode's own WIP/RO-aware model, or one of the
+        # ML+ (global / per-activity) duration models — waiting time always
+        # comes from ml_models.predict_waiting_time regardless of variant.
+        _duration_override = {
+            'petri_net_wip_aware': 'ml_wip_aware',
+            'petri_net_wip_aware_ml_plus_global': 'petri_net_ml_plus_global',
+            'petri_net_wip_aware_ml_plus_per_act': 'petri_net_ml_plus_per_act',
+        }[self.mode]
+        _uses_mlp = _duration_override in ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act')
+
+        unique_objects = (
+            self.activity_stats[['object', 'object_type',
+                                 'higher_level_activity']]
+            .drop_duplicates(subset=['higher_level_activity'])
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key = (object_name, object_type, higher_level_activity)
+            model = self.process_models.get(key) if self.process_models else None
+
+            if model is None:
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net_wip_aware mode: no Petri net found for key {key}. "
+                    f"Available keys: {available}")
+
+            net = model['net']
+            im  = model['im']
+            fm  = model['fm']
+            stochastic_map = model.get('stochastic_map', {})
+            duration_map   = model.get('duration_map', {})
+            max_case_length = model.get('max_case_length', 200)
+
+            marking = copy.copy(im)
+            activity_count = 0
+            max_steps = max(max_case_length * 2, 50)
+            step = 0
+            activity_history = []
+            case_start_ts = current_sim_time  # needed by the ML+ feature vector
+
+            print(f"\nCase {case_id}: WIP/RO-aware Petri net simulation for "
+                  f"{object_name} ({object_type}) [duration={_duration_override}]")
+
+            while step < max_steps:
+                step += 1
+
+                if marking == fm:
+                    print(f"    Final marking reached after {activity_count} activities.")
+                    break
+                fm_reached = all(marking.get(p, 0) >= fm[p] for p in fm)
+                if fm_reached and activity_count > 0:
+                    print(f"    Final marking subset reached after {activity_count} activities.")
+                    break
+
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after {activity_count} activities.")
+                    break
+
+                chosen = self._choose_transition(enabled, stochastic_map, rng=_pn_rng)
+                marking = self._fire_transition(marking, chosen)
+
+                if chosen.label is not None:
+                    activity_label = str(chosen.label).strip()
+                    act_key = (activity_label, object_name, object_type,
+                               higher_level_activity)
+
+                    # ── WIP/RO lookup from the reference load profile ─────
+                    resource_id = None
+                    if act_key in self.activity_config:
+                        resource_id = self.activity_config[act_key].get('resource_id')
+                    wip = self.load_profile.wip_at(
+                        current_sim_time, exclude_case_id=case_id
+                    )
+                    ro = self.load_profile.ro_at(current_sim_time, resource_id)
+
+                    # ── Waiting time (queueing/contention delay) ──────────
+                    waiting_minutes = self.ml_models.predict_waiting_time(
+                        activity_label, object_name, object_type,
+                        higher_level_activity, object_attributes,
+                        wip=wip, ro=ro,
+                    )
+                    if waiting_minutes is None:
+                        waiting_minutes = 0.0
+                    current_sim_time += waiting_minutes * 60
+
+                    # ── Duration: WIP/RO-aware model, or ML+ (global/per-act) ─
+                    if _uses_mlp:
+                        activity_duration = self._get_activity_duration(
+                            activity_label, object_name, object_type,
+                            higher_level_activity, object_attributes,
+                            activity_history=activity_history,
+                            activity_index=activity_count,
+                            override_mode=_duration_override,
+                            current_sim_ts=current_sim_time,
+                            case_start_ts=case_start_ts,
+                        )
+                    else:
+                        activity_duration = self._get_activity_duration(
+                            activity_label, object_name, object_type,
+                            higher_level_activity, object_attributes,
+                            activity_history=activity_history,
+                            activity_index=activity_count,
+                            override_mode=_duration_override,
+                            wip=wip, ro=ro,
+                        )
+
+                    start_time_obj = datetime.fromtimestamp(current_sim_time)
+                    current_sim_time += activity_duration * 60
+                    end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                    self._log_event(
+                        case_id=case_id,
+                        activity=activity_label,
+                        timestamp_start=start_time_obj,
+                        timestamp_end=end_time_obj,
+                        object_name=object_name,
+                        object_type=object_type,
+                        higher_level_activity=higher_level_activity,
+                        object_attributes=object_attributes,
+                    )
+
+                    activity_count += 1
+                    current_sim_time += 1  # 1 second gap
+
+                    activity_history.insert(0, (activity_label, activity_duration))
+                    activity_history = activity_history[:2]
+
+                    print(f"    [{activity_count}] Fired '{activity_label}' "
+                          f"(wait={waiting_minutes:.1f} min, dur={activity_duration:.1f} min, "
+                          f"wip={wip:.0f}, ro={ro:.0f})")
+                else:
+                    pass
+
+            if step >= max_steps:
+                print(f"    WARNING: Max steps ({max_steps}) reached for {object_name} — stopping.")
+
+            print(f"  Completed {object_name} WIP/RO-aware simulation with "
+                  f"{activity_count} activities")
+
+    # ------------------------------------------------------------------
+    # WIP-branching-aware: like petri_net_wip_aware, but the transition
+    # (branching) choice is ALSO WIP/RO-aware — using a per-key classifier
+    # that is only trusted when it beat the statistical baseline at
+    # training time (SimModeller.train_wip_transitions); otherwise falls
+    # back to the frequency-based statistical transitions, exactly as the
+    # plain petri_net_statistical mode does for its own blending.
+    # ------------------------------------------------------------------
+
+    def _simulate_petri_net_wip_branching_aware_for_case(self, case_id,
+                                                         object_attributes,
+                                                         start_time):
+        """
+        Simulate one case using the Petri net structure as a constraint on
+        which activities can follow. At each decision point (after the first
+        activity), the next activity is sampled from:
+          - a WIP/RO-aware ML transition classifier, if one was kept for the
+            (prev_activity, object, object_type, higher_level_activity) key
+            (i.e. it beat the statistical baseline during training), else
+          - the frequency-based statistical transition distribution.
+
+        Duration and waiting time use the same WIP/RO-aware mechanism as
+        petri_net_wip_aware (ml_models.predict_waiting_time / the
+        'ml_wip_aware' duration path).
+        """
+        current_sim_time = start_time.timestamp()
+        unique_objects = (
+            self.activity_stats[['object', 'object_type',
+                                 'higher_level_activity']]
+            .drop_duplicates(subset=['higher_level_activity'])
+        )
+
+        for _, obj_config in unique_objects.iterrows():
+            object_name = str(obj_config['object']).strip()
+            object_type = str(obj_config['object_type']).strip()
+            higher_level_activity = (
+                str(obj_config['higher_level_activity']).strip()
+                if pd.notna(obj_config['higher_level_activity']) else None
+            )
+
+            key = (object_name, object_type, higher_level_activity)
+            model = self.process_models.get(key) if self.process_models else None
+            if model is None:
+                available = list(self.process_models.keys()) if self.process_models else []
+                raise RuntimeError(
+                    f"petri_net_wip_branching_aware mode: no Petri net found for "
+                    f"key {key}. Available keys: {available}")
+
+            net = model['net']
+            im  = model['im']
+            fm  = model['fm']
+            max_case_length = model.get('max_case_length', 200)
+
+            marking = copy.copy(im)
+            activity_count = 0
+            activity_history = []
+            max_steps = max(max_case_length * 2, 50)
+            step = 0
+
+            print(f"\nCase {case_id}: WIP-branching-aware Petri net simulation "
+                  f"for {object_name} ({object_type})")
+
+            while step < max_steps:
+                step += 1
+
+                if marking == fm:
+                    print(f"    Final marking reached after {activity_count} activities.")
+                    break
+                fm_reached = all(marking.get(p, 0) >= fm[p] for p in fm)
+                if fm_reached and activity_count > 0:
+                    print(f"    Final marking subset reached after {activity_count} activities.")
+                    break
+
+                enabled = self._get_enabled_transitions(net, marking)
+                if not enabled:
+                    print(f"    No enabled transitions — deadlock after {activity_count} activities.")
+                    break
+
+                label_to_transitions = defaultdict(list)
+                silent_transitions = []
+                for t in enabled:
+                    if t.label is not None:
+                        label_to_transitions[str(t.label).strip()].append(t)
+                    else:
+                        silent_transitions.append(t)
+
+                if not label_to_transitions:
+                    chosen_transition = random.choice(silent_transitions)
+                    marking = self._fire_transition(marking, chosen_transition)
+                    continue
+
+                valid_labels = set(label_to_transitions.keys())
+                wip, ro = 0.0, 0.0
+
+                if activity_count == 0:
+                    start_acts = self._get_start_activities(
+                        object_name, object_type, higher_level_activity
+                    )
+                    constrained_starts = [a for a in start_acts if a in valid_labels]
+                    if not constrained_starts:
+                        constrained_starts = list(valid_labels)
+                    if not constrained_starts:
+                        print("    No valid start activities — ending.")
+                        break
+                    chosen_label = random.choice(constrained_starts)
+                else:
+                    prev_activity = self.events[-1]['activity']
+                    prev_key = (prev_activity, object_name, object_type,
+                                higher_level_activity)
+
+                    resource_id = self.activity_config.get(prev_key, {}).get('resource_id')
+                    wip = self.load_profile.wip_at(current_sim_time, exclude_case_id=case_id)
+                    ro  = self.load_profile.ro_at(current_sim_time, resource_id)
+
+                    ml_probs = self.ml_models.predict_transitions_wip_aware(
+                        prev_activity, object_name, object_type,
+                        higher_level_activity, object_attributes,
+                        wip=wip, ro=ro,
+                    )
+                    if ml_probs:
+                        source_probs, source_label = ml_probs, 'ml_wip_aware'
+                    else:
+                        source_probs = self.activity_config.get(prev_key, {}).get('transitions', {})
+                        source_label = 'statistical'
+
+                    candidate_probs = {
+                        lbl: p for lbl, p in source_probs.items()
+                        if lbl in valid_labels or lbl == '__END__'
+                    }
+                    total = sum(candidate_probs.values())
+                    if total <= 0:
+                        candidate_probs = {lbl: 1.0 for lbl in valid_labels}
+                        total = sum(candidate_probs.values())
+
+                    labels = list(candidate_probs.keys())
+                    probs  = [candidate_probs[l] / total for l in labels]
+                    chosen_label = str(np.random.choice(labels, p=probs)).strip()
+
+                    if chosen_label == '__END__':
+                        print(f"    Selected END transition (source={source_label}) — stopping.")
+                        break
+
+                    print(f"    Constrained next: {chosen_label} (source={source_label})")
+
+                candidates = label_to_transitions.get(chosen_label, [])
+                if not candidates:
+                    print(f"    WARNING: label '{chosen_label}' not in enabled "
+                          "transitions — ending.")
+                    break
+                chosen_transition = random.choice(candidates)
+                marking = self._fire_transition(marking, chosen_transition)
+
+                # ── Waiting time (queueing/contention delay) ──────────────
+                waiting_minutes = self.ml_models.predict_waiting_time(
+                    chosen_label, object_name, object_type,
+                    higher_level_activity, object_attributes,
+                    wip=wip, ro=ro,
+                )
+                if waiting_minutes is None:
+                    waiting_minutes = 0.0
+                current_sim_time += waiting_minutes * 60
+
+                # ── Duration (WIP/RO-aware, falls back to statistical) ────
+                activity_duration = self._get_activity_duration(
+                    chosen_label, object_name, object_type,
+                    higher_level_activity, object_attributes,
+                    activity_history=activity_history,
+                    activity_index=activity_count,
+                    override_mode='ml_wip_aware',
+                    wip=wip, ro=ro,
+                )
+
+                start_time_obj = datetime.fromtimestamp(current_sim_time)
+                current_sim_time += activity_duration * 60
+                end_time_obj = datetime.fromtimestamp(current_sim_time)
+
+                self._log_event(
+                    case_id=case_id, activity=chosen_label,
+                    timestamp_start=start_time_obj, timestamp_end=end_time_obj,
+                    object_name=object_name, object_type=object_type,
+                    higher_level_activity=higher_level_activity,
+                    object_attributes=object_attributes,
+                )
+
+                activity_history.insert(0, (chosen_label, activity_duration))
+                activity_history = activity_history[:2]
+                activity_count += 1
+                current_sim_time += 1  # 1 second gap
+
+                print(f"    [{activity_count}] '{chosen_label}' "
+                      f"(wait={waiting_minutes:.1f} min, dur={activity_duration:.1f} min, "
+                      f"wip={wip:.0f}, ro={ro:.0f})")
+
+            if step >= max_steps:
+                print(f"    WARNING: Max steps ({max_steps}) reached for {object_name} — stopping.")
+
+            print(f"  Completed {object_name} WIP-branching-aware simulation with "
                   f"{activity_count} activities")
 
     # ------------------------------------------------------------------
@@ -2395,6 +2841,23 @@ class ProcessSimulation:
             )
             return
 
+        # ── WIP/RO-aware: PN transitions + waiting-time model + duration
+        #    (own WIP/RO-aware model, or ML+ global/per-activity)
+        if self.mode in ('petri_net_wip_aware',
+                         'petri_net_wip_aware_ml_plus_global',
+                         'petri_net_wip_aware_ml_plus_per_act'):
+            self._simulate_petri_net_wip_aware_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
+        # ── WIP-branching-aware: also makes the transition choice WIP/RO-aware
+        if self.mode == 'petri_net_wip_branching_aware':
+            self._simulate_petri_net_wip_branching_aware_for_case(
+                case_id, object_attributes, start_time
+            )
+            return
+
         # ── Petri net + statistical combined mode ─────────────────────
         if self.mode == 'petri_net_statistical':
             self._simulate_petri_net_statistical_for_case(
@@ -2608,6 +3071,80 @@ class ProcessSimulation:
             simulated_df = simulated_df.sort_values('timestamp_start').reset_index(drop=True)
         
         return simulated_df
+
+
+def simulate_with_wip_ro(activity_stats_df, production_plan, ml_models,
+                         reference_mode='petri_net', random_seed=42,
+                         final_mode='petri_net_wip_aware',
+                         **kwargs):
+    """
+    Two-pass driver for the 'petri_net_wip_aware' family of modes.
+
+    Pass 1 runs an ordinary simulation (``reference_mode``, e.g. 'petri_net'
+    or 'statistical') to get a self-consistent reference timeline for the
+    same production plan. A LoadProfile is built from that reference log.
+    Pass 2 re-runs the simulation in ``final_mode``, looking up WIP/RO from
+    the pass-1 profile at each sampled event.
+
+    This is a cheap approximation: WIP/RO come from a prior pass, not a
+    live closed loop within pass 2 (a duration change in pass 2 doesn't
+    retroactively update the profile pass 2 itself is reading from).
+
+    Parameters
+    ----------
+    activity_stats_df : DataFrame or tuple
+        Same as ``ProcessSimulation``'s first argument.
+    production_plan : pd.DataFrame
+        Same production plan used for both passes.
+    ml_models : SimModeller
+        Must have been trained with 'wip'/'ro' features and waiting-time
+        models (i.e. ``sim_extractor.extract_process`` was run and its
+        raw_df — which now carries 'wip'/'ro'/'waiting_time' — was passed
+        to ``SimModeller.train``). Used for waiting time in every variant,
+        and for duration too when ``final_mode == 'petri_net_wip_aware'``.
+    reference_mode : str
+        Simulation mode used for the pass-1 reference run.
+    final_mode : str
+        One of 'petri_net_wip_aware' (duration from ml_models),
+        'petri_net_wip_aware_ml_plus_global', or
+        'petri_net_wip_aware_ml_plus_per_act' (duration from the ML+
+        global/per-activity tuples — pass mlp_global_tuple/mlp_per_act_tuples/
+        mlp_feat_cols/mlp_activity_means/mlp_global_mean via kwargs).
+    kwargs :
+        Passed through to both ``ProcessSimulation`` instances (e.g.
+        ``verbose=False``, ``process_models=...``, or the ``mlp_*`` params
+        needed by the ML+ variants).
+
+    Returns
+    -------
+    final_df : pd.DataFrame
+        The pass-2 simulated log.
+    reference_df : pd.DataFrame
+        The pass-1 reference log the load profile was built from.
+    """
+    reference_sim = ProcessSimulation(
+        activity_stats_df, production_plan,
+        mode=reference_mode, random_seed=random_seed, **kwargs
+    )
+    reference_df = reference_sim.run()
+
+    if reference_df.empty:
+        raise RuntimeError(
+            "simulate_with_wip_ro: pass-1 reference simulation produced no "
+            "events — cannot build a load profile."
+        )
+
+    load_profile = LoadProfile(reference_df, resource_col='resource_id')
+
+    final_sim = ProcessSimulation(
+        activity_stats_df, production_plan,
+        mode=final_mode, ml_models=ml_models,
+        random_seed=random_seed, load_profile=load_profile, **kwargs
+    )
+    final_df = final_sim.run()
+
+    return final_df, reference_df
+
 
 def compare_simulation_with_real(simulated_df, real_df):
     """Compare simulation results with real data"""

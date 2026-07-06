@@ -95,6 +95,36 @@ class _ConstantPredictor:
         return f"_ConstantPredictor(strategy='{self.strategy}', value={self._value:.4f})"
 
 
+class _ConstantClassifier:
+    """Sklearn-compatible classifier baseline that always predicts the most
+    frequent (mode) class seen during fit — the only sensible constant
+    baseline for classification. Used for the 'mean'/'median' model_type
+    entries when training a classifier (arithmetic mean/median of
+    label-encoded class integers is meaningless and can even produce a
+    non-integer, non-class prediction)."""
+
+    def __init__(self, strategy: str = 'mean'):
+        self.strategy = strategy  # kept only for repr/consistency; unused
+        self._value = 0
+
+    def fit(self, X, y):
+        y_arr = np.asarray(y)
+        values, counts = np.unique(y_arr, return_counts=True)
+        self._value = values[np.argmax(counts)]
+        return self
+
+    def predict(self, X):
+        return np.full(len(X), self._value)
+
+    # Deliberately no predict_proba: callers (predict_transitions /
+    # predict_transitions_wip_aware) check hasattr(model, 'predict_proba')
+    # and fall back to the statistical distribution when absent — the right
+    # behaviour here, since a single constant class isn't a real distribution.
+
+    def __repr__(self):
+        return f"_ConstantClassifier(value={self._value!r})"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Model factories (default parameters)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -130,8 +160,10 @@ def _default_regressor(model_type: str, random_state: int = 42):
 def _default_classifier(model_type: str, random_state: int = 42):
     """Return a classifier instance with sensible defaults."""
     if model_type in ('mean', 'median'):
-        # Baselines aren't meaningful for classification but shouldn't crash
-        return _ConstantPredictor(strategy=model_type)
+        # Constant-majority-class baseline (predicting the arithmetic
+        # mean/median of label-encoded class integers is meaningless for
+        # classification — both map to the same majority-class strategy here).
+        return _ConstantClassifier(strategy=model_type)
     if model_type == 'xgboost':
         if not _XGBOOST_AVAILABLE:
             raise RuntimeError("xgboost not installed")
@@ -198,7 +230,8 @@ def _optuna_regressor(trial, model_type: str, random_state: int = 42):
 def _optuna_classifier(trial, model_type: str, random_state: int = 42):
     """Return a classifier with Optuna-suggested hyper-parameters."""
     if model_type in ('mean', 'median'):
-        return _ConstantPredictor(strategy=model_type)
+        # No hyperparameters to tune — same majority-class baseline as above.
+        return _ConstantClassifier(strategy=model_type)
     if model_type == 'xgboost':
         return XGBClassifier(
             n_estimators=trial.suggest_int('n_estimators', 50, 300),
@@ -269,10 +302,12 @@ class SimModeller:
         n_optuna_trials: int = 50,
         val_size: float = 0.20,
         train_transitions: bool = True,
+        train_waiting: bool = True,
         random_state: int = 42,
     ):
         self.model_types = model_types or ['xgboost']
         self.train_transitions = train_transitions
+        self.train_waiting = train_waiting
         self.optimize_hyperparams  = optimize_hyperparams
         self.n_optuna_trials       = n_optuna_trials
         self.val_size              = val_size
@@ -287,6 +322,14 @@ class SimModeller:
         self.duration_models:     dict = {}   # key -> (model, feature_cols, model_type)
         self.duration_std_models: dict = {}   # key -> (model, feature_cols, model_type)
         self.transition_models:   dict = {}   # key -> (model, LabelEncoder, feature_cols, model_type)
+        self.waiting_models:      dict = {}   # key -> (model, feature_cols, model_type)
+        self.waiting_std_models:  dict = {}   # key -> (model, feature_cols, model_type)
+        # WIP/RO-aware transition classifiers — populated by train_wip_transitions().
+        # Only kept per-key when they beat the statistical baseline on validation
+        # (see train_wip_transitions); otherwise absent, so
+        # predict_transitions_wip_aware() returns None and the caller falls
+        # back to the frequency-based statistical transitions.
+        self.transition_wip_models: dict = {}   # key -> (model, LabelEncoder, feature_cols, model_type)
 
         # ── statistical fallbacks (populated from stats_df during train) ──
         self.duration_fallback:   dict = {}   # key -> (dist_name, dist_params)
@@ -295,9 +338,11 @@ class SimModeller:
         # ── evaluation metrics (internal validation for model selection) ──
         self.duration_val_metrics:   dict = {}   # key -> {mae, rmse, r2, model_type}
         self.transition_val_metrics: dict = {}   # key -> {accuracy, f1, model_type}
+        self.waiting_val_metrics:    dict = {}   # key -> {mae, rmse, r2, model_type}
         # All model results (for comparison reporting)
         self.duration_all_results:   dict = {}   # key -> {model_type: {mae, rmse, r2}}
         self.transition_all_results: dict = {}   # key -> {model_type: {accuracy, f1}}
+        self.waiting_all_results:    dict = {}   # key -> {model_type: {mae, rmse, r2}}
 
         self._trained = False
 
@@ -324,10 +369,11 @@ class SimModeller:
 
     @staticmethod
     def _feature_cols(df: pd.DataFrame) -> list[str]:
-        """Return attr_* plus prev_* feature columns."""
+        """Return attr_* plus prev_* plus wip/ro feature columns."""
         cols = [c for c in df.columns if c.startswith('attr_')]
         for c in ('prev_activity_1', 'prev_duration_1',
-                  'prev_activity_2', 'prev_duration_2'):
+                  'prev_activity_2', 'prev_duration_2',
+                  'wip', 'ro'):
             if c in df.columns:
                 cols.append(c)
         return cols
@@ -428,8 +474,29 @@ class SimModeller:
             split = int(n * 0.8)
             X_tr, X_val = X_train.iloc[:split], X_train.iloc[split:]
             y_tr, y_val = y_enc_train[:split], y_enc_train[split:]
-            model.fit(X_tr, y_tr)
-            return accuracy_score(y_val, model.predict(X_val))
+
+            # XGBoost requires the labels passed to fit() to be exactly
+            # 0..k-1 for whatever classes appear in THIS call. A naive
+            # positional split can leave y_tr with a non-contiguous subset
+            # of the globally-encoded classes (e.g. {0,2,5,6}), which
+            # XGBClassifier rejects outright. Re-encode locally to a
+            # compact, contiguous range for this split.
+            local_classes = np.unique(y_tr)
+            if len(local_classes) < 2:
+                return 0.0  # nothing to learn from a single-class split
+            local_map = {c: i for i, c in enumerate(local_classes)}
+            y_tr_local = np.array([local_map[c] for c in y_tr])
+
+            # Validation rows whose true class never appeared in y_tr are
+            # unlearnable for this model — exclude them rather than crash.
+            val_mask = np.isin(y_val, local_classes)
+            if val_mask.sum() == 0:
+                return 0.0
+            y_val_local = np.array([local_map[c] for c in np.asarray(y_val)[val_mask]])
+            X_val_known = X_val.iloc[val_mask] if hasattr(X_val, 'iloc') else X_val[val_mask]
+
+            model.fit(X_tr, y_tr_local)
+            return accuracy_score(y_val_local, model.predict(X_val_known))
 
         sampler = optuna.samplers.TPESampler(seed=self.random_state)
         study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -510,8 +577,9 @@ class SimModeller:
                       'higher_level_activity']
         grouped = raw_df.groupby(group_keys, dropna=False)
 
-        dur_trained = 0
-        tr_trained  = 0
+        dur_trained  = 0
+        tr_trained   = 0
+        wait_trained = 0
 
         print(f"\n[SimModeller] Model types      : {self.model_types}")
         print(f"[SimModeller] Optuna tuning    : {self.optimize_hyperparams}")
@@ -619,6 +687,80 @@ class SimModeller:
                     print(f"    [!] Final duration re-train failed: {exc}")
 
             # ==============================================================
+            # 1b. Waiting-time model — same shape as the duration model,
+            #     but predicts the queueing/contention gap *before* this
+            #     activity starts (skipped if no 'waiting_time' column or
+            #     train_waiting=False).
+            # ==============================================================
+            if self.train_waiting and 'waiting_time' in group.columns:
+                y_fit_wait = fit_g['waiting_time'].astype(float)
+                y_val_wait = val_g['waiting_time'].astype(float)
+                y_all_wait = group['waiting_time'].astype(float)
+
+                best_wait_mae    = float('inf')
+                best_wait_type   = None
+                best_wait_metrics = None
+                wait_results = {}
+
+                for mtype in self.model_types:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            model = self._fit_regressor(mtype, X_fit, y_fit_wait)
+
+                        if len(X_val) > 0:
+                            y_pred = model.predict(X_val)
+                            mae  = mean_absolute_error(y_val_wait, y_pred)
+                            rmse = np.sqrt(mean_squared_error(y_val_wait, y_pred))
+                            r2   = r2_score(y_val_wait, y_pred)
+                            wait_results[mtype] = {'mae': mae, 'rmse': rmse, 'r2': r2}
+                            print(f"    Waiting   [{mtype:>8s}]  "
+                                  f"MAE={mae:.3f}  RMSE={rmse:.3f}  R²={r2:.3f}")
+
+                            if mae < best_wait_mae:
+                                best_wait_mae   = mae
+                                best_wait_type  = mtype
+                                best_wait_metrics = wait_results[mtype]
+                        else:
+                            if best_wait_type is None:
+                                best_wait_type = mtype
+                    except Exception as exc:
+                        print(f"    Waiting   [{mtype:>8s}]  FAILED: {exc}")
+
+                if best_wait_type is not None:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            final_wait_model = self._fit_regressor(
+                                best_wait_type, X_all, y_all_wait
+                            )
+                        self.waiting_models[key] = (final_wait_model, feature_cols,
+                                                    best_wait_type)
+                        wait_trained += 1
+                        if best_wait_metrics:
+                            self.waiting_val_metrics[key] = {
+                                **best_wait_metrics, 'model_type': best_wait_type,
+                            }
+                        if wait_results:
+                            self.waiting_all_results[key] = wait_results
+
+                        print(f"    ✓ Best waiting model: {best_wait_type}"
+                              + (f"  (val MAE={best_wait_mae:.3f})"
+                                 if best_wait_mae < float('inf') else ""))
+
+                        residuals = np.abs(
+                            y_all_wait.values - final_wait_model.predict(X_all)
+                        )
+                        wait_std_model = self._fit_regressor(
+                            best_wait_type, X_all, pd.Series(residuals)
+                        )
+                        self.waiting_std_models[key] = (wait_std_model,
+                                                        feature_cols,
+                                                        best_wait_type)
+                    except Exception as exc:
+                        print(f"    [!] Final waiting re-train failed: {exc}")
+
+            # ==============================================================
             # 2. Transition model — train ALL types, pick best by accuracy
             #    (skipped when train_transitions=False, e.g. ml_duration_only)
             # ==============================================================
@@ -706,13 +848,180 @@ class SimModeller:
 
         print(
             f"\n[SimModeller] Training complete – "
-            f"{dur_trained} duration models, {tr_trained} transition models."
+            f"{dur_trained} duration models, {tr_trained} transition models, "
+            f"{wait_trained} waiting-time models."
         )
 
         # ── Global model (single model across all activities) ─────────────
         self._train_global_duration_model(raw_df)
 
         self._trained = True
+
+    # ------------------------------------------------------------------
+    # WIP/RO-aware transition classifiers (for petri_net_wip_branching_aware)
+    # ------------------------------------------------------------------
+
+    def train_wip_transitions(self, raw_df: pd.DataFrame, stats_df: pd.DataFrame) -> None:
+        """
+        Train WIP/RO-aware transition classifiers, one per
+        (activity, object, object_type, higher_level_activity) key, predicting
+        the next activity (including '__END__').
+
+        A model is kept **only if it beats the frequency-based statistical
+        baseline's accuracy** on the same internal validation split. Groups
+        with fewer than ``_MIN_SAMPLES`` rows, or where no ``model_types``
+        candidate beats the baseline, are left unset — at prediction time
+        ``predict_transitions_wip_aware`` then returns None for that key,
+        signalling the caller to fall back to the statistical distribution
+        (``self.transition_fallback`` / ``activity_config[...]['transitions']``).
+
+        This is additive and independent of ``train()``/``transition_models``
+        (used by the plain 'ml' mode) — calling this does not change the
+        behaviour of any other simulation mode.
+        """
+        if not self.model_types:
+            print("[SimModeller] No model types available — "
+                  "skipping WIP-transition training.")
+            return
+
+        feature_cols = self._feature_cols(raw_df)
+        if not feature_cols:
+            print("[SimModeller] No feature columns found — "
+                  "skipping WIP-transition training.")
+            return
+
+        # Populate the statistical fallback in case train() hasn't run yet.
+        for _, row in stats_df.iterrows():
+            key = self._make_key(
+                row['activity'], row['object'],
+                row['object_type'], row['higher_level_activity']
+            )
+            self.transition_fallback.setdefault(key, row['transition'])
+
+        group_keys = ['activity', 'object', 'object_type', 'higher_level_activity']
+        grouped = raw_df.groupby(group_keys, dropna=False)
+
+        n_trained, n_rejected, n_skipped = 0, 0, 0
+
+        print(f"\n[SimModeller] Training WIP/RO-aware transition classifiers "
+              f"(model_types={self.model_types})")
+
+        for key_vals, group in grouped:
+            key = tuple(
+                str(k).strip() if pd.notna(k) else None
+                for k in key_vals
+            )
+
+            if len(group) < _MIN_SAMPLES:
+                n_skipped += 1
+                continue
+
+            fit_g, val_g = self._validation_split(group, self.val_size)
+            X_fit = self._build_X(fit_g, feature_cols)
+            X_val = self._build_X(val_g, feature_cols)
+            X_all = self._build_X(group, feature_cols)
+
+            y_fit_tr = fit_g['next_activity'].astype(str)
+            y_val_tr = val_g['next_activity'].astype(str)
+            y_all_tr = group['next_activity'].astype(str)
+
+            if y_all_tr.nunique() < 2 or len(y_val_tr) == 0:
+                n_skipped += 1
+                continue
+
+            le = LabelEncoder()
+            le.fit(y_all_tr)
+            y_enc_fit = le.transform(y_fit_tr)
+
+            # ── statistical baseline accuracy on the SAME validation rows ──
+            stat_dist = self.transition_fallback.get(key, {})
+            if stat_dist:
+                baseline_label = max(stat_dist, key=stat_dist.get)
+            else:
+                baseline_label = y_fit_tr.mode().iloc[0] if len(y_fit_tr) else None
+            baseline_acc = (
+                float((y_val_tr == baseline_label).mean())
+                if baseline_label is not None else 0.0
+            )
+
+            best_acc, best_type = -1.0, None
+            for mtype in self.model_types:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        model = self._fit_classifier(mtype, X_fit, y_enc_fit)
+
+                    known_mask = y_val_tr.isin(le.classes_)
+                    if known_mask.sum() == 0:
+                        continue
+                    y_enc_val = le.transform(y_val_tr[known_mask])
+                    y_pred    = model.predict(X_val[known_mask])
+                    acc = accuracy_score(y_enc_val, y_pred)
+                    if acc > best_acc:
+                        best_acc, best_type = acc, mtype
+                except Exception as exc:
+                    print(f"    WIP-transition {key} [{mtype:>8s}]  FAILED: {exc}")
+
+            if best_type is not None and best_acc > baseline_acc:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    y_enc_all = le.transform(y_all_tr)
+                    final_model = self._fit_classifier(best_type, X_all, y_enc_all)
+                self.transition_wip_models[key] = (final_model, le, feature_cols, best_type)
+                n_trained += 1
+                print(f"    ✓ {key}: {best_type}  "
+                      f"(val Acc={best_acc:.3f} vs baseline={baseline_acc:.3f})")
+            else:
+                n_rejected += 1
+                print(f"    ✗ {key}: best ML Acc={best_acc:.3f} did not beat "
+                      f"baseline={baseline_acc:.3f} — falling back to statistical.")
+
+        print(
+            f"[SimModeller] WIP-transition training complete – "
+            f"{n_trained} kept, {n_rejected} fell back to statistical baseline, "
+            f"{n_skipped} skipped (< {_MIN_SAMPLES} samples or single-class)."
+        )
+
+    def predict_transitions_wip_aware(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        wip: float = 0.0,
+        ro: float = 0.0,
+    ) -> dict | None:
+        """
+        Predict transition probabilities using the WIP/RO-aware classifier
+        trained by ``train_wip_transitions``.
+
+        Returns ``None`` when no model was kept for this key (either too few
+        samples, or it didn't beat the statistical baseline) — the caller
+        should fall back to the frequency-based statistical distribution.
+        """
+        key = self._make_key(activity, object_name, object_type,
+                             higher_level_activity)
+
+        if key not in self.transition_wip_models:
+            return None
+
+        tr_model, le, feature_cols, _mtype = self.transition_wip_models[key]
+        if not hasattr(tr_model, 'predict_proba'):
+            return None
+
+        features = self._attrs_to_features(object_attributes, feature_cols,
+                                           wip=wip, ro=ro)
+        X = pd.DataFrame([features])[feature_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
+
+        probs = tr_model.predict_proba(X)[0]
+        return {
+            str(cls): float(prob)
+            for cls, prob in zip(le.classes_, probs)
+        }
 
     # ------------------------------------------------------------------
     # Global model training
@@ -1022,6 +1331,85 @@ class SimModeller:
         pred = float(model.predict(X)[0])
         return max(0.1, pred)
 
+    def predict_duration_wip_aware(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        wip: float = 0.0,
+        ro: float = 0.0,
+    ) -> float | None:
+        """
+        Point-estimate duration prediction (no noise) using the same
+        per-key duration model as ``predict_duration_median``, but with
+        live ``wip``/``ro`` values (from a ``LoadProfile`` lookup at
+        simulation time) injected into the feature vector instead of the
+        training-time defaults of 0.
+
+        Returns ``None`` when no ML model is available for the given key.
+        """
+        key = self._make_key(activity, object_name, object_type,
+                             higher_level_activity)
+
+        if key not in self.duration_models:
+            return None
+
+        dur_model, feature_cols, _mtype = self.duration_models[key]
+        features = self._attrs_to_features(object_attributes, feature_cols,
+                                           wip=wip, ro=ro)
+        X = pd.DataFrame([features])[feature_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
+
+        median_pred = float(dur_model.predict(X)[0])
+        return max(0.1, median_pred)
+
+    def predict_waiting_time(
+        self,
+        activity: str,
+        object_name: str,
+        object_type: str,
+        higher_level_activity,
+        object_attributes: dict,
+        wip: float = 0.0,
+        ro: float = 0.0,
+    ) -> float | None:
+        """
+        Predict a sampled waiting time (minutes) — the queueing/contention
+        gap before ``activity`` starts — analogous to ``predict_duration``
+        but for the ``waiting_models`` family.  ``wip``/``ro`` come from a
+        live ``LoadProfile`` lookup at simulation time.
+
+        Returns ``None`` when no waiting-time model is available for the
+        given key, signalling the caller to fall back to a fixed/no gap.
+        """
+        key = self._make_key(activity, object_name, object_type,
+                             higher_level_activity)
+
+        if key not in self.waiting_models:
+            return None
+
+        wait_model, feature_cols, _mtype = self.waiting_models[key]
+        features = self._attrs_to_features(object_attributes, feature_cols,
+                                           wip=wip, ro=ro)
+        X = pd.DataFrame([features])[feature_cols]
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors='coerce')
+        X = X.fillna(0.0)
+
+        median_pred = float(wait_model.predict(X)[0])
+
+        std_pred = 0.0
+        if key in self.waiting_std_models:
+            std_model, _, _ = self.waiting_std_models[key]
+            std_pred = max(0.0, float(std_model.predict(X)[0]))
+
+        sampled = np.random.normal(median_pred, std_pred) if std_pred > 0 else median_pred
+        return max(0.0, float(sampled))
+
     def predict_transitions(
         self,
         activity: str,
@@ -1064,14 +1452,22 @@ class SimModeller:
 
     @staticmethod
     def _attrs_to_features(object_attributes: dict,
-                           feature_cols: list[str]) -> dict:
+                           feature_cols: list[str],
+                           wip: float = 0.0,
+                           ro: float = 0.0) -> dict:
         """Map ``object_attributes`` dict to the ``attr_*`` / ``prev_*``
         feature space.  ``prev_*`` columns default to 0 here and are
-        overridden by the caller when activity history is available."""
+        overridden by the caller when activity history is available.
+        ``wip``/``ro`` come from a live ``LoadProfile`` lookup at
+        simulation time (they aren't part of ``object_attributes``)."""
         feats = {}
         for col in feature_cols:
             if col.startswith('attr_'):
                 feats[col] = object_attributes.get(col[5:], 0)
+            elif col == 'wip':
+                feats[col] = wip
+            elif col == 'ro':
+                feats[col] = ro
             else:
                 feats[col] = 0   # prev_* defaults; overridden by caller
         return feats

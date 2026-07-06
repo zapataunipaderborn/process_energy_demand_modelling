@@ -84,7 +84,7 @@ constants.SHOW_PROGRESS_BAR = False
 # %%
 import pandas as pd
 from sim_extractor import extract_process
-from simulation import ProcessSimulation
+from simulation import ProcessSimulation, simulate_with_wip_ro
 from sim_modeller import SimModeller
 
 from sklearn.linear_model import Lasso, LogisticRegression
@@ -418,6 +418,10 @@ MODES_TO_COMPARE = [
     'petri_net_inductive',
     'petri_net_inductive_ml_plus_global',
     'petri_net_inductive_ml_plus_per_act',
+    'petri_net_wip_aware',   # PN transitions + WIP/RO-aware duration + waiting-time model
+    'petri_net_wip_aware_ml_plus_global',    # same, but duration from the ML+ global model
+    'petri_net_wip_aware_ml_plus_per_act',   # same, but duration from the ML+ per-activity models
+    'petri_net_wip_branching_aware',   # wip_aware + WIP/RO-aware branching (falls back to statistical if not better)
     # 'petri_net_ilp',
     # 'petri_net_ilp_ml_plus_global',
     # 'petri_net_ilp_ml_plus_per_act',
@@ -524,12 +528,18 @@ SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only
 #   'manual'     – original manual extraction (no process mining)
 # ─────────────────────────────────────────────────────────────────────────────
 #MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
-MINING_ALGORITHM = 'heuristic'
+MINING_ALGORITHM = os.environ.get('PIPELINE_DEFAULT_MINING_ALGORITHM', 'heuristic')
 #MINING_ALGORITHM = 'alpha'
 #MINING_ALGORITHM = 'ilp'
 
 # Petri-net miner variants to compare when mode names include the algorithm.
-PETRI_NET_ALGORITHMS = ['alpha', 'heuristic', 'inductive']#, 'ilp']
+# Override via PIPELINE_MINING_ALGORITHMS (comma-separated, e.g. "heuristic,inductive").
+_env_mining_algorithms = os.environ.get('PIPELINE_MINING_ALGORITHMS')
+PETRI_NET_ALGORITHMS = (
+    [a.strip() for a in _env_mining_algorithms.split(',') if a.strip()]
+    if _env_mining_algorithms else
+    ['alpha', 'heuristic', 'inductive']#, 'ilp']
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MINER HYPERPARAMETER OPTIMIZATION (for inductive + heuristic)
@@ -584,8 +594,11 @@ TRAIN_RATIO         = 0.70    # fraction of cases used for training
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
 RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
-RUN_CURVE_ONLY_EVALUATION = True   # run curve-quality benchmark (MAE/RMSE/R²)
-RUN_PROCESS_MODELLING     = True#os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'false').lower() == 'true'
+# Energy profile/curve modelling (sensor curve fitting + curve-quality benchmark).
+# Turn off to run process modelling only — skips all build_and_train_pipeline_*
+# training and evaluation. Override via PIPELINE_RUN_ENERGY_MODELLING=true/false.
+RUN_CURVE_ONLY_EVALUATION = os.environ.get('PIPELINE_RUN_ENERGY_MODELLING', 'true').lower() == 'true'
+RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'true').lower() == 'true'
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          DTW + position index (sklearn regressor)
@@ -1949,7 +1962,7 @@ for _mode_name in MODES_TO_COMPARE:
         continue
     if _mode_name.startswith('petri_net_'):
         _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
-        if (_mode_alg in ('combined', 'median_duration') or
+        if (_mode_alg in ('combined', 'median_duration', 'wip_aware', 'wip_branching_aware') or
                 _mode_alg.endswith('_ml_plus_global') or
                 _mode_alg.endswith('_ml_plus_per_act')):
             _filtered_modes.append(_mode_name)
@@ -2117,6 +2130,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
 
+        if 'petri_net_wip_branching_aware' in MODES_TO_COMPARE:
+            ml_models.train_wip_transitions(raw_df, activity_stats_df)
+
     # ── Loop over modes ───────────────────────────────────────────────────
     process_mode_results = []
 
@@ -2140,7 +2156,13 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         simulation_mode = sim_mode
         mode_activity_stats_df = activity_stats_df
 
-        if sim_mode.startswith('petri_net_'):
+        if sim_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
+            # Not parametrized by mining algorithm — uses the default
+            # MINING_ALGORITHM's Petri net + the shared ml_models (trained
+            # with 'wip'/'ro' features and waiting-time models; branching_aware
+            # additionally uses ml_models.transition_wip_models, if trained).
+            mode_algorithm = MINING_ALGORITHM
+        elif sim_mode.startswith('petri_net_'):
             mode_algorithm = sim_mode.replace('petri_net_', '', 1).strip().lower()
             if mode_algorithm not in extraction_by_algorithm:
                 print(
@@ -2152,13 +2174,20 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
 
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
-        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory') else None
+        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory', 'petri_net_wip_aware', 'petri_net_wip_branching_aware') else None
 
-        simulated_log_train = ProcessSimulation(
-            mode_activity_stats_df, production_plan,
-            mode=simulation_mode, ml_models=mode_ml,
-            process_models=mode_pm,
-        ).run()
+        if simulation_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
+            simulated_log_train, _ = simulate_with_wip_ro(
+                mode_activity_stats_df, production_plan, mode_ml,
+                reference_mode='petri_net', process_models=mode_pm,
+                final_mode=simulation_mode,
+            )
+        else:
+            simulated_log_train = ProcessSimulation(
+                mode_activity_stats_df, production_plan,
+                mode=simulation_mode, ml_models=mode_ml,
+                process_models=mode_pm,
+            ).run()
 
         print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
 
@@ -2201,13 +2230,22 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         df_test = test_datasets[process]['event_log'] if test_datasets else None
         if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
             production_plan_test = test_datasets[process]['production_plan']
-            simulated_log_test = ProcessSimulation(
-                mode_activity_stats_df,
-                production_plan_test,
-                mode=simulation_mode,
-                ml_models=mode_ml,
-                process_models=mode_pm,
-            ).run()
+            if simulation_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
+                # Fresh reference pass + load profile from the test period's
+                # own production plan (not reused from train).
+                simulated_log_test, _ = simulate_with_wip_ro(
+                    mode_activity_stats_df, production_plan_test, mode_ml,
+                    reference_mode='petri_net', process_models=mode_pm,
+                    final_mode=simulation_mode,
+                )
+            else:
+                simulated_log_test = ProcessSimulation(
+                    mode_activity_stats_df,
+                    production_plan_test,
+                    mode=simulation_mode,
+                    ml_models=mode_ml,
+                    process_models=mode_pm,
+                ).run()
 
             print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
 
@@ -2596,6 +2634,103 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
                 process_mode_results.append(flattened_amlp)
                 evaluation_results_list.append(flattened_amlp)
+
+    # ── WIP/RO-aware combined with ML+ duration (global / per-activity) ──────
+    # Reuses the ML+ tuples trained just above (_mlp_glb_tpl/_mlp_pa_tpls) for
+    # duration, plus the shared ml_models (SimModeller) for waiting time, plus
+    # the default MINING_ALGORITHM's Petri net (like plain petri_net_wip_aware).
+    _wip_mlp_modes_requested = [
+        m for m in MODES_TO_COMPARE
+        if m in ('petri_net_wip_aware_ml_plus_global', 'petri_net_wip_aware_ml_plus_per_act')
+    ]
+    if _wip_mlp_modes_requested:
+        _wip_mlp_pm    = extraction_by_algorithm[MINING_ALGORITHM]['process_models']
+        _wip_mlp_stats = extraction_by_algorithm[MINING_ALGORITHM]['activity_stats_df']
+
+        for _wip_mlp_mode in _wip_mlp_modes_requested:
+            _use_global = _wip_mlp_mode.endswith('_ml_plus_global')
+            _g_arg  = _mlp_glb_tpl if _use_global else None
+            _pa_arg = None if _use_global else _mlp_pa_tpls
+
+            print("\n" + "─"*80)
+            print(f"  ▶ SIMULATION MODE: {_wip_mlp_mode.upper()}")
+            print("─"*80)
+
+            sim_wipmlp_train, _ = simulate_with_wip_ro(
+                _wip_mlp_stats, production_plan, ml_models,
+                reference_mode='petri_net', process_models=_wip_mlp_pm,
+                final_mode=_wip_mlp_mode,
+                mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
+                mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                mlp_global_mean=_mlp_glb_mean,
+            )
+            print(f"\n  Simulated log TRAIN ({_wip_mlp_mode}): {len(sim_wipmlp_train)} events")
+
+            eval_wipmlp_train = comprehensive_simulation_evaluation(
+                sim_wipmlp_train, df_train, process_models=_wip_mlp_pm
+            )
+            flattened_wipmlp = {
+                'process':          process,
+                'mode':             _wip_mlp_mode,
+                'simulation_mode':  _wip_mlp_mode,
+                'mining_algorithm': MINING_ALGORITHM,
+                'split':            split_label,
+            }
+            for _cat, _mets in eval_wipmlp_train.items():
+                if isinstance(_mets, dict):
+                    for _mn, _mv in _mets.items():
+                        flattened_wipmlp[f"train_{_cat}_{_mn}"] = _mv
+                else:
+                    flattened_wipmlp[f"train_{_cat}"] = _mets
+
+            _df_test_wipmlp = test_datasets[process]['event_log'] if test_datasets else None
+            if TEMPORAL_SPLIT and _df_test_wipmlp is not None and len(_df_test_wipmlp) > 0:
+                _pp_test_wipmlp = test_datasets[process]['production_plan']
+                sim_wipmlp_test, _ = simulate_with_wip_ro(
+                    _wip_mlp_stats, _pp_test_wipmlp, ml_models,
+                    reference_mode='petri_net', process_models=_wip_mlp_pm,
+                    final_mode=_wip_mlp_mode,
+                    mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
+                    mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                    mlp_global_mean=_mlp_glb_mean,
+                )
+                print(f"\n  Simulated log TEST  ({_wip_mlp_mode}): {len(sim_wipmlp_test)} events")
+
+                if EXPORT_RESULTS:
+                    _safe_process = str(process).replace(' ', '_').replace('/', '_')
+                    _safe_mode    = str(_wip_mlp_mode).replace(' ', '_').replace('/', '_')
+                    _pred_df = sim_wipmlp_test.drop(
+                        columns=[c for c in sim_wipmlp_test.columns
+                                 if c == 'simulated_energy_curves'],
+                        errors='ignore',
+                    )
+                    _pred_path = os.path.join(
+                        _predicted_logs_dir, f'{_safe_process}_{_safe_mode}.parquet'
+                    )
+                    _pred_df.to_parquet(_pred_path, index=False)
+                    print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
+
+                eval_wipmlp_test = comprehensive_simulation_evaluation(
+                    sim_wipmlp_test, _df_test_wipmlp, process_models=_wip_mlp_pm
+                )
+                for _cat, _mets in eval_wipmlp_test.items():
+                    if isinstance(_mets, dict):
+                        for _mn, _mv in _mets.items():
+                            flattened_wipmlp[f"test_{_cat}_{_mn}"] = _mv
+                    else:
+                        flattened_wipmlp[f"test_{_cat}"] = _mets
+
+                _combined_sim_store.append({
+                    'process':     process,
+                    'mode':        _wip_mlp_mode,
+                    'sim_df':      sim_wipmlp_test,
+                    'exp_df':      test_datasets[process].get('expanded'),
+                    'sensors':     [],
+                    'act_metrics': {},
+                })
+
+            process_mode_results.append(flattened_wipmlp)
+            evaluation_results_list.append(flattened_wipmlp)
 
     # ── Energy-aware Petri-net modes ─────────────────────────────────────────
     # These run AFTER all base modes (including petri_net_combined) so the
