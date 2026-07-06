@@ -1,4 +1,5 @@
 import copy
+import zlib
 import pandas as pd
 import numpy as np
 import random
@@ -9,6 +10,20 @@ from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.petri_net import semantics as pn_semantics
 
 from sim_extractor import sample_from_dist, LoadProfile
+
+
+def _stable_case_seed(case_id) -> int:
+    """
+    Deterministic (cross-process) seed derived from a case_id.
+
+    Python's built-in hash() randomizes string hashes per-process (PEP 456 /
+    PYTHONHASHSEED) for security — using it to seed an RNG means the same
+    case_id gets a *different* seed every time the process is relaunched,
+    silently making "reproducible" simulations (same random_seed) actually
+    non-reproducible across runs. zlib.crc32 is stable across processes and
+    Python versions.
+    """
+    return zlib.crc32(str(case_id).encode('utf-8'))
 
 
 class ProcessSimulation:
@@ -621,7 +636,7 @@ class ProcessSimulation:
         # transition sequence is identical regardless of how durations are
         # sampled (statistical vs ML+), since ML predictions consume zero
         # numpy random draws while scipy/numpy sampling would.
-        _pn_rng = np.random.default_rng(abs(hash(str(case_id))) % (2**32))
+        _pn_rng = np.random.default_rng(_stable_case_seed(case_id))
 
         unique_objects = (
             self.activity_stats[['object', 'object_type',
@@ -796,7 +811,7 @@ class ProcessSimulation:
         *prior* simulation pass, not a live closed loop across this run.
         """
         current_sim_time = start_time.timestamp()
-        _pn_rng = np.random.default_rng(abs(hash(str(case_id))) % (2**32))
+        _pn_rng = np.random.default_rng(_stable_case_seed(case_id))
 
         # Duration source: this mode's own WIP/RO-aware model, or one of the
         # ML+ (global / per-activity) duration models — waiting time always
