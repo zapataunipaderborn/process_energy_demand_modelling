@@ -90,6 +90,7 @@ from sim_modeller import SimModeller
 from sklearn.linear_model import Lasso, LogisticRegression
 from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
 from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
+from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from xgboost import XGBRegressor
 
 # %%
@@ -789,6 +790,17 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
             return
         result_total = compare_energy_distributions(real_stats, sim_stats, statistic='total_value')
         result_mean  = compare_energy_distributions(real_stats, sim_stats, statistic='mean_value')
+
+        # Raw pooled-value comparison — no per-case sum/mean at all, so it's
+        # valid for intensive sensors (temperature, concentration) where
+        # summing/averaging across a case has no physical meaning, not just
+        # extensive ones (power, flow) like the two comparisons above.
+        real_pooled = pool_real_curve_values(real_expanded_df, sensors)
+        sim_pooled = pool_simulated_curve_values(
+            simulated_df, pipelines_for_process, sensors,
+            activity_exog_means=globals().get('_activity_exog_means', {}),
+        )
+        result_pooled = compare_pooled_value_distributions(real_pooled, sim_pooled)
     except Exception as exc:
         print(f"  ⚠️ Energy-distribution metrics failed for {process}/{mode_name}: {exc}")
         return
@@ -801,6 +813,7 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
     result_total['per_case_sensor'].to_csv(os.path.join(out_dir, 'per_case_sensor_total.csv'), index=False)
     result_mean['per_activity_sensor'].to_csv(os.path.join(out_dir, 'per_activity_sensor_mean.csv'), index=False)
     result_mean['per_case_sensor'].to_csv(os.path.join(out_dir, 'per_case_sensor_mean.csv'), index=False)
+    result_pooled.to_csv(os.path.join(out_dir, 'per_sensor_pooled_values.csv'), index=False)
 
     core_row = {
         k: v for k, v in core_metrics_row.items()

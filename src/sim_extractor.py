@@ -8474,6 +8474,90 @@ def compare_energy_distributions(real_stats_df, sim_stats_df, statistic='mean_va
     return {'per_activity_sensor': per_activity_sensor, 'per_case_sensor': per_case_sensor}
 
 
+# ---------------------------------------------------------------------------
+# Raw pooled-value distribution comparison — no per-case sum/mean at all.
+#
+# Summing or averaging a sensor's readings across a case only makes physical
+# sense for extensive/flow quantities (power, mass flow) — summing readings
+# of an intensive quantity like temperature has no meaning. This compares
+# every individual reading directly instead, so it works uniformly for any
+# sensor type: pool every timestep from every instance into one set of
+# numbers per sensor (real vs. simulated) and compare those distributions.
+# ---------------------------------------------------------------------------
+
+def pool_real_curve_values(real_expanded_df, sensors, activity_col='activity_log'):
+    """
+    Pool every raw sensor reading (every timestep, every activity instance,
+    every case) per sensor — no per-case or per-activity aggregation.
+
+    Returns {sensor: np.ndarray of all real readings for that sensor}.
+    """
+    pooled = {}
+    for sensor in sensors:
+        if sensor not in real_expanded_df.columns:
+            continue
+        vals = real_expanded_df[sensor].dropna().values
+        if len(vals) > 0:
+            pooled[sensor] = np.asarray(vals, dtype=float)
+    return pooled
+
+
+def pool_simulated_curve_values(simulated_df, energy_pipelines, sensors,
+                                activity_exog_means=None,
+                                temporal_resolution_minutes=15.0,
+                                case_col='case_id', activity_col='activity',
+                                object_col='object'):
+    """
+    Pool every predicted sensor curve value (every timestep of every
+    predicted instance) per sensor — no per-instance or per-case aggregation.
+    Mirrors annotate_simulated_curve_stats's prediction step, but keeps the
+    full curve instead of reducing it to mean/total.
+
+    Returns {sensor: np.ndarray of all predicted values for that sensor}.
+    """
+    pooled = {s: [] for s in sensors}
+    for _, row in simulated_df.iterrows():
+        duration_minutes = (
+            (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60.0
+        )
+        object_attributes = row.get('object_attributes', {}) or {}
+        for sensor in sensors:
+            curve = predict_curve_for_instance(
+                row[activity_col], row[object_col], duration_minutes,
+                object_attributes, energy_pipelines, sensor,
+                activity_exog_means, temporal_resolution_minutes,
+            )
+            if curve is None or len(curve) == 0:
+                continue
+            pooled[sensor].extend(np.asarray(curve, dtype=float).tolist())
+    return {s: np.array(v) for s, v in pooled.items() if v}
+
+
+def compare_pooled_value_distributions(real_pooled, sim_pooled):
+    """
+    Wasserstein distance between the pooled raw-value distributions
+    (from pool_real_curve_values / pool_simulated_curve_values), per sensor.
+    Works uniformly for intensive (temperature, concentration) and
+    extensive (power, flow) sensors alike, since nothing is summed or
+    averaged before comparing.
+    """
+    from scipy.stats import wasserstein_distance
+    rows = []
+    for sensor, real_vals in real_pooled.items():
+        sim_vals = sim_pooled.get(sensor)
+        if sim_vals is None or len(sim_vals) == 0 or len(real_vals) == 0:
+            continue
+        rows.append({
+            'sensor':      sensor,
+            'n_real':      len(real_vals),
+            'n_sim':       len(sim_vals),
+            'real_median': float(np.median(real_vals)),
+            'sim_median':  float(np.median(sim_vals)),
+            'wasserstein': float(wasserstein_distance(real_vals, sim_vals)),
+        })
+    return pd.DataFrame(rows)
+
+
 def evaluate_pipeline_joint_duration(test_curves, pipeline):
     """
     Timing-aware evaluation for joint duration experiments.
