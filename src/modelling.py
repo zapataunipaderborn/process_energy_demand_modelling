@@ -601,6 +601,13 @@ RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
 # training and evaluation. Override via PIPELINE_RUN_ENERGY_MODELLING=true/false.
 RUN_CURVE_ONLY_EVALUATION = os.environ.get('PIPELINE_RUN_ENERGY_MODELLING', 'true').lower() == 'true'
 RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'true').lower() == 'true'
+# Joint Duration + Profile Evaluation heatmaps (the per-instance-matched curve
+# comparison, both the "all together" and "per simulation mode" sections) —
+# slow, and superseded by the energy-distribution metrics (per_case_sensor_*
+# / per_sensor_pooled_values.csv), which don't rely on instance matching.
+# Off by default; does NOT affect curve-pipeline training (RUN_CURVE_ONLY_EVALUATION),
+# which the energy-distribution metrics still depend on.
+RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', 'false').lower() == 'true'
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          DTW + position index (sklearn regressor)
@@ -757,22 +764,37 @@ def _detect_sensors_for_energy_distribution(process, expanded_df):
     ]
 
 
+# Which global dict holds each curve-fitting approach's trained pipelines
+# (see the "CURVE-ONLY TRAINING" section — each approach gets reassembled
+# into its own all_energy_pipelines_<approach> dict; 'baseline' is the one
+# exception, stored unsuffixed as all_energy_pipelines for backward compat).
+_ENERGY_APPROACH_DICT_NAMES = {
+    'baseline': 'all_energy_pipelines',
+}
+
+
 def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_expanded_df,
-                                      core_metrics_row, output_root):
+                                      core_metrics_row, output_root, approach='baseline'):
     """
-    Compute and save the case/activity/sensor and case/sensor energy-distribution
-    comparison (compare_energy_distributions — no curve/instance matching) for
-    one (process, mode), alongside the already-computed CORE_METRIC_BASES scalar
-    values for that same mode, into output_root/<process>/<safe_mode>/.
+    Compute and save the case/activity/sensor, case/sensor, and raw-pooled-value
+    energy-distribution comparisons (no curve/instance matching) for one
+    (process, mode), using the trained curve-fitting pipelines for `approach`
+    (e.g. 'baseline', 'exog_prev_activity' — see _ENERGY_APPROACH_DICT_NAMES),
+    alongside the already-computed CORE_METRIC_BASES scalar values for that
+    same mode, into output_root/<process>/<safe_mode>/.
+
+    Filenames get an `_<approach>` suffix for every approach except 'baseline'
+    (kept unsuffixed for backward compatibility with earlier runs/notebooks),
+    so multiple approaches can coexist side by side in the same folder.
 
     Silently no-ops (with a short note) when there's nothing to compare against —
-    e.g. no trained energy_pipelines for this process (requires
+    e.g. no trained pipelines for this process/approach (requires
     run_energy_modelling=True for at least one prior run), no detectable sensor
     columns, or an empty simulated/real curve-stats result.
     """
+    dict_name = _ENERGY_APPROACH_DICT_NAMES.get(approach, f'all_energy_pipelines_{approach}')
     pipelines_for_process = (
-        globals()['all_energy_pipelines'].get(process)
-        if 'all_energy_pipelines' in globals() else None
+        globals()[dict_name].get(process) if dict_name in globals() else None
     )
     if not pipelines_for_process:
         return
@@ -802,18 +824,19 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
         )
         result_pooled = compare_pooled_value_distributions(real_pooled, sim_pooled)
     except Exception as exc:
-        print(f"  ⚠️ Energy-distribution metrics failed for {process}/{mode_name}: {exc}")
+        print(f"  ⚠️ Energy-distribution metrics ({approach}) failed for {process}/{mode_name}: {exc}")
         return
 
     safe_mode = str(mode_name).replace(' ', '_').replace('/', '_')
     out_dir = os.path.join(output_root, process, safe_mode)
     os.makedirs(out_dir, exist_ok=True)
+    suffix = '' if approach == 'baseline' else f'_{approach}'
 
-    result_total['per_activity_sensor'].to_csv(os.path.join(out_dir, 'per_activity_sensor_total.csv'), index=False)
-    result_total['per_case_sensor'].to_csv(os.path.join(out_dir, 'per_case_sensor_total.csv'), index=False)
-    result_mean['per_activity_sensor'].to_csv(os.path.join(out_dir, 'per_activity_sensor_mean.csv'), index=False)
-    result_mean['per_case_sensor'].to_csv(os.path.join(out_dir, 'per_case_sensor_mean.csv'), index=False)
-    result_pooled.to_csv(os.path.join(out_dir, 'per_sensor_pooled_values.csv'), index=False)
+    result_total['per_activity_sensor'].to_csv(os.path.join(out_dir, f'per_activity_sensor_total{suffix}.csv'), index=False)
+    result_total['per_case_sensor'].to_csv(os.path.join(out_dir, f'per_case_sensor_total{suffix}.csv'), index=False)
+    result_mean['per_activity_sensor'].to_csv(os.path.join(out_dir, f'per_activity_sensor_mean{suffix}.csv'), index=False)
+    result_mean['per_case_sensor'].to_csv(os.path.join(out_dir, f'per_case_sensor_mean{suffix}.csv'), index=False)
+    result_pooled.to_csv(os.path.join(out_dir, f'per_sensor_pooled_values{suffix}.csv'), index=False)
 
     core_row = {
         k: v for k, v in core_metrics_row.items()
@@ -821,9 +844,10 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
     }
     core_row['process'] = process
     core_row['mode'] = mode_name
-    pd.DataFrame([core_row]).to_csv(os.path.join(out_dir, 'core_metrics.csv'), index=False)
+    core_row['approach'] = approach
+    pd.DataFrame([core_row]).to_csv(os.path.join(out_dir, f'core_metrics{suffix}.csv'), index=False)
 
-    print(f"  💾 Energy-distribution metrics saved → "
+    print(f"  💾 Energy-distribution metrics ({approach}) saved → "
           f"energy_distribution_results/{process}/{safe_mode}/")
 
 
@@ -4095,13 +4119,25 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
 # CURVE-ONLY TRAINING section just above). Compute + save now that the
 # curve pipelines actually exist.
 if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribution_pending:
+    # Compare against every curve-fitting approach that actually trained
+    # (not just 'baseline') — 'exog_prev_activity' ("DTW + Ext. Factors +
+    # Prev Activity") is usually the strongest approach per Curve-Only
+    # Evaluation, so it's worth comparing energy-distribution fidelity
+    # against it too, not only the simplest baseline.
+    _energy_approaches_available = ['baseline']
+    if 'all_energy_pipelines_exog_prev_activity' in dir() and all_energy_pipelines_exog_prev_activity:
+        _energy_approaches_available.append('exog_prev_activity')
+
     print("\n" + "="*50)
-    print(f"ENERGY-DISTRIBUTION METRICS ({len(_energy_distribution_pending)} process/mode combos)")
+    print(f"ENERGY-DISTRIBUTION METRICS ({len(_energy_distribution_pending)} process/mode combos "
+          f"x {len(_energy_approaches_available)} approach(es): {_energy_approaches_available})")
     print("="*50)
     for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
-        _save_energy_distribution_metrics(
-            _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
-        )
+        for _approach_p in _energy_approaches_available:
+            _save_energy_distribution_metrics(
+                _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
+                approach=_approach_p,
+            )
 
 
 if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_pipelines:
@@ -4904,7 +4940,8 @@ if RUN_TEST_EVALUATION:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _jdur_ready = (
-    globals().get('RUN_CURVE_ONLY_EVALUATION', False)
+    globals().get('RUN_JOINT_DURATION_EVAL', False)
+    and globals().get('RUN_CURVE_ONLY_EVALUATION', False)
     and bool(globals().get('_combined_sim_store'))
     and 'evaluation_results_df' in globals()
     and not globals()['evaluation_results_df'].empty

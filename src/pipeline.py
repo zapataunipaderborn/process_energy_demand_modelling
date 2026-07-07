@@ -14,6 +14,11 @@ Each entry in EXPERIMENTS defines one run. Fields:
   run_energy_modelling  bool       whether to run energy profile/curve modelling
                                    (sensor curve fitting + curve-quality benchmark).
                                    Set False to run process modelling only. Default: True.
+  run_joint_duration_eval bool     whether to run the (slow) per-instance-matched
+                                   "Joint Duration + Profile Evaluation" heatmaps.
+                                   Superseded by the energy-distribution metrics
+                                   (energy_distribution_results/), which don't rely
+                                   on instance matching. Default: False.
 """
 
 import os
@@ -39,17 +44,19 @@ EXPERIMENTS = [
         'temporal_resolution':   '15min',
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-        'run_energy_modelling':  True,   # set False to skip energy profile/curve modelling
+        'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
+        'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
     },
-    {
-        'data_experiment':       '1',
-        'run_name':              'experiment_701',
-        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-        'temporal_resolution':   '5min',
-        'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-        'run_energy_modelling':  True,   # set False to skip energy profile/curve modelling
-    },
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_701',
+    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
+    #     'temporal_resolution':   '5min',
+    #     'run_process_modelling': True,
+    #     'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+    #     'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
+    #     'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
+    # },
     
     # {
     #     'data_experiment':       '1',
@@ -110,6 +117,7 @@ modelling_script = Path(__file__).parent / 'modelling.py'
 for i, exp in enumerate(EXPERIMENTS, start=1):
     mining_algorithms = exp.get('mining_algorithms')
     run_energy_modelling = exp.get('run_energy_modelling', True)
+    run_joint_duration_eval = exp.get('run_joint_duration_eval', False)
 
     print(f"\n{'='*60}")
     print(f"  Running experiment {i}/{len(EXPERIMENTS)}: {exp['run_name']}")
@@ -118,7 +126,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"processes={exp['processes_to_run']}  "
           f"run_process_modelling={exp.get('run_process_modelling', False)}  "
           f"mining_algorithms={mining_algorithms or '(default)'}  "
-          f"run_energy_modelling={run_energy_modelling}")
+          f"run_energy_modelling={run_energy_modelling}  "
+          f"run_joint_duration_eval={run_joint_duration_eval}")
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
@@ -128,6 +137,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_TEMPORAL_RESOLUTION']   = exp['temporal_resolution']
     env['PIPELINE_RUN_PROCESS_MODELLING'] = 'true' if exp.get('run_process_modelling', False) else 'false'
     env['PIPELINE_RUN_ENERGY_MODELLING']  = 'true' if run_energy_modelling else 'false'
+    env['PIPELINE_RUN_JOINT_DURATION_EVAL'] = 'true' if run_joint_duration_eval else 'false'
     if mining_algorithms:
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
 

@@ -8306,12 +8306,17 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
         return None
 
     predict_fn = ep.get('predict_fn')
+    # exog_cols lives at the top level for the energy-aware modes' pipelines,
+    # but is nested under 'full_pipeline' for Curve-Only Evaluation pipelines
+    # (baseline, exog_prev_activity, etc. all wrap the trained pipeline dict
+    # under 'full_pipeline' when reassembled — see modelling.py).
+    exog_cols = ep.get('exog_cols') or ep.get('full_pipeline', {}).get('exog_cols')
     exog_vals = {}
-    if ep.get('exog_cols') and activity_exog_means:
+    if exog_cols and activity_exog_means:
         act_means = activity_exog_means.get(activity, {})
         exog_vals = {
             col: np.array([v]) for col, v in act_means.items()
-            if col in ep['exog_cols']
+            if col in exog_cols
         }
 
     n_ts = max(2, round(duration_minutes / temporal_resolution_minutes))
@@ -8323,20 +8328,31 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     if predict_fn is None:
         return input_curve
 
-    # energy_pipelines is populated by two different producers with
-    # incompatible predict_fn signatures: the energy-aware simulation modes
-    # use keyword args (raw_values=, activity=, object_attributes=, exog=),
-    # while the Curve-Only Evaluation section's pipelines use positional
-    # (rv, act, attrs) with no exog support at all. Try the keyword form
-    # first, fall back to positional on a signature mismatch.
-    try:
-        return predict_fn(
-            raw_values=input_curve, activity=activity,
-            object_attributes=object_attributes,
-            exog=exog_vals if exog_vals else None,
-        )
-    except TypeError:
-        return predict_fn(input_curve, activity, object_attributes)
+    # energy_pipelines is populated by several different producers with
+    # different predict_fn signatures: the energy-aware simulation modes use
+    # keyword args (raw_values=, activity=, object_attributes=, exog=);
+    # Curve-Only Evaluation's plain approaches (baseline, instance_stats...)
+    # use positional (rv, act, attrs) with no exog param at all; its
+    # exog-aware approaches (exog_prev_activity, seq2seq_exog...) use
+    # positional (rv, act, attrs, exog=None). Try each in turn — a plain
+    # 3-arg positional call as the last resort would silently succeed on an
+    # exog-aware predict_fn by using its exog=None default, silently
+    # dropping the external-factor values, so the exog-carrying attempt
+    # must come before the exog-less one.
+    exog_arg = exog_vals if exog_vals else None
+    attempts = (
+        lambda: predict_fn(raw_values=input_curve, activity=activity,
+                           object_attributes=object_attributes, exog=exog_arg),
+        lambda: predict_fn(input_curve, activity, object_attributes, exog_arg),
+        lambda: predict_fn(input_curve, activity, object_attributes),
+    )
+    last_exc = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_exc = exc
+    raise last_exc
 
 
 def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
