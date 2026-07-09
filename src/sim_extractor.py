@@ -8574,6 +8574,161 @@ def compare_pooled_value_distributions(real_pooled, sim_pooled):
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------------------
+# Complete-curve (per-case) comparison — curve-as-distribution Wasserstein.
+#
+# Treats one case's full energy profile (its per-activity curves concatenated
+# in time order) as a distribution of energy mass over the time axis, and
+# compares real vs. simulated+predicted profiles for the SAME case with W1
+# (Earth Mover's Distance) over time — a shift-tolerant alternative to
+# pointwise MAE/RMSE that doesn't explode when a simulated activity starts a
+# few minutes early/late.
+#
+# Matching is by case_id: simulation modes in this codebase replay the real
+# test cases through the discovered process model (same case population,
+# though not necessarily the same activity sequence per case), so every real
+# test case has a same-ID simulated counterpart to compare against directly —
+# no population-level/distributional workaround needed here.
+#
+# Both curves are placed on a *case-relative* time axis (minutes since that
+# case's own first activity start) rather than absolute calendar time, so a
+# simulation's scheduling offset (e.g. queueing delay before the case starts)
+# doesn't get charged as timing error — only the internal shape/timing of the
+# case's own profile is compared.
+# ---------------------------------------------------------------------------
+
+def build_real_case_curve(real_case_df, sensor,
+                          time_col='datetime_energy', start_col='timestamp_start_log'):
+    """
+    Concatenate one real case's per-timestep sensor readings (already all
+    belonging to that case) into a single (relative_time_minutes, value)
+    curve, ordered by real timestamp and zeroed at the case's own first
+    activity start.
+
+    Returns (None, None) if there's no usable data for `sensor`.
+    """
+    df = real_case_df.dropna(subset=[sensor, time_col, start_col])
+    if df.empty:
+        return None, None
+    df = df.sort_values(time_col)
+    case_start = pd.to_datetime(df[start_col]).min()
+    t = (pd.to_datetime(df[time_col]) - case_start).dt.total_seconds().values / 60.0
+    v = df[sensor].astype(float).values
+    if len(v) == 0:
+        return None, None
+    return t, v
+
+
+def build_predicted_case_curve(sim_case_df, energy_pipelines, sensor,
+                               activity_exog_means=None,
+                               temporal_resolution_minutes=15.0,
+                               activity_col='activity', object_col='object'):
+    """
+    Concatenate predicted per-activity curves for one simulated case
+    (already filtered to that case_id) into a single
+    (relative_time_minutes, value) curve for `sensor`, ordered by the case's
+    own simulated activity timestamps and zeroed at the case's first
+    activity start. Each activity's predicted curve (from
+    predict_curve_for_instance) is laid out evenly over its own predicted
+    [timestamp_start, timestamp_end] window.
+
+    Returns (None, None) if no pipeline produced a curve for any activity in
+    this case.
+    """
+    sim_case_df = sim_case_df.sort_values('timestamp_start')
+    case_start = sim_case_df['timestamp_start'].iloc[0]
+    times, values = [], []
+    for _, row in sim_case_df.iterrows():
+        duration_minutes = (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60.0
+        object_attributes = row.get('object_attributes', {}) or {}
+        curve = predict_curve_for_instance(
+            row[activity_col], row[object_col], duration_minutes,
+            object_attributes, energy_pipelines, sensor,
+            activity_exog_means, temporal_resolution_minutes,
+        )
+        if curve is None or len(curve) == 0:
+            continue
+        n = len(curve)
+        t_start = (row['timestamp_start'] - case_start).total_seconds() / 60.0
+        t_end   = (row['timestamp_end']   - case_start).total_seconds() / 60.0
+        t = np.linspace(t_start, t_end, n) if n > 1 else np.array([t_start])
+        times.append(t)
+        values.append(np.asarray(curve, dtype=float))
+    if not times:
+        return None, None
+    return np.concatenate(times), np.concatenate(values)
+
+
+def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipelines, sensors,
+                                 activity_exog_means=None,
+                                 temporal_resolution_minutes=15.0,
+                                 real_case_col='case_id_log', sim_case_col='case_id'):
+    """
+    Per real test case (matched to the simulated log by case_id), per sensor:
+    build the real case's complete profile and the simulated case's complete
+    predicted profile, and compare them with the curve-as-distribution
+    Wasserstein distance (EMD with case-relative time as the transport axis,
+    weighted by curve value).
+
+    W1 on a curve treated as a distribution normalises away overall
+    magnitude (a profile with the right shape but 30% too much total energy
+    can still score well), so `total_energy_rel_error` is reported alongside
+    it — the two are meant to be read together, not either alone.
+
+    Returns a DataFrame with one row per (case_id, sensor):
+    ['case_id', 'sensor', 'n_real_pts', 'n_sim_pts', 'wasserstein_time',
+     'real_total', 'sim_total', 'total_energy_rel_error'].
+    """
+    from scipy.stats import wasserstein_distance
+
+    real_cases = set(real_expanded_df[real_case_col].dropna().unique())
+    sim_cases  = set(simulated_df[sim_case_col].dropna().unique())
+    shared_cases = sorted(real_cases & sim_cases, key=str)
+
+    rows = []
+    for cid in shared_cases:
+        real_g = real_expanded_df[real_expanded_df[real_case_col] == cid]
+        sim_g  = simulated_df[simulated_df[sim_case_col] == cid]
+        if real_g.empty or sim_g.empty:
+            continue
+        for sensor in sensors:
+            if sensor not in real_g.columns:
+                continue
+            t_real, v_real = build_real_case_curve(real_g, sensor)
+            if t_real is None:
+                continue
+            t_sim, v_sim = build_predicted_case_curve(
+                sim_g, energy_pipelines, sensor,
+                activity_exog_means, temporal_resolution_minutes,
+            )
+            if t_sim is None:
+                continue
+
+            # wasserstein_distance requires non-negative weights.
+            w_real = np.clip(v_real, 0, None)
+            w_sim  = np.clip(v_sim, 0, None)
+            if w_real.sum() <= 0 or w_sim.sum() <= 0:
+                continue
+
+            w1 = float(wasserstein_distance(t_real, t_sim, u_weights=w_real, v_weights=w_sim))
+            real_total = float(v_real.sum())
+            sim_total  = float(v_sim.sum())
+            rows.append({
+                'case_id':               cid,
+                'sensor':                sensor,
+                'n_real_pts':            int(len(v_real)),
+                'n_sim_pts':             int(len(v_sim)),
+                'wasserstein_time':      w1,
+                'real_total':            real_total,
+                'sim_total':             sim_total,
+                'total_energy_rel_error': (
+                    abs(sim_total - real_total) / abs(real_total)
+                    if real_total != 0 else float('nan')
+                ),
+            })
+    return pd.DataFrame(rows)
+
+
 def evaluate_pipeline_joint_duration(test_curves, pipeline):
     """
     Timing-aware evaluation for joint duration experiments.

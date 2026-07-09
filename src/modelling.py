@@ -91,6 +91,7 @@ from sklearn.linear_model import Lasso, LogisticRegression
 from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
 from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
+from sim_extractor import compare_complete_case_curves
 from xgboost import XGBRegressor
 
 # %%
@@ -667,11 +668,13 @@ _process_results_dir = os.path.join(_run_dir, 'process_results')
 _energy_results_dir  = os.path.join(_run_dir, 'energy_results')
 _predicted_logs_dir  = os.path.join(_run_dir, 'predicted_logs')
 _energy_distribution_dir = os.path.join(_run_dir, 'energy_distribution_results')
+_complete_curve_eval_dir = os.path.join(_run_dir, 'complete_curve_eval_results')
 os.makedirs(_plots_dir, exist_ok=True)
 os.makedirs(_process_results_dir, exist_ok=True)
 os.makedirs(_energy_results_dir, exist_ok=True)
 os.makedirs(_predicted_logs_dir, exist_ok=True)
 os.makedirs(_energy_distribution_dir, exist_ok=True)
+os.makedirs(_complete_curve_eval_dir, exist_ok=True)
 
 LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
 
@@ -849,6 +852,72 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
 
     print(f"  💾 Energy-distribution metrics ({approach}) saved → "
           f"energy_distribution_results/{process}/{safe_mode}/")
+
+
+def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_expanded_df,
+                                      output_root, approach='baseline'):
+    """
+    Complete-curve (per real test case) evaluation — see
+    compare_complete_case_curves in sim_extractor.py for the metric itself.
+
+    Additional, standalone evaluation: does NOT touch/replace the
+    energy_distribution_results metrics above. For each real test case
+    (matched to this mode's simulated log by case_id), concatenates the
+    real per-activity curves into one complete real profile and the
+    predicted (curve-fitting pipeline `approach`, applied to the simulated
+    log's own activities/durations) curves into one complete simulated
+    profile for that same case, then compares the two with the
+    curve-as-distribution Wasserstein distance (time as transport axis) —
+    shift-tolerant, unlike per-timestep MAE/RMSE.
+
+    Silently no-ops when there's nothing to compare against (no trained
+    pipelines for this process/approach, no detectable sensor columns, or no
+    shared case_ids between the real test set and this mode's simulated log).
+    """
+    dict_name = _ENERGY_APPROACH_DICT_NAMES.get(approach, f'all_energy_pipelines_{approach}')
+    pipelines_for_process = (
+        globals()[dict_name].get(process) if dict_name in globals() else None
+    )
+    if not pipelines_for_process:
+        return
+    sensors = _detect_sensors_for_energy_distribution(process, real_expanded_df)
+    if not sensors or simulated_df is None or simulated_df.empty:
+        return
+
+    try:
+        case_curve_df = compare_complete_case_curves(
+            real_expanded_df, simulated_df, pipelines_for_process, sensors,
+            activity_exog_means=globals().get('_activity_exog_means', {}),
+            temporal_resolution_minutes=globals().get('TEMPORAL_RESOLUTION_MINUTES', 15.0),
+        )
+    except Exception as exc:
+        print(f"  ⚠️ Complete-curve eval ({approach}) failed for {process}/{mode_name}: {exc}")
+        return
+    if case_curve_df.empty:
+        return
+
+    safe_mode = str(mode_name).replace(' ', '_').replace('/', '_')
+    out_dir = os.path.join(output_root, process, safe_mode)
+    os.makedirs(out_dir, exist_ok=True)
+    suffix = '' if approach == 'baseline' else f'_{approach}'
+
+    case_curve_df.to_csv(os.path.join(out_dir, f'per_case_complete_curve{suffix}.csv'), index=False)
+
+    summary = (
+        case_curve_df.groupby('sensor')[['wasserstein_time', 'total_energy_rel_error']]
+        .median()
+        .reset_index()
+        .rename(columns={'wasserstein_time': 'wasserstein_time_median',
+                          'total_energy_rel_error': 'total_energy_rel_error_median'})
+    )
+    summary['n_cases'] = case_curve_df.groupby('sensor')['case_id'].nunique().values
+    summary['process'] = process
+    summary['mode'] = mode_name
+    summary['approach'] = approach
+    summary.to_csv(os.path.join(out_dir, f'complete_curve_summary{suffix}.csv'), index=False)
+
+    print(f"  💾 Complete-curve eval ({approach}) saved → "
+          f"complete_curve_eval_results/{process}/{safe_mode}/")
 
 
 # Default definitions to avoid NameError when testing is skipped
@@ -4136,6 +4205,32 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
         for _approach_p in _energy_approaches_available:
             _save_energy_distribution_metrics(
                 _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
+                approach=_approach_p,
+            )
+
+    # Complete-curve eval is pure inference (all pipelines are already trained
+    # above), so — unlike the energy-distribution loop above, which is kept to
+    # 'baseline' + 'exog_prev_activity' on purpose — it runs against every
+    # approach that actually trained pipelines for this run (i.e. every entry
+    # in APPROACHES with a non-empty all_energy_pipelines_<approach> dict), not
+    # just those two. Independent list, so it doesn't change what
+    # energy_distribution_results computes.
+    _complete_curve_approaches_available = []
+    for _appr_candidate in APPROACHES:
+        _dict_name_c = _ENERGY_APPROACH_DICT_NAMES.get(_appr_candidate, f'all_energy_pipelines_{_appr_candidate}')
+        if _dict_name_c in dir() and globals().get(_dict_name_c):
+            _complete_curve_approaches_available.append(_appr_candidate)
+    if not _complete_curve_approaches_available:
+        _complete_curve_approaches_available = ['baseline']
+
+    print("\n" + "="*50)
+    print(f"COMPLETE-CURVE EVAL ({len(_energy_distribution_pending)} process/mode combos "
+          f"x {len(_complete_curve_approaches_available)} approach(es): {_complete_curve_approaches_available})")
+    print("="*50)
+    for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
+        for _approach_p in _complete_curve_approaches_available:
+            _save_complete_curve_eval_metrics(
+                _proc_p, _mode_p, _sim_p, _exp_p, _complete_curve_eval_dir,
                 approach=_approach_p,
             )
 
