@@ -242,21 +242,7 @@ def simulate(n_batches: int = N_BATCHES,
                     volume_L, vol_affected, rng
                 )
                 
-                # Machine Breakdowns: 5% chance before working/heat
-                if act_name in ('working', 'heat') and rng.random() < 0.05:
-                    breakdown_dur = float(rng.uniform(60.0, 120.0))
-                    events.append({
-                        'case_id':               case_id,
-                        'activity':              f'{resource_name}_maintenance',
-                        'timestamp_start':       current_time,
-                        'timestamp_end':         current_time + timedelta(minutes=breakdown_dur),
-                        'higher_level_activity': 'sterilization_process',
-                        'station':               station,
-                        'object_type':           object_type,
-                        'object':                resource_name,
-                        'object_attributes':     obj_attrs,
-                    })
-                    current_time += timedelta(minutes=breakdown_dur) + timedelta(seconds=1)
+                # Machine Breakdowns removed as requested
 
                 ts_start = current_time
                 ts_end   = current_time + timedelta(minutes=dur)
@@ -277,7 +263,10 @@ def simulate(n_batches: int = N_BATCHES,
                 # Microscopic rework inside Autoclave
                 if station == 'Autoclaving' and act_name == 'cool':
                     if rng.random() < 0.15:  # 15% chance to rework
-                        rework_events = [e for e in cfg['events'] if e['name'] in ('heat', 'hold', 'cool')]
+                        if rng.random() < 0.5:  # 50% of reworks start from heat
+                            rework_events = [e for e in cfg['events'] if e['name'] in ('heat', 'hold', 'cool')]
+                        else:                   # 50% of reworks start from prepare
+                            rework_events = [e for e in cfg['events'] if e['name'] in ('prepare', 'heat', 'hold', 'cool')]
                         events_to_process = events_to_process[:idx+1] + rework_events + events_to_process[idx+1:]
                 
                 idx += 1
