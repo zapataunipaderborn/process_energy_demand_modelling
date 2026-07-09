@@ -8306,12 +8306,17 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
         return None
 
     predict_fn = ep.get('predict_fn')
+    # exog_cols lives at the top level for the energy-aware modes' pipelines,
+    # but is nested under 'full_pipeline' for Curve-Only Evaluation pipelines
+    # (baseline, exog_prev_activity, etc. all wrap the trained pipeline dict
+    # under 'full_pipeline' when reassembled — see modelling.py).
+    exog_cols = ep.get('exog_cols') or ep.get('full_pipeline', {}).get('exog_cols')
     exog_vals = {}
-    if ep.get('exog_cols') and activity_exog_means:
+    if exog_cols and activity_exog_means:
         act_means = activity_exog_means.get(activity, {})
         exog_vals = {
             col: np.array([v]) for col, v in act_means.items()
-            if col in ep['exog_cols']
+            if col in exog_cols
         }
 
     n_ts = max(2, round(duration_minutes / temporal_resolution_minutes))
@@ -8323,20 +8328,31 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     if predict_fn is None:
         return input_curve
 
-    # energy_pipelines is populated by two different producers with
-    # incompatible predict_fn signatures: the energy-aware simulation modes
-    # use keyword args (raw_values=, activity=, object_attributes=, exog=),
-    # while the Curve-Only Evaluation section's pipelines use positional
-    # (rv, act, attrs) with no exog support at all. Try the keyword form
-    # first, fall back to positional on a signature mismatch.
-    try:
-        return predict_fn(
-            raw_values=input_curve, activity=activity,
-            object_attributes=object_attributes,
-            exog=exog_vals if exog_vals else None,
-        )
-    except TypeError:
-        return predict_fn(input_curve, activity, object_attributes)
+    # energy_pipelines is populated by several different producers with
+    # different predict_fn signatures: the energy-aware simulation modes use
+    # keyword args (raw_values=, activity=, object_attributes=, exog=);
+    # Curve-Only Evaluation's plain approaches (baseline, instance_stats...)
+    # use positional (rv, act, attrs) with no exog param at all; its
+    # exog-aware approaches (exog_prev_activity, seq2seq_exog...) use
+    # positional (rv, act, attrs, exog=None). Try each in turn — a plain
+    # 3-arg positional call as the last resort would silently succeed on an
+    # exog-aware predict_fn by using its exog=None default, silently
+    # dropping the external-factor values, so the exog-carrying attempt
+    # must come before the exog-less one.
+    exog_arg = exog_vals if exog_vals else None
+    attempts = (
+        lambda: predict_fn(raw_values=input_curve, activity=activity,
+                           object_attributes=object_attributes, exog=exog_arg),
+        lambda: predict_fn(input_curve, activity, object_attributes, exog_arg),
+        lambda: predict_fn(input_curve, activity, object_attributes),
+    )
+    last_exc = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_exc = exc
+    raise last_exc
 
 
 def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
@@ -8472,6 +8488,90 @@ def compare_energy_distributions(real_stats_df, sim_stats_df, statistic='mean_va
     per_case_sensor = pd.DataFrame(rows_b)
 
     return {'per_activity_sensor': per_activity_sensor, 'per_case_sensor': per_case_sensor}
+
+
+# ---------------------------------------------------------------------------
+# Raw pooled-value distribution comparison — no per-case sum/mean at all.
+#
+# Summing or averaging a sensor's readings across a case only makes physical
+# sense for extensive/flow quantities (power, mass flow) — summing readings
+# of an intensive quantity like temperature has no meaning. This compares
+# every individual reading directly instead, so it works uniformly for any
+# sensor type: pool every timestep from every instance into one set of
+# numbers per sensor (real vs. simulated) and compare those distributions.
+# ---------------------------------------------------------------------------
+
+def pool_real_curve_values(real_expanded_df, sensors, activity_col='activity_log'):
+    """
+    Pool every raw sensor reading (every timestep, every activity instance,
+    every case) per sensor — no per-case or per-activity aggregation.
+
+    Returns {sensor: np.ndarray of all real readings for that sensor}.
+    """
+    pooled = {}
+    for sensor in sensors:
+        if sensor not in real_expanded_df.columns:
+            continue
+        vals = real_expanded_df[sensor].dropna().values
+        if len(vals) > 0:
+            pooled[sensor] = np.asarray(vals, dtype=float)
+    return pooled
+
+
+def pool_simulated_curve_values(simulated_df, energy_pipelines, sensors,
+                                activity_exog_means=None,
+                                temporal_resolution_minutes=15.0,
+                                case_col='case_id', activity_col='activity',
+                                object_col='object'):
+    """
+    Pool every predicted sensor curve value (every timestep of every
+    predicted instance) per sensor — no per-instance or per-case aggregation.
+    Mirrors annotate_simulated_curve_stats's prediction step, but keeps the
+    full curve instead of reducing it to mean/total.
+
+    Returns {sensor: np.ndarray of all predicted values for that sensor}.
+    """
+    pooled = {s: [] for s in sensors}
+    for _, row in simulated_df.iterrows():
+        duration_minutes = (
+            (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60.0
+        )
+        object_attributes = row.get('object_attributes', {}) or {}
+        for sensor in sensors:
+            curve = predict_curve_for_instance(
+                row[activity_col], row[object_col], duration_minutes,
+                object_attributes, energy_pipelines, sensor,
+                activity_exog_means, temporal_resolution_minutes,
+            )
+            if curve is None or len(curve) == 0:
+                continue
+            pooled[sensor].extend(np.asarray(curve, dtype=float).tolist())
+    return {s: np.array(v) for s, v in pooled.items() if v}
+
+
+def compare_pooled_value_distributions(real_pooled, sim_pooled):
+    """
+    Wasserstein distance between the pooled raw-value distributions
+    (from pool_real_curve_values / pool_simulated_curve_values), per sensor.
+    Works uniformly for intensive (temperature, concentration) and
+    extensive (power, flow) sensors alike, since nothing is summed or
+    averaged before comparing.
+    """
+    from scipy.stats import wasserstein_distance
+    rows = []
+    for sensor, real_vals in real_pooled.items():
+        sim_vals = sim_pooled.get(sensor)
+        if sim_vals is None or len(sim_vals) == 0 or len(real_vals) == 0:
+            continue
+        rows.append({
+            'sensor':      sensor,
+            'n_real':      len(real_vals),
+            'n_sim':       len(sim_vals),
+            'real_median': float(np.median(real_vals)),
+            'sim_median':  float(np.median(sim_vals)),
+            'wasserstein': float(wasserstein_distance(real_vals, sim_vals)),
+        })
+    return pd.DataFrame(rows)
 
 
 def evaluate_pipeline_joint_duration(test_curves, pipeline):
