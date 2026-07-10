@@ -39,11 +39,11 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_802',
+        'run_name':              'experiment_803',
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-        'temporal_resolution':   '5min',
+        'temporal_resolution':   '15min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+        'mining_algorithms':     ['heuristic', 'alpha'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
         'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
     },

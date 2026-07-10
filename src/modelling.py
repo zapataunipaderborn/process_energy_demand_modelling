@@ -866,9 +866,11 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
     real per-activity curves into one complete real profile and the
     predicted (curve-fitting pipeline `approach`, applied to the simulated
     log's own activities/durations) curves into one complete simulated
-    profile for that same case, then compares the two with the
-    curve-as-distribution Wasserstein distance (time as transport axis) —
-    shift-tolerant, unlike per-timestep MAE/RMSE.
+    profile for that same case, then compares the two along two orthogonal
+    axes: wasserstein_time (is the timing/shape right — shift-tolerant,
+    unlike per-timestep MAE/RMSE) and wasserstein_value (is the distribution
+    of magnitudes right — order-blind, catches scale/spread errors that
+    wasserstein_time can't see).
 
     Silently no-ops when there's nothing to compare against (no trained
     pipelines for this process/approach, no detectable sensor columns, or no
@@ -904,11 +906,11 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
     case_curve_df.to_csv(os.path.join(out_dir, f'per_case_complete_curve{suffix}.csv'), index=False)
 
     summary = (
-        case_curve_df.groupby('sensor')[['wasserstein_time', 'total_energy_rel_error']]
+        case_curve_df.groupby('sensor')[['wasserstein_time', 'wasserstein_value']]
         .median()
         .reset_index()
-        .rename(columns={'wasserstein_time': 'wasserstein_time_median',
-                          'total_energy_rel_error': 'total_energy_rel_error_median'})
+        .rename(columns={'wasserstein_time':  'wasserstein_time_median',
+                          'wasserstein_value': 'wasserstein_value_median'})
     )
     summary['n_cases'] = case_curve_df.groupby('sensor')['case_id'].nunique().values
     summary['process'] = process
@@ -4215,8 +4217,21 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     # in APPROACHES with a non-empty all_energy_pipelines_<approach> dict), not
     # just those two. Independent list, so it doesn't change what
     # energy_distribution_results computes.
+    #
+    # seq2seq* approaches are excluded: predict_curve_for_instance calls
+    # predict_fn statelessly, one activity instance at a time, with no access
+    # to the case's running history. The sklearn/DTW/regression approaches
+    # (baseline, exog_prev_activity, ml_linear, ...) are designed for exactly
+    # that; the seq2seq encoder-decoder approaches expect an autoregressive
+    # rollout (see the "autoreg" evaluation block above) and produce
+    # non-finite output when called this way — confirmed by every seq2seq*
+    # attempt failing with scipy's "Weight array-like sum must be positive
+    # and finite" on the experiment_802 run. This mirrors why
+    # _energy_approaches_available above never included them either.
     _complete_curve_approaches_available = []
     for _appr_candidate in APPROACHES:
+        if _appr_candidate.startswith('seq2seq'):
+            continue
         _dict_name_c = _ENERGY_APPROACH_DICT_NAMES.get(_appr_candidate, f'all_energy_pipelines_{_appr_candidate}')
         if _dict_name_c in dir() and globals().get(_dict_name_c):
             _complete_curve_approaches_available.append(_appr_candidate)
