@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from autoclave_function import sterilization_profile
+from old_notebooks.simulation_process_original.autoclave_function import sterilization_profile
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 

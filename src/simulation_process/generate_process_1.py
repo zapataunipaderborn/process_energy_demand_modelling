@@ -1,5 +1,5 @@
 """
-Sterilization process simulation → simulation_process/data/process_1/datasets/
+Sterilization process simulation → data/gold/experiment_1/process_1/datasets/
 
 Produces:
   df_event_log.parquet       – process event log (same schema as process_2)
@@ -595,9 +595,11 @@ def build_production_plan(df_event_log: pd.DataFrame) -> pd.DataFrame:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    # <repo_root>/data/gold/experiment_1/process_1/datasets — the same location used
+    # by the original (non-physical) simulation, so this replaces it in place.
     out_dir = (
-        Path(__file__).resolve().parent
-        / 'data' / 'process_1' / 'datasets'
+        Path(__file__).resolve().parent.parent.parent
+        / 'data' / 'gold' / 'experiment_1' / 'process_1' / 'datasets'
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
