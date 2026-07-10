@@ -23,7 +23,7 @@ def sterilization_profile(t_ges = 6000,
     t_heating = t_ges * 0.27
     t_holding = t_ges * 0.53
     t_cooling = t_ges * 0.19
-    t_phase = round(0.71 * t_heating)
+    t_phase = round(0.55 * t_heating)  # heat demand starts tapering off earlier
 
     def get_latent_heat(T, fluid='Water'):
         h_liq = CP.PropsSI('H', 'T', T, 'Q', 0, fluid)
@@ -169,12 +169,17 @@ def sterilization_profile(t_ges = 6000,
         'Q_kW': Q_dot_steam_total
     })
 
-    # Holding phase (constant T, constant Q)
+    # Holding phase (constant T, constant Q on average — with realistic steam-valve
+    # chatter around that level, since a perfectly flat line looks unrealistic)
     t_holding_abs = np.arange(int(t_heating) + 1, int(t_heating) + int(t_holding) + 1)
     T_holding_arr = np.full_like(t_holding_abs, T_steri)
     # For Q: Option A is customary (total heat loss),
     # Option B is per above. Here, **A** (Q_holding_fill).
-    Q_holding_arr = np.full_like(t_holding_abs, Q_holding_fill)
+    holding_noise_rel = 0.06
+    Q_holding_arr = Q_holding_fill + np.random.normal(
+        0.0, Q_holding_fill * holding_noise_rel, len(t_holding_abs)
+    )
+    Q_holding_arr = np.clip(Q_holding_arr, 0.0, None)
     df_holding = pd.DataFrame({
         'time': t_holding_abs,
         'temperature_c': T_holding_arr-273.15,
