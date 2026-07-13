@@ -176,7 +176,7 @@ if TEMPORAL_RESOLUTION != 'original':
 
 # %%
 _env_processes   = os.environ.get('PIPELINE_PROCESSES_TO_RUN')
-processes_to_run = _env_processes.split(',') if _env_processes else ['process_1', 'process_2', 'process_3', 'process_4', 'process_5']
+processes_to_run = _env_processes.split(',') if _env_processes else ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5']
 
 print(f"Processes to run: {processes_to_run}")
 
@@ -198,11 +198,17 @@ process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_senso
 # process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
 # process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
 
-process_datasets_to_model_sensors['process_4'] = process_datasets_to_model_sensors.get('process_4', {})
-# process_4 = spray tower (formerly process_3)
-# process_datasets_to_model_sensors['process_4']['objects_to_model'] = ['tower_1']
-# process_datasets_to_model_sensors['process_4']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_4']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
+process_datasets_to_model_sensors['process_4_1'] = process_datasets_to_model_sensors.get('process_4_1', {})
+# process_4_1 = spray tower (formerly process_3), regime before June 2025
+# process_datasets_to_model_sensors['process_4_1']['objects_to_model'] = ['tower_1']
+# process_datasets_to_model_sensors['process_4_1']['activities_to_model'] = ['Produktion']
+# process_datasets_to_model_sensors['process_4_1']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
+
+process_datasets_to_model_sensors['process_4_2'] = process_datasets_to_model_sensors.get('process_4_2', {})
+# process_4_2 = spray tower (formerly process_3), regime from June 2025 onward
+# process_datasets_to_model_sensors['process_4_2']['objects_to_model'] = ['tower_1']
+# process_datasets_to_model_sensors['process_4_2']['activities_to_model'] = ['Produktion']
+# process_datasets_to_model_sensors['process_4_2']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
 
 process_datasets_to_model_sensors['process_5'] = process_datasets_to_model_sensors.get('process_5', {})
 # process_5 = Erhitzer (formerly process_4)

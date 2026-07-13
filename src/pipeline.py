@@ -40,7 +40,7 @@ EXPERIMENTS = [
     {
         'data_experiment':       '1',
         'run_name':              'experiment_900',
-        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
+        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic', 'alpha'],#None,   # e.g. ['heuristic', 'inductive'] to test only those

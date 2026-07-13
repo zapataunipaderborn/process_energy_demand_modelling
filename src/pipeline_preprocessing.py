@@ -975,8 +975,6 @@ process = 3  # silver data still lives in process_3/
 
 # Define folder paths
 files_folder_silver = folder_silver_base / f'process_{process}'
-files_folder_gold = folder_gold_base / 'process_4'   # saved as process_4 in gold
-files_folder_gold.mkdir(parents=True, exist_ok=True)
 
 df = pd.read_parquet(files_folder_silver / "data_prepared_for_analysis.parquet")
 
@@ -1206,23 +1204,38 @@ print(df_expanded.columns)
 
 
 # Save datasets
-files_folder_gold_datasets = files_folder_gold / 'datasets'
-files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
+#
+# process_4 (spray tower) shows a clear regime shift starting June 2025:
+# Produktion activity duration median ~171-234min (Nov'24-May'25) jumps to
+# ~227-381min (Jun'25 onward), events/case drops from ~10-13 to ~7-10.
+# Split into two complete, independent datasets at that boundary so each
+# gets its own temporal train/test split downstream instead of blending
+# two different operating regimes into one process.
+split_date_process_4 = '2025-06-01'
 
-df_expanded.to_parquet(
-    files_folder_gold_datasets / "df_expanded.parquet",
-    index=False
-)
+df_event_log_1 = df_event_log[df_event_log['case_id'] < split_date_process_4].copy()
+df_event_log_2 = df_event_log[df_event_log['case_id'] >= split_date_process_4].copy()
 
-df_event_log.to_parquet(
-    files_folder_gold_datasets / "df_event_log.parquet",
-    index=False
-)
+df_expanded_1 = df_expanded[df_expanded['case_id_log'] < split_date_process_4].copy()
+df_expanded_2 = df_expanded[df_expanded['case_id_log'] >= split_date_process_4].copy()
 
-df_production_plan.to_parquet(
-    files_folder_gold_datasets / "df_production_plan.parquet",
-    index=False
-)
+df_production_plan_1 = df_production_plan[df_production_plan['case_id'] < split_date_process_4].copy()
+df_production_plan_2 = df_production_plan[df_production_plan['case_id'] >= split_date_process_4].copy()
+
+for _suffix, _ev, _exp, _plan in [
+    ('process_4_1', df_event_log_1, df_expanded_1, df_production_plan_1),
+    ('process_4_2', df_event_log_2, df_expanded_2, df_production_plan_2),
+]:
+    _files_folder_gold = folder_gold_base / _suffix
+    _files_folder_gold_datasets = _files_folder_gold / 'datasets'
+    _files_folder_gold_datasets.mkdir(parents=True, exist_ok=True)
+
+    _exp.to_parquet(_files_folder_gold_datasets / "df_expanded.parquet", index=False)
+    _ev.to_parquet(_files_folder_gold_datasets / "df_event_log.parquet", index=False)
+    _plan.to_parquet(_files_folder_gold_datasets / "df_production_plan.parquet", index=False)
+
+    print(f"{_suffix}: {_ev['case_id'].nunique()} cases, date range "
+          f"{_ev['timestamp_start'].min()} to {_ev['timestamp_start'].max()}")
 
 
 
