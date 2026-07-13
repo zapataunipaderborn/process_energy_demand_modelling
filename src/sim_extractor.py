@@ -8774,6 +8774,311 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------------------
+# "Schedule Profile Evaluation" — what if we skip process simulation entirely?
+#
+# Everything above (compare_complete_case_curves) predicts a case's energy
+# profile by first simulating its activities/durations via the discovered
+# process model, then predicting each activity's curve. This section builds
+# and evaluates an alternative that never sees the process at all: given only
+# what a production schedule knows in advance — recipe/case attributes, case
+# start time, external factors (a weather forecast, not a simulation output)
+# — predict the WHOLE case's energy profile directly, one case = one curve,
+# the same DBA-barycenter + DTW-decode + regression architecture used
+# elsewhere in this file, just at case granularity instead of activity
+# granularity. Answers: does going through process simulation actually beat
+# just regressing straight from the schedule to a profile?
+#
+# Paired with a second, even more naive reference: a stochastic generator
+# (per-canonical-position Normal fit, sampled) that doesn't even use schedule
+# features — the "DES + stochastic distributions" style of prior energy-DES
+# literature (e.g. Kouki et al. 2017), as opposed to a learned model.
+#
+# Since there's no simulated duration for a schedule-only prediction, every
+# case's predicted (and stochastic) profile is placed on the SAME fixed time
+# axis: the mean real case duration over the training set. That value is also
+# what the DBA barycenter itself is expressed against, so training and
+# prediction use one consistent notion of "how long is a typical case" rather
+# than each case's own (unknown, at prediction time) length.
+# ---------------------------------------------------------------------------
+
+def build_case_level_curves(real_expanded_df, sensor, ef_cols=None,
+                            case_col='case_id_log', time_col='datetime_energy',
+                            start_col='timestamp_start_log'):
+    """
+    Build one complete real curve plus a schedule-only feature dict per case,
+    for one sensor. Deliberately no per-activity information — this is the
+    same granularity a production schedule offers before any process
+    simulation: case/recipe attributes, case start time, external factors.
+
+    Returns a list of dicts: {'case_id', 'values', 'duration_minutes', 'attributes'}.
+    """
+    ef_cols = ef_cols or []
+    out = []
+    for cid, g in real_expanded_df.groupby(case_col):
+        curves = _extract_real_case_curves_all_sensors(g, [sensor], time_col=time_col, start_col=start_col)
+        if sensor not in curves:
+            continue
+        _, v = curves[sensor]
+        if len(v) < 2:
+            continue
+
+        raw_attrs = g['object_attributes_log'].iloc[0] if 'object_attributes_log' in g.columns and not g.empty else {}
+        attrs = dict(raw_attrs) if isinstance(raw_attrs, dict) else {}
+        ts = pd.to_datetime(g[start_col]).min()
+        attrs['hour_of_day'] = float(ts.hour) if pd.notnull(ts) else 0.0
+        attrs['day_of_week'] = float(ts.dayofweek) if pd.notnull(ts) else 0.0
+        for col in ef_cols:
+            if col in g.columns:
+                vals = g[col].dropna()
+                attrs[col] = float(vals.mean()) if len(vals) else float('nan')
+
+        case_start = pd.to_datetime(g[start_col]).min()
+        case_end   = pd.to_datetime(g[time_col]).max()
+        duration_minutes = (case_end - case_start).total_seconds() / 60.0 if pd.notnull(case_start) and pd.notnull(case_end) else float(len(v))
+
+        out.append({'case_id': cid, 'values': v, 'duration_minutes': max(duration_minutes, 1e-6),
+                    'attributes': attrs})
+    return out
+
+
+def train_schedule_profile_pipeline(train_cases, fixed_length=100, val_size=0.2,
+                                    random_state=42, max_barycenter_cases=150,
+                                    model_class=None, verbose=0):
+    """
+    Train a case-level, schedule-only profile predictor: DBA barycenter + DTW
+    decode + regression — the same architecture as build_and_train_pipeline,
+    but the base unit is a whole case, and the only inputs are schedule-level
+    features (see build_case_level_curves) — no simulated activities,
+    duration, or previous-activity context.
+
+    max_barycenter_cases caps how many cases feed the DBA computation itself
+    (the slow part) — the regression fit afterwards uses all of them. This
+    keeps runtime roughly constant regardless of how many cases a process has.
+
+    Returns a pipeline dict compatible with predict_schedule_profile_curve,
+    or None if there isn't enough data to train on.
+    """
+    if model_class is None:
+        model_class = GradientBoostingRegressor
+    if len(train_cases) < 4:
+        if verbose:
+            print(f"  [schedule-profile] skipped: only {len(train_cases)} cases (need >= 4)")
+        return None
+
+    rng = np.random.default_rng(random_state)
+    if len(train_cases) <= max_barycenter_cases:
+        bary_cases = train_cases
+    else:
+        idx = rng.choice(len(train_cases), size=max_barycenter_cases, replace=False)
+        bary_cases = [train_cases[i] for i in idx]
+
+    resampled_for_dba = np.array([
+        np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
+        for c in bary_cases
+    ])[:, :, np.newaxis]
+    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = dba_barycenter[:, 0]
+
+    for c in train_cases:
+        c['resampled_values'] = _align_curve_with_dtw(c['values'], reference_curve)
+
+    all_keys, key_types = _infer_key_types(train_cases)
+
+    _rel_denom = max(fixed_length - 1, 1)
+    rows = []
+    for c in train_cases:
+        for position_idx in range(fixed_length):
+            row = {'case_id': c['case_id'], 'position_idx': position_idx,
+                   'relative_pos': position_idx / _rel_denom, 'y': c['resampled_values'][position_idx]}
+            for key in all_keys:
+                value = c['attributes'].get(key, None)
+                if key_types[key] == 'numeric':
+                    try:
+                        row[key] = float(value) if value is not None else np.nan
+                    except (ValueError, TypeError):
+                        row[key] = np.nan
+                else:
+                    row[key] = str(value) if value is not None else 'None'
+            rows.append(row)
+    df_reg = pd.DataFrame(rows)
+
+    categorical_cols = [k for k in all_keys if key_types[k] == 'category']
+    X_all = df_reg[['position_idx', 'relative_pos']].copy()
+    for key in all_keys:
+        X_all = X_all.assign(**{key: df_reg[key].values})
+    if categorical_cols:
+        X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    y_all = df_reg['y'].copy()
+
+    unique_cases = df_reg['case_id'].unique()
+    if len(unique_cases) < 4:
+        train_inst, val_inst = unique_cases, unique_cases
+    else:
+        train_inst, val_inst = train_test_split(unique_cases, test_size=val_size, random_state=random_state)
+    train_mask = df_reg['case_id'].isin(train_inst)
+    val_mask   = df_reg['case_id'].isin(val_inst)
+
+    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
+    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = ['position_idx', 'relative_pos'] + [k for k in all_keys if key_types[k] == 'numeric']
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(X_train[numeric_feature_cols])
+        X_val.loc[:, numeric_feature_cols]   = feature_scaler.transform(X_val[numeric_feature_cols])
+
+    X_train = X_train.fillna(0)
+    X_val   = X_val.fillna(0)
+
+    model = model_class(n_estimators=150, max_depth=5, learning_rate=0.1,
+                        subsample=0.8, random_state=random_state)
+    model.fit(X_train, y_train)
+    val_mae = float(mean_absolute_error(y_val, model.predict(X_val))) if len(X_val) else float('nan')
+
+    if verbose:
+        print(f"  [schedule-profile] trained on {len(train_cases)} cases "
+              f"({len(bary_cases)} for barycenter), val_mae={val_mae:.4f}")
+
+    return {
+        'model': model, 'reference_curve': reference_curve, 'fixed_length': fixed_length,
+        'all_keys': all_keys, 'key_types': key_types, 'feature_columns': feature_columns,
+        'feature_scaler': feature_scaler, 'numeric_feature_cols': numeric_feature_cols,
+        'val_mae': val_mae,
+    }
+
+
+def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_minutes):
+    """
+    Predict a complete case profile from schedule-only attributes. Output time
+    axis is fixed at median_case_duration_minutes for every case — the only
+    length assumption available without simulating the process, not the
+    (unknown, at prediction time) true case duration.
+
+    Returns (t, v), same shape as the other build_*_case_curve functions.
+    """
+    fixed_length          = pipeline['fixed_length']
+    model                 = pipeline['model']
+    feature_columns       = pipeline['feature_columns']
+    feature_scaler        = pipeline.get('feature_scaler')
+    numeric_feature_cols  = pipeline.get('numeric_feature_cols', [])
+    all_keys              = pipeline['all_keys']
+    key_types             = pipeline['key_types']
+
+    _rel_denom = max(fixed_length - 1, 1)
+    rows = []
+    for position_idx in range(fixed_length):
+        row = {'position_idx': position_idx, 'relative_pos': position_idx / _rel_denom}
+        for key in all_keys:
+            value = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows.append(row)
+    X = pd.DataFrame(rows)
+
+    categorical_cols = [k for k in all_keys if key_types[k] == 'category']
+    if categorical_cols:
+        X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+    for col in feature_columns:
+        if col not in X.columns:
+            X[col] = 0
+    X = X[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X.columns]
+        if cols_to_scale:
+            X[cols_to_scale] = X[cols_to_scale].astype('float64')
+            X.loc[:, cols_to_scale] = feature_scaler.transform(X[cols_to_scale])
+    X = X.fillna(0)
+
+    y_pred = model.predict(X)
+    t = np.linspace(0, median_case_duration_minutes, fixed_length)
+    return t, np.asarray(y_pred, dtype=float)
+
+
+def fit_stochastic_profile_generator(train_cases, fixed_length=100):
+    """
+    Population-level reference generator with no schedule conditioning at
+    all: fit a Normal distribution per canonical position from the real
+    training case curves (same fractional-progress resampling as the
+    barycenter above). Matches the "DES + stochastic distributions" style of
+    prior energy-DES literature (e.g. Kouki et al. 2017), as opposed to a
+    learned model — the floor a schedule-aware model needs to beat.
+    """
+    if len(train_cases) < 2:
+        return None
+    resampled = np.array([
+        np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
+        for c in train_cases
+    ])
+    return {'mean': resampled.mean(axis=0), 'std': resampled.std(axis=0), 'fixed_length': fixed_length}
+
+
+def sample_stochastic_profile(generator, median_case_duration_minutes, rng=None):
+    """Draw one sample curve from the fitted per-position Normal distributions."""
+    rng = rng if rng is not None else np.random.default_rng()
+    mean, std = generator['mean'], generator['std']
+    sample = rng.normal(mean, np.clip(std, 1e-6, None))
+    sample = np.clip(sample, 0, None)
+    t = np.linspace(0, median_case_duration_minutes, generator['fixed_length'])
+    return t, sample
+
+
+def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stochastic_generator,
+                                             median_case_duration_minutes, random_state=42):
+    """
+    For each real test case (from build_case_level_curves), compare its real
+    complete profile against (a) the schedule-only prediction and (b) one
+    stochastic-generator sample, using the same two Wasserstein distances as
+    compare_complete_case_curves.
+
+    Returns a DataFrame with one row per case_id:
+    ['case_id', 'schedule_wasserstein_time', 'schedule_wasserstein_value',
+     'stochastic_wasserstein_time', 'stochastic_wasserstein_value'].
+    """
+    from scipy.stats import wasserstein_distance
+    rng = np.random.default_rng(random_state)
+    rows = []
+    for c in test_cases:
+        v_real = c['values']
+        t_real = np.linspace(0, c['duration_minutes'], len(v_real))
+        w_real = np.clip(v_real, 0, None)
+        if w_real.sum() <= 0:
+            continue
+
+        row = {'case_id': c['case_id']}
+
+        if schedule_pipeline is not None:
+            t_sched, v_sched = predict_schedule_profile_curve(
+                c['attributes'], schedule_pipeline, median_case_duration_minutes
+            )
+            w_sched = np.clip(v_sched, 0, None)
+            if w_sched.sum() > 0:
+                row['schedule_wasserstein_time']  = float(wasserstein_distance(t_real, t_sched, u_weights=w_real, v_weights=w_sched))
+                row['schedule_wasserstein_value'] = float(wasserstein_distance(v_real, v_sched))
+
+        if stochastic_generator is not None:
+            t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, median_case_duration_minutes, rng=rng)
+            w_stoch = np.clip(v_stoch, 0, None)
+            if w_stoch.sum() > 0:
+                row['stochastic_wasserstein_time']  = float(wasserstein_distance(t_real, t_stoch, u_weights=w_real, v_weights=w_stoch))
+                row['stochastic_wasserstein_value'] = float(wasserstein_distance(v_real, v_stoch))
+
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def evaluate_pipeline_joint_duration(test_curves, pipeline):
     """
     Timing-aware evaluation for joint duration experiments.

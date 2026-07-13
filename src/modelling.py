@@ -92,6 +92,10 @@ from sim_extractor import extract_energy_modifiers, extract_energy_direct_models
 from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from sim_extractor import compare_complete_case_curves
+from sim_extractor import (
+    build_case_level_curves, train_schedule_profile_pipeline,
+    fit_stochastic_profile_generator, compare_schedule_and_stochastic_profiles,
+)
 from xgboost import XGBRegressor
 
 # %%
@@ -609,6 +613,15 @@ RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'tr
 # Off by default; does NOT affect curve-pipeline training (RUN_CURVE_ONLY_EVALUATION),
 # which the energy-distribution metrics still depend on.
 RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', 'false').lower() == 'true'
+# Schedule Profile Evaluation — ablation of the whole process-simulation step:
+# predicts each case's COMPLETE energy profile directly from schedule-only
+# features (recipe/case attributes, start time, external factors — no
+# simulated activities/durations), plus a stochastic (no-features-at-all)
+# reference generator, both compared against the same real test cases used by
+# the complete-curve eval. Off by default — trains one extra model per
+# (process, sensor), on top of everything else. Does NOT affect any other
+# evaluation. See sim_extractor.py's "Schedule Profile Evaluation" section.
+RUN_SCHEDULE_PROFILE_EVAL = os.environ.get('PIPELINE_RUN_SCHEDULE_PROFILE_EVAL', 'false').lower() == 'true'
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          DTW + position index (sklearn regressor)
@@ -669,12 +682,14 @@ _energy_results_dir  = os.path.join(_run_dir, 'energy_results')
 _predicted_logs_dir  = os.path.join(_run_dir, 'predicted_logs')
 _energy_distribution_dir = os.path.join(_run_dir, 'energy_distribution_results')
 _complete_curve_eval_dir = os.path.join(_run_dir, 'complete_curve_eval_results')
+_schedule_profile_eval_dir = os.path.join(_run_dir, 'schedule_profile_eval_results')
 os.makedirs(_plots_dir, exist_ok=True)
 os.makedirs(_process_results_dir, exist_ok=True)
 os.makedirs(_energy_results_dir, exist_ok=True)
 os.makedirs(_predicted_logs_dir, exist_ok=True)
 os.makedirs(_energy_distribution_dir, exist_ok=True)
 os.makedirs(_complete_curve_eval_dir, exist_ok=True)
+os.makedirs(_schedule_profile_eval_dir, exist_ok=True)
 
 LOG_FILE = os.path.join(_run_dir, 'pipeline_execution.log')
 
@@ -920,6 +935,83 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
 
     print(f"  💾 Complete-curve eval ({approach}) saved → "
           f"complete_curve_eval_results/{process}/{safe_mode}/")
+
+
+def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, sensors, ef_cols,
+                                output_root, best_mode_safe=None, complete_curve_dir=None):
+    """
+    "Schedule Profile Evaluation" — see sim_extractor.py's Schedule Profile
+    Evaluation section for the design. Per sensor: trains a schedule-only
+    case-level predictor and a stochastic reference generator on TRAIN cases,
+    evaluates both against REAL TEST cases, and (if available) merges in the
+    already-computed per-case W1 numbers for the 'exog_prev_activity'
+    approach on this process's best-fidelity simulation mode — giving a
+    3-way comparison, all on the exact same real cases: schedule-only vs.
+    stochastic vs. the full process-simulation-based pipeline ("Best, mine").
+
+    Silently no-ops (per sensor) when there isn't enough data to train on.
+    """
+    import time as _t
+    _t0 = _t.perf_counter()
+
+    best_case_df = None
+    if best_mode_safe and complete_curve_dir:
+        _best_path = os.path.join(complete_curve_dir, process, best_mode_safe,
+                                  'per_case_complete_curve_exog_prev_activity.csv')
+        if os.path.exists(_best_path):
+            best_case_df = pd.read_csv(_best_path)
+            best_case_df['case_id'] = best_case_df['case_id'].astype(str)
+
+    all_rows = []
+    for sensor in sensors:
+        train_cases = build_case_level_curves(train_expanded_df, sensor, ef_cols=ef_cols)
+        test_cases  = build_case_level_curves(test_expanded_df, sensor, ef_cols=ef_cols)
+        if len(train_cases) < 4 or not test_cases:
+            continue
+
+        median_case_duration_minutes = float(np.median([c['duration_minutes'] for c in train_cases]))
+
+        schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
+        stochastic_gen    = fit_stochastic_profile_generator(train_cases)
+
+        cmp_df = compare_schedule_and_stochastic_profiles(
+            test_cases, schedule_pipeline, stochastic_gen, median_case_duration_minutes,
+        )
+        if cmp_df.empty:
+            continue
+        cmp_df['sensor'] = sensor
+        cmp_df['case_id'] = cmp_df['case_id'].astype(str)
+
+        if best_case_df is not None:
+            _best_sensor = (
+                best_case_df[best_case_df['sensor'] == sensor]
+                [['case_id', 'wasserstein_time', 'wasserstein_value']]
+                .rename(columns={'wasserstein_time': 'best_wasserstein_time',
+                                 'wasserstein_value': 'best_wasserstein_value'})
+            )
+            cmp_df = cmp_df.merge(_best_sensor, on='case_id', how='left')
+
+        all_rows.append(cmp_df)
+
+    if not all_rows:
+        return
+
+    result = pd.concat(all_rows, ignore_index=True)
+    result['process'] = process
+
+    out_dir = os.path.join(output_root, process)
+    os.makedirs(out_dir, exist_ok=True)
+    result.to_csv(os.path.join(out_dir, 'per_case_schedule_profile_eval.csv'), index=False)
+
+    _metric_cols = [c for c in result.columns if c.endswith('_wasserstein_time') or c.endswith('_wasserstein_value')]
+    summary = result.groupby('sensor')[_metric_cols].median().reset_index()
+    summary['n_cases'] = result.groupby('sensor')['case_id'].nunique().values
+    summary['process'] = process
+    summary.to_csv(os.path.join(out_dir, 'schedule_profile_eval_summary.csv'), index=False)
+
+    _elapsed = _t.perf_counter() - _t0
+    print(f"  💾 Schedule Profile Evaluation saved → schedule_profile_eval_results/{process}/  "
+          f"({len(sensors)} sensors, {_elapsed:.1f}s)")
 
 
 # Default definitions to avoid NameError when testing is skipped
@@ -4247,6 +4339,42 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
             _save_complete_curve_eval_metrics(
                 _proc_p, _mode_p, _sim_p, _exp_p, _complete_curve_eval_dir,
                 approach=_approach_p,
+            )
+
+    # ── Schedule Profile Evaluation (opt-in — off by default) ─────────────
+    # Runs once per process (not per mode): trains a schedule-only case-level
+    # predictor + stochastic generator on train cases, evaluates both against
+    # real test cases, and merges in the already-computed per-case
+    # 'exog_prev_activity' numbers for this process's best-fidelity mode as
+    # the "Best, mine" comparator — no retraining/resimulating needed for
+    # that column, it's already sitting on disk from the loop just above.
+    if RUN_SCHEDULE_PROFILE_EVAL:
+        _best_mode_by_process = {}
+        _best_error_by_process = {}
+        for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
+            _err = _core_p.get('test_overall_error')
+            if _err is None:
+                continue
+            if _proc_p not in _best_error_by_process or _err < _best_error_by_process[_proc_p]:
+                _best_error_by_process[_proc_p] = _err
+                _best_mode_by_process[_proc_p] = str(_mode_p).replace(' ', '_').replace('/', '_')
+
+        print("\n" + "="*50)
+        print(f"SCHEDULE PROFILE EVALUATION ({len({p for p, *_ in _energy_distribution_pending})} processes)")
+        print("="*50)
+        for _proc_p in sorted({p for p, *_ in _energy_distribution_pending}):
+            _train_exp_p = train_datasets.get(_proc_p, {}).get('expanded')
+            _test_exp_p  = test_datasets.get(_proc_p, {}).get('expanded')
+            if _train_exp_p is None or _train_exp_p.empty or _test_exp_p is None or _test_exp_p.empty:
+                continue
+            _sensors_p = _detect_sensors_for_energy_distribution(_proc_p, _test_exp_p)
+            _ef_cols_p = [c for c in _train_exp_p.columns
+                         if c.startswith('ef_') and _train_exp_p[c].dtype in ('float64', 'float32', 'int64', 'int32')]
+            _save_schedule_profile_eval(
+                _proc_p, _train_exp_p, _test_exp_p, _sensors_p, _ef_cols_p,
+                _schedule_profile_eval_dir,
+                best_mode_safe=_best_mode_by_process.get(_proc_p),
+                complete_curve_dir=_complete_curve_eval_dir,
             )
 
 
