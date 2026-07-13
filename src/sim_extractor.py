@@ -2826,6 +2826,54 @@ import matplotlib.pyplot as plt
 # Change this value once to use a different reference grid length.
 REFERENCE_LENGTH = 100
 
+
+def relevant_objects_for_sensor(df, sensor_col, objects, object_col='object_log'):
+    """
+    Subset of `objects` for which `sensor_col` actually carries signal
+    (not identically zero/NaN) in `df`.
+
+    In multi-object processes (e.g. process_1: destillation, bottling,
+    autoclaving_1/2/3, ...), most sensor columns are wired to exactly one
+    object and are constant-zero for every other object's rows. Falls back
+    to `objects` unchanged if the sensor shows no signal anywhere (avoids
+    silently training on nothing).
+    """
+    if object_col not in df.columns:
+        return list(objects)
+    relevant = []
+    for o in objects:
+        vals = df.loc[df[object_col] == o, sensor_col]
+        if vals.notna().any() and (vals.fillna(0) != 0).any():
+            relevant.append(o)
+    return relevant if relevant else list(objects)
+
+
+def build_sensor_activity_object_combos(df, sensors, activities, objects,
+                                         object_col='object_log', activity_col='activity_log'):
+    """
+    (sensor, activity, object) combos to train/evaluate, restricted per-sensor
+    to the objects where that sensor actually carries signal (see
+    relevant_objects_for_sensor), and per-object to the activities that
+    actually occur for that object — instead of the blind full cross
+    product of every sensor x every activity x every object, which wastes
+    compute and trains degenerate always-zero pipelines for sensor/object
+    pairs that have nothing to do with each other.
+    """
+    has_object_col = object_col in df.columns
+    combos = []
+    for s in sensors:
+        rel_objects = relevant_objects_for_sensor(df, s, objects, object_col) if has_object_col else objects
+        for o in rel_objects:
+            if has_object_col:
+                acts_for_o = df.loc[df[object_col] == o, activity_col].dropna().unique().tolist()
+                acts_for_o = [a for a in acts_for_o if a in activities]
+            else:
+                acts_for_o = list(activities)
+            for a in acts_for_o:
+                combos.append((s, a, o))
+    return combos
+
+
 def split_curves(df_expanded, variable, activities, objects,
                  test_size=0.15, random_state=42, verbose=1,
                  exog_columns=None):

@@ -92,6 +92,7 @@ from sim_extractor import extract_energy_modifiers, extract_energy_direct_models
 from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from sim_extractor import compare_complete_case_curves
+from sim_extractor import build_sensor_activity_object_combos
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
     fit_stochastic_profile_generator, compare_schedule_and_stochastic_profiles,
@@ -3323,12 +3324,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                             _ef_entry[f'{col}_std']     = _std
                                         _activity_exog_means[_act] = _ef_entry
 
-                            _combos = [
-                                (s, a, o)
-                                for s in _sensors
-                                for a in _activities_list
-                                for o in _objects_list
-                            ]
+                            # Restrict per-sensor to the objects/activities where that sensor
+                            # actually carries signal (see build_sensor_activity_object_combos).
+                            _combos = build_sensor_activity_object_combos(
+                                _df_expanded_train, _sensors, _activities_list, _objects_list
+                            )
                             _n_workers = min(len(_combos), os.cpu_count() or 4)
                             print(f"\n  ℹ️ Training {len(_combos)} pipelines across {_n_workers} workers"
                                   f" ({'with' if _ef_ep_cols else 'without'} external factors)...")
@@ -3806,7 +3806,10 @@ if RUN_CURVE_ONLY_EVALUATION:
                                if a in {'seq2seq','seq2seq_only','seq2seq_exog','seq2seq_prev_activity',
                                         'seq2seq_dtw_linear_decode'}]
 
-        _combos    = [(s, a, o) for s in _sensors for a in _activities for o in _objects]
+        # Restrict per-sensor to the objects/activities where that sensor actually
+        # carries signal — e.g. process_1's destillation sensors have nothing to do
+        # with autoclaving activities, so don't train/evaluate that cross product.
+        _combos    = build_sensor_activity_object_combos(_df_train_exp, _sensors, _activities, _objects)
         _n_workers = min(len(_combos), _os.cpu_count() or 4)
 
         if _sklearn_approaches and _combos:
@@ -3979,28 +3982,26 @@ if RUN_CURVE_ONLY_EVALUATION:
 
         # ── Mean baseline: predict training mean at every timestep ──────────
         _pipelines_mean = {}
-        for _s in _sensors:
-            for _a in _activities:
-                for _o in _objects:
-                    _mask_m = (
-                        (_df_train_exp['activity_log'] == _a) &
-                        (_df_train_exp['object_log']   == _o) &
-                        _df_train_exp[_s].notna()
-                    )
-                    _vals_m = _df_train_exp.loc[_mask_m, _s].values
-                    if len(_vals_m) == 0:
-                        continue
-                    _mean_val = float(np.mean(_vals_m))
-                    _pip_m = {
-                        'reference_curve': None,
-                        'full_pipeline': {
-                            'approach':      'mean_baseline',
-                            'train_mean':    _mean_val,
-                            'variable_name': _s,
-                        },
-                        'predict_fn': (lambda m: lambda rv, act, attrs: np.full(len(rv), m))(_mean_val),
-                    }
-                    _pipelines_mean.setdefault(_s, {}).setdefault(_a, {})[_o] = _pip_m
+        for _s, _a, _o in _combos:
+            _mask_m = (
+                (_df_train_exp['activity_log'] == _a) &
+                (_df_train_exp['object_log']   == _o) &
+                _df_train_exp[_s].notna()
+            )
+            _vals_m = _df_train_exp.loc[_mask_m, _s].values
+            if len(_vals_m) == 0:
+                continue
+            _mean_val = float(np.mean(_vals_m))
+            _pip_m = {
+                'reference_curve': None,
+                'full_pipeline': {
+                    'approach':      'mean_baseline',
+                    'train_mean':    _mean_val,
+                    'variable_name': _s,
+                },
+                'predict_fn': (lambda m: lambda rv, act, attrs: np.full(len(rv), m))(_mean_val),
+            }
+            _pipelines_mean.setdefault(_s, {}).setdefault(_a, {})[_o] = _pip_m
 
         all_energy_pipelines[_proc]                   = _pipelines_baseline
         all_energy_pipelines_mean[_proc]              = _pipelines_mean
