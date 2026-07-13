@@ -3811,7 +3811,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                 _futs = {
                     _pool.submit(_train_curve_only_worker,
                                  s, a, o, _df_train_exp, _sklearn_approaches, _ef_cols,
-                                 100, 0.2, CURVE_OPTIMIZE_HYPERPARAMS, CURVE_N_OPTUNA_TRIALS): (s, a, o)
+                                 None, 0.2, CURVE_OPTIMIZE_HYPERPARAMS, CURVE_N_OPTUNA_TRIALS): (s, a, o)
                     for s, a, o in _combos
                 }
                 _worker_results = []

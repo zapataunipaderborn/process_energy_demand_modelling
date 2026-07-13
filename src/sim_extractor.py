@@ -3251,7 +3251,7 @@ def _build_feature_matrix(curves, all_keys, key_types, fixed_length,
 def build_and_train_pipeline(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -3314,6 +3314,8 @@ def build_and_train_pipeline(
         print(f"\n[2a] Computing DBA barycenter from {len(train_curves)} train curves "
               f"(fixed_length={fixed_length})...")
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -3635,7 +3637,7 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
 def build_and_train_pipeline_ml_linear(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -3664,6 +3666,8 @@ def build_and_train_pipeline_ml_linear(
             'Random Forest':     RandomForestRegressor,
         }
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     # Linearly resample each curve to fixed_length — no DBA, no DTW
     for curve in train_curves:
         orig = np.asarray(curve['original_values'], dtype=float)
@@ -3890,7 +3894,7 @@ def predict_raw_curve_ml_linear(raw_values, activity, attributes, pipeline):
 def build_and_train_pipeline_ml_dtw_linear_decode(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -3980,7 +3984,7 @@ def predict_raw_curve_ml_dtw_linear_decode(raw_values, activity, attributes, pip
 def build_and_train_pipeline_seq2seq_dtw_linear_decode(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     hidden_size=128,
@@ -4149,7 +4153,7 @@ def _build_feature_matrix_plus(curves, all_keys, key_types, fixed_length,
 def build_and_train_pipeline_instance_stats(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -4181,6 +4185,8 @@ def build_and_train_pipeline_instance_stats(
         print(f"\n[2a] Computing DBA barycenter from {len(train_curves)} train curves "
               f"(fixed_length={fixed_length})...")
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -4514,7 +4520,7 @@ def _build_stats_predictor_dataset(curves, all_keys, key_types):
 def build_and_train_pipeline_istats_leakfree(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -4549,6 +4555,8 @@ def build_and_train_pipeline_istats_leakfree(
         print(f"\n[0] Computing DBA barycenter from {len(train_curves)} train curves "
               f"(fixed_length={fixed_length})...")
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -4941,7 +4949,7 @@ def _build_feature_matrix_dtw_phase(
 def build_and_train_pipeline_dtw_phase(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -4977,6 +4985,8 @@ def build_and_train_pipeline_dtw_phase(
         print(f"\n[2a] Computing DBA barycenter from {len(train_curves)} train curves "
               f"(fixed_length={fixed_length})...")
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -5319,7 +5329,7 @@ def _make_bspline_basis(fixed_length, n_basis):
 def build_and_train_pipeline_basis(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     n_basis=20,
     val_size=0.2,
     random_state=42,
@@ -5348,6 +5358,8 @@ def build_and_train_pipeline_basis(
             'Random Forest':     RandomForestRegressor,
         }
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     # 1. Resample all train curves to fixed_length
     resampled = np.array([
         np.interp(
@@ -5642,7 +5654,7 @@ def _resample_signal(arr, target_length):
 def build_and_train_pipeline_exog(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -5685,6 +5697,8 @@ def build_and_train_pipeline_exog(
         print(f"  External-factor columns: {exog_cols}")
 
     # ── DBA barycenter ────────────────────────────────────────────────────────
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -5929,7 +5943,7 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
 def build_and_train_pipeline_exog_prev_activity(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -6032,7 +6046,7 @@ def predict_raw_curve_exog_prev_activity(raw_values, activity, attributes, pipel
 def build_and_train_pipeline_amplitude_shape(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -6060,6 +6074,8 @@ def build_and_train_pipeline_amplitude_shape(
         }
 
     # ── DBA barycenter + DTW alignment ───────────────────────────────────────
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -6396,7 +6412,7 @@ def predict_raw_curve_amplitude_shape(raw_values, activity, attributes, pipeline
 def build_and_train_pipeline_amplitude_shape_exog(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     models=None,
@@ -6419,6 +6435,8 @@ def build_and_train_pipeline_amplitude_shape_exog(
         }
 
     # ── DBA barycenter + DTW alignment ───────────────────────────────────────
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -6899,7 +6917,7 @@ def _build_seq2seq_input(curves, all_keys, key_types, fixed_length,
 def build_and_train_pipeline_seq2seq(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     hidden_size=128,
@@ -6938,6 +6956,8 @@ def build_and_train_pipeline_seq2seq(
     # ------------------------------------------------------------------
     # 2a. DBA barycenter
     # ------------------------------------------------------------------
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -7174,7 +7194,7 @@ def predict_raw_curve_seq2seq(raw_values, activity, attributes, pipeline):
 def build_and_train_pipeline_seq2seq_only(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     hidden_size=128,
@@ -7201,6 +7221,8 @@ def build_and_train_pipeline_seq2seq_only(
         print("STEP 2 — BUILD + TRAIN SEQ2SEQ-ONLY PIPELINE  (no DTW)")
         print("=" * 80)
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     # Resample each curve to fixed_length as training target (no DTW)
     for curve in train_curves:
         curve['resampled_values'] = np.interp(
@@ -7452,7 +7474,7 @@ def _build_seq2seq_exog_input(curves, all_keys, key_types, fixed_length,
 def build_and_train_pipeline_seq2seq_exog(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     hidden_size=128,
@@ -7492,6 +7514,8 @@ def build_and_train_pipeline_seq2seq_exog(
         print(f"    External factor columns: {exog_cols}")
 
     # DBA barycenter
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
     resampled_for_dba = np.array([
         np.interp(
             np.linspace(0, 1, fixed_length),
@@ -7721,7 +7745,7 @@ def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
 def build_and_train_pipeline_seq2seq_prev_activity(
     train_curves,
     variable,
-    fixed_length=100,
+    fixed_length=None,
     val_size=0.2,
     random_state=42,
     hidden_size=128,
@@ -7868,7 +7892,7 @@ def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1, ef_
         pipeline = build_and_train_pipeline_exog(
             curves,
             variable=sensor,
-            fixed_length=100,
+            fixed_length=None,
             val_size=0.2,
             models={
                 'Linear Regression': LinearRegression,
@@ -7882,7 +7906,7 @@ def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1, ef_
         pipeline = build_and_train_pipeline(
             curves,
             variable=sensor,
-            fixed_length=100,
+            fixed_length=None,
             val_size=0.2,
             models={
                 'Linear Regression': LinearRegression,
@@ -7896,7 +7920,7 @@ def _train_energy_pipeline_worker(sensor, activity, obj, df_train, n_jobs=1, ef_
 
 
 def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_cols,
-                             fixed_length=100, val_size=0.2,
+                             fixed_length=None, val_size=0.2,
                              optimize_hyperparams=False, n_trials=50):
     """
     Top-level picklable worker for RUN_CURVE_ONLY_EVALUATION parallel training.
@@ -8008,7 +8032,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                           hidden_size=128, num_layers=2, dropout=0.1,
                           epochs=80, batch_size=32, lr=1e-3,
                           teacher_forcing_ratio=0.5, patience=10,
-                          fixed_length=100, val_size=0.2):
+                          fixed_length=None, val_size=0.2):
     """
     Top-level picklable worker for parallel seq2seq training.
     Trains all seq2seq variants for one (sensor, activity, object) combo —
@@ -8842,7 +8866,7 @@ def build_case_level_curves(real_expanded_df, sensor, ef_cols=None,
     return out
 
 
-def train_schedule_profile_pipeline(train_cases, fixed_length=100, val_size=0.2,
+def train_schedule_profile_pipeline(train_cases, fixed_length=None, val_size=0.2,
                                     random_state=42, max_barycenter_cases=150,
                                     model_class=None, verbose=0):
     """
@@ -8873,6 +8897,8 @@ def train_schedule_profile_pipeline(train_cases, fixed_length=100, val_size=0.2,
         idx = rng.choice(len(train_cases), size=max_barycenter_cases, replace=False)
         bary_cases = [train_cases[i] for i in idx]
 
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['values']) for c in train_cases]))))
     resampled_for_dba = np.array([
         np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
         for c in bary_cases
@@ -9007,7 +9033,7 @@ def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_mi
     return t, np.asarray(y_pred, dtype=float)
 
 
-def fit_stochastic_profile_generator(train_cases, fixed_length=100):
+def fit_stochastic_profile_generator(train_cases, fixed_length=None):
     """
     Population-level reference generator with no schedule conditioning at
     all: fit a Normal distribution per canonical position from the real
@@ -9018,6 +9044,8 @@ def fit_stochastic_profile_generator(train_cases, fixed_length=100):
     """
     if len(train_cases) < 2:
         return None
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['values']) for c in train_cases]))))
     resampled = np.array([
         np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
         for c in train_cases
