@@ -9134,6 +9134,180 @@ def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_mi
     return t, np.asarray(y_pred, dtype=float)
 
 
+def train_case_duration_pipeline(train_cases, val_size=0.2, random_state=42,
+                                 model_class=None, verbose=0):
+    """
+    Train a case-level TOTAL DURATION predictor: schedule-only attributes
+    (see build_case_level_curves) -> scalar case duration (minutes). Same
+    feature encoding as train_schedule_profile_pipeline, but one row per
+    case (not per position) and a single scalar target instead of a whole
+    curve.
+
+    Used to correct "Best, duration-corrected": the process-simulation
+    timeline (discovered process model + per-activity duration draws) has
+    no mechanism forcing its total elapsed time to be realistic -- local
+    per-activity errors and resource/shift queueing artifacts compound
+    freely, so a case's simulated total span can drift arbitrarily far from
+    its real duration even when the individual predicted values are good.
+    This pipeline gives an independent, dedicated estimate of what the total
+    should be, so the simulated timeline can be rescaled to match it (see
+    rescale_case_curve_to_duration) instead of trusting the raw simulated
+    span.
+
+    Returns a pipeline dict compatible with predict_case_duration, or None
+    if there isn't enough data to train on.
+    """
+    if model_class is None:
+        model_class = GradientBoostingRegressor
+    if len(train_cases) < 4:
+        if verbose:
+            print(f"  [case-duration] skipped: only {len(train_cases)} cases (need >= 4)")
+        return None
+
+    all_keys, key_types = _infer_key_types(train_cases)
+
+    rows = []
+    for c in train_cases:
+        row = {'case_id': c['case_id'], 'y': c['duration_minutes']}
+        for key in all_keys:
+            value = c['attributes'].get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(value) if value is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(value) if value is not None else 'None'
+        rows.append(row)
+    df_reg = pd.DataFrame(rows)
+
+    categorical_cols = [k for k in all_keys if key_types[k] == 'category']
+    X_all = pd.DataFrame(index=df_reg.index)
+    for key in all_keys:
+        X_all = X_all.assign(**{key: df_reg[key].values})
+    if categorical_cols:
+        X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    y_all = df_reg['y'].copy()
+
+    unique_cases = df_reg['case_id'].unique()
+    if len(unique_cases) < 4:
+        train_inst, val_inst = unique_cases, unique_cases
+    else:
+        train_inst, val_inst = train_test_split(unique_cases, test_size=val_size, random_state=random_state)
+    train_mask = df_reg['case_id'].isin(train_inst)
+    val_mask   = df_reg['case_id'].isin(val_inst)
+
+    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
+    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = [k for k in all_keys if key_types[k] == 'numeric']
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(X_train[numeric_feature_cols])
+        X_val.loc[:, numeric_feature_cols]   = feature_scaler.transform(X_val[numeric_feature_cols])
+
+    X_train = X_train.fillna(0)
+    X_val   = X_val.fillna(0)
+
+    model = model_class(n_estimators=150, max_depth=5, learning_rate=0.1,
+                        subsample=0.8, random_state=random_state)
+    model.fit(X_train, y_train)
+    val_mae = float(mean_absolute_error(y_val, model.predict(X_val))) if len(X_val) else float('nan')
+
+    # Guard: only trust the learned model if it actually beats a trivial
+    # "always predict the median training duration" baseline on the held-out
+    # validation cases. With few training cases (common per sensor/process)
+    # a GBR can easily be noisier than just guessing the median -- and since
+    # this pipeline's whole job is to correct a wrong simulated duration,
+    # feeding it a worse-than-median prediction would actively hurt the
+    # duration-corrected reconstruction rather than help it.
+    median_duration = float(np.median(y_train))
+    baseline_val_mae = (float(mean_absolute_error(y_val, np.full(len(y_val), median_duration)))
+                       if len(y_val) else float('nan'))
+    use_median_fallback = not (pd.notna(val_mae) and pd.notna(baseline_val_mae) and val_mae < baseline_val_mae)
+
+    if verbose:
+        _status = 'median fallback (model did not beat it)' if use_median_fallback else 'model'
+        print(f"  [case-duration] trained on {len(train_cases)} cases, val_mae={val_mae:.2f} min "
+              f"vs. median baseline={baseline_val_mae:.2f} min -> using {_status}")
+
+    return {
+        'model': model, 'all_keys': all_keys, 'key_types': key_types,
+        'feature_columns': feature_columns, 'feature_scaler': feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols, 'val_mae': val_mae,
+        'median_duration': median_duration, 'baseline_val_mae': baseline_val_mae,
+        'use_median_fallback': use_median_fallback,
+    }
+
+
+def predict_case_duration(attributes, pipeline):
+    """
+    Predict a scalar total case duration (minutes) from schedule-only
+    attributes -- falls back to the median training duration if the learned
+    model didn't beat that trivial baseline on held-out validation cases
+    (see use_median_fallback in train_case_duration_pipeline).
+    """
+    if pipeline.get('use_median_fallback'):
+        return pipeline['median_duration']
+
+    feature_columns      = pipeline['feature_columns']
+    feature_scaler       = pipeline.get('feature_scaler')
+    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
+    all_keys             = pipeline['all_keys']
+    key_types            = pipeline['key_types']
+
+    row = {}
+    for key in all_keys:
+        value = attributes.get(key, None)
+        if key_types[key] == 'numeric':
+            try:
+                row[key] = float(value) if value is not None else np.nan
+            except (ValueError, TypeError):
+                row[key] = np.nan
+        else:
+            row[key] = str(value) if value is not None else 'None'
+    X = pd.DataFrame([row])
+
+    categorical_cols = [k for k in all_keys if key_types[k] == 'category']
+    if categorical_cols:
+        X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+    for col in feature_columns:
+        if col not in X.columns:
+            X[col] = 0
+    X = X[feature_columns]
+
+    if feature_scaler is not None and numeric_feature_cols:
+        cols_to_scale = [c for c in numeric_feature_cols if c in X.columns]
+        if cols_to_scale:
+            X[cols_to_scale] = X[cols_to_scale].astype('float64')
+            X.loc[:, cols_to_scale] = feature_scaler.transform(X[cols_to_scale])
+    X = X.fillna(0)
+
+    pred = pipeline['model'].predict(X)
+    return max(float(pred[0]), 1e-6)
+
+
+def rescale_case_curve_to_duration(t_minutes, predicted_duration, raw_simulated_duration):
+    """
+    Rescale a simulated case's reconstructed curve time axis so its total
+    span matches predicted_duration, given the raw simulated schedule's own
+    (potentially very wrong) total span raw_simulated_duration. Preserves
+    the relative sequencing/shape the process simulation contributes --
+    which activity happens before/after which, roughly how big one is next
+    to another -- only the absolute scale is corrected.
+    """
+    if raw_simulated_duration <= 1e-6:
+        return t_minutes
+    scale = predicted_duration / raw_simulated_duration
+    return t_minutes * scale
+
+
 def fit_stochastic_profile_generator(train_cases, fixed_length=None):
     """
     Population-level reference generator with no schedule conditioning at

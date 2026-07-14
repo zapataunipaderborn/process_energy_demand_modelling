@@ -96,6 +96,7 @@ from sim_extractor import build_sensor_activity_object_combos
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
     fit_stochastic_profile_generator, compare_schedule_and_stochastic_profiles,
+    train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
 )
 from xgboost import XGBRegressor
 
@@ -753,6 +754,8 @@ METRICS_LOWER_IS_BETTER = {
     'duration_metrics_activity_duration_mae',
     'duration_metrics_activity_duration_rmse',
     'duration_metrics_activity_duration_wape',
+    'duration_metrics_case_span_error',
+    'duration_metrics_case_span_mae',
     'duration_metrics_dur_js_whole',
     'duration_metrics_dur_js_activ',
     'case_metrics_events_per_case_ks',
@@ -769,6 +772,7 @@ CORE_METRIC_BASES = [
     'basic_metrics_event_count_error',
     'duration_metrics_mean_duration_error',
     'duration_metrics_activity_duration_error',
+    'duration_metrics_case_span_error',
     'activity_metrics_js_divergence',
     'control_flow_metrics_edge_f1_error',
     'conformance_metrics_fitness_error',
@@ -961,7 +965,8 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
 
 
 def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, sensors, ef_cols,
-                                output_root, best_mode_safe=None, complete_curve_dir=None):
+                                output_root, best_mode_safe=None, complete_curve_dir=None,
+                                predicted_logs_dir=None):
     """
     "Schedule Profile Evaluation" — see sim_extractor.py's Schedule Profile
     Evaluation section for the design. Per sensor: trains a schedule-only
@@ -969,8 +974,21 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     evaluates both against REAL TEST cases, and (if available) merges in the
     already-computed per-case W1 numbers for the 'exog_prev_activity'
     approach on this process's best-fidelity simulation mode — giving a
-    3-way comparison, all on the exact same real cases: schedule-only vs.
-    stochastic vs. the full process-simulation-based pipeline ("Best, mine").
+    4-way comparison, all on the exact same real cases: schedule-only vs.
+    stochastic vs. the full process-simulation-based pipeline ("Best, mine")
+    vs. that same pipeline with its timeline rescaled to a dedicated
+    case-duration prediction ("Best, duration-corrected").
+
+    "Best, duration-corrected" exists because the process-simulation
+    timeline has no mechanism forcing its total elapsed time to be
+    realistic — local per-activity duration errors and resource/shift
+    queueing artifacts compound freely (confirmed: simulated case durations
+    off by 0.3x-11x vs. real in several processes), even when the
+    individual predicted energy values are good. This variant keeps "Best,
+    mine"'s per-activity value predictions untouched and only rescales the
+    time axis so the total span matches an independently-trained case-level
+    duration regressor (train_case_duration_pipeline), instead of trusting
+    the raw simulated schedule's own (possibly very wrong) total span.
 
     Silently no-ops (per sensor) when there isn't enough data to train on.
     """
@@ -990,6 +1008,25 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         if os.path.exists(_candidate_curve_path):
             _best_curve_path = _candidate_curve_path
 
+    # Raw simulated per-case total span (first activity start -> last
+    # activity end) for the winning ("best") mode, straight from its own
+    # simulated log — independent of which activities a curve pipeline could
+    # actually predict, so a missing-pipeline gap doesn't silently distort
+    # this reference number too. Used as the "before" scale for rescaling.
+    _raw_sim_durations = {}
+    if best_mode_safe and predicted_logs_dir:
+        _sim_log_path = os.path.join(predicted_logs_dir, f'{process}_{best_mode_safe}.parquet')
+        if os.path.exists(_sim_log_path):
+            try:
+                _sim_log_df = pd.read_parquet(
+                    _sim_log_path, columns=['case_id', 'timestamp_start', 'timestamp_end'])
+                _sim_log_df['case_id'] = _sim_log_df['case_id'].astype(str)
+                _sim_starts = _sim_log_df.groupby('case_id')['timestamp_start'].min()
+                _sim_ends   = _sim_log_df.groupby('case_id')['timestamp_end'].max()
+                _raw_sim_durations = ((_sim_ends - _sim_starts).dt.total_seconds() / 60.0).to_dict()
+            except Exception:
+                _raw_sim_durations = {}
+
     all_rows = []
     all_curve_rows = [] if SAVE_PREDICTED_CURVES else None
     for sensor in sensors:
@@ -1002,6 +1039,8 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
         schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
         stochastic_gen    = fit_stochastic_profile_generator(train_cases)
+        duration_pipeline = train_case_duration_pipeline(train_cases, verbose=0)
+        test_case_attrs   = {str(c['case_id']): c['attributes'] for c in test_cases}
 
         _cmp_result = compare_schedule_and_stochastic_profiles(
             test_cases, schedule_pipeline, stochastic_gen, median_case_duration_minutes,
@@ -1032,7 +1071,8 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
             # Fold in the already-computed "Best, mine" curves for this sensor
             # (from the complete-curve eval parquet, same real test cases) so
-            # one file has all four series: real, schedule, stochastic, best.
+            # one file has all five series: real, schedule, stochastic, best,
+            # best_duration_corrected.
             if _best_curve_path is not None:
                 try:
                     _best_curves = pd.read_parquet(_best_curve_path)
@@ -1046,6 +1086,23 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
                     _best_curves['case_id'] = _best_curves['case_id'].astype(str)
                     _best_curves = _best_curves[['case_id', 'sensor', 'series', 't_minutes', 'value']]
                     all_curve_rows.append(_best_curves)
+
+                    # -- "Best, duration-corrected": same values, rescaled timeline --
+                    if duration_pipeline is not None and _raw_sim_durations:
+                        _corrected_rows = []
+                        for cid, grp in _best_curves.groupby('case_id'):
+                            _attrs   = test_case_attrs.get(cid)
+                            _raw_dur = _raw_sim_durations.get(cid)
+                            if _attrs is None or not _raw_dur or _raw_dur <= 1e-6:
+                                continue
+                            _pred_dur = predict_case_duration(_attrs, duration_pipeline)
+                            _g = grp.copy()
+                            _g['t_minutes'] = rescale_case_curve_to_duration(
+                                _g['t_minutes'].to_numpy(), _pred_dur, _raw_dur)
+                            _g['series'] = 'best_duration_corrected'
+                            _corrected_rows.append(_g)
+                        if _corrected_rows:
+                            all_curve_rows.append(pd.concat(_corrected_rows, ignore_index=True))
 
     if not all_rows:
         return
@@ -1066,7 +1123,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     if all_curve_rows:
         curves_out = pd.concat(all_curve_rows, ignore_index=True)
         curves_out.to_parquet(os.path.join(out_dir, 'predicted_curves.parquet'), index=False)
-        print(f"  💾 Predicted curves (real/schedule/stochastic/best) saved → "
+        print(f"  💾 Predicted curves (real/schedule/stochastic/best/best_duration_corrected) saved → "
               f"schedule_profile_eval_results/{process}/predicted_curves.parquet")
 
     _elapsed = _t.perf_counter() - _t0
@@ -1243,14 +1300,15 @@ def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, sav
 
 
 def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='test'):
-    """Short heatmap: 6 error metrics (0=best) + Overall. Works for train or test split."""
+    """Short heatmap: error metrics (0=best) + Overall. Works for train or test split."""
     if target_df is None or target_df.empty or 'mode' not in target_df.columns:
         return
 
-    _col_js     = f'{split}_activity_metrics_js_divergence'
     _col_wape   = f'{split}_duration_metrics_activity_duration_wape'
     _col_dur_a  = f'{split}_duration_metrics_activity_duration_error'   # fallback (MAPE)
     _col_mae    = f'{split}_duration_metrics_activity_duration_mae'
+    _col_span   = f'{split}_duration_metrics_case_span_error'
+    _col_span_mae = f'{split}_duration_metrics_case_span_mae'
     _col_f1     = f'{split}_control_flow_metrics_edge_f1_error'
     _col_fit    = f'{split}_conformance_metrics_fitness_error'
     _col_prec   = f'{split}_conformance_metrics_precision_error'
@@ -1259,8 +1317,9 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     # Use WAPE if available (new runs), fall back to MAPE for older parquets
     _col_dur    = _col_wape if _col_wape in target_df.columns else _col_dur_a
 
-    all_metric_cols = [_col_js, _col_dur, _col_mae, _col_f1, _col_fit, _col_prec, _col_ov]
-    needed = [_col_js, _col_f1]
+    all_metric_cols = [_col_dur, _col_mae, _col_span, _col_span_mae,
+                       _col_f1, _col_fit, _col_prec, _col_ov]
+    needed = [_col_f1]
     available = [c for c in needed if c in target_df.columns]
     if not available:
         return
@@ -1272,10 +1331,9 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         mode_avg = target_df.groupby('mode')[agg_cols].mean()
 
     hm = pd.DataFrame(index=mode_avg.index)
-    _mae_actual_by_mode: dict = {}  # raw mode name → actual MAE (minutes)
+    _mae_actual_by_mode: dict = {}       # raw mode name → actual activity-duration MAE (minutes)
+    _span_mae_actual_by_mode: dict = {}  # raw mode name → actual case-span MAE (minutes)
 
-    if _col_js in mode_avg.columns:
-        hm['ActJSDiv']   = mode_avg[_col_js]
     if _col_dur in mode_avg.columns:
         _dur_label = 'DurWAPE' if 'wape' in _col_dur else 'DurMAPE'
         hm[_dur_label]   = mode_avg[_col_dur]
@@ -1285,13 +1343,21 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         _mae_rng = _mae_max - _mae_min
         hm['DurMAE'] = (_mae_raw - _mae_min) / _mae_rng if _mae_rng > 0 else 0.0
         _mae_actual_by_mode = _mae_raw.to_dict()
+    if _col_span in mode_avg.columns:
+        hm['CaseSpanErr'] = mode_avg[_col_span]
+    if _col_span_mae in mode_avg.columns:
+        _span_mae_raw = mode_avg[_col_span_mae]
+        _span_mae_min, _span_mae_max = _span_mae_raw.min(), _span_mae_raw.max()
+        _span_mae_rng = _span_mae_max - _span_mae_min
+        hm['CaseSpanMAE'] = (_span_mae_raw - _span_mae_min) / _span_mae_rng if _span_mae_rng > 0 else 0.0
+        _span_mae_actual_by_mode = _span_mae_raw.to_dict()
     if _col_f1 in mode_avg.columns:
         hm['EdgeF1Err']  = mode_avg[_col_f1]
     if _col_fit in mode_avg.columns:
         hm['FitnessErr'] = mode_avg[_col_fit]
     if _col_prec in mode_avg.columns:
         hm['PrecisionErr'] = mode_avg[_col_prec]
-    err_cols = [c for c in ['ActJSDiv', 'DurWAPE', 'DurMAPE', 'DurMAE',
+    err_cols = [c for c in ['DurWAPE', 'DurMAPE', 'DurMAE', 'CaseSpanErr', 'CaseSpanMAE',
                              'EdgeF1Err', 'FitnessErr', 'PrecisionErr']
                 if c in hm.columns]
     if err_cols:
@@ -1311,11 +1377,13 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     _raw_modes = list(hm.index)
     _mae_by_display = {_display_mode(m): _mae_actual_by_mode.get(m, float('nan'))
                        for m in _raw_modes}
+    _span_mae_by_display = {_display_mode(m): _span_mae_actual_by_mode.get(m, float('nan'))
+                            for m in _raw_modes}
     hm.index = [_display_mode(m) for m in _raw_modes]
 
     hm = hm.sort_values('Overall', ascending=True)
 
-    # Annotation: DurMAE column shows actual minutes; all others show 3 dp
+    # Annotation: DurMAE/CaseSpanMAE columns show actual minutes; all others show 3 dp
     _annot_rows = []
     for _dm in hm.index:
         _row = []
@@ -1323,6 +1391,9 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
             _val = hm.loc[_dm, _hm_col]
             if _hm_col == 'DurMAE':
                 _actual = _mae_by_display.get(_dm, float('nan'))
+                _row.append(f'{_actual:.1f}' if not pd.isna(_actual) else '')
+            elif _hm_col == 'CaseSpanMAE':
+                _actual = _span_mae_by_display.get(_dm, float('nan'))
                 _row.append(f'{_actual:.1f}' if not pd.isna(_actual) else '')
             else:
                 _row.append(f'{_val:.3f}' if not pd.isna(_val) else '')
@@ -1337,7 +1408,7 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
                 cbar_kws={'label': 'Error (0 = best)', 'shrink': 0.7}, ax=ax)
     ax.axvline(x=sep, color='navy', linewidth=2.0)
     ax.set_title(
-        f'{title}\nAll metrics: 0 = best  |  DurMAE annotation = actual minutes (colour normalised)  |  Overall = mean of first {sep} cols',
+        f'{title}\nAll metrics: 0 = best  |  DurMAE/CaseSpanMAE annotations = actual minutes (colour normalised)  |  Overall = mean of first {sep} cols',
         fontsize=11, fontweight='bold')
     ax.set_ylabel('Mode')
     ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
@@ -1475,6 +1546,23 @@ def _per_case_median_metrics(simulated_df, real_df,
         real_mu = real_durs.mean()
         dur_err_whole = abs(sim_durs.mean() - real_mu) / real_mu if real_mu > 0 else np.nan
 
+        # --- CaseSpanErr: relative error of the case's TOTAL elapsed time
+        # (max(end) - min(start)), distinct from dur_err_whole above (mean of
+        # individual per-activity-instance durations within a case). This is
+        # the metric that actually catches a process model whose overall
+        # simulated case length drifts from reality -- e.g. via queueing/
+        # resource-availability artifacts inserting large idle gaps between
+        # activities, or compounding per-activity duration bias -- even when
+        # individual activity durations look fine on average. ---
+        real_span = (rc[end_col].max() - rc[start_col].min()).total_seconds() / 60.0
+        sim_span  = (sc[end_col].max() - sc[start_col].min()).total_seconds() / 60.0
+        case_span_err = abs(sim_span - real_span) / real_span if real_span > 0 else np.nan
+        # Absolute-minutes companion to case_span_err, mirroring dur_mae below
+        # (per-activity-type MAE in minutes) but for the whole-case total --
+        # directly answers "how many minutes off is the simulated case
+        # length," which a relative % can obscure for very short/long cases.
+        case_span_mae = abs(sim_span - real_span)
+
         # --- DurErr(activ): mean relative error across activity types in this case ---
         r_act = (rc.assign(_d=(rc[end_col]-rc[start_col]).dt.total_seconds()/60.0)
                    .groupby(activity_col)['_d'].mean())
@@ -1524,6 +1612,8 @@ def _per_case_median_metrics(simulated_df, real_df,
 
         rows.append({'evt_ratio_err': evt_ratio_err,
                      'dur_err_whole': dur_err_whole,
+                     'case_span_err': case_span_err,
+                     'case_span_mae': case_span_mae,
                      'dur_err_activ': dur_err_activ,
                      'dur_mae':       dur_mae,
                      'dur_rmse':      dur_rmse,
@@ -1537,6 +1627,8 @@ def _per_case_median_metrics(simulated_df, real_df,
     return {
         'evt_ratio_err': float(df['evt_ratio_err'].median()),
         'dur_err_whole': float(df['dur_err_whole'].median()),
+        'case_span_err': float(df['case_span_err'].median()),
+        'case_span_mae': float(df['case_span_mae'].median()),
         'dur_err_activ': float(df['dur_err_activ'].median()),
         'dur_mae':       float(df['dur_mae'].median()),
         'dur_rmse':      float(df['dur_rmse'].median()),
@@ -2000,17 +2092,20 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report(f"\nPer-case median metrics ({_pc.get('n_cases', 0)} cases matched):")
 
     # Fall back to global values for any metric the per-case routine couldn't compute
-    _evt_ratio_global = results['basic_metrics']['event_count_ratio']
-    _js_div_global    = results['activity_metrics'].get('js_divergence', np.nan)
     _edge_f1_global   = results['control_flow_metrics'].get('edge_f1_score', np.nan)
-    _dur_whole_global = results['duration_metrics']['mean_duration_error']
     _dur_activ_global = results['duration_metrics'].get('activity_duration_error', np.nan)
 
+    # overall_error (drives best-mode selection, see _best_mode_by_process) --
+    # evt_ratio_err and js_div are still computed and stored as diagnostic
+    # columns below, just no longer averaged into this selection score.
+    # case_span_err (total case duration, vs. dur_err_activ's per-activity-
+    # type durations) is included here deliberately: it's exactly the metric
+    # that was missing when a mode with poor control-flow/duration fidelity
+    # got selected as "best" despite simulated case lengths drifting 0.3x-11x
+    # from real (see the process_2 idle-gap investigation).
     short_components = {
-        'evt_ratio_err':          _pc.get('evt_ratio_err',
-                                          abs(_evt_ratio_global - 1.0) if pd.notna(_evt_ratio_global) else np.nan),
         'dur_err_activ':          _pc.get('dur_err_activ', _dur_activ_global),
-        'js_div':                 _pc.get('js_div', _js_div_global),
+        'case_span_err':          _pc.get('case_span_err', np.nan),
         'edge_err (1-EdgeF1)':    (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
                                   ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan),
         'fitness_err (1-Fitness)':    results['conformance_metrics'].get('fitness_error', np.nan),
@@ -2048,6 +2143,10 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         results['basic_metrics']['event_count_ratio']              = 1.0 + _pc['evt_ratio_err']
         results['basic_metrics']['event_count_error']              = _pc['evt_ratio_err']
         results['duration_metrics']['mean_duration_error']         = _pc['dur_err_whole']
+        if pd.notna(_pc.get('case_span_err', np.nan)):
+            results['duration_metrics']['case_span_error']          = _pc['case_span_err']
+        if pd.notna(_pc.get('case_span_mae', np.nan)):
+            results['duration_metrics']['case_span_mae']            = _pc['case_span_mae']
         if pd.notna(_pc.get('dur_err_activ', np.nan)):
             results['duration_metrics']['activity_duration_error'] = _pc['dur_err_activ']
         if pd.notna(_pc.get('dur_mae', np.nan)):
@@ -4435,6 +4534,7 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
                 _schedule_profile_eval_dir,
                 best_mode_safe=_best_mode_by_process.get(_proc_p),
                 complete_curve_dir=_complete_curve_eval_dir,
+                predicted_logs_dir=_predicted_logs_dir,
             )
 
 
