@@ -630,6 +630,15 @@ RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', '
 # evaluation. See sim_extractor.py's "Schedule Profile Evaluation" section.
 RUN_SCHEDULE_PROFILE_EVAL = os.environ.get('PIPELINE_RUN_SCHEDULE_PROFILE_EVAL', 'false').lower() == 'true'
 
+# Whether to persist the actual real/predicted curve arrays behind the
+# complete-curve and schedule-profile Wasserstein numbers (not just the
+# aggregated distances) — one row per (case_id, sensor, series, timestep), so
+# they can be reloaded later to compute other metrics or plot without
+# re-simulating anything. Off by default — adds a parquet file per (process,
+# mode) for complete-curve eval, and one per process for schedule-profile
+# eval. See compare_complete_case_curves / compare_schedule_and_stochastic_profiles.
+SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false').lower() == 'true'
+
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          DTW + position index (sklearn regressor)
 #    'instance_stats'    DTW + per-curve stats  (leaky — known invalid)
@@ -909,14 +918,16 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
         return
 
     try:
-        case_curve_df = compare_complete_case_curves(
+        _result = compare_complete_case_curves(
             real_expanded_df, simulated_df, pipelines_for_process, sensors,
             activity_exog_means=globals().get('_activity_exog_means', {}),
             temporal_resolution_minutes=globals().get('TEMPORAL_RESOLUTION_MINUTES', 15.0),
+            save_curves=SAVE_PREDICTED_CURVES,
         )
     except Exception as exc:
         print(f"  ⚠️ Complete-curve eval ({approach}) failed for {process}/{mode_name}: {exc}")
         return
+    case_curve_df, curve_df = _result if SAVE_PREDICTED_CURVES else (_result, None)
     if case_curve_df.empty:
         return
 
@@ -926,6 +937,11 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
     suffix = '' if approach == 'baseline' else f'_{approach}'
 
     case_curve_df.to_csv(os.path.join(out_dir, f'per_case_complete_curve{suffix}.csv'), index=False)
+
+    if curve_df is not None and not curve_df.empty:
+        curve_df.to_parquet(os.path.join(out_dir, f'predicted_curves{suffix}.parquet'), index=False)
+        print(f"  💾 Predicted curves ({approach}) saved → "
+              f"complete_curve_eval_results/{process}/{safe_mode}/predicted_curves{suffix}.parquet")
 
     summary = (
         case_curve_df.groupby('sensor')[['wasserstein_time', 'wasserstein_value']]
@@ -962,14 +978,20 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     _t0 = _t.perf_counter()
 
     best_case_df = None
+    _best_curve_path = None
     if best_mode_safe and complete_curve_dir:
         _best_path = os.path.join(complete_curve_dir, process, best_mode_safe,
                                   'per_case_complete_curve_exog_prev_activity.csv')
         if os.path.exists(_best_path):
             best_case_df = pd.read_csv(_best_path)
             best_case_df['case_id'] = best_case_df['case_id'].astype(str)
+        _candidate_curve_path = os.path.join(complete_curve_dir, process, best_mode_safe,
+                                             'predicted_curves_exog_prev_activity.parquet')
+        if os.path.exists(_candidate_curve_path):
+            _best_curve_path = _candidate_curve_path
 
     all_rows = []
+    all_curve_rows = [] if SAVE_PREDICTED_CURVES else None
     for sensor in sensors:
         train_cases = build_case_level_curves(train_expanded_df, sensor, ef_cols=ef_cols)
         test_cases  = build_case_level_curves(test_expanded_df, sensor, ef_cols=ef_cols)
@@ -981,9 +1003,11 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
         stochastic_gen    = fit_stochastic_profile_generator(train_cases)
 
-        cmp_df = compare_schedule_and_stochastic_profiles(
+        _cmp_result = compare_schedule_and_stochastic_profiles(
             test_cases, schedule_pipeline, stochastic_gen, median_case_duration_minutes,
+            save_curves=SAVE_PREDICTED_CURVES,
         )
+        cmp_df, sensor_curve_df = _cmp_result if SAVE_PREDICTED_CURVES else (_cmp_result, None)
         if cmp_df.empty:
             continue
         cmp_df['sensor'] = sensor
@@ -1000,6 +1024,29 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
         all_rows.append(cmp_df)
 
+        if SAVE_PREDICTED_CURVES and sensor_curve_df is not None and not sensor_curve_df.empty:
+            sensor_curve_df = sensor_curve_df.copy()
+            sensor_curve_df['sensor'] = sensor
+            sensor_curve_df['case_id'] = sensor_curve_df['case_id'].astype(str)
+            all_curve_rows.append(sensor_curve_df)
+
+            # Fold in the already-computed "Best, mine" curves for this sensor
+            # (from the complete-curve eval parquet, same real test cases) so
+            # one file has all four series: real, schedule, stochastic, best.
+            if _best_curve_path is not None:
+                try:
+                    _best_curves = pd.read_parquet(_best_curve_path)
+                except Exception:
+                    _best_curves = pd.DataFrame()
+                if not _best_curves.empty:
+                    _best_curves = _best_curves[
+                        (_best_curves['sensor'] == sensor) & (_best_curves['series'] == 'predicted')
+                    ].copy()
+                    _best_curves['series'] = 'best'
+                    _best_curves['case_id'] = _best_curves['case_id'].astype(str)
+                    _best_curves = _best_curves[['case_id', 'sensor', 'series', 't_minutes', 'value']]
+                    all_curve_rows.append(_best_curves)
+
     if not all_rows:
         return
 
@@ -1015,6 +1062,12 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     summary['n_cases'] = result.groupby('sensor')['case_id'].nunique().values
     summary['process'] = process
     summary.to_csv(os.path.join(out_dir, 'schedule_profile_eval_summary.csv'), index=False)
+
+    if all_curve_rows:
+        curves_out = pd.concat(all_curve_rows, ignore_index=True)
+        curves_out.to_parquet(os.path.join(out_dir, 'predicted_curves.parquet'), index=False)
+        print(f"  💾 Predicted curves (real/schedule/stochastic/best) saved → "
+              f"schedule_profile_eval_results/{process}/predicted_curves.parquet")
 
     _elapsed = _t.perf_counter() - _t0
     print(f"  💾 Schedule Profile Evaluation saved → schedule_profile_eval_results/{process}/  "

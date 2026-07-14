@@ -23,7 +23,7 @@ from destilation_function import DistillationEnergyDemand
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-N_BATCHES      = 300   # one batch every 4 h × 365 days = 1 year of production
+N_BATCHES      = 300#300   # one batch every 4 h × 365 days = 1 year of production
 START_DATE     = datetime(2024, 1, 15)
 RANDOM_SEED    = 42
 VOLUME_RANGE_L = (200, 800)   # uniform per batch

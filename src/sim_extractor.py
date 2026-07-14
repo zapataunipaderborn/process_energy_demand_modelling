@@ -8063,6 +8063,25 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                 fixed_length=fixed_length, val_size=val_size,
                 models=models, verbose=0, n_jobs=1, **_hp_kwargs,
             )
+        elif 'baseline' in result:
+            # Fewer than 5 curves survive the stricter prev-activity-context
+            # extraction (a separate, narrower filter than the len(curves)<5
+            # check above that already passed for 'baseline') -- previously
+            # this silently left 'exog_prev_activity' unset with no log line
+            # at all, which meant predict_curve_for_instance would return
+            # None for every instance of this (sensor, activity, object) and
+            # leave an unexplained gap in the complete-curve/schedule-profile
+            # curves. Fall back to the plain baseline pipeline (already
+            # trained above, just without previous-activity context) so a
+            # prediction still happens, and log it so the gap has a cause.
+            print(f"  [WARN] exog_prev_activity: only {len(_prev_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
+                  f"falling back to the baseline pipeline for this combo.")
+            result['exog_prev_activity'] = result['baseline']
+        else:
+            print(f"  [WARN] exog_prev_activity: only {len(_prev_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
+                  f"no baseline pipeline available either -- no prediction possible for this combo.")
     if 'ml_linear' in _active:
         result['ml_linear'] = build_and_train_pipeline_ml_linear(
             curves, variable=sensor, fixed_length=fixed_length,
@@ -8155,6 +8174,19 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                 teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
                 verbose=False,
             )
+        elif 'seq2seq' in result:
+            # Same silent-skip issue as exog_prev_activity above -- fall back
+            # to the plain seq2seq pipeline (no previous-activity context)
+            # instead of leaving this (sensor, activity, object) with no
+            # prediction and no explanation in the logs.
+            print(f"  [WARN] seq2seq_prev_activity: only {len(_prev_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
+                  f"falling back to the plain seq2seq pipeline for this combo.")
+            result['seq2seq_prev_activity'] = result['seq2seq']
+        else:
+            print(f"  [WARN] seq2seq_prev_activity: only {len(_prev_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
+                  f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
 
     if 'seq2seq_dtw_linear_decode' in _active:
         result['seq2seq_dtw_linear_decode'] = build_and_train_pipeline_seq2seq_dtw_linear_decode(
@@ -8754,7 +8786,8 @@ def _predict_case_curves_all_sensors(sim_case_df, energy_pipelines, sensors,
 def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipelines, sensors,
                                  activity_exog_means=None,
                                  temporal_resolution_minutes=15.0,
-                                 real_case_col='case_id_log', sim_case_col='case_id'):
+                                 real_case_col='case_id_log', sim_case_col='case_id',
+                                 save_curves=False):
     """
     Per real test case (matched to the simulated log by case_id), per sensor:
     build the real case's complete profile and the simulated case's complete
@@ -8781,6 +8814,12 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     Returns a DataFrame with one row per (case_id, sensor):
     ['case_id', 'sensor', 'n_real_pts', 'n_sim_pts', 'wasserstein_time',
      'wasserstein_value'].
+
+    When save_curves=True, also returns a second, long-format DataFrame with
+    one row per (case_id, sensor, series, timestep) — series in {'real',
+    'predicted'} — columns ['case_id', 'sensor', 'series', 't_minutes',
+    'value'], so the exact curves behind the W1 numbers above can be reloaded
+    later for other metrics or plots without re-simulating anything.
     """
     from scipy.stats import wasserstein_distance
 
@@ -8804,6 +8843,7 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     sim_groups  = simulated_df[sim_valid].groupby(sim_ids_str[sim_valid])
 
     rows = []
+    curve_rows = [] if save_curves else None
     for cid in shared_cases:
         real_g = real_groups.get_group(cid)
         sim_g  = sim_groups.get_group(cid)
@@ -8843,6 +8883,19 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
                 'wasserstein_time':  w1_time,
                 'wasserstein_value': w1_value,
             })
+
+            if save_curves:
+                curve_rows.extend({
+                    'case_id': cid, 'sensor': sensor, 'series': 'real',
+                    't_minutes': float(t), 'value': float(v),
+                } for t, v in zip(t_real, v_real))
+                curve_rows.extend({
+                    'case_id': cid, 'sensor': sensor, 'series': 'predicted',
+                    't_minutes': float(t), 'value': float(v),
+                } for t, v in zip(t_sim, v_sim))
+
+    if save_curves:
+        return pd.DataFrame(rows), pd.DataFrame(curve_rows)
     return pd.DataFrame(rows)
 
 
@@ -9112,7 +9165,8 @@ def sample_stochastic_profile(generator, median_case_duration_minutes, rng=None)
 
 
 def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stochastic_generator,
-                                             median_case_duration_minutes, random_state=42):
+                                             median_case_duration_minutes, random_state=42,
+                                             save_curves=False):
     """
     For each real test case (from build_case_level_curves), compare its real
     complete profile against (a) the schedule-only prediction and (b) one
@@ -9122,10 +9176,18 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
     Returns a DataFrame with one row per case_id:
     ['case_id', 'schedule_wasserstein_time', 'schedule_wasserstein_value',
      'stochastic_wasserstein_time', 'stochastic_wasserstein_value'].
+
+    When save_curves=True, also returns a second, long-format DataFrame with
+    one row per (case_id, series, timestep) — series in {'real', 'schedule',
+    'stochastic'} — columns ['case_id', 'series', 't_minutes', 'value'], so
+    the exact curves behind the W1 numbers above can be reloaded later for
+    other metrics or plots. The caller adds a 'sensor' column since this
+    function is called once per sensor.
     """
     from scipy.stats import wasserstein_distance
     rng = np.random.default_rng(random_state)
     rows = []
+    curve_rows = [] if save_curves else None
     for c in test_cases:
         v_real = c['values']
         t_real = np.linspace(0, c['duration_minutes'], len(v_real))
@@ -9134,6 +9196,9 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
             continue
 
         row = {'case_id': c['case_id']}
+        if save_curves:
+            curve_rows.extend({'case_id': c['case_id'], 'series': 'real', 't_minutes': float(t), 'value': float(v)}
+                              for t, v in zip(t_real, v_real))
 
         if schedule_pipeline is not None:
             t_sched, v_sched = predict_schedule_profile_curve(
@@ -9143,6 +9208,9 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
             if w_sched.sum() > 0:
                 row['schedule_wasserstein_time']  = float(wasserstein_distance(t_real, t_sched, u_weights=w_real, v_weights=w_sched))
                 row['schedule_wasserstein_value'] = float(wasserstein_distance(v_real, v_sched))
+                if save_curves:
+                    curve_rows.extend({'case_id': c['case_id'], 'series': 'schedule', 't_minutes': float(t), 'value': float(v)}
+                                      for t, v in zip(t_sched, v_sched))
 
         if stochastic_generator is not None:
             t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, median_case_duration_minutes, rng=rng)
@@ -9150,8 +9218,14 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
             if w_stoch.sum() > 0:
                 row['stochastic_wasserstein_time']  = float(wasserstein_distance(t_real, t_stoch, u_weights=w_real, v_weights=w_stoch))
                 row['stochastic_wasserstein_value'] = float(wasserstein_distance(v_real, v_stoch))
+                if save_curves:
+                    curve_rows.extend({'case_id': c['case_id'], 'series': 'stochastic', 't_minutes': float(t), 'value': float(v)}
+                                      for t, v in zip(t_stoch, v_stoch))
 
         rows.append(row)
+
+    if save_curves:
+        return pd.DataFrame(rows), pd.DataFrame(curve_rows)
     return pd.DataFrame(rows)
 
 

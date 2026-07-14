@@ -23,6 +23,11 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    (Best/mine vs. Schedule-direct vs. Stochastic
                                    generator, per process) — writes to
                                    schedule_profile_eval_results/. Default: False.
+  save_predicted_curves bool       whether to also persist the actual real/predicted
+                                   curve arrays (not just the aggregated Wasserstein
+                                   distances) behind complete-curve eval and schedule
+                                   profile eval, for recomputing other metrics or
+                                   plotting later. Default: False.
 """
 
 import os
@@ -43,14 +48,15 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_902',
+        'run_name':              'experiment_905',
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],#, 'alpha'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+        'mining_algorithms':     ['heuristic', 'alpha'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
         'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval': True, # Best/mine vs. Schedule-direct vs. Stochastic generator, per process
+        'save_predicted_curves': True, # persist real/predicted curve arrays for later metrics/plots
     },
     # {
     #     'data_experiment':       '1',
@@ -124,6 +130,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_energy_modelling = exp.get('run_energy_modelling', True)
     run_joint_duration_eval = exp.get('run_joint_duration_eval', False)
     run_schedule_profile_eval = exp.get('run_schedule_profile_eval', False)
+    save_predicted_curves = exp.get('save_predicted_curves', False)
 
     print(f"\n{'='*60}")
     print(f"  Running experiment {i}/{len(EXPERIMENTS)}: {exp['run_name']}")
@@ -134,7 +141,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"mining_algorithms={mining_algorithms or '(default)'}  "
           f"run_energy_modelling={run_energy_modelling}  "
           f"run_joint_duration_eval={run_joint_duration_eval}  "
-          f"run_schedule_profile_eval={run_schedule_profile_eval}")
+          f"run_schedule_profile_eval={run_schedule_profile_eval}  "
+          f"save_predicted_curves={save_predicted_curves}")
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
@@ -146,6 +154,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_RUN_ENERGY_MODELLING']  = 'true' if run_energy_modelling else 'false'
     env['PIPELINE_RUN_JOINT_DURATION_EVAL'] = 'true' if run_joint_duration_eval else 'false'
     env['PIPELINE_RUN_SCHEDULE_PROFILE_EVAL'] = 'true' if run_schedule_profile_eval else 'false'
+    env['PIPELINE_SAVE_PREDICTED_CURVES'] = 'true' if save_predicted_curves else 'false'
     if mining_algorithms:
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
 
