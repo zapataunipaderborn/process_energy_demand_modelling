@@ -423,7 +423,6 @@ def _mlp_train_models(df_train, target_transform=None):
 
 
 MODES_TO_COMPARE = [
-    'statistical',
     'petri_net_alpha',
     'petri_net_alpha_ml_plus_global',
     'petri_net_alpha_ml_plus_per_act',
