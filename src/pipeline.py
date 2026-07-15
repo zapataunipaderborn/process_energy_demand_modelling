@@ -28,6 +28,10 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    distances) behind complete-curve eval and schedule
                                    profile eval, for recomputing other metrics or
                                    plotting later. Default: False.
+  train_ratio           float      fraction of cases used for training in the
+                                   temporal train/test split (the rest go to test).
+                                   e.g. 0.8 for an 80/20 split. Default: 0.70
+                                   (modelling.py's own default, used when omitted).
 """
 
 import os
@@ -48,21 +52,24 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_910',
+        'run_name':              'experiment_922',
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic', 'alpha'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-        'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
+        'run_energy_modelling':  False,    # set False to skip energy profile/curve modelling
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
-        'run_schedule_profile_eval': True, # Best/mine vs. Schedule-direct vs. Stochastic generator, per process
-        'save_predicted_curves': True, # persist real/predicted curve arrays for later metrics/plots
+        'run_schedule_profile_eval':False, # Best/mine vs. Schedule-direct vs. Stochastic generator, per process
+        'save_predicted_curves': False, # persist real/predicted curve arrays for later metrics/plots
+        'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
     },
+
+
     # {
     #     'data_experiment':       '1',
     #     'run_name':              'experiment_701',
     #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-    #     'temporal_resolution':   '5min',
+    #     'temporal_resolution':   '5min',ok
     #     'run_process_modelling': True,
     #     'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
     #     'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
@@ -131,6 +138,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_joint_duration_eval = exp.get('run_joint_duration_eval', False)
     run_schedule_profile_eval = exp.get('run_schedule_profile_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
+    train_ratio = exp.get('train_ratio')
 
     print(f"\n{'='*60}")
     print(f"  Running experiment {i}/{len(EXPERIMENTS)}: {exp['run_name']}")
@@ -142,7 +150,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"run_energy_modelling={run_energy_modelling}  "
           f"run_joint_duration_eval={run_joint_duration_eval}  "
           f"run_schedule_profile_eval={run_schedule_profile_eval}  "
-          f"save_predicted_curves={save_predicted_curves}")
+          f"save_predicted_curves={save_predicted_curves}  "
+          f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}")
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
@@ -157,6 +166,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_SAVE_PREDICTED_CURVES'] = 'true' if save_predicted_curves else 'false'
     if mining_algorithms:
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
+    if train_ratio is not None:
+        env['PIPELINE_TRAIN_RATIO'] = str(train_ratio)
 
     result = subprocess.run(
         [sys.executable, str(modelling_script)],

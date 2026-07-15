@@ -605,7 +605,8 @@ CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) 
 
 # ── Train / test split ────────────────────────────────────────────────────────
 TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
-TRAIN_RATIO         = 0.70    # fraction of cases used for training
+# Fraction of cases used for training. Override via PIPELINE_TRAIN_RATIO=0.8 (etc).
+TRAIN_RATIO         = float(os.environ.get('PIPELINE_TRAIN_RATIO', '0.70'))
 
 # ── Pipeline execution flags ──────────────────────────────────────────────────
 RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
@@ -1322,12 +1323,13 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     _col_fit    = f'{split}_conformance_metrics_fitness_error'
     _col_prec   = f'{split}_conformance_metrics_precision_error'
     _col_ov     = f'{split}_overall_error'
+    _col_evt    = f'{split}_basic_metrics_event_count_error'
 
     # Use WAPE if available (new runs), fall back to MAPE for older parquets
     _col_dur    = _col_wape if _col_wape in target_df.columns else _col_dur_a
 
     all_metric_cols = [_col_dur, _col_mae, _col_span, _col_span_mae,
-                       _col_f1, _col_fit, _col_prec, _col_ov]
+                       _col_f1, _col_fit, _col_prec, _col_ov, _col_evt]
     needed = [_col_f1]
     available = [c for c in needed if c in target_df.columns]
     if not available:
@@ -1371,6 +1373,15 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
                 if c in hm.columns]
     if err_cols:
         hm['Overall'] = hm[err_cols].mean(axis=1)
+    # Diagnostic-only column, added AFTER Overall so it's never part of the
+    # composite -- how far the simulated event count is from the real one
+    # per case (|sim_n_events/real_n_events - 1|). Kept out of Overall on
+    # request, but shown since a mismatch here (stochastic Petri-net
+    # branching/looping firing a different number of activities than the
+    # matched real case) is often the dominant driver of CaseSpanErr, more
+    # so than any per-activity duration mis-prediction.
+    if _col_evt in mode_avg.columns:
+        hm['EvtRatioErr'] = mode_avg[_col_evt]
 
     def _display_mode(m):
         m = str(m)
@@ -1411,7 +1422,10 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
 
     n_rows = max(2, len(hm))
     fig, ax = plt.subplots(figsize=(max(10, len(hm.columns) * 1.5), n_rows * 0.9 + 1.8))
-    sep = len(hm.columns) - 1  # separator before Overall
+    # Separator before Overall -- computed from its position, not
+    # len(columns)-1, since diagnostic-only columns (e.g. EvtRatioErr) can
+    # now follow it.
+    sep = list(hm.columns).index('Overall') + 1 if 'Overall' in hm.columns else len(hm.columns) - 1
     sns.heatmap(hm.round(3), annot=_annot_arr, fmt='', cmap='RdYlGn_r',
                 vmin=0, vmax=1, linewidths=0.5, linecolor='white',
                 cbar_kws={'label': 'Error (0 = best)', 'shrink': 0.7}, ax=ax)
@@ -4531,6 +4545,8 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     if RUN_SCHEDULE_PROFILE_EVAL:
         _best_mode_by_process = {}
         _best_error_by_process = {}
+        _best_sim_by_process = {}
+        _best_core_by_process = {}
         for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
             _err = _core_p.get('test_overall_error')
             if _err is None:
@@ -4538,6 +4554,8 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
             if _proc_p not in _best_error_by_process or _err < _best_error_by_process[_proc_p]:
                 _best_error_by_process[_proc_p] = _err
                 _best_mode_by_process[_proc_p] = str(_mode_p).replace(' ', '_').replace('/', '_')
+                _best_sim_by_process[_proc_p] = _sim_p
+                _best_core_by_process[_proc_p] = _core_p
 
         print("\n" + "="*50)
         print(f"SCHEDULE PROFILE EVALUATION ({len({p for p, *_ in _energy_distribution_pending})} processes)")
