@@ -1015,7 +1015,8 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     # this reference number too. Used as the "before" scale for rescaling.
     _raw_sim_durations = {}
     if best_mode_safe and predicted_logs_dir:
-        _sim_log_path = os.path.join(predicted_logs_dir, f'{process}_{best_mode_safe}.parquet')
+        _safe_process = str(process).replace(' ', '_').replace('/', '_')
+        _sim_log_path = os.path.join(predicted_logs_dir, f'{_safe_process}_{best_mode_safe}.parquet')
         if os.path.exists(_sim_log_path):
             try:
                 _sim_log_df = pd.read_parquet(
@@ -1024,8 +1025,13 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
                 _sim_starts = _sim_log_df.groupby('case_id')['timestamp_start'].min()
                 _sim_ends   = _sim_log_df.groupby('case_id')['timestamp_end'].max()
                 _raw_sim_durations = ((_sim_ends - _sim_starts).dt.total_seconds() / 60.0).to_dict()
-            except Exception:
+            except Exception as _exc:
+                print(f"  ⚠️ Could not read simulated log for duration correction "
+                      f"({_sim_log_path}): {_exc} — 'Best, duration-corrected' will be skipped.")
                 _raw_sim_durations = {}
+        else:
+            print(f"  ⚠️ Simulated log not found for duration correction ({_sim_log_path}) — "
+                  f"'Best, duration-corrected' will be skipped for {process}.")
 
     all_rows = []
     all_curve_rows = [] if SAVE_PREDICTED_CURVES else None
@@ -1040,6 +1046,9 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
         stochastic_gen    = fit_stochastic_profile_generator(train_cases)
         duration_pipeline = train_case_duration_pipeline(train_cases, verbose=0)
+        if duration_pipeline is None:
+            print(f"  ⚠️ Case-duration pipeline not trained for {process}/{sensor} "
+                  f"(too few train cases) — 'Best, duration-corrected' will be skipped for this sensor.")
         test_case_attrs   = {str(c['case_id']): c['attributes'] for c in test_cases}
 
         _cmp_result = compare_schedule_and_stochastic_profiles(
@@ -1525,15 +1534,27 @@ def _per_case_median_metrics(simulated_df, real_df,
     the MEDIAN across cases.  This removes the global-pooling bias where
     a few large cases dominate the aggregate.
     """
-    common = sorted(set(simulated_df[case_col].dropna().unique()) &
-                    set(real_df[case_col].dropna().unique()))
+    # Match by case_id as strings, not raw values — the real and simulated
+    # logs can carry the same case_id in different dtypes (e.g. float64 vs
+    # object/str for numeric-looking IDs), which silently zeroes out every
+    # match under a raw-value set intersection despite full overlap. Same
+    # fix already applied in compare_complete_case_curves (sim_extractor.py)
+    # for the identical failure mode. Confirmed to actually happen: process_5
+    # real case_id is float64 (10708907.0), its simulated log's is object
+    # ('10708907.0') — 0/16 cases matched raw, 16/16 matched as strings.
+    sim_ids_str  = simulated_df[case_col].astype(str)
+    real_ids_str = real_df[case_col].astype(str)
+    sim_valid    = simulated_df[case_col].notna()
+    real_valid   = real_df[case_col].notna()
+    common = sorted(set(sim_ids_str[sim_valid].unique()) &
+                    set(real_ids_str[real_valid].unique()))
     if not common:
         return {}
 
     rows = []
     for cid in common:
-        rc = real_df[real_df[case_col] == cid]
-        sc = simulated_df[simulated_df[case_col] == cid]
+        rc = real_df[real_valid & (real_ids_str == cid)]
+        sc = simulated_df[sim_valid & (sim_ids_str == cid)]
         if rc.empty:
             continue
 

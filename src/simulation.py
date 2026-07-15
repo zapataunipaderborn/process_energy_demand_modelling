@@ -251,6 +251,12 @@ class ProcessSimulation:
                 # True machine/resource this activity runs on (for RO lookups);
                 # None when the stats_df predates this field.
                 'resource_id':  row.get('resource_id'),
+                # Real historical frequency of every resource this activity
+                # ran on, e.g. {'autoclave_1': 0.55, 'autoclave_2': 0.45} --
+                # sampled per logged instance in _log_event instead of
+                # hardcoding a single resource for every simulated case.
+                # {} (or missing) falls back to the fixed resource_id above.
+                'resource_weights': row.get('resource_weights') or {},
             }
             
             print(f"  Config: {key}")
@@ -533,18 +539,44 @@ class ProcessSimulation:
         
         return start_activities
     
+    def _sample_resource(self, act_key):
+        """
+        Sample a resource (machine/object) for one activity instance,
+        proportional to how often it actually ran on each real resource --
+        instead of hardcoding whichever resource happened to be most
+        frequent for every single simulated case (which silently mis-
+        assigns ~all cases that historically used the minority resource).
+        Falls back to the fixed majority-vote 'resource_id' when
+        'resource_weights' is unavailable (e.g. older stats_df).
+        """
+        _act_cfg = self.activity_config.get(act_key, {})
+        _res_weights = _act_cfg.get('resource_weights')
+        if _res_weights:
+            _resources = list(_res_weights.keys())
+            _probs = np.array(list(_res_weights.values()), dtype=float)
+            _probs = _probs / _probs.sum() if _probs.sum() > 0 else None
+            if _probs is not None:
+                return np.random.choice(_resources, p=_probs)
+        return _act_cfg.get('resource_id')
+
     def _log_event(self, case_id, activity, timestamp_start, timestamp_end,
-                   object_name, object_type, higher_level_activity, object_attributes):
-        """Log a simulation event"""
-        # 'object' here is the synthetic per-process-group label (equal to
-        # higher_level_activity) — NOT the true machine/resource. Resolve
-        # the true resource id (for RO lookups) from activity_config, which
-        # carries it from stats_df's 'resource_id' column.
+                   object_name, object_type, higher_level_activity, object_attributes,
+                   resource_id=None):
+        """
+        Log a simulation event. 'object' here is the synthetic per-process-
+        group label (equal to higher_level_activity) — NOT the true machine/
+        resource. If the caller already resolved resource_id (e.g. because
+        it needed the same value for a WIP/RO lookup before this activity's
+        duration was decided), pass it in so the logged resource matches
+        the one the scheduling decision actually used. Otherwise it's
+        sampled fresh here from activity_config's resource_weights/resource_id.
+        """
         act_key = (
             str(activity).strip(), str(object_name).strip(), str(object_type).strip(),
             str(higher_level_activity).strip() if pd.notna(higher_level_activity) else None,
         )
-        resource_id = self.activity_config.get(act_key, {}).get('resource_id')
+        if resource_id is None:
+            resource_id = self._sample_resource(act_key)
 
         self.events.append({
             'case_id': str(case_id).strip(),
@@ -888,9 +920,10 @@ class ProcessSimulation:
                                higher_level_activity)
 
                     # ── WIP/RO lookup from the reference load profile ─────
-                    resource_id = None
-                    if act_key in self.activity_config:
-                        resource_id = self.activity_config[act_key].get('resource_id')
+                    # Sampled once here (not the fixed majority-vote resource)
+                    # and passed into _log_event below so the logged resource
+                    # matches the one this RO/waiting-time decision used.
+                    resource_id = self._sample_resource(act_key)
                     wip = self.load_profile.wip_at(
                         current_sim_time, exclude_case_id=case_id
                     )
@@ -940,6 +973,7 @@ class ProcessSimulation:
                         object_type=object_type,
                         higher_level_activity=higher_level_activity,
                         object_attributes=object_attributes,
+                        resource_id=resource_id,
                     )
 
                     activity_count += 1
@@ -1070,7 +1104,12 @@ class ProcessSimulation:
                     prev_key = (prev_activity, object_name, object_type,
                                 higher_level_activity)
 
-                    resource_id = self.activity_config.get(prev_key, {}).get('resource_id')
+                    # RO here reflects the PREVIOUS activity's actual
+                    # resource occupancy -- use the resource that was really
+                    # sampled/logged for it (self.events[-1]), not a fresh
+                    # (and un-weighted) re-derivation from activity_config,
+                    # which could disagree with what got logged.
+                    resource_id = self.events[-1].get('resource_id')
                     wip = self.load_profile.wip_at(current_sim_time, exclude_case_id=case_id)
                     ro  = self.load_profile.ro_at(current_sim_time, resource_id)
 

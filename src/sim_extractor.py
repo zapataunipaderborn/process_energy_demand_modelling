@@ -666,19 +666,32 @@ def _extract_duration_and_raw(group, object_name, object_type,
         dist_name, dist_params = fit_best_distribution(durations.values)
         print(f"    {activity}: best fit = {dist_name} {dist_params}")
 
-        # ── Majority resource (machine/object) this activity runs on ──
+        # ── Resource (machine/object) this activity runs on ───────────
+        # Real historical frequency of every resource this activity actually
+        # ran on, e.g. {'autoclave_1': 0.55, 'autoclave_2': 0.45} -- used to
+        # SAMPLE a resource per simulated instance (see simulation.py's
+        # _log_event) instead of hardcoding whichever resource happened to
+        # be most frequent for every single simulated case. Hardcoding the
+        # mode meant ~all cases that historically ran on the minority
+        # resource would be logged against the wrong one by construction.
+        # 'resource_id' (the mode) is kept as a backward-compatible fallback
+        # for any consumer that doesn't sample from resource_weights.
         resource_id = None
+        resource_weights = {}
         if 'object' in activity_data.columns and len(activity_data) > 0:
-            modes = activity_data['object'].mode()
-            resource_id = modes.iloc[0] if len(modes) > 0 else None
+            _counts = activity_data['object'].value_counts(normalize=True)
+            if len(_counts) > 0:
+                resource_weights = _counts.to_dict()
+                resource_id = _counts.index[0]
 
         duration_info[activity] = {
-            'duration':     duration_median,
-            'duration_std': duration_std,
-            'dist_name':    dist_name,
-            'dist_params':  dist_params,
-            'n_events':     n_events,
-            'resource_id':  resource_id,
+            'duration':         duration_median,
+            'duration_std':     duration_std,
+            'dist_name':        dist_name,
+            'dist_params':      dist_params,
+            'n_events':         n_events,
+            'resource_id':      resource_id,
+            'resource_weights': resource_weights,
         }
 
         # ── Raw rows for ML training ──────────────────────────────────
@@ -830,6 +843,7 @@ def _extract_manual(group, object_name, object_type, higher_level_activity,
             'is_start':              is_start,
             'is_end':                is_end,
             'resource_id':           d.get('resource_id'),
+            'resource_weights':      d.get('resource_weights', {}),
         })
 
     return stats, None  # No process_model for manual
@@ -988,6 +1002,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
             'is_start':              is_start,
             'is_end':                is_end,
             'resource_id':           d.get('resource_id'),
+            'resource_weights':      d.get('resource_weights', {}),
         })
 
     # ── Build label-level stochastic weights for blending ───────────
@@ -1378,7 +1393,7 @@ def extract_energy_modifiers(
 
     if df_recs.empty:
         print("  WARNING: no valid activity instances found — returning empty modifiers.")
-        return {}, {}, energy_state_columns
+        return {}, {}, energy_state_columns, {}
 
     if duration_models is None: duration_models = ['xgboost']
     if transition_models is None: transition_models = ['logistic']
@@ -2744,9 +2759,16 @@ def _build_energy_state_matrix_with_next(
             continue
 
         prev_id = inst_row.get('prev_instance_id')
-        curr_summary = instance_summaries[instance_id]
         prev_summary = instance_summaries.get(prev_id) if pd.notna(prev_id) else None
-        base_summary = prev_summary if prev_summary is not None else curr_summary
+        # Case-starting instances (no predecessor) get a neutral empty summary,
+        # NOT this activity's own curve -- falling back to curr_summary would
+        # leak the target-adjacent signal (the very curve whose duration/
+        # next-activity we're predicting) into its own "previous state"
+        # features. base_summary.get(..., np.nan) below already yields NaN for
+        # missing keys, and the "prev_activity" == '__START__' categorical
+        # flag already tells the model this is a case start -- matches the
+        # zero-leakage sentinel pattern used by split_curves_with_prev_activity.
+        base_summary = prev_summary if prev_summary is not None else {}
 
         _prev_dur = instance_durations.get(prev_id, 0.0) if pd.notna(prev_id) else 0.0
         row = {
