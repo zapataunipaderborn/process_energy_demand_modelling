@@ -756,6 +756,7 @@ METRICS_LOWER_IS_BETTER = {
     'duration_metrics_activity_duration_wape',
     'duration_metrics_case_span_error',
     'duration_metrics_case_span_mae',
+    'duration_metrics_case_span_wape',
     'duration_metrics_dur_js_whole',
     'duration_metrics_dur_js_activ',
     'case_metrics_events_per_case_ks',
@@ -1316,8 +1317,13 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
     _col_wape   = f'{split}_duration_metrics_activity_duration_wape'
     _col_dur_a  = f'{split}_duration_metrics_activity_duration_error'   # fallback (MAPE)
     _col_mae    = f'{split}_duration_metrics_activity_duration_mae'
-    _col_span   = f'{split}_duration_metrics_case_span_error'
+    _col_span_a = f'{split}_duration_metrics_case_span_error'   # fallback (relative-error)
+    _col_span_w = f'{split}_duration_metrics_case_span_wape'
     _col_span_mae = f'{split}_duration_metrics_case_span_mae'
+
+    # Use WAPE if available (new runs), fall back to the plain relative error
+    # for older parquets -- same precedent as DurWAPE/DurMAPE above.
+    _col_span   = _col_span_w if _col_span_w in target_df.columns else _col_span_a
     _col_f1     = f'{split}_control_flow_metrics_edge_f1_error'
     _col_fit    = f'{split}_conformance_metrics_fitness_error'
     _col_prec   = f'{split}_conformance_metrics_precision_error'
@@ -1354,7 +1360,8 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         hm['DurMAE'] = (_mae_raw - _mae_min) / _mae_rng if _mae_rng > 0 else 0.0
         _mae_actual_by_mode = _mae_raw.to_dict()
     if _col_span in mode_avg.columns:
-        hm['CaseSpanErr'] = mode_avg[_col_span]
+        _span_label = 'CaseSpanWape' if 'wape' in _col_span else 'CaseSpanErr'
+        hm[_span_label] = mode_avg[_col_span]
     if _col_span_mae in mode_avg.columns:
         _span_mae_raw = mode_avg[_col_span_mae]
         _span_mae_min, _span_mae_max = _span_mae_raw.min(), _span_mae_raw.max()
@@ -1367,7 +1374,7 @@ def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='tes
         hm['FitnessErr'] = mode_avg[_col_fit]
     if _col_prec in mode_avg.columns:
         hm['PrecisionErr'] = mode_avg[_col_prec]
-    err_cols = [c for c in ['DurWAPE', 'DurMAPE', 'DurMAE', 'CaseSpanErr', 'CaseSpanMAE',
+    err_cols = [c for c in ['DurWAPE', 'DurMAPE', 'DurMAE', 'CaseSpanWape', 'CaseSpanErr', 'CaseSpanMAE',
                              'EdgeF1Err', 'FitnessErr', 'PrecisionErr']
                 if c in hm.columns]
     if err_cols:
@@ -1596,6 +1603,7 @@ def _per_case_median_metrics(simulated_df, real_df,
         # directly answers "how many minutes off is the simulated case
         # length," which a relative % can obscure for very short/long cases.
         case_span_mae = abs(sim_span - real_span)
+        span_real = real_span
 
         # --- DurErr(activ): mean relative error across activity types in this case ---
         r_act = (rc.assign(_d=(rc[end_col]-rc[start_col]).dt.total_seconds()/60.0)
@@ -1648,6 +1656,7 @@ def _per_case_median_metrics(simulated_df, real_df,
                      'dur_err_whole': dur_err_whole,
                      'case_span_err': case_span_err,
                      'case_span_mae': case_span_mae,
+                     'span_real':     span_real,
                      'dur_err_activ': dur_err_activ,
                      'dur_mae':       dur_mae,
                      'dur_rmse':      dur_rmse,
@@ -1658,11 +1667,23 @@ def _per_case_median_metrics(simulated_df, real_df,
     if not rows:
         return {}
     df = pd.DataFrame(rows)
+    # CaseSpanWape: true WAPE for case span -- sum of absolute case-span
+    # errors over sum of real case spans, pooled across ALL matched cases
+    # (mirrors dur_wape's sum-over-sum shape, just pooled across cases
+    # instead of across activity types within one case, since a case only
+    # has a single span value). Distinct from case_span_err below (median
+    # of per-case relative errors) -- that one still drives overall_error/
+    # mode-selection unchanged; this is a display-only companion metric.
+    _valid_span   = df['span_real'] > 0
+    _span_abs_sum = float(df.loc[_valid_span, 'case_span_mae'].sum())
+    _span_real_sum = float(df.loc[_valid_span, 'span_real'].sum())
+    case_span_wape = (_span_abs_sum / _span_real_sum) * 100 if _span_real_sum > 0 else np.nan
     return {
         'evt_ratio_err': float(df['evt_ratio_err'].median()),
         'dur_err_whole': float(df['dur_err_whole'].median()),
         'case_span_err': float(df['case_span_err'].median()),
         'case_span_mae': float(df['case_span_mae'].median()),
+        'case_span_wape': case_span_wape,
         'dur_err_activ': float(df['dur_err_activ'].median()),
         'dur_mae':       float(df['dur_mae'].median()),
         'dur_rmse':      float(df['dur_rmse'].median()),
@@ -2181,6 +2202,8 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
             results['duration_metrics']['case_span_error']          = _pc['case_span_err']
         if pd.notna(_pc.get('case_span_mae', np.nan)):
             results['duration_metrics']['case_span_mae']            = _pc['case_span_mae']
+        if pd.notna(_pc.get('case_span_wape', np.nan)):
+            results['duration_metrics']['case_span_wape']           = _pc['case_span_wape']
         if pd.notna(_pc.get('dur_err_activ', np.nan)):
             results['duration_metrics']['activity_duration_error'] = _pc['dur_err_activ']
         if pd.notna(_pc.get('dur_mae', np.nan)):
