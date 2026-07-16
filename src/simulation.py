@@ -622,7 +622,8 @@ class ProcessSimulation:
             new_marking[arc.target] += 1
         return new_marking
 
-    def _choose_transition(self, enabled, stochastic_map, rng=None):
+    def _choose_transition(self, enabled, stochastic_map, rng=None,
+                            activity_fire_counts=None, activity_caps=None):
         """
         Given a set of enabled transitions, pick one using stochastic
         weights.  Falls back to uniform random if no weights available.
@@ -630,13 +631,32 @@ class ProcessSimulation:
         rng: optional np.random.Generator. When provided, all random draws
              use this isolated generator instead of the global numpy state,
              so duration-sampling code cannot shift the transition sequence.
+
+        activity_fire_counts / activity_caps: optional dicts (label -> int)
+        tracking how many times each activity has already fired in this
+        case, and this case's own sampled repeat quota per activity (see
+        _sample_activity_caps). A transition whose label has already hit or
+        passed its quota gets its weight heavily discounted (not zeroed --
+        a hard block could deadlock a case where looping is the only
+        structural way forward). This keeps loop lengths grounded in real
+        per-case repeat behaviour instead of a memoryless per-step draw,
+        which has a geometric tail and can run away arbitrarily far past
+        anything seen in training.
         """
         # Sort to make sampling independent from set iteration order.
         enabled_list = sorted(
             list(enabled),
             key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
         )
-        weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
+        weights = []
+        for t in enabled_list:
+            w = stochastic_map.get(t, 1.0)
+            if activity_caps and t.label is not None:
+                label = str(t.label).strip()
+                cap = activity_caps.get(label)
+                if cap is not None and (activity_fire_counts or {}).get(label, 0) >= cap:
+                    w *= 0.05
+            weights.append(w)
         total = sum(weights)
         if total <= 0:
             if rng is not None:
@@ -646,6 +666,27 @@ class ProcessSimulation:
         if rng is not None:
             return rng.choice(enabled_list, p=probs)
         return np.random.choice(enabled_list, p=probs)
+
+    def _sample_activity_caps(self, repeat_counts, rng):
+        """
+        Draw one case-specific repeat quota per activity, nonparametrically
+        bootstrapped from its real per-case occurrence-count distribution
+        (repeat_counts: dict[label] -> list[int], one count per training
+        case -- see sim_extractor._compute_activity_repeat_counts). e.g. if
+        an activity fired {0, 0, 1, 2} times across 4 training cases, this
+        case's quota is drawn uniformly from that exact list, so the
+        simulated case repeats it about as often as a real case would,
+        rather than an unbounded memoryless coin-flip at every visit.
+        """
+        if not repeat_counts:
+            return {}
+        caps = {}
+        for act, counts in repeat_counts.items():
+            if not counts:
+                continue
+            idx = int(rng.integers(len(counts)))
+            caps[act] = counts[idx]
+        return caps
 
     def _simulate_petri_net_for_case(self, case_id, object_attributes,
                                      start_time, use_median_duration=False):
@@ -707,6 +748,18 @@ class ProcessSimulation:
             step = 0
             case_start_ts  = current_sim_time          # Unix timestamp at case start
             activity_history = []                       # [(name, duration), ...] most-recent first
+            # Per-case loop-quota state (see _sample_activity_caps /
+            # _choose_transition) -- keeps loop lengths grounded in real
+            # per-case repeat behaviour instead of a memoryless per-step draw.
+            activity_fire_counts = defaultdict(int)
+            # Independent RNG stream (not _pn_rng) so sampling a quota never
+            # perturbs the transition-choice draws that follow -- keeps this
+            # feature's effect isolated to loop lengths, not the whole
+            # random trajectory of the case.
+            _cap_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_caps"))
+            activity_caps = self._sample_activity_caps(
+                model.get('activity_repeat_counts', {}), _cap_rng
+            )
 
             print(f"\nCase {case_id}: Petri net simulation for {object_name} "
                   f"({object_type})")
@@ -739,7 +792,11 @@ class ProcessSimulation:
                 # Choose which transition to fire (isolated RNG — independent
                 # of duration sampling so ML+ and statistical produce the same
                 # transition sequence for the same case_id)
-                chosen = self._choose_transition(enabled, stochastic_map, rng=_pn_rng)
+                chosen = self._choose_transition(
+                    enabled, stochastic_map, rng=_pn_rng,
+                    activity_fire_counts=activity_fire_counts,
+                    activity_caps=activity_caps,
+                )
 
                 # Fire the transition (update marking)
                 marking = self._fire_transition(marking, chosen)
@@ -747,6 +804,7 @@ class ProcessSimulation:
                 # If this is a visible transition (has a label), log event
                 if chosen.label is not None:
                     activity_label = str(chosen.label).strip()
+                    activity_fire_counts[activity_label] += 1
 
                     # ── Duration sampling ─────────────────────────────────
                     _MLP_PN_MODES = ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act')
@@ -891,6 +949,13 @@ class ProcessSimulation:
             step = 0
             activity_history = []
             case_start_ts = current_sim_time  # needed by the ML+ feature vector
+            activity_fire_counts = defaultdict(int)
+            # Independent RNG stream -- see _simulate_petri_net_for_case's
+            # identical comment for why this isn't _pn_rng.
+            _cap_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_caps"))
+            activity_caps = self._sample_activity_caps(
+                model.get('activity_repeat_counts', {}), _cap_rng
+            )
 
             print(f"\nCase {case_id}: WIP/RO-aware Petri net simulation for "
                   f"{object_name} ({object_type}) [duration={_duration_override}]")
@@ -911,11 +976,16 @@ class ProcessSimulation:
                     print(f"    No enabled transitions — deadlock after {activity_count} activities.")
                     break
 
-                chosen = self._choose_transition(enabled, stochastic_map, rng=_pn_rng)
+                chosen = self._choose_transition(
+                    enabled, stochastic_map, rng=_pn_rng,
+                    activity_fire_counts=activity_fire_counts,
+                    activity_caps=activity_caps,
+                )
                 marking = self._fire_transition(marking, chosen)
 
                 if chosen.label is not None:
                     activity_label = str(chosen.label).strip()
+                    activity_fire_counts[activity_label] += 1
                     act_key = (activity_label, object_name, object_type,
                                higher_level_activity)
 
@@ -1052,6 +1122,15 @@ class ProcessSimulation:
             activity_history = []
             max_steps = max(max_case_length * 2, 50)
             step = 0
+            activity_fire_counts = defaultdict(int)
+            # This mode doesn't use an isolated _pn_rng for transitions
+            # elsewhere (it samples via global random/np.random state), so a
+            # dedicated cap RNG here doesn't shift anything else -- still
+            # seeded independently per case for reproducibility.
+            _cap_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_caps"))
+            activity_caps = self._sample_activity_caps(
+                model.get('activity_repeat_counts', {}), _cap_rng
+            )
 
             print(f"\nCase {case_id}: WIP-branching-aware Petri net simulation "
                   f"for {object_name} ({object_type})")
@@ -1131,6 +1210,22 @@ class ProcessSimulation:
                     total = sum(candidate_probs.values())
                     if total <= 0:
                         candidate_probs = {lbl: 1.0 for lbl in valid_labels}
+
+                    # Per-case loop-quota discount (see _sample_activity_caps /
+                    # _choose_transition's docstring) -- heavily (not fully)
+                    # discourage a label that's already hit or passed this
+                    # case's sampled repeat quota, so loop lengths stay
+                    # grounded in real per-case repeat behaviour instead of
+                    # an unbounded memoryless draw at every visit.
+                    for lbl in list(candidate_probs.keys()):
+                        if lbl == '__END__':
+                            continue
+                        cap = activity_caps.get(lbl)
+                        if cap is not None and activity_fire_counts.get(lbl, 0) >= cap:
+                            candidate_probs[lbl] *= 0.05
+                    total = sum(candidate_probs.values())
+                    if total <= 0:
+                        candidate_probs = {lbl: 1.0 for lbl in valid_labels}
                         total = sum(candidate_probs.values())
 
                     labels = list(candidate_probs.keys())
@@ -1148,6 +1243,7 @@ class ProcessSimulation:
                     print(f"    WARNING: label '{chosen_label}' not in enabled "
                           "transitions — ending.")
                     break
+                activity_fire_counts[chosen_label] += 1
                 chosen_transition = random.choice(candidates)
                 marking = self._fire_transition(marking, chosen_transition)
 

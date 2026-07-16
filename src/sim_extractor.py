@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, Counter
 import pandas as pd
 import numpy as np
 from scipy import stats as scipy_stats
@@ -510,6 +510,34 @@ def _compute_decision_point_weights(net, im, fm, case_sorted):
     return decision_weights, max_case_length
 
 
+def _compute_activity_repeat_counts(case_sorted):
+    """
+    For every activity label that appears in at least one case, collect the
+    per-case occurrence count (including 0 for cases where it never fires).
+
+    Returns dict[activity_label] -> list[int], one entry per case -- the raw
+    empirical distribution used to sample a per-case repeat quota at
+    simulation time (see ProcessSimulation._sample_activity_caps). This keeps
+    the Petri-net token game's loop lengths grounded in real per-case repeat
+    behaviour instead of a memoryless per-step frequency draw, which has a
+    geometric tail and can occasionally run away well past anything ever
+    observed in training (the mechanism behind the max_steps safety-net
+    firing on a small fraction of cases).
+    """
+    per_case_counts = []
+    all_activities = set()
+    for _, case_df in case_sorted.items():
+        counts = Counter(case_df['activity'].tolist())
+        per_case_counts.append(counts)
+        all_activities.update(counts.keys())
+
+    repeat_counts = {act: [] for act in all_activities}
+    for counts in per_case_counts:
+        for act in all_activities:
+            repeat_counts[act].append(counts.get(act, 0))
+    return repeat_counts
+
+
 def _derive_transitions_from_net(net, im, fm, sub_log, sub_df):
     """
     Derive transition probabilities from the Petri net by analysing
@@ -964,6 +992,10 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
           f"{n_end} with __END__ probability")
     print(f"    Max case length in training: {max_case_length}")
 
+    # ── Per-activity repeat-count distribution (for simulation-time
+    #    loop-quota sampling — see ProcessSimulation._sample_activity_caps) ──
+    activity_repeat_counts = _compute_activity_repeat_counts(case_sorted)
+
     # ── Derive transitions from the mined model ──────────────────────
     transitions_dict, start_acts, end_acts = _derive_transitions_from_net(
         net, im, fm, sub_log, sub_df
@@ -1035,6 +1067,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         'activity_count_transitions': activity_count_transitions,
         'decision_weights': decision_weights,
         'max_case_length': max_case_length,
+        'activity_repeat_counts': activity_repeat_counts,
     }
 
     return stats, process_model
