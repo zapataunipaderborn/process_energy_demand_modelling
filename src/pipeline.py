@@ -29,9 +29,18 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    profile eval, for recomputing other metrics or
                                    plotting later. Default: False.
   train_ratio           float      fraction of cases used for training in the
-                                   temporal train/test split (the rest go to test).
+                                   train/test split (the rest go to test).
                                    e.g. 0.8 for an 80/20 split. Default: 0.70
                                    (modelling.py's own default, used when omitted).
+  split_type            str        how cases are assigned to train vs. test:
+                                   'temporal' (default) — earliest train_ratio
+                                   fraction of cases by start time → train, the
+                                   rest (the "future") → test, no leakage.
+                                   'random' — fixed-seed shuffle of case IDs at
+                                   the same ratio, no time ordering. Same
+                                   case-id partition is applied to every
+                                   evaluation (process, energy/profile,
+                                   schedule-profile) either way.
 """
 
 import os
@@ -52,16 +61,17 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_929',
+        'run_name':              'experiment_935',
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+        'mining_algorithms':     ['heuristic', 'alpha'],#, 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
         'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':True, # Best/mine vs. Schedule-direct vs. Stochastic generator, per process
         'save_predicted_curves': True, # persist real/predicted curve arrays for later metrics/plots
-        'train_ratio':           0.60, # fraction of cases used for training (e.g. 0.8 for 80/20)
+        'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
+        'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
     },
 
 
@@ -139,6 +149,11 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_schedule_profile_eval = exp.get('run_schedule_profile_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
     train_ratio = exp.get('train_ratio')
+    split_type = exp.get('split_type', 'temporal')
+    if split_type not in ('temporal', 'random'):
+        print(f"[pipeline] ERROR: {exp['run_name']} has split_type={split_type!r}, "
+              f"must be 'temporal' or 'random'. Stopping.")
+        sys.exit(1)
 
     print(f"\n{'='*60}")
     print(f"  Running experiment {i}/{len(EXPERIMENTS)}: {exp['run_name']}")
@@ -151,7 +166,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"run_joint_duration_eval={run_joint_duration_eval}  "
           f"run_schedule_profile_eval={run_schedule_profile_eval}  "
           f"save_predicted_curves={save_predicted_curves}  "
-          f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}")
+          f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}  "
+          f"split_type={split_type}")
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
@@ -168,6 +184,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
     if train_ratio is not None:
         env['PIPELINE_TRAIN_RATIO'] = str(train_ratio)
+    env['PIPELINE_SPLIT_TYPE'] = split_type
 
     result = subprocess.run(
         [sys.executable, str(modelling_script)],

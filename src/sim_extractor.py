@@ -228,7 +228,67 @@ def _mine_petri_net(sub_log, algorithm='inductive', noise_threshold=0.2,
     else:
         raise ValueError(f"Unknown mining algorithm: {algorithm}")
 
+    net = _repair_and_join_artifacts(net)
+
     return net, im, fm
+
+
+def _repair_and_join_artifacts(net):
+    """
+    Fix a miner→Petri-net conversion artifact seen with the Heuristics
+    Miner: a labelled transition occasionally ends up wired with in-arcs
+    from MULTIPLE places, so firing it requires tokens in ALL of them
+    simultaneously (an AND-join) — but those places are actually
+    alternative predecessors of the same activity (an XOR choice: "reached
+    from A, or from B"), not a genuine concurrent split. Since nothing else
+    in the net produces tokens into both places at once, the transition
+    becomes almost unreachable during token-game replay even though
+    token-based-replay (which uses forced/logged moves to push through
+    fitness gaps) still assigns it a legitimate-looking positive stochastic
+    weight. Net effect: a real, frequent activity silently drops out of
+    every simulated case.
+
+    Confirmed directly: an activity occurring in 71% of real training
+    cases, with stochastic weight 21 (comparable to siblings that DO fire),
+    was enabled 0 times across 200 replayed simulated cases purely because
+    its two "predecessor" places are never simultaneously marked.
+
+    Detects the artifact by checking whether any *other* transition in the
+    net has an AND-split feeding tokens into ALL of the candidate
+    transition's input places at once (a genuine synchronization). If no
+    such split exists, the multi-input transition is split into one
+    single-input transition per original input place (same label, same
+    outputs) — correctly modelling "reachable from any of these places"
+    instead of "needs all of them at once".
+    """
+    from pm4py.objects.petri_net.utils import petri_utils
+
+    suspects = [t for t in list(net.transitions)
+               if t.label is not None and len(t.in_arcs) > 1]
+
+    for t in suspects:
+        in_places = [a.source for a in t.in_arcs]
+
+        has_and_split = any(
+            other is not t and all(p in {a.target for a in other.out_arcs} for p in in_places)
+            for other in net.transitions
+        )
+        if has_and_split:
+            continue  # genuine synchronization -- leave it alone
+
+        out_targets = [(a.target, a.weight) for a in t.out_arcs]
+        label = t.label
+        base_name = t.name
+
+        petri_utils.remove_transition(net, t)
+
+        for i, p in enumerate(in_places):
+            new_t = petri_utils.add_transition(net, name=f"{base_name}__split{i}", label=label)
+            petri_utils.add_arc_from_to(p, new_t, net)
+            for target, weight in out_targets:
+                petri_utils.add_arc_from_to(new_t, target, net, weight=weight)
+
+    return net
 
 
 def _evaluate_mined_model(sub_log, net, im, fm):

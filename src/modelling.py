@@ -603,7 +603,19 @@ CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) 
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Train / test split ────────────────────────────────────────────────────────
-TEMPORAL_SPLIT      = True    # True → split by case start time; False → use all data
+TEMPORAL_SPLIT      = True    # True → split cases into train/test; False → use all data
+# How cases are assigned to train vs. test within TEMPORAL_SPLIT. 'temporal'
+# (default): earliest train_ratio fraction of cases by start time → train, the
+# rest (the "future") → test — no leakage, mirrors deployment. 'random': a
+# fixed-seed shuffle of case IDs → train/test — same ratio, no time ordering.
+# Override via PIPELINE_SPLIT_TYPE=temporal|random. Consumed by
+# _split_process_datasets, applied identically to every evaluation (process,
+# energy/profile, schedule-profile) since they all key off the same case-id
+# partition — see that function's docstring.
+SPLIT_TYPE          = os.environ.get('PIPELINE_SPLIT_TYPE', 'temporal').lower()
+if SPLIT_TYPE not in ('temporal', 'random'):
+    raise ValueError(f"PIPELINE_SPLIT_TYPE must be 'temporal' or 'random', got {SPLIT_TYPE!r}")
+RANDOM_SPLIT_SEED   = int(os.environ.get('PIPELINE_RANDOM_SPLIT_SEED', '42'))
 # Fraction of cases used for training. Override via PIPELINE_TRAIN_RATIO=0.8 (etc).
 TRAIN_RATIO         = float(os.environ.get('PIPELINE_TRAIN_RATIO', '0.70'))
 
@@ -2353,14 +2365,37 @@ def visualize_heuristic_nets(df_compare, simulated_log):
 
 ##ä sim code
 
-def _split_process_datasets(datasets, train_ratio=0.80):
+def _order_case_ids_for_split(case_start, split_type, seed=42):
+    """
+    Return case_start's case-id index ordered so that a plain head/tail slice
+    at n_train produces the requested split:
+      'temporal' → earliest-start-first (case_start is already sorted this
+                   way), so the tail is the chronologically later "future".
+      'random'   → a fixed-seed shuffle, so the tail is an arbitrary random
+                   subset at the same ratio, with no time ordering.
+    Keeping this as the only place that decides ordering means every caller
+    (main event-log split, the production-plan fallback below) stays
+    identical apart from which ordering feeds the same slicing logic.
+    """
+    if split_type == 'random':
+        rng = np.random.RandomState(seed)
+        return case_start.index[rng.permutation(len(case_start))]
+    return case_start.index
+
+
+def _split_process_datasets(datasets, train_ratio=0.80, split_type='temporal',
+                            random_seed=42):
     """
     Split *every* process inside ``datasets`` into two copies:
     ``train_datasets`` and ``test_datasets``.
 
-    For each process the event_log is used to determine the temporal
-    cutoff by case start time.  The same case partition is then applied
-    to **production_plan** and **expanded** (using ``case_id_log``).
+    For each process the event_log is used to determine the case partition
+    (by case start time for split_type='temporal', or a fixed-seed shuffle
+    for split_type='random' — see _order_case_ids_for_split). The same
+    case-id partition is then applied to **production_plan** and
+    **expanded** (using ``case_id_log``), so every downstream evaluation
+    (process, energy/profile, schedule-profile) is scored against the exact
+    same held-out cases regardless of split_type.
 
     Returns (train_datasets, test_datasets).
     """
@@ -2377,8 +2412,9 @@ def _split_process_datasets(datasets, train_ratio=0.80):
         case_start = el.groupby('case_id')['timestamp_start'].min().sort_values()
         n_train = max(1, int(len(case_start) * train_ratio))
 
-        train_cases = set(case_start.index[:n_train])
-        test_cases  = set(case_start.index[n_train:])
+        ordered_ids = _order_case_ids_for_split(case_start, split_type, random_seed)
+        train_cases = set(ordered_ids[:n_train])
+        test_cases  = set(ordered_ids[n_train:])
 
         # ── event log split ───────────────────────────────────────────────
         el_train = el[el['case_id'].isin(train_cases)].copy()
@@ -2397,8 +2433,9 @@ def _split_process_datasets(datasets, train_ratio=0.80):
                 .sort_values()
             )
             n_pp_train = max(1, int(len(pp_case_start) * train_ratio))
-            pp_train_ids = set(pp_case_start.index[:n_pp_train])
-            pp_test_ids  = set(pp_case_start.index[n_pp_train:])
+            pp_ordered_ids = _order_case_ids_for_split(pp_case_start, split_type, random_seed)
+            pp_train_ids = set(pp_ordered_ids[:n_pp_train])
+            pp_test_ids  = set(pp_ordered_ids[n_pp_train:])
             pp_train = production_plan[production_plan['case_id'].isin(pp_train_ids)].copy()
             pp_test  = production_plan[production_plan['case_id'].isin(pp_test_ids)].copy()
 
@@ -2409,7 +2446,14 @@ def _split_process_datasets(datasets, train_ratio=0.80):
                 exp_train = expanded[expanded['case_id_log'].isin(train_cases)].copy()
                 exp_test  = expanded[expanded['case_id_log'].isin(test_cases)].copy()
             else:
-                # fallback: use datetime_energy and the cutoff date
+                # fallback: use datetime_energy and the cutoff date. No case
+                # identifier is available on these rows, so a case-level
+                # random split isn't possible here -- always falls back to a
+                # temporal cutoff regardless of split_type.
+                if split_type == 'random':
+                    print(f"  ⚠️ {proc_name}: 'expanded' has no case_id_log — "
+                          f"can't apply a random split without a case identifier; "
+                          f"falling back to a temporal cutoff for this table.")
                 cutoff = case_start.iloc[n_train - 1]
                 if 'datetime_energy' in expanded.columns:
                     exp_train = expanded[expanded['datetime_energy'] <= cutoff].copy()
@@ -2441,10 +2485,11 @@ def _split_process_datasets(datasets, train_ratio=0.80):
 
 # ── Build the two dictionaries ───────────────────────────────────────────────
 if TEMPORAL_SPLIT:
-    print(f"\n📌 TEMPORAL SPLIT ({TRAIN_RATIO:.0%} train / "
+    print(f"\n📌 {SPLIT_TYPE.upper()} SPLIT ({TRAIN_RATIO:.0%} train / "
           f"{1-TRAIN_RATIO:.0%} test) — splitting all processes:")
     train_datasets, test_datasets = _split_process_datasets(
-        process_datasets_to_model, TRAIN_RATIO
+        process_datasets_to_model, TRAIN_RATIO,
+        split_type=SPLIT_TYPE, random_seed=RANDOM_SPLIT_SEED,
     )
 else:
     print("\n📌 NO SPLIT – using all data for extraction & training")
@@ -6067,6 +6112,8 @@ else:
         'temporal_resolution': TEMPORAL_RESOLUTION,
         'processes': processes_to_run,
         'approaches': APPROACHES,
+        'split_type': SPLIT_TYPE,
+        'train_ratio': TRAIN_RATIO,
     }
     _info_path = os.path.join(_run_dir, 'info.json')
     with open(_info_path, 'w') as _f:

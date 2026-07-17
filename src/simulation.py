@@ -296,11 +296,54 @@ class ProcessSimulation:
                 row.append(0.0)
         return row
 
-    def _predict_mlp_duration(self, model_tuple, feature_vec):
-        """Predict duration in minutes from ML+ (model, scaler, name) tuple."""
+    def _predict_mlp_duration(self, model_tuple, feature_vec, cap_minutes=None):
+        """
+        Predict duration in minutes from ML+ (model, scaler, name) tuple.
+
+        cap_minutes: optional sane upper bound. The underlying regressor is
+        trained on log1p(duration) and inverted with expm1 here, so any bad
+        extrapolation (e.g. a rarely-fired activity queried with an unusual
+        feature combination) gets amplified exponentially -- a prediction a
+        few units too high in log-space becomes tens of thousands of real
+        minutes. Confirmed in practice: an activity with a tight real
+        distribution (mean ~12 min) got predicted at 56354 min, which later
+        overflowed datetime.fromtimestamp and crashed the whole run. Capping
+        keeps one bad prediction from taking down the simulation while still
+        allowing genuinely long activities through (see _activity_duration_cap).
+        """
         m, sc = model_tuple[0], model_tuple[1]
         X = np.array(feature_vec, dtype=float).reshape(1, -1)
-        return float(np.clip(np.expm1(m.predict(sc.transform(X))), 0, None)[0])
+        pred = float(np.clip(np.expm1(m.predict(sc.transform(X))), 0, None)[0])
+        if cap_minutes is not None:
+            pred = min(pred, cap_minutes)
+        return pred
+
+    def _activity_duration_cap(self, key, fallback_mean=10.0):
+        """
+        Sane upper bound (minutes) for one activity's duration, derived from
+        its own fitted real-data distribution (the 99.9th percentile) rather
+        than an arbitrary constant -- so activities that are genuinely
+        long-tailed in reality still get a generous cap, while tight
+        distributions don't let a single bad ML extrapolation through.
+        """
+        config = self.activity_config.get(key)
+        if config:
+            dist_name = config.get('dist_name', 'norm')
+            dist_params = config.get('dist_params')
+            if dist_params:
+                try:
+                    import scipy.stats as _scipy_stats
+                    from sim_extractor import _DIST_MAP
+                    dist = _DIST_MAP.get(dist_name, _scipy_stats.norm)
+                    cap = float(dist.ppf(0.999, *dist_params))
+                    if np.isfinite(cap) and cap > 0:
+                        return cap
+                except Exception:
+                    pass
+            mean = config.get('duration')
+            if mean and np.isfinite(mean) and mean > 0:
+                return mean * 50.0
+        return fallback_mean * 50.0
 
     def _get_activity_duration(self, activity, object_name, object_type,
                                higher_level_activity, object_attributes=None,
@@ -420,11 +463,13 @@ class ProcessSimulation:
                 case_start_ts  or 0.0,
             )
             if eval_mode == 'petri_net_ml_plus_global' and self.mlp_global_tuple is not None:
-                return max(0.1, self._predict_mlp_duration(self.mlp_global_tuple, feat_vec))
+                cap = self._activity_duration_cap(key, fallback_mean=self.mlp_global_mean or 10.0)
+                return max(0.1, self._predict_mlp_duration(self.mlp_global_tuple, feat_vec, cap_minutes=cap))
             if eval_mode == 'petri_net_ml_plus_per_act':
                 tpl = self.mlp_per_act_tuples.get(activity)
                 if tpl is not None:
-                    return max(0.1, self._predict_mlp_duration(tpl, feat_vec))
+                    cap = self._activity_duration_cap(key, fallback_mean=self.mlp_global_mean or 10.0)
+                    return max(0.1, self._predict_mlp_duration(tpl, feat_vec, cap_minutes=cap))
                 # fallback: per-activity median (no model for this activity or n < 20)
                 fallback = self.mlp_activity_means.get(activity, self.mlp_global_mean or 10.0)
                 return max(0.1, float(fallback))
