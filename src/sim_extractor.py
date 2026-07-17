@@ -783,6 +783,11 @@ def _extract_duration_and_raw(group, object_name, object_type,
         }
 
         # ── Raw rows for ML training ──────────────────────────────────
+        # Also accumulate this activity's real waiting-time samples (gap
+        # before it starts) so the base petri_net simulation can reproduce
+        # idle time between activities instead of butting them back-to-back
+        # (see MODEL_BASE_IDLE in simulation.py).
+        _waiting_samples = []
         for case_id, case_acts in case_sorted.items():
             current_indices = case_acts[case_acts['activity'] == activity].index
 
@@ -820,6 +825,7 @@ def _extract_duration_and_raw(group, object_name, object_type,
                         .total_seconds() / 60
                     )
                     waiting_time = max(0.0, gap)
+                _waiting_samples.append(waiting_time)
                 if idx >= 2:
                     prev_row2 = case_acts.iloc[idx - 2]
                     prev_act_2 = prev_row2['activity']
@@ -861,6 +867,31 @@ def _extract_duration_and_raw(group, object_name, object_type,
                     'prev_duration_2':       prev_dur_2,
                     **attr_flat,
                 })
+
+        # ── Per-activity waiting-time (idle) empirical sample ─────────
+        # Store the REAL waiting-time samples (bounded reservoir) so the base
+        # petri_net sim can *bootstrap* an idle gap — i.e. draw an actual
+        # observed value at random. Real waiting times are heavily zero-
+        # inflated with a long tail; a parametric normal(median,std) badly
+        # over-injects idle for such distributions (confirmed: process_2 got
+        # 45% simulated idle vs 0.6% real). Bootstrapping reproduces the
+        # zero-mass and the tail exactly. waiting_cap is kept only as a hard
+        # safety clip. waiting_median stays for reporting/diagnostics.
+        if _waiting_samples:
+            _ws = np.asarray(_waiting_samples, dtype=float)
+            _ws = np.clip(_ws[np.isfinite(_ws)], 0.0, None)
+            # Bounded, deterministic reservoir so a high-frequency activity
+            # doesn't bloat the stats; preserves the empirical distribution.
+            _RESERVOIR_N = 1000
+            if len(_ws) > _RESERVOIR_N:
+                _ws = np.random.RandomState(0).choice(_ws, size=_RESERVOIR_N, replace=False)
+            duration_info[activity]['waiting_samples'] = _ws.tolist()
+            duration_info[activity]['waiting_median']  = float(np.median(_ws))
+            duration_info[activity]['waiting_cap']     = float(np.percentile(_ws, 99.9)) if len(_ws) >= 10 else float(_ws.max())
+        else:
+            duration_info[activity]['waiting_samples'] = []
+            duration_info[activity]['waiting_median']  = 0.0
+            duration_info[activity]['waiting_cap']     = 0.0
 
     return duration_info, raw_rows
 
@@ -932,6 +963,11 @@ def _extract_manual(group, object_name, object_type, higher_level_activity,
             'is_end':                is_end,
             'resource_id':           d.get('resource_id'),
             'resource_weights':      d.get('resource_weights', {}),
+            # Real idle-gap samples before this activity, bootstrapped by the
+            # base sim to reproduce idle time (see MODEL_BASE_IDLE).
+            'waiting_samples':       d.get('waiting_samples', []),
+            'waiting_median':        d.get('waiting_median', 0.0),
+            'waiting_cap':           d.get('waiting_cap', 0.0),
         })
 
     return stats, None  # No process_model for manual
@@ -1095,6 +1131,11 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
             'is_end':                is_end,
             'resource_id':           d.get('resource_id'),
             'resource_weights':      d.get('resource_weights', {}),
+            # Real idle-gap samples before this activity, bootstrapped by the
+            # base sim to reproduce idle time (see MODEL_BASE_IDLE).
+            'waiting_samples':       d.get('waiting_samples', []),
+            'waiting_median':        d.get('waiting_median', 0.0),
+            'waiting_cap':           d.get('waiting_cap', 0.0),
         })
 
     # ── Build label-level stochastic weights for blending ───────────

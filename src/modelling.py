@@ -2163,33 +2163,42 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     _edge_f1_global   = results['control_flow_metrics'].get('edge_f1_score', np.nan)
     _dur_activ_global = results['duration_metrics'].get('activity_duration_error', np.nan)
 
-    # overall_error (drives best-mode selection, see _best_mode_by_process) --
-    # evt_ratio_err and js_div are still computed and stored as diagnostic
-    # columns below, just no longer averaged into this selection score.
+    # overall_error (drives best-mode selection, see _best_mode_by_process).
+    # Each component carries a weight; the score is their weighted mean.
     # case_span_err (total case duration, vs. dur_err_activ's per-activity-
-    # type durations) is included here deliberately: it's exactly the metric
-    # that was missing when a mode with poor control-flow/duration fidelity
-    # got selected as "best" despite simulated case lengths drifting 0.3x-11x
+    # type durations) is included deliberately: it's exactly the metric that
+    # was missing when a mode with poor control-flow/duration fidelity got
+    # selected as "best" despite simulated case lengths drifting 0.3x-11x
     # from real (see the process_2 idle-gap investigation).
+    # evt_ratio_err (per-case |sim_events/real_events - 1|, median) is folded
+    # in at a *small* weight: event count is strongly upstream of case span
+    # (too few events -> short span almost regardless of durations), so a mode
+    # can no longer win by nailing per-activity durations while producing half
+    # the events -- but it's down-weighted so it informs, not dominates,
+    # selection. js_div is still computed/stored as a diagnostic only.
+    _EVT_RATIO_WEIGHT = 0.3   # relative to 1.0 for the core components
     short_components = {
-        'dur_err_activ':          _pc.get('dur_err_activ', _dur_activ_global),
-        'case_span_err':          _pc.get('case_span_err', np.nan),
-        'edge_err (1-EdgeF1)':    (1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
-                                  ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan),
-        'fitness_err (1-Fitness)':    results['conformance_metrics'].get('fitness_error', np.nan),
-        'precision_err (1-Prec)':     results['conformance_metrics'].get('precision_error', np.nan),
+        'dur_err_activ':          (_pc.get('dur_err_activ', _dur_activ_global), 1.0),
+        'case_span_err':          (_pc.get('case_span_err', np.nan), 1.0),
+        'edge_err (1-EdgeF1)':    ((1.0 - _pc['edge_f1']) if 'edge_f1' in _pc else
+                                   ((1.0 - _edge_f1_global) if pd.notna(_edge_f1_global) else np.nan), 1.0),
+        'fitness_err (1-Fitness)':    (results['conformance_metrics'].get('fitness_error', np.nan), 1.0),
+        'precision_err (1-Prec)':     (results['conformance_metrics'].get('precision_error', np.nan), 1.0),
+        'evt_ratio_err':          (_pc.get('evt_ratio_err', np.nan), _EVT_RATIO_WEIGHT),
     }
 
     report("\nShort-heatmap error components (0 = best):")
-    err_values = []
-    for comp_name, comp_val in short_components.items():
+    _weighted_sum = 0.0
+    _weight_total = 0.0
+    for comp_name, (comp_val, comp_wt) in short_components.items():
         if pd.isna(comp_val):
             report(f"  {comp_name:30}: n/a")
         else:
-            report(f"  {comp_name:30}: {comp_val:.4f}")
-            err_values.append(float(comp_val))
+            report(f"  {comp_name:30}: {float(comp_val):.4f}  (w={comp_wt})")
+            _weighted_sum += float(comp_val) * comp_wt
+            _weight_total += comp_wt
 
-    overall_error = float(np.mean(err_values)) if err_values else np.nan
+    overall_error = (_weighted_sum / _weight_total) if _weight_total > 0 else np.nan
     report(f"\nOVERALL ERROR SCORE: {overall_error:.4f} (0=perfect)")
 
     if pd.notna(overall_error) and overall_error <= 0.05:

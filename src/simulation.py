@@ -12,6 +12,38 @@ from pm4py.objects.petri_net import semantics as pn_semantics
 from sim_extractor import sample_from_dist, LoadProfile
 
 
+# ── Case-length / event-count / idle tuning knobs ───────────────────────
+# Single source of truth for the simulation-length controls. All default to
+# values that *reduce systematic event under-production and span shortfall*
+# seen in evaluation (simulated cases ending too early with no idle time).
+# Set END_TRANSITION_PENALTY = 1.0 and MIN_END_LENGTH_FRACTION = 0.0 and
+# MODEL_BASE_IDLE = False to recover the previous behaviour exactly.
+#
+# END_TRANSITION_PENALTY: multiplier applied to the sampled ``__END__``
+#   weight at every decision point in the ``__END__``-sampling modes
+#   (statistical / statistical_memory / wip_branching). <1.0 makes cases run
+#   longer, counteracting the geometric early-stop that shortens cases.
+END_TRANSITION_PENALTY = 0.5
+# MIN_END_LENGTH_FRACTION: in the marking-based modes, the *subset* final-
+#   marking heuristic (fm ⊆ current marking, but not the exact fm) is not
+#   accepted as a stop until the case has fired at least this fraction of its
+#   per-case sampled target length (sum of activity quotas). The exact
+#   ``marking == fm`` stop is always honoured. Prevents structurally-early
+#   exits from truncating cases. Inert when a model has no repeat-count data.
+MIN_END_LENGTH_FRACTION = 0.5
+# _LOOP_QUOTA_DISCOUNT: weight multiplier for a transition whose activity has
+#   already hit/passed this case's sampled repeat quota (soft cap, not a hard
+#   block — a hard zero could deadlock a case where looping is the only way
+#   forward). Shared by every mode's loop-quota logic.
+_LOOP_QUOTA_DISCOUNT = 0.05
+# MODEL_BASE_IDLE: when True, the base Petri-net token-game mode samples a
+#   waiting/idle gap before each activity from that activity's real observed
+#   waiting-time stats (mean/std, non-negative, capped at the 99.9th pct),
+#   instead of butting activities back-to-back. Recovers the idle fraction
+#   real cases show (18-19% in some processes) that the back-to-back sim lost.
+MODEL_BASE_IDLE = True
+
+
 def _stable_case_seed(case_id) -> int:
     """
     Deterministic (cross-process) seed derived from a case_id.
@@ -257,6 +289,13 @@ class ProcessSimulation:
                 # hardcoding a single resource for every simulated case.
                 # {} (or missing) falls back to the fixed resource_id above.
                 'resource_weights': row.get('resource_weights') or {},
+                # Real idle-gap samples before this activity, bootstrapped by
+                # the base petri_net mode to reproduce idle time when
+                # MODEL_BASE_IDLE is on (see _simulate_petri_net_for_case).
+                # Empty/0 = no idle, so stats_dfs predating these columns
+                # behave exactly as before.
+                'waiting_samples':  list(row['waiting_samples']) if isinstance(row.get('waiting_samples'), (list, tuple, np.ndarray)) else [],
+                'waiting_cap':      row.get('waiting_cap', 0.0) if pd.notna(row.get('waiting_cap', 0.0)) else 0.0,
             }
             
             print(f"  Config: {key}")
@@ -695,12 +734,9 @@ class ProcessSimulation:
         )
         weights = []
         for t in enabled_list:
-            w = stochastic_map.get(t, 1.0)
-            if activity_caps and t.label is not None:
-                label = str(t.label).strip()
-                cap = activity_caps.get(label)
-                if cap is not None and (activity_fire_counts or {}).get(label, 0) >= cap:
-                    w *= 0.05
+            w = stochastic_map.get(t, 1.0) * self._cap_discount(
+                t, activity_caps, activity_fire_counts
+            )
             weights.append(w)
         total = sum(weights)
         if total <= 0:
@@ -711,6 +747,73 @@ class ProcessSimulation:
         if rng is not None:
             return rng.choice(enabled_list, p=probs)
         return np.random.choice(enabled_list, p=probs)
+
+    def _cap_discount(self, transition, activity_caps, activity_fire_counts):
+        """
+        Selection-weight multiplier for one *transition* under this case's
+        per-activity loop quota. Returns 1.0 when there is no quota for the
+        transition's activity or it hasn't been hit yet, and
+        ``_LOOP_QUOTA_DISCOUNT`` once the activity has fired at least its
+        sampled cap number of times (soft cap — see _choose_transition).
+        Silent transitions and quota-less models are never discounted.
+        """
+        if not activity_caps or transition.label is None:
+            return 1.0
+        label = str(transition.label).strip()
+        cap = activity_caps.get(label)
+        if cap is not None and (activity_fire_counts or {}).get(label, 0) >= cap:
+            return _LOOP_QUOTA_DISCOUNT
+        return 1.0
+
+    def _sample_idle_gap(self, act_key, rng=None):
+        """
+        Sample an idle/waiting gap (minutes, ≥0) to insert *before* an
+        activity of *act_key* by *bootstrapping* one of that activity's real
+        observed waiting-time samples (see MODEL_BASE_IDLE / sim_extractor
+        waiting_samples). Bootstrapping — rather than a parametric
+        normal(median, std) — is essential because real waiting times are
+        heavily zero-inflated with a long tail: a normal over-injects idle
+        massively (process_2: 45% simulated vs 0.6% real), whereas drawing an
+        actual observed value reproduces both the zero-mass and the tail.
+        Returns 0.0 when idle modelling is off or no samples exist (identical
+        to the old back-to-back sim).
+        """
+        if not MODEL_BASE_IDLE:
+            return 0.0
+        config = self.activity_config.get(act_key)
+        if not config:
+            return 0.0
+        samples = config.get('waiting_samples')
+        if not samples:
+            return 0.0
+        if rng is not None:
+            gap = float(samples[int(rng.integers(len(samples)))])
+        else:
+            gap = float(samples[int(np.random.randint(len(samples)))])
+        gap = max(0.0, gap)
+        cap = float(config.get('waiting_cap', 0.0) or 0.0)
+        if cap > 0.0:
+            gap = min(gap, cap)
+        return gap
+
+    def _accept_subset_end(self, activity_count, activity_caps):
+        """
+        Whether an *eager* subset final-marking match (fm ⊆ current marking,
+        but not the exact final marking) should be accepted as a stop right
+        now. Blocks it until the case has fired at least
+        ``MIN_END_LENGTH_FRACTION`` of its per-case sampled target length
+        (the sum of activity quotas), so structurally-early exits don't
+        truncate cases below the real per-case length band. Returns True
+        (guard inert, behaviour unchanged) whenever there is no quota target
+        — i.e. models without activity_repeat_counts. The exact
+        ``marking == fm`` stop is handled separately and never gated here.
+        """
+        if not activity_caps:
+            return True
+        target = sum(activity_caps.values())
+        if target <= 0:
+            return True
+        return activity_count >= MIN_END_LENGTH_FRACTION * target
 
     def _sample_activity_caps(self, repeat_counts, rng):
         """
@@ -805,6 +908,10 @@ class ProcessSimulation:
             activity_caps = self._sample_activity_caps(
                 model.get('activity_repeat_counts', {}), _cap_rng
             )
+            # Independent idle-gap RNG stream (see _sample_idle_gap) -- kept
+            # separate from _pn_rng so sampling idle never perturbs the
+            # transition sequence (same isolation rationale as _cap_rng).
+            _idle_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_idle"))
 
             print(f"\nCase {case_id}: Petri net simulation for {object_name} "
                   f"({object_type})")
@@ -822,7 +929,8 @@ class ProcessSimulation:
                 fm_reached = all(
                     marking.get(p, 0) >= fm[p] for p in fm
                 )
-                if fm_reached and activity_count > 0:
+                if (fm_reached and activity_count > 0
+                        and self._accept_subset_end(activity_count, activity_caps)):
                     print(f"    Final marking subset reached after "
                           f"{activity_count} activities.")
                     break
@@ -886,6 +994,17 @@ class ProcessSimulation:
                             print(f"    WARNING: No duration info for "
                                   f"'{activity_label}' — using 10 min default.")
                             activity_duration = 10.0
+
+                    # ── Idle/waiting gap before this activity starts ──────
+                    # Reproduce the real between-activity idle time (see
+                    # MODEL_BASE_IDLE) instead of butting activities back to
+                    # back. No-op (0 min) for the first activity of the case,
+                    # when idle modelling is off, or when no waiting stats
+                    # exist for this activity.
+                    if activity_count > 0:
+                        _idle_key = (activity_label, object_name, object_type,
+                                     higher_level_activity)
+                        current_sim_time += self._sample_idle_gap(_idle_key, rng=_idle_rng) * 60
 
                     # Calculate timestamps
                     start_time_obj = datetime.fromtimestamp(current_sim_time)
@@ -1012,7 +1131,8 @@ class ProcessSimulation:
                     print(f"    Final marking reached after {activity_count} activities.")
                     break
                 fm_reached = all(marking.get(p, 0) >= fm[p] for p in fm)
-                if fm_reached and activity_count > 0:
+                if (fm_reached and activity_count > 0
+                        and self._accept_subset_end(activity_count, activity_caps)):
                     print(f"    Final marking subset reached after {activity_count} activities.")
                     break
 
@@ -1187,7 +1307,8 @@ class ProcessSimulation:
                     print(f"    Final marking reached after {activity_count} activities.")
                     break
                 fm_reached = all(marking.get(p, 0) >= fm[p] for p in fm)
-                if fm_reached and activity_count > 0:
+                if (fm_reached and activity_count > 0
+                        and self._accept_subset_end(activity_count, activity_caps)):
                     print(f"    Final marking subset reached after {activity_count} activities.")
                     break
 
@@ -1267,7 +1388,11 @@ class ProcessSimulation:
                             continue
                         cap = activity_caps.get(lbl)
                         if cap is not None and activity_fire_counts.get(lbl, 0) >= cap:
-                            candidate_probs[lbl] *= 0.05
+                            candidate_probs[lbl] *= _LOOP_QUOTA_DISCOUNT
+                    # Counteract systematic early stopping: down-weight the
+                    # explicit __END__ choice (see END_TRANSITION_PENALTY).
+                    if '__END__' in candidate_probs:
+                        candidate_probs['__END__'] *= END_TRANSITION_PENALTY
                     total = sum(candidate_probs.values())
                     if total <= 0:
                         candidate_probs = {lbl: 1.0 for lbl in valid_labels}
@@ -1414,6 +1539,13 @@ class ProcessSimulation:
             activity_history = []
             max_steps = max(max_case_length * 2, 50)  # Change 4: guard from data
             step = 0
+            # Per-case loop-quota state (see _sample_activity_caps): bounds how
+            # many times each activity repeats and feeds the subset-end guard.
+            activity_fire_counts = defaultdict(int)
+            _cap_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_caps"))
+            activity_caps = self._sample_activity_caps(
+                model.get('activity_repeat_counts', {}), _cap_rng
+            )
 
             print(f"\nCase {case_id}: Petri-net-statistical simulation "
                   f"for {object_name} ({object_type})  [alpha={alpha}]")
@@ -1429,7 +1561,8 @@ class ProcessSimulation:
                 fm_reached = all(
                     marking.get(p, 0) >= fm[p] for p in fm
                 )
-                if fm_reached and activity_count > 0:
+                if (fm_reached and activity_count > 0
+                        and self._accept_subset_end(activity_count, activity_caps)):
                     print(f"    Final marking subset reached after "
                           f"{activity_count} activities.")
                     break
@@ -1530,6 +1663,17 @@ class ProcessSimulation:
                         p = pn_weights.get(lbl, 0.0) / pn_total
                         blended[lbl] = alpha * s + (1.0 - alpha) * p
 
+                    # Per-case loop-quota discount + __END__ penalty (keeps
+                    # loop lengths / case lengths in the real band — see
+                    # _sample_activity_caps and END_TRANSITION_PENALTY).
+                    for lbl in list(blended.keys()):
+                        if lbl == '__END__':
+                            blended[lbl] *= END_TRANSITION_PENALTY
+                            continue
+                        cap = activity_caps.get(lbl)
+                        if cap is not None and activity_fire_counts.get(lbl, 0) >= cap:
+                            blended[lbl] *= _LOOP_QUOTA_DISCOUNT
+
                     # Sample from blended probabilities (including __END__)
                     acts = list(blended.keys())
                     probs = [blended[a] for a in acts]
@@ -1559,6 +1703,7 @@ class ProcessSimulation:
                           f"enabled transitions — ending.")
                     break
                 chosen_transition = random.choice(candidates)
+                activity_fire_counts[chosen_label] += 1
                 marking = self._fire_transition(marking, chosen_transition)
 
                 # ── Sample duration using full pipeline ────────────────
@@ -1679,6 +1824,13 @@ class ProcessSimulation:
             prev_activity = '__START__'  # sentinel for first step
             max_steps = max(max_case_length * 2, 50)  # Change 4
             step = 0
+            # Per-case loop-quota state (see _sample_activity_caps): reuses
+            # activity_counts_map as the fire-count source for the cap discount
+            # and the subset-end guard below.
+            _cap_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_caps"))
+            activity_caps = self._sample_activity_caps(
+                model.get('activity_repeat_counts', {}), _cap_rng
+            )
 
             print(f"\nCase {case_id}: Petri-net-memory simulation "
                   f"for {object_name} ({object_type})")
@@ -1694,7 +1846,8 @@ class ProcessSimulation:
                 fm_reached = all(
                     marking.get(p, 0) >= fm[p] for p in fm
                 )
-                if fm_reached and activity_count > 0:
+                if (fm_reached and activity_count > 0
+                        and self._accept_subset_end(activity_count, activity_caps)):
                     print(f"    Final marking subset reached after "
                           f"{activity_count} activities.")
                     break
@@ -1818,6 +1971,18 @@ class ProcessSimulation:
                     else:
                         weights = base_weights
                         weight_source = 'decision_point' if dp_weights else 'label_stochastic'
+
+                    # Per-case loop-quota discount + __END__ penalty (keeps
+                    # loop / case lengths in the real band — see
+                    # _sample_activity_caps and END_TRANSITION_PENALTY).
+                    # activity_counts_map is this mode's per-label fire count.
+                    for lbl in list(weights.keys()):
+                        if lbl == '__END__':
+                            weights[lbl] *= END_TRANSITION_PENALTY
+                            continue
+                        cap = activity_caps.get(lbl)
+                        if cap is not None and activity_counts_map.get(lbl, 0) >= cap:
+                            weights[lbl] *= _LOOP_QUOTA_DISCOUNT
 
                     # ── Normalise and sample ──────────────────────────
                     all_labels = list(weights.keys())
@@ -2347,6 +2512,14 @@ class ProcessSimulation:
             _case_start_ts              = current_sim_time
             _activity_occurrence_counts: dict = {}   # {activity_label: count fired so far}
             _last_occurrence_count: float = 0.0      # occurrence count of the last-fired activity
+            # Per-case loop-quota state (see _sample_activity_caps): bounds
+            # activity repeats so this mode can't run a loop away past the
+            # real per-case band. _activity_occurrence_counts is the fire-count
+            # source consumed by _cap_discount below.
+            _cap_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_caps"))
+            activity_caps = self._sample_activity_caps(
+                model.get('activity_repeat_counts', {}), _cap_rng
+            )
 
             # Seed energy state from start-activity modifier means (same logic as modifier method)
             if self.energy_state_columns:
@@ -2511,6 +2684,12 @@ class ProcessSimulation:
                         else:
                             alpha = float(getattr(clf, '_blend_alpha', 1.0))
                         weights = [alpha * m + (1.0 - alpha) * p for m, p in zip(ml_p, pn_p)]
+                        # Per-case loop-quota discount (see _sample_activity_caps):
+                        # discourage an activity already at its sampled repeat cap.
+                        weights = [
+                            w * self._cap_discount(t, activity_caps, _activity_occurrence_counts)
+                            for w, t in zip(weights, enabled_list)
+                        ]
 
                         total = sum(weights)
                         if total > 0:
@@ -2521,8 +2700,13 @@ class ProcessSimulation:
                             print(f"    WARNING: direct transition sampling failed: {exc}")
 
                 if chosen_transition is None:
-                    # Fallback: base PN stochastic weights
-                    weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
+                    # Fallback: base PN stochastic weights (with the same
+                    # per-case loop-quota discount as the ML-blend branch).
+                    weights = [
+                        stochastic_map.get(t, 1.0)
+                        * self._cap_discount(t, activity_caps, _activity_occurrence_counts)
+                        for t in enabled_list
+                    ]
                     total   = sum(weights)
                     if total <= 0:
                         chosen_transition = random.choice(enabled_list)
