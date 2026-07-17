@@ -1745,17 +1745,18 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report("\n1. BASIC PROCESS METRICS")
     report("-" * 40)
     
-    # Event counts
+    # Event counts. Ratio is real/simulated (not sim/real): 1.0 = perfect
+    # match, >1 = simulation under-counts events, <1 = simulation over-counts.
     sim_events = len(simulated_df)
     real_events = len(real_df)
-    event_ratio = sim_events / real_events if real_events > 0 else 0
-    
-    # Case counts  
+    event_ratio = real_events / sim_events if sim_events > 0 else 0
+
+    # Case counts
     sim_cases = simulated_df[case_col].nunique() if case_col in simulated_df.columns else 0
     real_cases = real_df[case_col].nunique() if case_col in real_df.columns else 0
     case_ratio = sim_cases / real_cases if real_cases > 0 else 0
-    
-    report(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio: {event_ratio:.3f}")
+
+    report(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio (real/sim): {event_ratio:.3f}")
     report(f"Cases - Real: {real_cases}, Sim: {sim_cases}, Ratio: {case_ratio:.3f}")
     
     results['basic_metrics'] = {
@@ -2205,10 +2206,10 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     # Overwrite the individual result-dict entries with per-case median values so
     # the flattening → heatmap pipeline uses per-case medians everywhere.
     if _pc:
-        # event_count_ratio is stored raw; heatmap computes abs(ratio-1), so set
-        # ratio = 1 + median_err so the heatmap recovers the correct median error.
-        results['basic_metrics']['event_count_ratio']              = 1.0 + _pc['evt_ratio_err']
-        results['basic_metrics']['event_count_error']              = _pc['evt_ratio_err']
+        # event_count_ratio/error are left as the simple pooled real/sim
+        # count ratio computed above (not overwritten with the per-case
+        # median here) -- straightforward to read, and comparable directly
+        # across modes.
         results['duration_metrics']['mean_duration_error']         = _pc['dur_err_whole']
         if pd.notna(_pc.get('case_span_err', np.nan)):
             results['duration_metrics']['case_span_error']          = _pc['case_span_err']

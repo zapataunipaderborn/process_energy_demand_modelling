@@ -324,6 +324,14 @@ class SimModeller:
         self.transition_models:   dict = {}   # key -> (model, LabelEncoder, feature_cols, model_type)
         self.waiting_models:      dict = {}   # key -> (model, feature_cols, model_type)
         self.waiting_std_models:  dict = {}   # key -> (model, feature_cols, model_type)
+        # key -> sane upper bound (minutes) for predict_waiting_time, derived
+        # from the 99.9th percentile of that key's own observed waiting_time
+        # samples -- same rationale as _activity_duration_cap in simulation.py:
+        # a WIP/RO combination outside the training range can push a tree
+        # regressor to extrapolate to an unbounded leaf value, and unlike
+        # duration this had no cap at all, so a single degenerate key could
+        # inject the same huge wait on every case that visits it.
+        self.waiting_time_caps:  dict = {}   # key -> float (minutes)
         # WIP/RO-aware transition classifiers — populated by train_wip_transitions().
         # Only kept per-key when they beat the statistical baseline on validation
         # (see train_wip_transitions); otherwise absent, so
@@ -736,6 +744,10 @@ class SimModeller:
                             )
                         self.waiting_models[key] = (final_wait_model, feature_cols,
                                                     best_wait_type)
+                        _wait_cap = float(np.percentile(y_all_wait, 99.9)) if len(y_all_wait) >= 10 \
+                            else (float(y_all_wait.max()) if len(y_all_wait) else None)
+                        if _wait_cap is not None and np.isfinite(_wait_cap) and _wait_cap > 0:
+                            self.waiting_time_caps[key] = _wait_cap
                         wait_trained += 1
                         if best_wait_metrics:
                             self.waiting_val_metrics[key] = {
@@ -1385,6 +1397,12 @@ class SimModeller:
 
         Returns ``None`` when no waiting-time model is available for the
         given key, signalling the caller to fall back to a fixed/no gap.
+
+        Clipped to ``waiting_time_caps[key]`` (99.9th percentile of that
+        key's observed waiting_time samples) before returning -- a WIP/RO
+        combination outside the training range can push the regressor to
+        an unbounded extrapolated leaf, and one degenerate key would
+        otherwise inject the same huge wait into every case that visits it.
         """
         key = self._make_key(activity, object_name, object_type,
                              higher_level_activity)
@@ -1408,7 +1426,12 @@ class SimModeller:
             std_pred = max(0.0, float(std_model.predict(X)[0]))
 
         sampled = np.random.normal(median_pred, std_pred) if std_pred > 0 else median_pred
-        return max(0.0, float(sampled))
+        sampled = max(0.0, float(sampled))
+
+        cap = self.waiting_time_caps.get(key)
+        if cap is not None:
+            sampled = min(sampled, cap)
+        return sampled
 
     def predict_transitions(
         self,
