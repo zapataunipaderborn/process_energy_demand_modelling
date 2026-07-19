@@ -48,6 +48,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+setting = True
+
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
     # {
@@ -61,15 +63,15 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_937',
+        'run_name':              'experiment_943',
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic', 'alpha'],#, 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-        'run_energy_modelling':  False,    # set False to skip energy profile/curve modelling
+        'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
-        'run_schedule_profile_eval':False, # Best/mine vs. Schedule-direct vs. Stochastic generator, per process
-        'save_predicted_curves': False, # persist real/predicted curve arrays for later metrics/plots
+        'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
+        'save_predicted_curves': setting, # ON: persists predicted_curves.parquet the schedule-profile comparison reads
         'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
         'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
     },

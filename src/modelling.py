@@ -436,6 +436,9 @@ MODES_TO_COMPARE = [
     'petri_net_wip_aware_ml_plus_global',    # same, but duration from the ML+ global model
     'petri_net_wip_aware_ml_plus_per_act',   # same, but duration from the ML+ per-activity models
     'petri_net_wip_branching_aware',   # wip_aware + WIP/RO-aware branching (falls back to statistical if not better)
+    'petri_net_budget',   # base PN token game, but each case is generated to match its predicted total-duration budget (train_case_duration_pipeline) — folds the "duration-corrected" span-fix into the generator (no post-hoc step)
+    'petri_net_budget_ml_plus_global',   # petri_net_budget + ML+ global duration model (better internal timing under the same total-duration budget)
+    'petri_net_budget_ml_plus_per_act',  # petri_net_budget + ML+ per-activity duration models
     # 'petri_net_ilp',
     # 'petri_net_ilp_ml_plus_global',
     # 'petri_net_ilp_ml_plus_per_act',
@@ -979,7 +982,7 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
 
 def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, sensors, ef_cols,
                                 output_root, best_mode_safe=None, complete_curve_dir=None,
-                                predicted_logs_dir=None):
+                                predicted_logs_dir=None, budget_mode_safe=None):
     """
     "Schedule Profile Evaluation" — see sim_extractor.py's Schedule Profile
     Evaluation section for the design. Per sensor: trains a schedule-only
@@ -1003,23 +1006,41 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     duration regressor (train_case_duration_pipeline), instead of trusting
     the raw simulated schedule's own (possibly very wrong) total span.
 
+    "Best, budget" (``budget_mode_safe``) is a FIXED-mode comparator: the
+    petri_net_budget family generates each case to match its predicted total
+    duration inside the simulator, so its span is already right without any
+    post-hoc rescale. It is pinned to one named mode (not the per-process
+    overall_error winner like "Best, mine") precisely so this table shows a
+    clean, like-for-like evaluation of that method across every process —
+    otherwise it is silently mixed in with other modes wherever it happens to
+    win, and can never be compared head-to-head with "Best, duration-corrected".
+
     Silently no-ops (per sensor) when there isn't enough data to train on.
     """
     import time as _t
     _t0 = _t.perf_counter()
 
-    best_case_df = None
-    _best_curve_path = None
-    if best_mode_safe and complete_curve_dir:
-        _best_path = os.path.join(complete_curve_dir, process, best_mode_safe,
-                                  'per_case_complete_curve_exog_prev_activity.csv')
-        if os.path.exists(_best_path):
-            best_case_df = pd.read_csv(_best_path)
-            best_case_df['case_id'] = best_case_df['case_id'].astype(str)
-        _candidate_curve_path = os.path.join(complete_curve_dir, process, best_mode_safe,
-                                             'predicted_curves_exog_prev_activity.parquet')
-        if os.path.exists(_candidate_curve_path):
-            _best_curve_path = _candidate_curve_path
+    def _load_mode_curve_sources(_mode_safe):
+        """(per_case_df, curves_parquet_path) for one simulation mode's
+        already-computed 'exog_prev_activity' complete-curve outputs."""
+        _case_df, _curve_path = None, None
+        if _mode_safe and complete_curve_dir:
+            _p = os.path.join(complete_curve_dir, process, _mode_safe,
+                              'per_case_complete_curve_exog_prev_activity.csv')
+            if os.path.exists(_p):
+                _case_df = pd.read_csv(_p)
+                _case_df['case_id'] = _case_df['case_id'].astype(str)
+            _cp = os.path.join(complete_curve_dir, process, _mode_safe,
+                               'predicted_curves_exog_prev_activity.parquet')
+            if os.path.exists(_cp):
+                _curve_path = _cp
+        return _case_df, _curve_path
+
+    best_case_df, _best_curve_path = _load_mode_curve_sources(best_mode_safe)
+    budget_case_df, _budget_curve_path = _load_mode_curve_sources(budget_mode_safe)
+    if budget_mode_safe and budget_case_df is None and _budget_curve_path is None:
+        print(f"  ⚠️ 'Best, budget': no complete-curve output found for "
+              f"{process}/{budget_mode_safe} — that series will be missing.")
 
     # Raw simulated per-case total span (first activity start -> last
     # activity end) for the winning ("best") mode, straight from its own
@@ -1083,6 +1104,15 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
             )
             cmp_df = cmp_df.merge(_best_sensor, on='case_id', how='left')
 
+        if budget_case_df is not None:
+            _budget_sensor = (
+                budget_case_df[budget_case_df['sensor'] == sensor]
+                [['case_id', 'wasserstein_time', 'wasserstein_value']]
+                .rename(columns={'wasserstein_time': 'budget_wasserstein_time',
+                                 'wasserstein_value': 'budget_wasserstein_value'})
+            )
+            cmp_df = cmp_df.merge(_budget_sensor, on='case_id', how='left')
+
         all_rows.append(cmp_df)
 
         if SAVE_PREDICTED_CURVES and sensor_curve_df is not None and not sensor_curve_df.empty:
@@ -1125,6 +1155,27 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
                             _corrected_rows.append(_g)
                         if _corrected_rows:
                             all_curve_rows.append(pd.concat(_corrected_rows, ignore_index=True))
+
+            # -- "Best, budget": the pinned petri_net_budget mode's own curves.
+            # Its span is already correct by construction (the budget is spent
+            # inside the simulator), so NO rescale is applied here — that's the
+            # whole point of comparing it against best_duration_corrected.
+            if _budget_curve_path is not None:
+                try:
+                    _budget_curves = pd.read_parquet(_budget_curve_path)
+                except Exception:
+                    _budget_curves = pd.DataFrame()
+                if not _budget_curves.empty:
+                    _budget_curves = _budget_curves[
+                        (_budget_curves['sensor'] == sensor)
+                        & (_budget_curves['series'] == 'predicted')
+                    ].copy()
+                    if not _budget_curves.empty:
+                        _budget_curves['series'] = 'best_budget'
+                        _budget_curves['case_id'] = _budget_curves['case_id'].astype(str)
+                        _budget_curves = _budget_curves[
+                            ['case_id', 'sensor', 'series', 't_minutes', 'value']]
+                        all_curve_rows.append(_budget_curves)
 
     if not all_rows:
         return
@@ -2517,7 +2568,8 @@ for _mode_name in MODES_TO_COMPARE:
         continue
     if _mode_name.startswith('petri_net_'):
         _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
-        if (_mode_alg in ('combined', 'median_duration', 'wip_aware', 'wip_branching_aware') or
+        if (_mode_alg in ('combined', 'median_duration', 'wip_aware',
+                          'wip_branching_aware', 'budget') or
                 _mode_alg.endswith('_ml_plus_global') or
                 _mode_alg.endswith('_ml_plus_per_act')):
             _filtered_modes.append(_mode_name)
@@ -2694,6 +2746,32 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         if 'petri_net_wip_branching_aware' in MODES_TO_COMPARE:
             ml_models.train_wip_transitions(raw_df, activity_stats_df)
 
+    # ── Train the case-duration predictor for petri_net_budget mode ───────
+    # One per-case total-duration regressor (schedule-only attributes -> total
+    # minutes), the same predictor the "duration-corrected" post-processing
+    # used — but here it's handed to the simulator so petri_net_budget can
+    # generate each case to match its predicted duration natively. Trained on
+    # TRAIN cases only. None -> the mode falls back to a plain-span timeline.
+    _case_duration_pipeline = None
+    if 'petri_net_budget' in MODES_TO_COMPARE:
+        _bud_train_exp = train_datasets.get(process, {}).get('expanded') if train_datasets else None
+        if _bud_train_exp is not None and not _bud_train_exp.empty:
+            _bud_sensors = _detect_sensors_for_energy_distribution(process, _bud_train_exp)
+            _bud_ef_cols = [c for c in _bud_train_exp.columns
+                            if c.startswith('ef_') and _bud_train_exp[c].dtype in ('float64', 'float32', 'int64', 'int32')]
+            if _bud_sensors:
+                try:
+                    # Case duration/attributes are case-level (sensor-independent),
+                    # so any one sensor's case list yields the same duration model.
+                    _bud_cases = build_case_level_curves(_bud_train_exp, _bud_sensors[0], ef_cols=_bud_ef_cols)
+                    _case_duration_pipeline = train_case_duration_pipeline(_bud_cases, verbose=0)
+                except Exception as _bud_exc:
+                    print(f"  ⚠️ petri_net_budget: case-duration pipeline training failed "
+                          f"({_bud_exc}) — mode will run as plain petri_net for {process}.")
+        if _case_duration_pipeline is None:
+            print(f"  ⚠️ petri_net_budget: no case-duration predictor available for {process} "
+                  f"— mode runs as plain petri_net (no budget).")
+
     # ── Loop over modes ───────────────────────────────────────────────────
     process_mode_results = []
 
@@ -2723,6 +2801,12 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             # with 'wip'/'ro' features and waiting-time models; branching_aware
             # additionally uses ml_models.transition_wip_models, if trained).
             mode_algorithm = MINING_ALGORITHM
+        elif sim_mode == 'petri_net_budget':
+            # Base PN token game on MINING_ALGORITHM's net, plus a per-case
+            # duration budget spent inside the generator (case_duration_pipeline
+            # passed to ProcessSimulation below). simulation_mode stays
+            # 'petri_net_budget' so the dispatch routes to the budget variant.
+            mode_algorithm = MINING_ALGORITHM
         elif sim_mode.startswith('petri_net_'):
             mode_algorithm = sim_mode.replace('petri_net_', '', 1).strip().lower()
             if mode_algorithm not in extraction_by_algorithm:
@@ -2734,8 +2818,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             simulation_mode = 'petri_net'
             mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
 
-        mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net') else None
-        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_statistical', 'petri_net_statistical_memory', 'petri_net_wip_aware', 'petri_net_wip_branching_aware') else None
+        mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net', 'petri_net_budget') else None
+        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_budget', 'petri_net_statistical', 'petri_net_statistical_memory', 'petri_net_wip_aware', 'petri_net_wip_branching_aware') else None
 
         if simulation_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
             simulated_log_train, _ = simulate_with_wip_ro(
@@ -2748,6 +2832,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 mode_activity_stats_df, production_plan,
                 mode=simulation_mode, ml_models=mode_ml,
                 process_models=mode_pm,
+                case_duration_pipeline=(_case_duration_pipeline
+                                        if simulation_mode == 'petri_net_budget' else None),
             ).run()
 
         print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
@@ -2806,6 +2892,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     mode=simulation_mode,
                     ml_models=mode_ml,
                     process_models=mode_pm,
+                    case_duration_pipeline=(_case_duration_pipeline
+                                            if simulation_mode == 'petri_net_budget' else None),
                 ).run()
 
             print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
@@ -3310,6 +3398,115 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
             process_mode_results.append(flattened_wipmlp)
             evaluation_results_list.append(flattened_wipmlp)
+
+    # ── Budget + ML+ duration variants ───────────────────────────────────────
+    # petri_net_budget (each case generated to its predicted total-duration
+    # budget) combined with ML+ per-activity / global duration prediction — for
+    # better INTERNAL timing under the same correct total span. Reuses the ML+
+    # tuples trained above (_mlp_glb_tpl/_mlp_pa_tpls; guaranteed present since
+    # requesting a budget_ml_plus mode sets _any_algo_mlp) and this process's
+    # case-duration predictor (_case_duration_pipeline). Uses MINING_ALGORITHM's
+    # net, plain ProcessSimulation (no WIP/RO pass).
+    _bud_mlp_modes = [
+        m for m in MODES_TO_COMPARE
+        if m in ('petri_net_budget_ml_plus_global', 'petri_net_budget_ml_plus_per_act')
+    ]
+    if _bud_mlp_modes and _any_algo_mlp:
+        _bud_mlp_pm    = extraction_by_algorithm[MINING_ALGORITHM]['process_models']
+        _bud_mlp_stats = extraction_by_algorithm[MINING_ALGORITHM]['activity_stats_df']
+
+        for _bud_mode in _bud_mlp_modes:
+            _use_global = _bud_mode.endswith('_ml_plus_global')
+            _g_arg  = _mlp_glb_tpl if _use_global else None
+            _pa_arg = None if _use_global else _mlp_pa_tpls
+
+            print("\n" + "─"*80)
+            print(f"  ▶ SIMULATION MODE: {_bud_mode.upper()}")
+            print("─"*80)
+
+            sim_budmlp_train = ProcessSimulation(
+                _bud_mlp_stats, production_plan,
+                mode=_bud_mode,
+                process_models=_bud_mlp_pm,
+                case_duration_pipeline=_case_duration_pipeline,
+                mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
+                mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                mlp_global_mean=_mlp_glb_mean,
+            ).run()
+            print(f"\n  Simulated log TRAIN ({_bud_mode}): {len(sim_budmlp_train)} events")
+
+            eval_budmlp_train = comprehensive_simulation_evaluation(
+                sim_budmlp_train, df_train, process_models=_bud_mlp_pm
+            )
+            flattened_budmlp = {
+                'process':          process,
+                'mode':             _bud_mode,
+                'simulation_mode':  _bud_mode,
+                'mining_algorithm': MINING_ALGORITHM,
+                'split':            split_label,
+            }
+            for _cat, _mets in eval_budmlp_train.items():
+                if isinstance(_mets, dict):
+                    for _mn, _mv in _mets.items():
+                        flattened_budmlp[f"train_{_cat}_{_mn}"] = _mv
+                else:
+                    flattened_budmlp[f"train_{_cat}"] = _mets
+
+            _df_test_budmlp = test_datasets[process]['event_log'] if test_datasets else None
+            if TEMPORAL_SPLIT and _df_test_budmlp is not None and len(_df_test_budmlp) > 0:
+                _pp_test_budmlp = test_datasets[process]['production_plan']
+                sim_budmlp_test = ProcessSimulation(
+                    _bud_mlp_stats, _pp_test_budmlp,
+                    mode=_bud_mode,
+                    process_models=_bud_mlp_pm,
+                    case_duration_pipeline=_case_duration_pipeline,
+                    mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
+                    mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                    mlp_global_mean=_mlp_glb_mean,
+                ).run()
+                print(f"\n  Simulated log TEST  ({_bud_mode}): {len(sim_budmlp_test)} events")
+
+                if EXPORT_RESULTS:
+                    _safe_process = str(process).replace(' ', '_').replace('/', '_')
+                    _safe_mode    = str(_bud_mode).replace(' ', '_').replace('/', '_')
+                    _pred_df = sim_budmlp_test.drop(
+                        columns=[c for c in sim_budmlp_test.columns
+                                 if c == 'simulated_energy_curves'],
+                        errors='ignore',
+                    )
+                    _pred_path = os.path.join(
+                        _predicted_logs_dir, f'{_safe_process}_{_safe_mode}.parquet'
+                    )
+                    _pred_df.to_parquet(_pred_path, index=False)
+                    print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
+
+                eval_budmlp_test = comprehensive_simulation_evaluation(
+                    sim_budmlp_test, _df_test_budmlp, process_models=_bud_mlp_pm
+                )
+                for _cat, _mets in eval_budmlp_test.items():
+                    if isinstance(_mets, dict):
+                        for _mn, _mv in _mets.items():
+                            flattened_budmlp[f"test_{_cat}_{_mn}"] = _mv
+                    else:
+                        flattened_budmlp[f"test_{_cat}"] = _mets
+
+                _combined_sim_store.append({
+                    'process':     process,
+                    'mode':        _bud_mode,
+                    'sim_df':      sim_budmlp_test,
+                    'exp_df':      test_datasets[process].get('expanded'),
+                    'sensors':     [],
+                    'act_metrics': {},
+                })
+
+                _energy_distribution_pending.append((
+                    process, _bud_mode, sim_budmlp_test,
+                    test_datasets[process].get('expanded'),
+                    dict(flattened_budmlp),
+                ))
+
+            process_mode_results.append(flattened_budmlp)
+            evaluation_results_list.append(flattened_budmlp)
 
     # ── Energy-aware Petri-net modes ─────────────────────────────────────────
     # These run AFTER all base modes (including petri_net_combined) so the
@@ -4645,12 +4842,26 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
             _sensors_p = _detect_sensors_for_energy_distribution(_proc_p, _test_exp_p)
             _ef_cols_p = [c for c in _train_exp_p.columns
                          if c.startswith('ef_') and _train_exp_p[c].dtype in ('float64', 'float32', 'int64', 'int32')]
+            # "Best, budget" is pinned to one named budget mode for EVERY
+            # process (unlike "Best, mine", which is the per-process
+            # overall_error winner) so the budget method gets a clean,
+            # like-for-like row instead of being silently blended in wherever
+            # it happens to win. Falls back through the budget family in
+            # order of preference; None -> series simply absent.
+            _budget_mode_pin = next(
+                (m for m in ('petri_net_budget_ml_plus_per_act',
+                             'petri_net_budget_ml_plus_global',
+                             'petri_net_budget')
+                 if m in MODES_TO_COMPARE),
+                None,
+            )
             _save_schedule_profile_eval(
                 _proc_p, _train_exp_p, _test_exp_p, _sensors_p, _ef_cols_p,
                 _schedule_profile_eval_dir,
                 best_mode_safe=_best_mode_by_process.get(_proc_p),
                 complete_curve_dir=_complete_curve_eval_dir,
                 predicted_logs_dir=_predicted_logs_dir,
+                budget_mode_safe=_budget_mode_pin,
             )
 
 

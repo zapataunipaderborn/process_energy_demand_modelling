@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.petri_net import semantics as pn_semantics
 
-from sim_extractor import sample_from_dist, LoadProfile
+from sim_extractor import sample_from_dist, LoadProfile, predict_case_duration
 
 
 # ── Case-length / event-count / idle tuning knobs ───────────────────────
@@ -42,6 +42,25 @@ _LOOP_QUOTA_DISCOUNT = 0.05
 #   instead of butting activities back-to-back. Recovers the idle fraction
 #   real cases show (18-19% in some processes) that the back-to-back sim lost.
 MODEL_BASE_IDLE = True
+# ── 'petri_net_budget' steering knobs ───────────────────────────────────
+# The budget mode does NOT rescale time. It generates activities with their
+# real sampled durations and simply keeps the case running until its
+# predicted total-duration budget B is spent, then closes it. The budget
+# therefore controls HOW MANY activities happen (the real defect) instead of
+# stretching however many happened to fire -- which is what an earlier
+# rescale-based version did, and which inflated per-activity durations
+# whenever the net under-produced events (process_5: 11 events stretched to
+# fill a 409-min budget that reality fills with 24.5, so each activity came
+# out ~3x too long).
+#
+# BUDGET_EXIT_DISCOUNT: while still under budget, weight multiplier applied
+#   to any transition that would carry the case into its final marking, i.e.
+#   the "exit" branches. Small value = the case resists ending early and
+#   keeps looping, so it can actually fill its budget.
+BUDGET_EXIT_DISCOUNT = 0.02
+# BUDGET_EXIT_BOOST: once the budget is spent, the same exit transitions are
+#   boosted instead, so the case closes promptly rather than over-running.
+BUDGET_EXIT_BOOST = 25.0
 
 
 def _stable_case_seed(case_id) -> int:
@@ -105,7 +124,8 @@ class ProcessSimulation:
                  mlp_feat_cols=None,
                  mlp_activity_means=None,
                  mlp_global_mean=0.0,
-                 load_profile=None):
+                 load_profile=None,
+                 case_duration_pipeline=None):
         # Backward-compatible input handling: extract_process now returns
         # (stats_df, raw_df, process_models), while older callers pass stats_df only.
         if isinstance(activity_stats_df, (tuple, list)):
@@ -135,6 +155,11 @@ class ProcessSimulation:
         self.mlp_activity_means = mlp_activity_means or {}
         self.mlp_global_mean    = float(mlp_global_mean) if mlp_global_mean else 0.0
         self.load_profile       = load_profile  # LoadProfile for WIP/RO lookups
+        # Trained case-duration predictor (train_case_duration_pipeline output)
+        # used by the 'petri_net_budget' mode to get a per-case total-duration
+        # budget the generation spends online (see _simulate_petri_net_for_case
+        # use_time_budget). None -> budget mode falls back to plain base idle.
+        self.case_duration_pipeline = case_duration_pipeline
         print(f"[DEBUG __init__] mode={self.mode}, "
               f"process_models is None: {process_models is None}, "
               f"process_models len: {len(process_models) if process_models else 'N/A'}")
@@ -151,7 +176,10 @@ class ProcessSimulation:
             self.mode = 'statistical'
 
         # Petri net mode validation
-        if self.mode in ('petri_net', 'petri_net_statistical',
+        if self.mode in ('petri_net', 'petri_net_budget',
+                         'petri_net_budget_ml_plus_global',
+                         'petri_net_budget_ml_plus_per_act',
+                         'petri_net_statistical',
                          'petri_net_statistical_memory') \
                 and (self.process_models is None or len(self.process_models) == 0):
             raise ValueError(
@@ -707,10 +735,19 @@ class ProcessSimulation:
         return new_marking
 
     def _choose_transition(self, enabled, stochastic_map, rng=None,
-                            activity_fire_counts=None, activity_caps=None):
+                            activity_fire_counts=None, activity_caps=None,
+                            marking=None, fm=None, exit_multiplier=1.0):
         """
         Given a set of enabled transitions, pick one using stochastic
         weights.  Falls back to uniform random if no weights available.
+
+        marking / fm / exit_multiplier: budget-mode steering. When
+        exit_multiplier != 1.0 (and marking/fm are given), any transition that
+        would carry the case into its final marking has its weight multiplied
+        by exit_multiplier — <1 while the case still has budget to spend (so
+        it resists ending early and keeps generating), >1 once the budget is
+        spent (so it closes promptly). Default 1.0 = no steering, so every
+        other mode behaves exactly as before.
 
         rng: optional np.random.Generator. When provided, all random draws
              use this isolated generator instead of the global numpy state,
@@ -733,10 +770,13 @@ class ProcessSimulation:
             key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
         )
         weights = []
+        _steer = (exit_multiplier != 1.0 and marking is not None and fm is not None)
         for t in enabled_list:
             w = stochastic_map.get(t, 1.0) * self._cap_discount(
                 t, activity_caps, activity_fire_counts
             )
+            if _steer and self._leads_to_final(marking, t, fm):
+                w *= exit_multiplier
             weights.append(w)
         total = sum(weights)
         if total <= 0:
@@ -747,6 +787,22 @@ class ProcessSimulation:
         if rng is not None:
             return rng.choice(enabled_list, p=probs)
         return np.random.choice(enabled_list, p=probs)
+
+    def _leads_to_final(self, marking, transition, fm):
+        """
+        Would firing *transition* from *marking* put the case into its final
+        marking (exactly, or as a superset of fm)? Used by the budget mode to
+        identify the "exit" branches so they can be discouraged while the case
+        still has budget left to spend, and encouraged once it doesn't.
+        Tentatively fires on a copy — markings are tiny, so this is cheap.
+        """
+        try:
+            m2 = self._fire_transition(marking, transition)
+        except Exception:
+            return False
+        if m2 == fm:
+            return True
+        return all(m2.get(p, 0) >= fm[p] for p in fm)
 
     def _cap_discount(self, transition, activity_caps, activity_fire_counts):
         """
@@ -837,9 +893,32 @@ class ProcessSimulation:
         return caps
 
     def _simulate_petri_net_for_case(self, case_id, object_attributes,
-                                     start_time, use_median_duration=False):
+                                     start_time, use_median_duration=False,
+                                     use_time_budget=False,
+                                     duration_override_mode=None):
         """
         Simulate one case using the Petri net token game.
+
+        use_time_budget ('petri_net_budget' mode): when True and a
+        ``case_duration_pipeline`` is available, a per-case total-duration
+        budget B is predicted up front from the case attributes, and the case
+        then simply **runs until that budget is spent**. Nothing is rescaled:
+        every activity keeps the duration it actually sampled, and the budget
+        instead controls HOW MANY activities the case generates —
+          * while elapsed < B, transitions that would carry the case into its
+            final marking are heavily discounted (BUDGET_EXIT_DISCOUNT) and
+            the per-activity loop quotas are lifted, so the case keeps
+            generating instead of exiting early;
+          * once elapsed >= B, those same exit transitions are boosted
+            (BUDGET_EXIT_BOOST) and the loop closes.
+        This targets the actual defect — the net under-produces events — so
+        span AND per-activity durations can both be right. It replaces an
+        earlier rescale-based version that stretched the finished timeline to
+        B: that fixed the span but inflated every duration whenever events
+        were missing (process_5: 11 events stretched over a 409-min budget
+        reality fills with 24.5, so durations came out ~3x too long).
+        A case whose net reaches the exact final marking before B is spent
+        still ends there — nothing is enabled, so it cannot be extended.
 
         For each (object, object_type, higher_level_activity) group that
         has a mined Petri net, we:
@@ -859,6 +938,23 @@ class ProcessSimulation:
         # numpy random draws while scipy/numpy sampling would.
         _pn_rng = np.random.default_rng(_stable_case_seed(case_id))
 
+        # ── Time-budget setup (petri_net_budget mode) ────────────────────
+        # Predict this case's total-duration budget B up front from its
+        # attributes. The walk runs exactly as the plain mode (real durations,
+        # real idle, real sequence); afterwards this case's generated timeline
+        # is *placed* onto B (see the post-walk block at the end). Disabled
+        # (None) when no predictor is available -> behaves as the plain mode.
+        _budget_B = None
+        if use_time_budget and self.case_duration_pipeline is not None:
+            try:
+                _bval = float(predict_case_duration(
+                    object_attributes or {}, self.case_duration_pipeline))
+                if _bval > 0:
+                    _budget_B = _bval
+            except Exception as _bexc:
+                if self.verbose:
+                    print(f"    WARNING: case-duration budget prediction failed "
+                          f"({_bexc}) — plain timeline for {case_id}.")
         unique_objects = (
             self.activity_stats[['object', 'object_type',
                                  'higher_level_activity']]
@@ -892,7 +988,11 @@ class ProcessSimulation:
             # Start the token game
             marking = copy.copy(im)
             activity_count = 0
-            max_steps = max(max_case_length * 2, 50)  # guard from training data
+            # Budget mode deliberately generates MORE events than the plain
+            # walk (that's the point), so give it a roomier step guard; the
+            # budget itself is the real bound on case length.
+            max_steps = (max(max_case_length * 4, 100) if _budget_B is not None
+                         else max(max_case_length * 2, 50))  # guard from training data
             step = 0
             case_start_ts  = current_sim_time          # Unix timestamp at case start
             activity_history = []                       # [(name, duration), ...] most-recent first
@@ -914,12 +1014,21 @@ class ProcessSimulation:
             _idle_rng = np.random.default_rng(_stable_case_seed(f"{case_id}_idle"))
 
             print(f"\nCase {case_id}: Petri net simulation for {object_name} "
-                  f"({object_type})")
+                  f"({object_type})"
+                  + (f"  [budget={_budget_B:.0f}min]" if _budget_B else ""))
 
             while step < max_steps:
                 step += 1
 
-                # Check if we reached the final marking
+                # Budget mode: how much of the predicted case duration is left?
+                _budget_spent = False
+                if _budget_B is not None:
+                    _elapsed_min = (current_sim_time - case_start_ts) / 60.0
+                    _budget_spent = _elapsed_min >= _budget_B
+
+                # Check if we reached the final marking. This one is
+                # structural — at fm nothing is enabled, so the case cannot be
+                # extended even if it still has budget left.
                 if marking == fm:
                     print(f"    Final marking reached after {activity_count} "
                           f"activities.")
@@ -929,7 +1038,16 @@ class ProcessSimulation:
                 fm_reached = all(
                     marking.get(p, 0) >= fm[p] for p in fm
                 )
-                if (fm_reached and activity_count > 0
+                if _budget_B is not None:
+                    # Budget mode: the budget decides when the case ends, not
+                    # the length heuristic. Stop once it's spent; while it
+                    # isn't, keep generating (the exit branches are discounted
+                    # below so the case rarely lands here early anyway).
+                    if _budget_spent and activity_count > 0:
+                        print(f"    Budget spent ({_budget_B:.0f} min) after "
+                              f"{activity_count} activities.")
+                        break
+                elif (fm_reached and activity_count > 0
                         and self._accept_subset_end(activity_count, activity_caps)):
                     print(f"    Final marking subset reached after "
                           f"{activity_count} activities.")
@@ -944,11 +1062,25 @@ class ProcessSimulation:
 
                 # Choose which transition to fire (isolated RNG — independent
                 # of duration sampling so ML+ and statistical produce the same
-                # transition sequence for the same case_id)
+                # transition sequence for the same case_id).
+                # Budget mode steers the choice instead of rescaling time:
+                # while budget remains, discount the exit branches AND lift the
+                # per-activity loop quotas so the case can actually keep
+                # generating; once the budget is spent, boost the exits so it
+                # closes. Non-budget modes pass exit_multiplier=1.0 (no-op).
+                _exit_mult = 1.0
+                _caps_arg = activity_caps
+                if _budget_B is not None:
+                    if _budget_spent:
+                        _exit_mult = BUDGET_EXIT_BOOST
+                    else:
+                        _exit_mult = BUDGET_EXIT_DISCOUNT
+                        _caps_arg = None   # quotas must not block filling the budget
                 chosen = self._choose_transition(
                     enabled, stochastic_map, rng=_pn_rng,
                     activity_fire_counts=activity_fire_counts,
-                    activity_caps=activity_caps,
+                    activity_caps=_caps_arg,
+                    marking=marking, fm=fm, exit_multiplier=_exit_mult,
                 )
 
                 # Fire the transition (update marking)
@@ -960,14 +1092,25 @@ class ProcessSimulation:
                     activity_fire_counts[activity_label] += 1
 
                     # ── Duration sampling ─────────────────────────────────
+                    # ML+ durations are used when the mode itself is an ML+
+                    # mode, OR a duration_override_mode names one (the budget
+                    # ML+ variants: budget placement + ML+ per-activity
+                    # durations for better internal timing). Otherwise the
+                    # statistical fitted-distribution durations are sampled.
                     _MLP_PN_MODES = ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act')
-                    if not use_median_duration and self.mode in _MLP_PN_MODES:
+                    _mlp_dur_mode = (
+                        self.mode if self.mode in _MLP_PN_MODES
+                        else duration_override_mode if duration_override_mode in _MLP_PN_MODES
+                        else None
+                    )
+                    if not use_median_duration and _mlp_dur_mode is not None:
                         activity_duration = self._get_activity_duration(
                             activity_label, object_name, object_type,
                             higher_level_activity,
                             object_attributes=object_attributes,
                             activity_history=activity_history,
                             activity_index=activity_count,
+                            override_mode=_mlp_dur_mode,
                             current_sim_ts=current_sim_time,
                             case_start_ts=case_start_ts,
                         )
@@ -998,9 +1141,8 @@ class ProcessSimulation:
                     # ── Idle/waiting gap before this activity starts ──────
                     # Reproduce the real between-activity idle time (see
                     # MODEL_BASE_IDLE) instead of butting activities back to
-                    # back. No-op (0 min) for the first activity of the case,
-                    # when idle modelling is off, or when no waiting stats
-                    # exist for this activity.
+                    # back. No-op for the first activity, when idle modelling
+                    # is off, or when no waiting stats exist for this activity.
                     if activity_count > 0:
                         _idle_key = (activity_label, object_name, object_type,
                                      higher_level_activity)
@@ -3209,6 +3351,29 @@ class ProcessSimulation:
         if self.mode in ('petri_net_ml_plus_global', 'petri_net_ml_plus_per_act'):
             self._simulate_petri_net_for_case(
                 case_id, object_attributes, start_time
+            )
+            return
+
+        # ── Time-budget: PN transitions + durations, but total span spent
+        #    online against a predicted per-case duration budget (generative,
+        #    not a post-hoc rescale — see _simulate_petri_net_for_case).
+        if self.mode == 'petri_net_budget':
+            self._simulate_petri_net_for_case(
+                case_id, object_attributes, start_time,
+                use_time_budget=True,
+            )
+            return
+
+        # ── Time-budget + ML+ durations: budget placement combined with ML+
+        #    per-activity/global duration prediction (better internal timing
+        #    than the statistical-duration budget mode).
+        if self.mode in ('petri_net_budget_ml_plus_global',
+                         'petri_net_budget_ml_plus_per_act'):
+            _dov = ('petri_net_ml_plus_global'
+                    if self.mode.endswith('_global') else 'petri_net_ml_plus_per_act')
+            self._simulate_petri_net_for_case(
+                case_id, object_attributes, start_time,
+                use_time_budget=True, duration_override_mode=_dov,
             )
             return
 
