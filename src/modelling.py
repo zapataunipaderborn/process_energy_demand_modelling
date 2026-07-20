@@ -95,8 +95,11 @@ from sim_extractor import compare_complete_case_curves
 from sim_extractor import build_sensor_activity_object_combos
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
-    fit_stochastic_profile_generator, compare_schedule_and_stochastic_profiles,
+    fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
+    compare_schedule_and_stochastic_profiles,
     train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
+    compare_pooled_value_distributions, compare_population_shape,
+    compare_population_case_stat, compute_population_coverage,
 )
 from xgboost import XGBRegressor
 
@@ -1079,15 +1082,22 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
         schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
         stochastic_gen    = fit_stochastic_profile_generator(train_cases)
+        bootstrap_gen     = fit_bootstrap_profile_generator(train_cases)
         duration_pipeline = train_case_duration_pipeline(train_cases, verbose=0)
         if duration_pipeline is None:
             print(f"  ⚠️ Case-duration pipeline not trained for {process}/{sensor} "
                   f"(too few train cases) — 'Best, duration-corrected' will be skipped for this sensor.")
         test_case_attrs   = {str(c['case_id']): c['attributes'] for c in test_cases}
 
+        # duration_pipeline is threaded through so schedule-direct, the
+        # per-position stochastic generator AND the bootstrap generator are all
+        # placed on each case's own predicted span (like "Best, duration-corrected")
+        # instead of a single median span for every case.
         _cmp_result = compare_schedule_and_stochastic_profiles(
             test_cases, schedule_pipeline, stochastic_gen, median_case_duration_minutes,
             save_curves=SAVE_PREDICTED_CURVES,
+            bootstrap_generator=bootstrap_gen,
+            duration_pipeline=duration_pipeline,
         )
         cmp_df, sensor_curve_df = _cmp_result if SAVE_PREDICTED_CURVES else (_cmp_result, None)
         if cmp_df.empty:
@@ -1196,8 +1206,72 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     if all_curve_rows:
         curves_out = pd.concat(all_curve_rows, ignore_index=True)
         curves_out.to_parquet(os.path.join(out_dir, 'predicted_curves.parquet'), index=False)
-        print(f"  💾 Predicted curves (real/schedule/stochastic/best/best_duration_corrected) saved → "
+        print(f"  💾 Predicted curves (real/schedule/stochastic/bootstrap/best/best_duration_corrected) saved → "
               f"schedule_profile_eval_results/{process}/predicted_curves.parquet")
+
+        # ── Population-Level (unpaired) Distributional Evaluation ─────────
+        # Pools the whole real case population against each method's whole
+        # case population per sensor (no case_id pairing) -- the right test
+        # for the stochastic/generative methods, which aren't trying to
+        # reproduce any one specific real case. Two sensor-type-agnostic
+        # axes: w1_shape (population generalization of the per-case W1-time
+        # metric above) and w1_magnitude (pooled raw-value W1, reusing
+        # compare_pooled_value_distributions). Strictly per (process,
+        # sensor) -- never pooled across sensors or processes.
+        def _pool_by_sensor(df, series_name):
+            sub = df[df['series'] == series_name]
+            return {s: g['value'].dropna().to_numpy(dtype=float)
+                    for s, g in sub.groupby('sensor') if len(g) > 0}
+
+        real_pooled = _pool_by_sensor(curves_out, 'real')
+        population_rows = []
+        for _pop_method in ('schedule', 'stochastic', 'bootstrap', 'best', 'best_duration_corrected'):
+            method_pooled = _pool_by_sensor(curves_out, _pop_method)
+            mag_df = compare_pooled_value_distributions(real_pooled, method_pooled)
+            shape_df = compare_population_shape(curves_out, method_series=_pop_method)
+            var_df = compare_population_case_stat(curves_out, method_series=_pop_method, stat_fn=np.std)
+            peak_df = compare_population_case_stat(curves_out, method_series=_pop_method, stat_fn=np.max)
+            cov_df = compute_population_coverage(curves_out, method_series=_pop_method)
+            if mag_df.empty and shape_df.empty and var_df.empty and peak_df.empty and cov_df.empty:
+                continue
+            merged = mag_df[['sensor', 'wasserstein']].rename(columns={'wasserstein': 'w1_magnitude'})
+            for _df, _col in ((shape_df, 'w1_shape'), (var_df, 'w1_variability'), (peak_df, 'w1_peak')):
+                merged = merged.merge(
+                    _df[['sensor', 'wasserstein']].rename(columns={'wasserstein': _col}),
+                    on='sensor', how='outer')
+            merged = merged.merge(cov_df[['sensor', 'coverage']], on='sensor', how='outer')
+            merged['method'] = _pop_method
+            population_rows.append(merged)
+
+        if population_rows:
+            population_out = pd.concat(population_rows, ignore_index=True)
+            population_out['process'] = process
+
+            def _scale_of(vals):
+                s = float(np.std(vals)) if len(vals) >= 2 else float('nan')
+                return s if s > 1e-9 else float('nan')
+
+            _mag_scale_map = {s: _scale_of(v) for s, v in real_pooled.items()}
+            population_out['real_magnitude_scale'] = population_out['sensor'].map(_mag_scale_map)
+            population_out['real_shape_scale'] = 1.0
+
+            _real_case_df = curves_out[curves_out['series'] == 'real']
+            _var_by_sensor, _peak_by_sensor = {}, {}
+            for _sensor, _g in _real_case_df.groupby('sensor'):
+                _stds, _peaks = [], []
+                for _, _cg in _g.groupby('case_id'):
+                    _v = _cg['value'].dropna().to_numpy(dtype=float)
+                    if _v.size:
+                        _stds.append(float(np.std(_v)))
+                        _peaks.append(float(np.max(_v)))
+                _var_by_sensor[_sensor] = _scale_of(_stds)
+                _peak_by_sensor[_sensor] = _scale_of(_peaks)
+            population_out['real_variability_scale'] = population_out['sensor'].map(_var_by_sensor)
+            population_out['real_peak_scale'] = population_out['sensor'].map(_peak_by_sensor)
+
+            population_out.to_csv(os.path.join(out_dir, 'population_distribution_eval.csv'), index=False)
+            print(f"  💾 Population-Level Distributional Evaluation saved → "
+                  f"schedule_profile_eval_results/{process}/population_distribution_eval.csv")
 
     _elapsed = _t.perf_counter() - _t0
     print(f"  💾 Schedule Profile Evaluation saved → schedule_profile_eval_results/{process}/  "

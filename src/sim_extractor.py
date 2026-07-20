@@ -8834,6 +8834,148 @@ def compare_pooled_value_distributions(real_pooled, sim_pooled):
     return pd.DataFrame(rows)
 
 
+def compare_population_shape(curves_df, method_series, real_series='real'):
+    """
+    Population-level (unpaired) SHAPE comparison between the real case
+    population and one method's case population — the shape-axis sibling of
+    compare_pooled_value_distributions (which compares raw MAGNITUDE, ignoring
+    time entirely). Operates on a long-format DataFrame with columns
+    ['case_id', 'sensor', 'series', 't_minutes', 'value'] (same schema as
+    predicted_curves.parquet / the curves this module already saves).
+
+    Generalizes the per-case 'W1 time' metric used in
+    compare_schedule_and_stochastic_profiles / compare_complete_case_curves to
+    population level: within EACH population separately, every case's own
+    timestamps are converted to relative time (0..1, using that case's own
+    duration) and its values (clipped to non-negative, used as transport
+    mass) are kept alongside. case_id is then dropped and every case's points
+    are concatenated into one pooled (relative_time, weight) sample per
+    population -- real cases pooled together, method cases pooled together --
+    so no real case is ever matched against a specific method case; only ONE
+    Wasserstein distance is computed per sensor, between the two pooled
+    populations.
+
+    Returns a DataFrame ['sensor', 'n_real_cases', 'n_method_cases',
+    'wasserstein'] -- same column convention as
+    compare_pooled_value_distributions so the two can be merged directly.
+    Already on a scale-free 0..1 relative-time axis, so no extra
+    normalization is needed downstream (unlike the magnitude axis, which is
+    in raw sensor units).
+    """
+    from scipy.stats import wasserstein_distance
+
+    def _pooled_time_mass(sub):
+        t_parts, w_parts, n_cases = [], [], 0
+        for _, g in sub.groupby('case_id'):
+            g = g.sort_values('t_minutes')
+            t = g['t_minutes'].to_numpy(dtype=float)
+            v = g['value'].to_numpy(dtype=float)
+            if t.size == 0:
+                continue
+            duration = float(t.max())
+            if duration <= 1e-9:
+                continue
+            w = np.clip(v, 0, None)
+            if w.sum() <= 0:
+                continue
+            t_parts.append(np.clip(t / duration, 0, 1))
+            w_parts.append(w)
+            n_cases += 1
+        if not t_parts:
+            return None, None, 0
+        return np.concatenate(t_parts), np.concatenate(w_parts), n_cases
+
+    rows = []
+    for sensor, sensor_g in curves_df.groupby('sensor'):
+        real_t, real_w, n_real = _pooled_time_mass(sensor_g[sensor_g['series'] == real_series])
+        method_t, method_w, n_method = _pooled_time_mass(sensor_g[sensor_g['series'] == method_series])
+        if real_t is None or method_t is None:
+            continue
+        rows.append({
+            'sensor':        sensor,
+            'n_real_cases':  n_real,
+            'n_method_cases': n_method,
+            'wasserstein':   float(wasserstein_distance(
+                real_t, method_t, u_weights=real_w, v_weights=method_w)),
+        })
+    return pd.DataFrame(rows)
+
+
+def compare_population_case_stat(curves_df, method_series, stat_fn, real_series='real'):
+    """
+    Population-level (unpaired) comparison of one per-case scalar reduction
+    (e.g. within-case std, peak/max) between the real case population and one
+    method's case population. Generalizes compare_pooled_value_distributions
+    (which pools every raw reading, with no notion of "case" at all) to a
+    specific per-case summary instead -- e.g. does the method reproduce the
+    real distribution of per-case VARIABILITY (stat_fn=np.std, catches methods
+    that regress toward the mean and flatten real case-to-case volatility) or
+    per-case PEAKS (stat_fn=np.max, catches methods that get the average
+    right but never reach real extremes).
+
+    Returns a DataFrame ['sensor', 'n_real_cases', 'n_method_cases',
+    'wasserstein'] -- same column convention as compare_pooled_value_distributions
+    / compare_population_shape, so all three can be merged directly.
+    """
+    from scipy.stats import wasserstein_distance
+
+    def _case_vals(sub):
+        vals = []
+        for _, g in sub.groupby('case_id'):
+            v = g['value'].dropna().to_numpy(dtype=float)
+            if v.size:
+                vals.append(float(stat_fn(v)))
+        return vals
+
+    rows = []
+    for sensor, sensor_g in curves_df.groupby('sensor'):
+        real_vals = _case_vals(sensor_g[sensor_g['series'] == real_series])
+        method_vals = _case_vals(sensor_g[sensor_g['series'] == method_series])
+        if len(real_vals) < 2 or len(method_vals) < 2:
+            continue
+        rows.append({
+            'sensor':         sensor,
+            'n_real_cases':   len(real_vals),
+            'n_method_cases': len(method_vals),
+            'wasserstein':    float(wasserstein_distance(real_vals, method_vals)),
+        })
+    return pd.DataFrame(rows)
+
+
+def compute_population_coverage(curves_df, method_series, real_series='real',
+                                 lower_q=0.05, upper_q=0.95):
+    """
+    Population-level CALIBRATION check -- not a Wasserstein distance, a
+    different KIND of question: not "how far apart are the two
+    distributions" but "does the method's population plausibly COVER
+    reality". For each sensor: what fraction of pooled REAL readings fall
+    within the [lower_q, upper_q] empirical percentile band of the METHOD's
+    pooled readings. The natural check for a stochastic/generative method --
+    ties to calibration/coverage evaluation of probabilistic forecasts.
+
+    HIGHER IS BETTER here (1.0 = every real reading falls inside the
+    method's band) -- the opposite convention from every w1_* metric in this
+    module, which are lower-is-better distances.
+
+    Returns a DataFrame ['sensor', 'n_real', 'n_method', 'coverage'].
+    """
+    rows = []
+    for sensor, sensor_g in curves_df.groupby('sensor'):
+        real_vals = sensor_g[sensor_g['series'] == real_series]['value'].dropna().to_numpy(dtype=float)
+        method_vals = sensor_g[sensor_g['series'] == method_series]['value'].dropna().to_numpy(dtype=float)
+        if real_vals.size == 0 or method_vals.size < 2:
+            continue
+        lo, hi = np.quantile(method_vals, [lower_q, upper_q])
+        inside = (real_vals >= lo) & (real_vals <= hi)
+        rows.append({
+            'sensor':   sensor,
+            'n_real':   int(real_vals.size),
+            'n_method': int(method_vals.size),
+            'coverage': float(inside.mean()),
+        })
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Complete-curve (per-case) comparison — curve-as-distribution Wasserstein.
 #
@@ -9484,19 +9626,59 @@ def fit_stochastic_profile_generator(train_cases, fixed_length=None):
     return {'mean': resampled.mean(axis=0), 'std': resampled.std(axis=0), 'fixed_length': fixed_length}
 
 
-def sample_stochastic_profile(generator, median_case_duration_minutes, rng=None):
-    """Draw one sample curve from the fitted per-position Normal distributions."""
+def sample_stochastic_profile(generator, case_duration_minutes, rng=None):
+    """Draw one sample curve from the fitted per-position Normal distributions.
+
+    The time axis is placed on ``case_duration_minutes`` — pass a per-case
+    predicted duration (see predict_case_duration) for a schedule-aware span,
+    or a single median duration for the classic constant-span behaviour.
+    """
     rng = rng if rng is not None else np.random.default_rng()
     mean, std = generator['mean'], generator['std']
     sample = rng.normal(mean, np.clip(std, 1e-6, None))
     sample = np.clip(sample, 0, None)
-    t = np.linspace(0, median_case_duration_minutes, generator['fixed_length'])
+    t = np.linspace(0, case_duration_minutes, generator['fixed_length'])
+    return t, sample
+
+
+def fit_bootstrap_profile_generator(train_cases, fixed_length=None):
+    """
+    Non-parametric empirical-bootstrap reference generator: instead of a
+    fitted per-position Normal (fit_stochastic_profile_generator), it keeps the
+    real training case curves themselves (resampled to a common canonical
+    length) and, at sample time, draws one of them at random. Because a whole
+    real curve is returned, the within-case temporal SHAPE and autocorrelation
+    are preserved exactly — precisely what the independent per-position Gaussian
+    destroys — while still using no schedule conditioning. This is the classic
+    resampling / block-bootstrap load-profile baseline; it is also robust with
+    very few training cases (no distribution to estimate), unlike a Markov
+    load model. Returns None if there aren't at least 2 cases to draw from.
+    """
+    if len(train_cases) < 2:
+        return None
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['values']) for c in train_cases]))))
+    resampled = np.array([
+        np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
+        for c in train_cases
+    ])
+    return {'curves': resampled, 'fixed_length': fixed_length}
+
+
+def sample_bootstrap_profile(generator, case_duration_minutes, rng=None):
+    """Draw one whole real training curve at random and place it on the given
+    (per-case predicted or median) span."""
+    rng = rng if rng is not None else np.random.default_rng()
+    curves = generator['curves']
+    sample = np.clip(curves[rng.integers(len(curves))], 0, None)
+    t = np.linspace(0, case_duration_minutes, generator['fixed_length'])
     return t, sample
 
 
 def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stochastic_generator,
                                              median_case_duration_minutes, random_state=42,
-                                             save_curves=False):
+                                             save_curves=False, bootstrap_generator=None,
+                                             duration_pipeline=None):
     """
     For each real test case (from build_case_level_curves), compare its real
     complete profile against (a) the schedule-only prediction and (b) one
@@ -9505,14 +9687,23 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
 
     Returns a DataFrame with one row per case_id:
     ['case_id', 'schedule_wasserstein_time', 'schedule_wasserstein_value',
-     'stochastic_wasserstein_time', 'stochastic_wasserstein_value'].
+     'stochastic_wasserstein_time', 'stochastic_wasserstein_value',
+     'bootstrap_wasserstein_time', 'bootstrap_wasserstein_value'].
 
     When save_curves=True, also returns a second, long-format DataFrame with
     one row per (case_id, series, timestep) — series in {'real', 'schedule',
-    'stochastic'} — columns ['case_id', 'series', 't_minutes', 'value'], so
-    the exact curves behind the W1 numbers above can be reloaded later for
-    other metrics or plots. The caller adds a 'sensor' column since this
-    function is called once per sensor.
+    'stochastic', 'bootstrap'} — columns ['case_id', 'series', 't_minutes',
+    'value'], so the exact curves behind the W1 numbers above can be reloaded
+    later for other metrics or plots. The caller adds a 'sensor' column since
+    this function is called once per sensor.
+
+    Span handling: when ``duration_pipeline`` is given, each predicted series
+    (schedule-direct, stochastic, bootstrap) is placed on that case's OWN
+    predicted total duration (predict_case_duration on the case attributes),
+    exactly like the "Best, duration-corrected" mode — so these baselines get
+    the same schedule-aware span the best modes do, instead of a single median
+    span for every case. Falls back to ``median_case_duration_minutes`` per
+    case whenever no predictor is available or the prediction is non-positive.
     """
     from scipy.stats import wasserstein_distance
     rng = np.random.default_rng(random_state)
@@ -9525,6 +9716,16 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
         if w_real.sum() <= 0:
             continue
 
+        # Per-case predicted span (schedule-aware), else the median fallback.
+        case_span = median_case_duration_minutes
+        if duration_pipeline is not None:
+            try:
+                _pred_span = float(predict_case_duration(c['attributes'], duration_pipeline))
+                if _pred_span > 0:
+                    case_span = _pred_span
+            except Exception:
+                pass
+
         row = {'case_id': c['case_id']}
         if save_curves:
             curve_rows.extend({'case_id': c['case_id'], 'series': 'real', 't_minutes': float(t), 'value': float(v)}
@@ -9532,7 +9733,7 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
 
         if schedule_pipeline is not None:
             t_sched, v_sched = predict_schedule_profile_curve(
-                c['attributes'], schedule_pipeline, median_case_duration_minutes
+                c['attributes'], schedule_pipeline, case_span
             )
             w_sched = np.clip(v_sched, 0, None)
             if w_sched.sum() > 0:
@@ -9543,7 +9744,7 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
                                       for t, v in zip(t_sched, v_sched))
 
         if stochastic_generator is not None:
-            t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, median_case_duration_minutes, rng=rng)
+            t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, case_span, rng=rng)
             w_stoch = np.clip(v_stoch, 0, None)
             if w_stoch.sum() > 0:
                 row['stochastic_wasserstein_time']  = float(wasserstein_distance(t_real, t_stoch, u_weights=w_real, v_weights=w_stoch))
@@ -9551,6 +9752,16 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
                 if save_curves:
                     curve_rows.extend({'case_id': c['case_id'], 'series': 'stochastic', 't_minutes': float(t), 'value': float(v)}
                                       for t, v in zip(t_stoch, v_stoch))
+
+        if bootstrap_generator is not None:
+            t_boot, v_boot = sample_bootstrap_profile(bootstrap_generator, case_span, rng=rng)
+            w_boot = np.clip(v_boot, 0, None)
+            if w_boot.sum() > 0:
+                row['bootstrap_wasserstein_time']  = float(wasserstein_distance(t_real, t_boot, u_weights=w_real, v_weights=w_boot))
+                row['bootstrap_wasserstein_value'] = float(wasserstein_distance(v_real, v_boot))
+                if save_curves:
+                    curve_rows.extend({'case_id': c['case_id'], 'series': 'bootstrap', 't_minutes': float(t), 'value': float(v)}
+                                      for t, v in zip(t_boot, v_boot))
 
         rows.append(row)
 
