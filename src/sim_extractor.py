@@ -8170,6 +8170,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     _SKLEARN_APPROACHES = {'baseline', 'instance_stats', 'istats_leakfree',
                            'dtw_phase', 'basis', 'exog', 'amplitude_shape',
                            'amplitude_shape_exog', 'exog_prev_activity',
+                           'prev_activity',
                            'ml_linear', 'ml_dtw_linear_decode'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
@@ -8268,6 +8269,40 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             print(f"  [WARN] exog_prev_activity: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no baseline pipeline available either -- no prediction possible for this combo.")
+    if 'prev_activity' in _active:
+        # Previous-activity context WITHOUT external factors (exog_columns=None)
+        # -- the ablation isolating the prev-activity contribution independent
+        # of the ef_ features. Reuses the exog_prev_activity builder/predictor;
+        # with no exog_values on the curves, build_and_train_pipeline_exog just
+        # yields exog_cols=[] (no external-factor features), while the
+        # prev_act_* attributes still flow through the standard attribute path.
+        # The pipeline's internal 'approach' stays 'exog_prev_activity', so all
+        # downstream routing (predict dispatch, eval split, autoregressive
+        # rollout) treats it identically -- only exog is absent.
+        _pa_curves, _ = split_curves_with_prev_activity(
+            df_train,
+            variable=sensor,
+            activities=[activity],
+            objects=[obj],
+            test_size=0.0,
+            verbose=0,
+            exog_columns=None,
+        )
+        if len(_pa_curves) >= 5:
+            result['prev_activity'] = build_and_train_pipeline_exog_prev_activity(
+                _pa_curves, variable=sensor,
+                fixed_length=fixed_length, val_size=val_size,
+                models=models, verbose=0, n_jobs=1, **_hp_kwargs,
+            )
+        elif 'baseline' in result:
+            print(f"  [WARN] prev_activity: only {len(_pa_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
+                  f"falling back to the baseline pipeline for this combo.")
+            result['prev_activity'] = result['baseline']
+        else:
+            print(f"  [WARN] prev_activity: only {len(_pa_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
+                  f"no baseline pipeline available either -- no prediction possible for this combo.")
     if 'ml_linear' in _active:
         result['ml_linear'] = build_and_train_pipeline_ml_linear(
             curves, variable=sensor, fixed_length=fixed_length,
@@ -8296,7 +8331,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     import torch
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
     _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_exog', 'seq2seq_prev_activity',
-                'seq2seq_dtw_linear_decode'}
+                'seq2seq_prev_activity_no_exog', 'seq2seq_dtw_linear_decode'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
         return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
@@ -8371,6 +8406,40 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             result['seq2seq_prev_activity'] = result['seq2seq']
         else:
             print(f"  [WARN] seq2seq_prev_activity: only {len(_prev_curves)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
+                  f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
+
+    if 'seq2seq_prev_activity_no_exog' in _active:
+        # Seq2Seq prev-activity ablation, WITHOUT external factors -- the
+        # seq2seq counterpart of the sklearn 'prev_activity' approach.
+        # exog_columns=None means the curves carry no exog_values, so
+        # build_and_train_pipeline_seq2seq_exog (which seq2seq_prev_activity
+        # wraps) detects exog_cols=[] and trains with no external-factor
+        # features; prev_act_* attributes still flow through unchanged.
+        _prev_curves_ne, _ = split_curves_with_prev_activity(
+            df_train,
+            variable=sensor,
+            activities=[activity],
+            objects=[obj],
+            test_size=0.0,
+            verbose=0,
+            exog_columns=None,
+        )
+        if len(_prev_curves_ne) >= 5:
+            result['seq2seq_prev_activity_no_exog'] = build_and_train_pipeline_seq2seq_prev_activity(
+                _prev_curves_ne, variable=sensor, fixed_length=fixed_length,
+                val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
+                dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
+                teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
+                verbose=False,
+            )
+        elif 'seq2seq' in result:
+            print(f"  [WARN] seq2seq_prev_activity_no_exog: only {len(_prev_curves_ne)} curve(s) with "
+                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
+                  f"falling back to the plain seq2seq pipeline for this combo.")
+            result['seq2seq_prev_activity_no_exog'] = result['seq2seq']
+        else:
+            print(f"  [WARN] seq2seq_prev_activity_no_exog: only {len(_prev_curves_ne)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
 

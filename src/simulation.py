@@ -404,20 +404,34 @@ class ProcessSimulation:
         """
         Predict duration in minutes from ML+ (model, scaler, name) tuple.
 
-        cap_minutes: optional sane upper bound. The underlying regressor is
-        trained on log1p(duration) and inverted with expm1 here, so any bad
-        extrapolation (e.g. a rarely-fired activity queried with an unusual
-        feature combination) gets amplified exponentially -- a prediction a
-        few units too high in log-space becomes tens of thousands of real
-        minutes. Confirmed in practice: an activity with a tight real
-        distribution (mean ~12 min) got predicted at 56354 min, which later
-        overflowed datetime.fromtimestamp and crashed the whole run. Capping
+        The inversion follows the transform the model was TRAINED with,
+        carried as the 4th tuple element (default 'log' for back-compat):
+          - 'log'    : trained on log1p(duration), inverted with expm1 here.
+                       Predicts the geometric mean (~median); for a right-skewed
+                       activity that is well BELOW the arithmetic mean, which
+                       makes budget mode over-generate (count = budget/duration).
+                       Also amplifies bad extrapolation exponentially -- an
+                       activity with mean ~12 min once predicted 56354 min and
+                       overflowed datetime.fromtimestamp, crashing the run.
+          - 'direct' : trained on raw duration, no expm1. A squared-error
+                       regressor then predicts the arithmetic MEAN (what a time
+                       budget needs) and bad extrapolation stays linear.
+
+        cap_minutes: optional sane upper bound (see _activity_duration_cap),
         keeps one bad prediction from taking down the simulation while still
-        allowing genuinely long activities through (see _activity_duration_cap).
+        allowing genuinely long activities through.
         """
         m, sc = model_tuple[0], model_tuple[1]
+        transform = model_tuple[3] if len(model_tuple) > 3 else 'log'
+        # 5th element: mean-bias calibration (OOF mean(actual)/mean(pred)),
+        # re-centers the median-like prediction onto the arithmetic mean that
+        # budget mode needs. Defaults to 1.0 (no-op) for tuples trained before
+        # this was added. See _mlp_fit_model_with_oof.
+        calib = model_tuple[4] if len(model_tuple) > 4 else 1.0
         X = np.array(feature_vec, dtype=float).reshape(1, -1)
-        pred = float(np.clip(np.expm1(m.predict(sc.transform(X))), 0, None)[0])
+        raw = m.predict(sc.transform(X))
+        raw = np.expm1(raw) if transform == 'log' else raw
+        pred = float(np.clip(raw, 0, None)[0]) * calib
         if cap_minutes is not None:
             pred = min(pred, cap_minutes)
         return pred

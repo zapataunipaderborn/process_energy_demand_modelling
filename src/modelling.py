@@ -363,7 +363,27 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5, target_transform='log'):
         return None, None
 
     best_name   = min(cand_scores, key=cand_scores.get)
-    valid_resid = cand_oofs[best_name][~np.isnan(cand_oofs[best_name])]
+    _best_oof   = cand_oofs[best_name]
+    _mask       = ~np.isnan(_best_oof)
+    valid_resid = _best_oof[_mask]
+
+    # Mean-bias calibration (5th tuple element). The candidate models are
+    # selected by MAE and include a robust regressor, so the point prediction
+    # tracks the MEDIAN; on right-skewed activities that sits well below the
+    # arithmetic MEAN. Budget mode needs the mean (count = budget / duration),
+    # so an uncorrected prediction makes it over-generate events (measured:
+    # process_5 duration predicted 0.37x real -> event ratio 2.8x, while the
+    # equally-skewed but well-fit process_4 stays ~1.0x). Correct with the
+    # OUT-OF-FOLD ratio mean(actual)/mean(oof_pred) -- OOF, not in-sample, so
+    # it captures the generalisation bias the simulation actually sees, and it
+    # self-targets: ~1.0 for a well-fit activity, larger only where the model
+    # genuinely under-predicts. inv(pred) = actual - residual, per row.
+    calib = 1.0
+    if _mask.sum() >= 5:
+        _actual   = y[_mask]
+        _mean_pred = float(np.mean(_actual - valid_resid))
+        if _mean_pred > 1e-9:
+            calib = float(np.clip(float(np.mean(_actual)) / _mean_pred, 0.5, 5.0))
 
     from sklearn.preprocessing import StandardScaler as _SS
     sc = _SS()
@@ -371,7 +391,10 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5, target_transform='log'):
     m.fit(sc.fit_transform(X), y_t)
 
     oof_out = valid_resid if len(valid_resid) >= 5 else None
-    return (m, sc, best_name), oof_out
+    # Tuple: (model, scaler, name, transform, mean_calib). transform lets the
+    # predictor invert correctly ('direct' => no expm1); mean_calib re-centers
+    # the median-like prediction onto the arithmetic mean (see above).
+    return (m, sc, best_name, target_transform, calib), oof_out
 
 
 def _mlp_train_models(df_train, target_transform=None):
@@ -591,8 +614,13 @@ ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
 ML_OPTIMIZE_HYPERPARAMS = True    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
 
-# ML+ duration model target transform: 'log' (log1p — default) or 'direct' (no transform)
-MLP_TARGET_TRANSFORM    = 'log'
+# ML+ duration model target transform: 'log' (log1p) or 'direct' (no transform).
+# 'direct' (2026-07-21): raw-scale squared-error regressor predicts the
+# ARITHMETIC MEAN duration, which is what budget mode needs (count =
+# budget / mean_duration). 'log' predicted the geometric mean (~median), which
+# under-fills the budget on right-skewed activities (e.g. process_5 "Produktion",
+# real mean 29 vs median 8) and made budget_ml_plus over-generate events 1.5-2.7x.
+MLP_TARGET_TRANSFORM    = 'direct'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CURVE MODELLING HYPERPARAMETER OPTIMIZATION
@@ -710,9 +738,10 @@ if _env_curve_approaches:
     # Full universe of valid approach names (not just the currently-uncommented
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
     _known = {'baseline', 'instance_stats', 'istats_leakfree', 'dtw_phase',
-              'basis', 'exog', 'exog_prev_activity', 'amplitude_shape',
+              'basis', 'exog', 'exog_prev_activity', 'prev_activity', 'amplitude_shape',
               'ml_linear', 'ml_dtw_linear_decode', 'seq2seq', 'seq2seq_only',
-              'seq2seq_exog', 'seq2seq_prev_activity', 'seq2seq_dtw_linear_decode'}
+              'seq2seq_exog', 'seq2seq_prev_activity', 'seq2seq_prev_activity_no_exog',
+              'seq2seq_dtw_linear_decode'}
     _unknown = [a for a in _requested if a not in _known]
     if _unknown:
         print(f"[modelling] WARNING: PIPELINE_CURVE_APPROACHES has names not in "
@@ -4275,12 +4304,14 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_basis           = {}   # Approach 2
     all_energy_pipelines_exog            = {}   # DTW + External Factors
     all_energy_pipelines_exog_prev_activity   = {}   # DTW + Ext. Factors + Prev Activity
+    all_energy_pipelines_prev_activity        = {}   # DTW + Prev Activity (no Ext. Factors) — ablation
     all_energy_pipelines_amplitude_shape      = {}   # Amplitude + Shape
     all_energy_pipelines_amplitude_shape_exog = {}   # removed — kept as empty for safety
     all_energy_pipelines_seq2seq              = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_exog         = {}   # DTW + Seq2Seq + Ext. Factors
     all_energy_pipelines_seq2seq_prev_activity = {}  # DTW + Seq2Seq + Ext. Factors + Prev Act
+    all_energy_pipelines_seq2seq_prev_activity_no_exog = {}  # DTW + Seq2Seq + Prev Act (no Ext.) — ablation
     all_energy_pipelines_ml_linear                  = {}   # ML, linear resample encode+decode
     all_energy_pipelines_ml_dtw_linear_decode       = {}   # ML, DTW train + linear decode
     all_energy_pipelines_seq2seq_dtw_linear_decode  = {}   # Seq2Seq, DTW train + linear decode
@@ -4350,12 +4381,14 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_basis               = {}
         _pipelines_exog                = {}
         _pipelines_exog_prev_activity   = {}
+        _pipelines_prev_activity        = {}
         _pipelines_amplitude_shape      = {}
         _pipelines_amplitude_shape_exog = {}  # removed
         _pipelines_seq2seq                  = {}
         _pipelines_seq2seq_only             = {}
         _pipelines_seq2seq_exog             = {}
         _pipelines_seq2seq_prev_activity    = {}
+        _pipelines_seq2seq_prev_activity_no_exog = {}
         _pipelines_ml_linear                = {}
         _pipelines_ml_dtw_linear_decode     = {}
         _pipelines_seq2seq_dtw_linear_decode = {}
@@ -4368,11 +4401,11 @@ if RUN_CURVE_ONLY_EVALUATION:
         import concurrent.futures, os as _os
 
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','exog_prev_activity','amplitude_shape',
+                               if a in {'baseline','instance_stats','istats_leakfree','dtw_phase','basis','exog','exog_prev_activity','prev_activity','amplitude_shape',
                                         'ml_linear','ml_dtw_linear_decode'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_exog','seq2seq_prev_activity',
-                                        'seq2seq_dtw_linear_decode'}]
+                                        'seq2seq_prev_activity_no_exog','seq2seq_dtw_linear_decode'}]
 
         # Restrict per-sensor to the objects/activities where that sensor actually
         # carries signal — e.g. process_1's destillation sensors have nothing to do
@@ -4453,6 +4486,15 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['exog_prev_activity']['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exog_prev_activity']),
                         'full_pipeline':   _r['exog_prev_activity'],
+                    }
+                if 'prev_activity' in _r:
+                    # Prev-activity ablation (no exog). Same predictor as
+                    # exog_prev_activity; the pipeline carries exog_cols=[] so
+                    # exog_values are simply unused at predict time.
+                    _pipelines_prev_activity.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['prev_activity']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['prev_activity']),
+                        'full_pipeline':   _r['prev_activity'],
                     }
                 if 'ml_linear' in _r:
                     _pipelines_ml_linear.setdefault(_s, {}).setdefault(_a, {})[_o] = {
@@ -4538,6 +4580,18 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'full_pipeline':   _ep,
                     }
                     print(f"  [{_s}|{_a}|{_o}] seq2seq_prev_activity  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
+                if 'seq2seq_prev_activity_no_exog' in _r2:
+                    # Seq2Seq prev-activity ablation, no external factors —
+                    # same predictor as seq2seq_prev_activity; exog_cols=[] on
+                    # this pipeline means exog_values are simply unused.
+                    _ep = _r2['seq2seq_prev_activity_no_exog']
+                    _ep['variable_name'] = _s
+                    _pipelines_seq2seq_prev_activity_no_exog.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _ep['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_seq2seq_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_ep),
+                        'full_pipeline':   _ep,
+                    }
+                    print(f"  [{_s}|{_a}|{_o}] seq2seq_prev_activity_no_exog  val_loss={_ep['val_loss']:.5f}  ({_s_elapsed:.1f}s)")
                 if 'seq2seq_dtw_linear_decode' in _r2:
                     _ep = _r2['seq2seq_dtw_linear_decode']
                     _ep['variable_name'] = _s
@@ -4579,12 +4633,14 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_basis[_proc]            = _pipelines_basis
         all_energy_pipelines_exog[_proc]             = _pipelines_exog
         all_energy_pipelines_exog_prev_activity[_proc]   = _pipelines_exog_prev_activity
+        all_energy_pipelines_prev_activity[_proc]        = _pipelines_prev_activity
         all_energy_pipelines_amplitude_shape[_proc]      = _pipelines_amplitude_shape
 
         all_energy_pipelines_seq2seq[_proc]               = _pipelines_seq2seq
         all_energy_pipelines_seq2seq_only[_proc]          = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_exog[_proc]          = _pipelines_seq2seq_exog
         all_energy_pipelines_seq2seq_prev_activity[_proc] = _pipelines_seq2seq_prev_activity
+        all_energy_pipelines_seq2seq_prev_activity_no_exog[_proc] = _pipelines_seq2seq_prev_activity_no_exog
         all_energy_pipelines_ml_linear[_proc]                 = _pipelines_ml_linear
         all_energy_pipelines_ml_dtw_linear_decode[_proc]     = _pipelines_ml_dtw_linear_decode
         all_energy_pipelines_seq2seq_dtw_linear_decode[_proc] = _pipelines_seq2seq_dtw_linear_decode
@@ -5008,12 +5064,14 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('Baseline',                          all_energy_pipelines_mean),
             ('DTW + pos',                         all_energy_pipelines),
             ('DTW + Ext. Factors + Prev Act',     all_energy_pipelines_exog_prev_activity),
+            ('DTW + Prev Act (no Ext.)',          all_energy_pipelines_prev_activity),
             ('ML Linear (no DTW)',                all_energy_pipelines_ml_linear),
             ('ML DTW + Linear Decode',            all_energy_pipelines_ml_dtw_linear_decode),
 
             ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
             ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
             ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_prev_activity),
+            ('DTW + Seq2Seq + Prev Act (no Ext.)', all_energy_pipelines_seq2seq_prev_activity_no_exog),
             ('Seq2Seq DTW + Linear Decode',       all_energy_pipelines_seq2seq_dtw_linear_decode),
         ]:
             if not _pipelines:
@@ -5038,6 +5096,18 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             )
             _all_records.extend(_ar_recs)
 
+        # ── Autoregressive rollout for prev_activity (no exog) ──────────────
+        if all_energy_pipelines_prev_activity:
+            display(Markdown("### DTW + Prev Act (no Ext.) (autoreg)"))
+            _ar_pa_recs = _run_curve_eval_autoregressive_prev_act(
+                all_energy_pipelines_prev_activity,
+                'DTW + Prev Act (no Ext.) (autoreg)',
+                _split_label,
+                _df_src, _activities_map, _objects_map,
+                save_dir=None,
+            )
+            _all_records.extend(_ar_pa_recs)
+
         # ── Autoregressive rollout for seq2seq_prev_activity ─────────────────
         if all_energy_pipelines_seq2seq_prev_activity:
             display(Markdown("### DTW + Seq2Seq + Ext. Factors + Prev Act (autoreg)"))
@@ -5049,6 +5119,18 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 save_dir=None,
             )
             _all_records.extend(_ar_s2s_recs)
+
+        # ── Autoregressive rollout for seq2seq_prev_activity_no_exog ────────
+        if all_energy_pipelines_seq2seq_prev_activity_no_exog:
+            display(Markdown("### DTW + Seq2Seq + Prev Act (no Ext.) (autoreg)"))
+            _ar_s2s_ne_recs = _run_curve_eval_autoregressive_prev_act(
+                all_energy_pipelines_seq2seq_prev_activity_no_exog,
+                'DTW + Seq2Seq + Prev Act (no Ext.) (autoreg)',
+                _split_label,
+                _df_src, _activities_map, _objects_map,
+                save_dir=None,
+            )
+            _all_records.extend(_ar_s2s_ne_recs)
 
     # ── Side-by-side comparison table ───────────────────────────────────────
     if not _all_records:
@@ -5311,6 +5393,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines' in dir() else {},
                     'DTW + Ext. Factors + Prev Act':      all_energy_pipelines_exog_prev_activity
                         if 'all_energy_pipelines_exog_prev_activity' in dir() else {},
+                    'DTW + Prev Act (no Ext.)':           all_energy_pipelines_prev_activity
+                        if 'all_energy_pipelines_prev_activity' in dir() else {},
                     'ML Linear (no DTW)':                 all_energy_pipelines_ml_linear
                         if 'all_energy_pipelines_ml_linear' in dir() else {},
                     'ML DTW + Linear Decode':             all_energy_pipelines_ml_dtw_linear_decode
@@ -5321,6 +5405,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_seq2seq_only' in dir() else {},
                     'DTW + Seq2Seq + Ext. Factors + Prev Act': all_energy_pipelines_seq2seq_prev_activity
                         if 'all_energy_pipelines_seq2seq_prev_activity' in dir() else {},
+                    'DTW + Seq2Seq + Prev Act (no Ext.)': all_energy_pipelines_seq2seq_prev_activity_no_exog
+                        if 'all_energy_pipelines_seq2seq_prev_activity_no_exog' in dir() else {},
                     'Seq2Seq DTW + Linear Decode':        all_energy_pipelines_seq2seq_dtw_linear_decode
                         if 'all_energy_pipelines_seq2seq_dtw_linear_decode' in dir() else {},
                 }

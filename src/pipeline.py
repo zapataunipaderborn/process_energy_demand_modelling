@@ -64,7 +64,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-setting = False
+setting = True
 
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
@@ -79,25 +79,56 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_953',
-        # LIGHT TEST RUN: single process + single miner + single curve model so
-        # the span-fix isolation (simulation.py BUDGET_EXIT_DISCOUNT/cap) can be
-        # re-checked fast. Restore the full lists for a real comparison run.
-        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],#['process_4_1'],
+        'run_name':              'experiment_957',
+        # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
+        # hyperparameter search ON. Tests the budget over-generation fix
+        # (simulation.py BUDGET_EXIT_DISCOUNT=0.35 + BUDGET_MAX_LENGTH_RATIO) and
+        # the DBA zero-calibration (sim_extractor._zero_calibrate_barycenter)
+        # end-to-end, and is directly comparable to experiment_944 (same split,
+        # same miners) for the before/after leakage check.
+        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],#, 'alpha'],#, 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+        'mining_algorithms':     ['heuristic', 'alpha'],   # matches experiment_944 for apples-to-apples comparison
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
         'save_predicted_curves': setting, # ON: persists predicted_curves.parquet the schedule-profile comparison reads
         'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
         'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
-        # Only fit the exogenous curve model (best performer, and the one the
-        # schedule-profile / complete-curve eval consumes). Fewer models = fast.
-        'curve_approaches':      ['exog_prev_activity'],
-        'curve_optimize_hyperparams': False, # OFF for speed; re-enable for the real run
-        'curve_n_optuna_trials': 10,         # only used if the search is on
+        # All standard curve approaches (the uncommented defaults in
+        # modelling.py's APPROACHES list — same set experiment_944 produced).
+        # NOTE: this trains ~8 curve families per (sensor, activity, object)
+        # instead of one, so with Optuna ON this is a big runtime multiplier —
+        # the seq2seq_* families especially are slow. The schedule-profile /
+        # complete-curve eval still keys off 'exog_prev_activity'.
+        'curve_approaches':      [
+            'baseline',
+            'exog_prev_activity',
+            'prev_activity',   # ablation: prev-activity context WITHOUT external factors
+            'ml_linear',
+            # 'ml_dtw_linear_decode',
+            'seq2seq',
+            'seq2seq_only',
+            'seq2seq_prev_activity',
+            'seq2seq_prev_activity_no_exog',   # ablation: seq2seq's counterpart of 'prev_activity'
+            # 'seq2seq_dtw_linear_decode',
+        ],
+        # Full reference — every valid approach name (uncomment to enable the
+        # experimental ones, which are commented out in modelling.py by
+        # default). Kept here so the whole universe is togglable in future.
+        # The baseline -> prev_activity -> exog -> exog_prev_activity chain
+        # (and its seq2seq counterpart: seq2seq/seq2seq_only ->
+        # seq2seq_prev_activity_no_exog -> seq2seq_exog -> seq2seq_prev_activity)
+        # is the external-factor ablation, isolating prev-activity's
+        # contribution independent of external factors:
+        #   'baseline', 'instance_stats', 'istats_leakfree', 'dtw_phase',
+        #   'basis', 'exog', 'prev_activity', 'exog_prev_activity',
+        #   'amplitude_shape', 'ml_linear', 'ml_dtw_linear_decode', 'seq2seq',
+        #   'seq2seq_only', 'seq2seq_exog', 'seq2seq_prev_activity_no_exog',
+        #   'seq2seq_prev_activity', 'seq2seq_dtw_linear_decode'
+        'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
+        'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
     },
 
 
