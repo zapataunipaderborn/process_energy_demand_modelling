@@ -57,7 +57,44 @@ MODEL_BASE_IDLE = True
 #   to any transition that would carry the case into its final marking, i.e.
 #   the "exit" branches. Small value = the case resists ending early and
 #   keeps looping, so it can actually fill its budget.
+# Measured 2026-07-20: at 0.02 (a 50x suppression of every exit branch) the
+# budget modes over-generated activities badly -- 2.81x the real mean activity
+# count on process_5, 1.64x on process_4_2, 1.31x on process_2 -- because the
+# case cannot end until its whole time budget is spent, and the ML+ duration
+# models predict SHORTER per-activity durations, so it must fire many more
+# activities to burn the same budget (plain budget 1.55x vs budget_ml_plus
+# 2.81x on process_5 is exactly that interaction).
+#
+# ISOLATION (2026-07-21): kept at the original, control-flow-tuned 0.02.
 BUDGET_EXIT_DISCOUNT = 0.02
+#
+# BUDGET backstop — TIME-based, not activity-count-based.
+# ------------------------------------------------------
+# Measured 2026-07-21 (exp 952 vs 944): the activity-count cap
+# (BUDGET_MAX_LENGTH_RATIO x median case length) is the WRONG backstop for a
+# budget whose objective is TIME. On processes where the duration model
+# under-predicts per-activity durations (process_5), filling the real time
+# budget legitimately needs many short activities; capping the COUNT then
+# guillotines the case before its time budget is met. Effect on process_5
+# budget: span 1.47x real -> 0.53x (case_span_mae 76 -> 174 min) and event
+# ratio 1.48x -> 0.64x. The cap swapped an over-generation error for an
+# under-generation + short-span error.
+#
+# The coherent backstop for a TIME budget is a TIME bound: a case may run to
+# at most BUDGET_MAX_TIME_RATIO x its predicted budget B, then it is closed.
+# Because the primary stop is already `elapsed >= B`, this only ever fires as
+# a safety net against a single pathologically long activity overshooting the
+# budget; it never truncates a case that is still legitimately filling B.
+# 1.5 = allow up to 50% overshoot before force-closing.
+BUDGET_MAX_TIME_RATIO = 1.5
+#
+# Legacy activity-count cap — kept for comparison, OFF by default. When True,
+# a budget case is force-closed once it exceeds BUDGET_MAX_LENGTH_RATIO x the
+# mined MEDIAN case length, regardless of remaining time budget. This is the
+# 952 behaviour that broke span on process_5 (see above); leave it off unless
+# reproducing that comparison.
+BUDGET_USE_LENGTH_CAP   = False
+BUDGET_MAX_LENGTH_RATIO = 1.2
 # BUDGET_EXIT_BOOST: once the budget is spent, the same exit transitions are
 #   boosted instead, so the case closes promptly rather than over-running.
 BUDGET_EXIT_BOOST = 25.0
@@ -984,6 +1021,13 @@ class ProcessSimulation:
             stochastic_map = model.get('stochastic_map', {})
             duration_map   = model.get('duration_map', {})
             max_case_length = model.get('max_case_length', 200)
+            # Legacy activity-count backstop (OFF by default, see
+            # BUDGET_USE_LENGTH_CAP). .get with fallback: nets mined before
+            # median_case_length was recorded yield None, i.e. no cap.
+            _median_case_length = model.get('median_case_length') or 0.0
+            _budget_len_cap = (int(round(_median_case_length * BUDGET_MAX_LENGTH_RATIO))
+                               if (BUDGET_USE_LENGTH_CAP and _median_case_length > 0)
+                               else None)
 
             # Start the token game
             marking = copy.copy(im)
@@ -1021,10 +1065,21 @@ class ProcessSimulation:
                 step += 1
 
                 # Budget mode: how much of the predicted case duration is left?
+                # The case is "done generating" when the TIME budget is spent
+                # (primary), or it has overshot the budget by more than
+                # BUDGET_MAX_TIME_RATIO (safety net against one long activity
+                # blowing past B). The legacy activity-count cap (_over_length)
+                # is OFF by default — it truncated cases before their time
+                # budget was met and broke span/event-ratio (see the
+                # BUDGET_MAX_TIME_RATIO note at module top).
                 _budget_spent = False
+                _over_length = False
                 if _budget_B is not None:
                     _elapsed_min = (current_sim_time - case_start_ts) / 60.0
-                    _budget_spent = _elapsed_min >= _budget_B
+                    _over_length = (_budget_len_cap is not None
+                                    and activity_count >= _budget_len_cap)
+                    _over_time = _elapsed_min >= BUDGET_MAX_TIME_RATIO * _budget_B
+                    _budget_spent = (_elapsed_min >= _budget_B) or _over_length or _over_time
 
                 # Check if we reached the final marking. This one is
                 # structural — at fm nothing is enabled, so the case cannot be
@@ -1044,7 +1099,11 @@ class ProcessSimulation:
                     # isn't, keep generating (the exit branches are discounted
                     # below so the case rarely lands here early anyway).
                     if _budget_spent and activity_count > 0:
-                        print(f"    Budget spent ({_budget_B:.0f} min) after "
+                        _why = ('length cap' if _over_length else
+                                f'budget spent ({_budget_B:.0f} min)')
+                        if not _over_length and _elapsed_min >= BUDGET_MAX_TIME_RATIO * _budget_B:
+                            _why = f'time cap ({BUDGET_MAX_TIME_RATIO:g}x{_budget_B:.0f} min)'
+                        print(f"    Case closed — {_why} — after "
                               f"{activity_count} activities.")
                         break
                 elif (fm_reached and activity_count > 0

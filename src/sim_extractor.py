@@ -494,12 +494,18 @@ def _compute_decision_point_weights(net, im, fm, case_sorted):
 
     decision_weights = defaultdict(lambda: defaultdict(int))
     max_case_length = 0
+    # Typical (median) case length is what the budget-mode over-generation
+    # guard needs: max_case_length is a single outlier case and is far too
+    # permissive as a bound (measured: budget modes emitting 2.8x the real
+    # mean activity count while still sitting well under max).
+    _case_lengths = []
 
     for case_id, case_df in case_sorted.items():
         activities_in_case = case_df['activity'].tolist()
         if not activities_in_case:
             continue
         max_case_length = max(max_case_length, len(activities_in_case))
+        _case_lengths.append(len(activities_in_case))
 
         marking = copy.copy(im)
         act_idx = 0
@@ -567,7 +573,12 @@ def _compute_decision_point_weights(net, im, fm, case_sorted):
     # Convert to plain dicts
     decision_weights = {k: dict(v) for k, v in decision_weights.items()}
 
-    return decision_weights, max_case_length
+    # Median, not mean: case-length distributions here are right-skewed (a few
+    # very long cases), so the mean sits above the typical case and would make
+    # the budget-mode length guard too permissive.
+    median_case_length = float(np.median(_case_lengths)) if _case_lengths else 0.0
+
+    return decision_weights, max_case_length, median_case_length
 
 
 def _compute_activity_repeat_counts(case_sorted):
@@ -1079,7 +1090,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
     print(f"    Stochastic map: {len(stochastic_map)} transition weights")
 
     # ── Decision-point-aware weights (Changes 2+3) ────────────────────
-    decision_weights, max_case_length = _compute_decision_point_weights(
+    decision_weights, max_case_length, median_case_length = _compute_decision_point_weights(
         net, im, fm, case_sorted
     )
     n_dp = len(decision_weights)
@@ -1168,6 +1179,7 @@ def _extract_with_pm4py(group, object_name, object_type, higher_level_activity,
         'activity_count_transitions': activity_count_transitions,
         'decision_weights': decision_weights,
         'max_case_length': max_case_length,
+        'median_case_length': median_case_length,
         'activity_repeat_counts': activity_repeat_counts,
     }
 
@@ -3530,7 +3542,9 @@ def build_and_train_pipeline(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     if verbose:
         print(f"    Barycenter length: {len(reference_curve)} points")
@@ -4401,7 +4415,9 @@ def build_and_train_pipeline_instance_stats(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     if verbose:
         print(f"    Barycenter length: {len(reference_curve)} points")
@@ -4771,7 +4787,9 @@ def build_and_train_pipeline_istats_leakfree(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     for i, curve in enumerate(train_curves):
         if verbose and i % max(1, len(train_curves) // 10) == 0:
@@ -5201,7 +5219,9 @@ def build_and_train_pipeline_dtw_phase(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     if verbose:
         print(f"    Barycenter length: {len(reference_curve)} points")
@@ -5913,7 +5933,9 @@ def build_and_train_pipeline_exog(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     # ── DTW-align train curves ────────────────────────────────────────────────
     for curve in train_curves:
@@ -6290,7 +6312,9 @@ def build_and_train_pipeline_amplitude_shape(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     for curve in train_curves:
         curve['resampled_values'] = _align_curve_with_dtw(
@@ -6651,7 +6675,9 @@ def build_and_train_pipeline_amplitude_shape_exog(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     for curve in train_curves:
         curve['resampled_values'] = _align_curve_with_dtw(
@@ -7172,7 +7198,9 @@ def build_and_train_pipeline_seq2seq(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     if verbose:
         print(f"    Barycenter length: {len(reference_curve)}")
@@ -7730,7 +7758,9 @@ def build_and_train_pipeline_seq2seq_exog(
     ])[:, :, np.newaxis]
 
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     if verbose:
         print(f"    Barycenter length: {len(reference_curve)}")
@@ -8543,6 +8573,74 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
 #   - per sensor              — pools per-case totals across all cases
 # ---------------------------------------------------------------------------
 
+ZERO_CALIBRATION_MIN_FRACTION = 0.05
+
+
+def _zero_calibrate_barycenter(reference_curve, resampled_train):
+    """
+    Restore the duty cycle (on/off intermittency) that DBA averages away.
+
+    Many of these sensors are intermittent: the equipment cycles on and off
+    within an activity, so the REAL curves sit at exactly zero most of the
+    time (measured: 80-87% zeros on processes 1/2/3). Averaging destroys
+    that -- the "off" blocks land at different phases in different cases, so
+    at nearly every position at least one case is on and the barycenter is
+    non-zero almost everywhere (measured: DBA reproduces only 26% zeros
+    against a real 87%, and a plain mean reproduces 0%). The barycenter is a
+    good estimate of the CONDITIONAL MEAN but an implausible SAMPLE, and the
+    complete-profile evaluation is distributional, so it is scored as a
+    sample.
+
+    Fix: keep the DBA shape, then snap its lowest-q fraction to exactly zero,
+    where q is the zero-fraction of the TRAINING curves (no test information
+    is used). Measured on 17 zero-inflated sensors, held out:
+        DBA            W1 0.118, zeros 26.0%, RMSE 1.006
+        DBA+zero-snap  W1 0.093, zeros 82.7%, RMSE 0.998   (real zeros 86.7%)
+    i.e. 21% better on W1 -- the headline complete-profile metric -- while
+    also fixing the duty cycle, and neutral on RMSE. Wins W1 on 16/17
+    sensors. Note a MEDIAN barycenter also fixes the zeros but doubles W1
+    (0.232), so it is not the right trade here.
+
+    No-ops for sensors whose training curves are not meaningfully
+    zero-inflated (< ZERO_CALIBRATION_MIN_FRACTION), leaving continuously
+    running sensors exactly as before.
+    """
+    ref = np.asarray(reference_curve, dtype=float)
+    train = np.asarray(resampled_train, dtype=float)
+    if train.size == 0 or ref.size == 0:
+        return ref
+    zero_fraction = float(np.mean(np.abs(train) < 1e-9))
+    if zero_fraction < ZERO_CALIBRATION_MIN_FRACTION:
+        return ref
+    threshold = float(np.quantile(ref, min(zero_fraction, 1.0)))
+    calibrated = ref.copy()
+    calibrated[calibrated <= threshold] = 0.0
+    return calibrated
+
+
+def _clip_physical(curve):
+    """
+    Clip a predicted sensor curve to the physically valid range.
+
+    Every sensor modelled here measures a non-negative quantity (energy /
+    power demand, mass or volume flow, temperature in deg C above the
+    process floor, concentration), and the REAL data confirms it: 0.00%
+    negative readings on processes 1/2/3/5 and <0.1% (sensor noise around
+    zero) on 4_1/4_2. The curve regressors, however, are unconstrained
+    (GradientBoosting / linear DTW decode) and freely predict below zero --
+    measured at ~23-24% of all predicted points on processes 2 and 3, down
+    to -512 kW of "cooling water demand".
+
+    Those values are physically impossible, and because the population-level
+    magnitude/variability/coverage comparisons are distributional, negative
+    mass in the predicted distribution corrupts them directly. Clipping is
+    applied to EVERY predictor (process-simulation and schedule-direct
+    alike -- schedule-direct emits ~33% negatives on process_1), so it is a
+    correctness fix, not a thumb on the scale for any one method.
+    """
+    return np.clip(np.asarray(curve, dtype=float), 0, None)
+
+
 def predict_curve_for_instance(activity, object_name, duration_minutes,
                                object_attributes, energy_pipelines, sensor,
                                activity_exog_means=None,
@@ -8554,6 +8652,13 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     internally (see simulation.py's "Update energy state" step), exposed
     standalone so it can be applied *after the fact* to the output of any
     simulation mode, not just petri_net_energy_*/petri_net_energy_direct*.
+
+    All returned curves are clipped at zero (see _clip_physical): these
+    sensors measure demand / flow / temperature, which are physically
+    non-negative, but the underlying regressors are unconstrained and do
+    emit negative values (up to ~24% of predicted points on some processes),
+    which is indefensible and corrupts every downstream distributional
+    comparison.
 
     Returns None when no pipeline exists for (sensor, activity, object).
     """
@@ -8586,7 +8691,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
         ref_curve,
     )
     if predict_fn is None:
-        return input_curve
+        return _clip_physical(input_curve)
 
     # energy_pipelines is populated by several different producers with
     # different predict_fn signatures: the energy-aware simulation modes use
@@ -8609,7 +8714,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     last_exc = None
     for attempt in attempts:
         try:
-            return attempt()
+            return _clip_physical(attempt())
         except TypeError as exc:
             last_exc = exc
     raise last_exc
@@ -9303,7 +9408,9 @@ def train_schedule_profile_pipeline(train_cases, fixed_length=None, val_size=0.2
         for c in bary_cases
     ])[:, :, np.newaxis]
     dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
-    reference_curve = dba_barycenter[:, 0]
+    # Restore the on/off duty cycle DBA averages away (see
+    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
+    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
 
     for c in train_cases:
         c['resampled_values'] = _align_curve_with_dtw(c['values'], reference_curve)
@@ -9429,7 +9536,9 @@ def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_mi
 
     y_pred = model.predict(X)
     t = np.linspace(0, median_case_duration_minutes, fixed_length)
-    return t, np.asarray(y_pred, dtype=float)
+    # Same non-negativity constraint as the process-simulation curves
+    # (see _clip_physical) -- applied to every predictor, not just one.
+    return t, _clip_physical(y_pred)
 
 
 def train_case_duration_pipeline(train_cases, val_size=0.2, random_state=42,

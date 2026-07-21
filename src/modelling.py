@@ -602,6 +602,14 @@ MLP_TARGET_TRANSFORM    = 'log'
 # ─────────────────────────────────────────────────────────────────────────────
 CURVE_OPTIMIZE_HYPERPARAMS = True   # ← Optuna search for sklearn curve models
 CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) combo
+# Pipeline-config overrides (PIPELINE_CURVE_OPTIMIZE_HYPERPARAMS / _N_OPTUNA_TRIALS)
+# so a light test run can turn the search off or cut trials without editing here.
+_env_opt_hp = os.environ.get('PIPELINE_CURVE_OPTIMIZE_HYPERPARAMS')
+if _env_opt_hp is not None:
+    CURVE_OPTIMIZE_HYPERPARAMS = _env_opt_hp.lower() == 'true'
+_env_opt_trials = os.environ.get('PIPELINE_CURVE_N_OPTUNA_TRIALS')
+if _env_opt_trials:
+    CURVE_N_OPTUNA_TRIALS = int(_env_opt_trials)
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -691,6 +699,26 @@ APPROACHES = [
     'seq2seq_prev_activity',
     'seq2seq_dtw_linear_decode',
 ]
+
+# Override the curve models to fit from the pipeline config
+# (PIPELINE_CURVE_APPROACHES, comma-separated). Lets a light run fit only e.g.
+# 'exog_prev_activity' without editing this file. Unknown names are dropped
+# with a warning so a typo can't silently train nothing.
+_env_curve_approaches = os.environ.get('PIPELINE_CURVE_APPROACHES')
+if _env_curve_approaches:
+    _requested = [a.strip() for a in _env_curve_approaches.split(',') if a.strip()]
+    # Full universe of valid approach names (not just the currently-uncommented
+    # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
+    _known = {'baseline', 'instance_stats', 'istats_leakfree', 'dtw_phase',
+              'basis', 'exog', 'exog_prev_activity', 'amplitude_shape',
+              'ml_linear', 'ml_dtw_linear_decode', 'seq2seq', 'seq2seq_only',
+              'seq2seq_exog', 'seq2seq_prev_activity', 'seq2seq_dtw_linear_decode'}
+    _unknown = [a for a in _requested if a not in _known]
+    if _unknown:
+        print(f"[modelling] WARNING: PIPELINE_CURVE_APPROACHES has names not in "
+              f"the default APPROACHES list: {_unknown} — ignoring those.")
+    APPROACHES = [a for a in _requested if a in _known] or APPROACHES
+    print(f"[modelling] Curve approaches overridden from pipeline config: {APPROACHES}")
 
 # ── Seq2Seq hyperparameters ───────────────────────────────────────────────────
 SEQ2SEQ_HIDDEN_SIZE          = 128
@@ -1870,18 +1898,23 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report("\n1. BASIC PROCESS METRICS")
     report("-" * 40)
     
-    # Event counts. Ratio is real/simulated (not sim/real): 1.0 = perfect
-    # match, >1 = simulation under-counts events, <1 = simulation over-counts.
+    # Event counts. Ratio is sim/real (matches modelling_utils and the
+    # EvtRatio column convention): 1.0 = perfect match, >1 = simulation
+    # OVER-counts events, <1 = simulation under-counts. NB: was real/sim here
+    # (a reciprocal inconsistency, fixed 2026-07-21) — that both inverted the
+    # table and made event_count_error under-penalise over-generation
+    # (sim=2x real gave error 0.5 instead of 1.0), masking budget-mode
+    # over-generation.
     sim_events = len(simulated_df)
     real_events = len(real_df)
-    event_ratio = real_events / sim_events if sim_events > 0 else 0
+    event_ratio = sim_events / real_events if real_events > 0 else 0
 
     # Case counts
     sim_cases = simulated_df[case_col].nunique() if case_col in simulated_df.columns else 0
     real_cases = real_df[case_col].nunique() if case_col in real_df.columns else 0
     case_ratio = sim_cases / real_cases if real_cases > 0 else 0
 
-    report(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio (real/sim): {event_ratio:.3f}")
+    report(f"Events - Real: {real_events}, Sim: {sim_events}, Ratio (sim/real): {event_ratio:.3f}")
     report(f"Cases - Real: {real_cases}, Sim: {sim_cases}, Ratio: {case_ratio:.3f}")
     
     results['basic_metrics'] = {

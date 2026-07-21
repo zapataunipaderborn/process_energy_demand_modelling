@@ -41,6 +41,22 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    case-id partition is applied to every
                                    evaluation (process, energy/profile,
                                    schedule-profile) either way.
+  curve_approaches      list|None  which curve-fitting models to train, e.g.
+                                   ['exog_prev_activity']. Subset of the
+                                   APPROACHES list in modelling.py ('baseline',
+                                   'exog_prev_activity', 'ml_linear',
+                                   'ml_dtw_linear_decode', 'seq2seq',
+                                   'seq2seq_only', 'seq2seq_prev_activity',
+                                   'seq2seq_dtw_linear_decode', ...). None
+                                   (default) → use modelling.py's own list.
+                                   Fewer models = much faster runs. The
+                                   schedule-profile / complete-curve eval needs
+                                   'exog_prev_activity' present.
+  curve_optimize_hyperparams bool  whether curve models run the (slow) Optuna
+                                   hyperparameter search. None → modelling.py
+                                   default (True). Set False for fast test runs.
+  curve_n_optuna_trials int|None   Optuna trials per (sensor, activity, object)
+                                   when the search is on. None → default (50).
 """
 
 import os
@@ -48,7 +64,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-setting = True
+setting = False
 
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
@@ -63,17 +79,25 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_944',
-        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
+        'run_name':              'experiment_953',
+        # LIGHT TEST RUN: single process + single miner + single curve model so
+        # the span-fix isolation (simulation.py BUDGET_EXIT_DISCOUNT/cap) can be
+        # re-checked fast. Restore the full lists for a real comparison run.
+        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],#['process_4_1'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha'],#, 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
+        'mining_algorithms':     ['heuristic'],#, 'alpha'],#, 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
         'save_predicted_curves': setting, # ON: persists predicted_curves.parquet the schedule-profile comparison reads
         'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
         'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
+        # Only fit the exogenous curve model (best performer, and the one the
+        # schedule-profile / complete-curve eval consumes). Fewer models = fast.
+        'curve_approaches':      ['exog_prev_activity'],
+        'curve_optimize_hyperparams': False, # OFF for speed; re-enable for the real run
+        'curve_n_optuna_trials': 10,         # only used if the search is on
     },
 
 
@@ -167,6 +191,9 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_joint_duration_eval = exp.get('run_joint_duration_eval', False)
     run_schedule_profile_eval = exp.get('run_schedule_profile_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
+    curve_approaches = exp.get('curve_approaches')
+    curve_optimize_hyperparams = exp.get('curve_optimize_hyperparams')
+    curve_n_optuna_trials = exp.get('curve_n_optuna_trials')
     train_ratio = exp.get('train_ratio')
     split_type = exp.get('split_type', 'temporal')
     if split_type not in ('temporal', 'random'):
@@ -185,6 +212,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"run_joint_duration_eval={run_joint_duration_eval}  "
           f"run_schedule_profile_eval={run_schedule_profile_eval}  "
           f"save_predicted_curves={save_predicted_curves}  "
+          f"curve_approaches={curve_approaches or '(default)'}  "
+          f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
           f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}  "
           f"split_type={split_type}")
     print(f"{'='*60}\n")
@@ -201,6 +230,12 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_SAVE_PREDICTED_CURVES'] = 'true' if save_predicted_curves else 'false'
     if mining_algorithms:
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
+    if curve_approaches:
+        env['PIPELINE_CURVE_APPROACHES'] = ','.join(curve_approaches)
+    if curve_optimize_hyperparams is not None:
+        env['PIPELINE_CURVE_OPTIMIZE_HYPERPARAMS'] = 'true' if curve_optimize_hyperparams else 'false'
+    if curve_n_optuna_trials is not None:
+        env['PIPELINE_CURVE_N_OPTUNA_TRIALS'] = str(curve_n_optuna_trials)
     if train_ratio is not None:
         env['PIPELINE_TRAIN_RATIO'] = str(train_ratio)
     env['PIPELINE_SPLIT_TYPE'] = split_type
