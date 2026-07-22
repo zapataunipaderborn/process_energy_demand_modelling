@@ -458,10 +458,12 @@ MODES_TO_COMPARE = [
     'petri_net_inductive',
     'petri_net_inductive_ml_plus_global',
     'petri_net_inductive_ml_plus_per_act',
-    'petri_net_wip_aware',   # PN transitions + WIP/RO-aware duration + waiting-time model
-    'petri_net_wip_aware_ml_plus_global',    # same, but duration from the ML+ global model
-    'petri_net_wip_aware_ml_plus_per_act',   # same, but duration from the ML+ per-activity models
-    'petri_net_wip_branching_aware',   # wip_aware + WIP/RO-aware branching (falls back to statistical if not better)
+    # wip_aware / wip_branching_aware disabled (2026-07-22): excluded from the
+    # ablation study on request. Re-enable by uncommenting if needed.
+    # 'petri_net_wip_aware',   # PN transitions + WIP/RO-aware duration + waiting-time model
+    # 'petri_net_wip_aware_ml_plus_global',    # same, but duration from the ML+ global model
+    # 'petri_net_wip_aware_ml_plus_per_act',   # same, but duration from the ML+ per-activity models
+    # 'petri_net_wip_branching_aware',   # wip_aware + WIP/RO-aware branching (falls back to statistical if not better)
     'petri_net_budget',   # base PN token game, but each case is generated to match its predicted total-duration budget (train_case_duration_pipeline) — folds the "duration-corrected" span-fix into the generator (no post-hoc step)
     'petri_net_budget_ml_plus_global',   # petri_net_budget + ML+ global duration model (better internal timing under the same total-duration budget)
     'petri_net_budget_ml_plus_per_act',  # petri_net_budget + ML+ per-activity duration models
@@ -684,6 +686,12 @@ RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', '
 # (process, sensor), on top of everything else. Does NOT affect any other
 # evaluation. See sim_extractor.py's "Schedule Profile Evaluation" section.
 RUN_SCHEDULE_PROFILE_EVAL = os.environ.get('PIPELINE_RUN_SCHEDULE_PROFILE_EVAL', 'false').lower() == 'true'
+
+# Autoregressive test-time rollout of the prev-activity curve approaches
+# (the "… (autoreg)" rows in the Curve-Only Evaluation). Off by default —
+# it only ADDS those extra comparison rows and does not affect any other
+# evaluation. See _run_curve_eval_autoregressive_prev_act.
+RUN_AUTOREGRESSIVE_EVAL = os.environ.get('PIPELINE_RUN_AUTOREGRESSIVE_EVAL', 'false').lower() == 'true'
 
 # Whether to persist the actual real/predicted curve arrays behind the
 # complete-curve and schedule-profile Wasserstein numbers (not just the
@@ -5141,7 +5149,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _all_records.extend(_recs)
 
         # ── Autoregressive rollout for ml_exog_prev_activity ───────────────────
-        if all_energy_pipelines_ml_exog_prev_activity:
+        if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_ml_exog_prev_activity:
             display(Markdown("### DTW + Ext. Factors + Prev Act (autoreg)"))
             _ar_recs = _run_curve_eval_autoregressive_prev_act(
                 all_energy_pipelines_ml_exog_prev_activity,
@@ -5153,7 +5161,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _all_records.extend(_ar_recs)
 
         # ── Autoregressive rollout for ml_prev_activity (no exog) ───────────
-        if all_energy_pipelines_ml_prev_activity:
+        if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_ml_prev_activity:
             display(Markdown("### ML Prev Act (no Ext.) (autoreg)"))
             _ar_pa_recs = _run_curve_eval_autoregressive_prev_act(
                 all_energy_pipelines_ml_prev_activity,
@@ -5165,7 +5173,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _all_records.extend(_ar_pa_recs)
 
         # ── Autoregressive rollout for seq2seq_prev_activity ─────────────────
-        if all_energy_pipelines_seq2seq_prev_activity:
+        if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_seq2seq_prev_activity:
             display(Markdown("### DTW + Seq2Seq + Ext. Factors + Prev Act (autoreg)"))
             _ar_s2s_recs = _run_curve_eval_autoregressive_prev_act(
                 all_energy_pipelines_seq2seq_prev_activity,
@@ -5177,7 +5185,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             _all_records.extend(_ar_s2s_recs)
 
         # ── Autoregressive rollout for seq2seq_prev_activity_no_exog ────────
-        if all_energy_pipelines_seq2seq_prev_activity_no_exog:
+        if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_seq2seq_prev_activity_no_exog:
             display(Markdown("### DTW + Seq2Seq + Prev Act (no Ext.) (autoreg)"))
             _ar_s2s_ne_recs = _run_curve_eval_autoregressive_prev_act(
                 all_energy_pipelines_seq2seq_prev_activity_no_exog,

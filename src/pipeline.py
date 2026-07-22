@@ -23,6 +23,10 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    (Best/mine vs. Schedule-direct vs. Stochastic
                                    generator, per process) — writes to
                                    schedule_profile_eval_results/. Default: False.
+  run_autoregressive_eval bool     whether to add the autoregressive test-time
+                                   rollout rows ("… (autoreg)") to the Curve-Only
+                                   Evaluation. Only adds those extra comparison
+                                   rows; affects nothing else. Default: False.
   save_predicted_curves bool       whether to also persist the actual real/predicted
                                    curve arrays (not just the aggregated Wasserstein
                                    distances) behind complete-curve eval and schedule
@@ -86,7 +90,7 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_960',
+        'run_name':              'experiment_961',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.35 + BUDGET_MAX_LENGTH_RATIO) and
@@ -100,6 +104,7 @@ EXPERIMENTS = [
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
+        'run_autoregressive_eval': False, # OFF: skip the "… (autoreg)" curve-eval rows
         'save_predicted_curves': setting, # ON: persists predicted_curves.parquet the schedule-profile comparison reads
         'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
         'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
@@ -116,16 +121,16 @@ EXPERIMENTS = [
             'baseline',              # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
             'median_activity_sensor', # "Median per Activity & Sensor": median curve per (sensor, activity, object), no model
             'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
-            'ml_exog',                # DBA + DTW + regression + external factors (no prev-activity)
+            #'ml_exog',                # DBA + DTW + regression + external factors (no prev-activity)
             'ml_exog_prev_activity',  # DBA + DTW + regression + external factors + prev-activity
-            'ml_prev_activity',      # ablation: prev-activity context WITHOUT external factors
+            #'ml_prev_activity',      # ablation: prev-activity context WITHOUT external factors
             'ml_only',                # no DTW at all (formerly 'ml_linear')
             # 'ml_dtw_linear_decode',
             'seq2seq',
             'seq2seq_only',
-            'seq2seq_exog',           # seq2seq counterpart of ml_exog
+            #'seq2seq_exog',           # seq2seq counterpart of ml_exog
             'seq2seq_prev_activity',
-            'seq2seq_prev_activity_no_exog',   # ablation: seq2seq's counterpart of 'ml_prev_activity'
+            #'seq2seq_prev_activity_no_exog',   # ablation: seq2seq's counterpart of 'ml_prev_activity'
             # 'seq2seq_dtw_linear_decode',
         ],
         # Full reference — every valid approach name (uncomment to enable the
@@ -249,6 +254,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_energy_modelling = exp.get('run_energy_modelling', True)
     run_joint_duration_eval = exp.get('run_joint_duration_eval', False)
     run_schedule_profile_eval = exp.get('run_schedule_profile_eval', False)
+    run_autoregressive_eval = exp.get('run_autoregressive_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
     curve_approaches = exp.get('curve_approaches')
     curve_optimize_hyperparams = exp.get('curve_optimize_hyperparams')
@@ -270,6 +276,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"run_energy_modelling={run_energy_modelling}  "
           f"run_joint_duration_eval={run_joint_duration_eval}  "
           f"run_schedule_profile_eval={run_schedule_profile_eval}  "
+          f"run_autoregressive_eval={run_autoregressive_eval}  "
           f"save_predicted_curves={save_predicted_curves}  "
           f"curve_approaches={curve_approaches or '(default)'}  "
           f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
@@ -286,6 +293,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_RUN_ENERGY_MODELLING']  = 'true' if run_energy_modelling else 'false'
     env['PIPELINE_RUN_JOINT_DURATION_EVAL'] = 'true' if run_joint_duration_eval else 'false'
     env['PIPELINE_RUN_SCHEDULE_PROFILE_EVAL'] = 'true' if run_schedule_profile_eval else 'false'
+    env['PIPELINE_RUN_AUTOREGRESSIVE_EVAL'] = 'true' if run_autoregressive_eval else 'false'
     env['PIPELINE_SAVE_PREDICTED_CURVES'] = 'true' if save_predicted_curves else 'false'
     if mining_algorithms:
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
