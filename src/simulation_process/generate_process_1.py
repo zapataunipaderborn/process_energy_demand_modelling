@@ -148,7 +148,6 @@ PROCESS_CONFIG = {
 ENERGY_PARAMS = {
     'bottling':   {'base_kW': 35.0,  'noise_std': 2.0},
     'individual_packaging':  {'base_kW': 25.0,  'noise_std': 1.5},
-    'water_supply': {'base_kW': 8.0, 'noise_std': 0.5},
 }
 
 REFERENCE_VOLUME_L = 500.0  # volume scaling pivot
@@ -474,13 +473,7 @@ def _power_curve(activity: str, station: str, duration_min: float,
     if station == 'Individual_packaging' and activity == 'prepare':
         return noisy(3.0, 0.3)
 
-    if station == 'Water_supply' and activity == 'working':
-        p = ENERGY_PARAMS['water_supply']
-        return noisy(p['base_kW'], p['noise_std'])
-    if station == 'Water_supply' and activity == 'prepare':
-        return noisy(1.0, 0.2)
-
-    return None   # no sensor for this combination
+    return None   # no sensor for this combination (e.g. Water_supply, Warehousing)
 
 
 def _resample_to_n(values: np.ndarray, n: int) -> np.ndarray:
@@ -545,7 +538,6 @@ def build_expanded(df_event_log: pd.DataFrame,
                 'autoclave_cooling_water_demand_kW_energy_to_model':     0.0,
                 'bottling_power_kW_energy_to_model':                     0.0,
                 'individual_packaging_power_kW_energy_to_model':                    0.0,
-                'water_supply_power_kW_energy_to_model':                 0.0,
                 # Log columns
                 'timestamp_start_log':          ev['timestamp_start'],
                 'timestamp_end_log':            ev['timestamp_end'],
@@ -572,8 +564,6 @@ def build_expanded(df_event_log: pd.DataFrame,
                 row['bottling_power_kW_energy_to_model'] = val
             elif station == 'Individual_packaging':
                 row['individual_packaging_power_kW_energy_to_model'] = val
-            elif station == 'Water_supply':
-                row['water_supply_power_kW_energy_to_model'] = val
 
             rows.append(row)
 

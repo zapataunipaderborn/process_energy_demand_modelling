@@ -2962,7 +2962,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from dtw import dtw
-from tslearn.barycenters import dtw_barycenter_averaging
 import optuna
 import matplotlib.pyplot as plt
 
@@ -3391,8 +3390,28 @@ def plot_training_curves(train_curves, n_plot=12, figsize_per_row=(14, 2.5), ver
 # INTERNAL HELPERS
 # =============================================================================
 
-def _align_curve_with_dtw(query, reference):
-    """DTW-align a single query curve onto the reference grid (train only)."""
+def _align_curve_with_dtw(query, reference, min_length_ratio=0.2):
+    """
+    DTW-align a single query curve onto the reference grid (train only).
+
+    Falls back to plain linear interpolation when the query is much shorter
+    than the reference. DTW's monotonic path has to hold a handful of query
+    points constant across most of the reference's index range when the
+    query is this short (length 11 onto a length-197 reference collapses to
+    essentially ONE repeated value for ~190 of the 197 positions) -- a
+    degenerate step function that, used directly as a regression target,
+    teaches the model contradictory locally-flat values at whatever position
+    each such curve happens to land on. Root-caused 2026-07-22 on
+    process_4_1's 'Produktion' activity (instance durations 2..1440 min,
+    fixed_length~197 -- curves this short are common there). Linear
+    interpolation gives a smooth, honest (if under-resolved) target instead.
+    """
+    if len(query) < min_length_ratio * len(reference):
+        return np.interp(
+            np.linspace(0, 1, len(reference)),
+            np.linspace(0, 1, len(query)),
+            query,
+        )
     alignment = dtw(query, reference, keep_internals=True)
     aligned = np.zeros(len(reference))
     counts  = np.zeros(len(reference))
@@ -3402,6 +3421,56 @@ def _align_curve_with_dtw(query, reference):
     counts  = np.where(counts == 0, 1, counts)
     aligned /= counts
     return aligned
+
+
+def _robust_dtw_barycenter(resampled_curves, barycenter_size, n_iterations=3,
+                            trim_fraction=0.1):
+    """
+    Duration-robust drop-in replacement for tslearn's dtw_barycenter_averaging.
+
+    DBA refines its barycenter by repeatedly DTW-aligning every curve to the
+    current estimate and MEAN-averaging the aligned points. That mean is not
+    robust when instance durations vary wildly relative to `barycenter_size`
+    (e.g. a 2-minute curve linearly stretched onto a 200-point canonical grid
+    injects implausible values at nearly every position). A handful of such
+    curves is enough to drag the whole barycenter shape off the true signal
+    -- root-caused 2026-07-22 on process_4_1's 'Produktion' activity
+    (durations 2..1440 min), where DBA produced an artificial ~30% dip that a
+    plain coordinate-wise median of the same curves did not show, and every
+    approach sharing this barycenter (ml_dtw, ml_exog*, seq2seq*) inherited
+    the distortion and lost to the naive median-curve baseline as a result.
+
+    Same DTW re-alignment DBA does, but each round aggregates with a trimmed
+    mean instead of a mean, so shape alignment still improves iteration over
+    iteration while a minority of badly-resampled curves can no longer pull
+    the estimate off the true shape.
+
+    Parameters
+    ----------
+    resampled_curves : np.ndarray, shape (n_curves, barycenter_size, 1)
+                        curves already linearly resampled onto the canonical
+                        grid -- the same input dtw_barycenter_averaging takes.
+    barycenter_size   : int  (unused directly; kept for call-site symmetry
+                        with dtw_barycenter_averaging -- length is implicit
+                        in resampled_curves' second dimension)
+    n_iterations      : int    -- DTW re-alignment rounds (DBA-style refinement)
+    trim_fraction     : float  -- fraction trimmed from EACH tail before
+                        averaging at every position (0.1 -> 20% trimmed mean)
+
+    Returns
+    -------
+    barycenter : np.ndarray, shape (barycenter_size, 1) -- same shape as
+                 tslearn's dtw_barycenter_averaging, so every call site can
+                 swap the two without touching downstream code.
+    """
+    flat = resampled_curves[:, :, 0]              # (n_curves, barycenter_size)
+    reference = np.median(flat, axis=0)            # robust starting point
+
+    for _ in range(n_iterations):
+        aligned = np.array([_align_curve_with_dtw(curve, reference) for curve in flat])
+        reference = scipy_stats.trim_mean(aligned, trim_fraction, axis=0)
+
+    return reference[:, np.newaxis]
 
 
 def _infer_key_types(curves):
@@ -3541,7 +3610,7 @@ def build_and_train_pipeline(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -3735,9 +3804,62 @@ def build_and_train_pipeline(
         'numeric_feature_cols': numeric_feature_cols,
         'val_mae':         all_results[best_name]['val_mae'],
         'all_results':     all_results,
+        # Explicit tag (previously relied on _dispatch_predict's implicit
+        # 'baseline' default, which collided with the *actual* trivial
+        # baseline once one was added -- see build_and_train_pipeline_median).
+        'approach':        'ml_dtw',
     }
 
     return pipeline
+
+
+def build_and_train_pipeline_median(train_curves, variable, fixed_length=None,
+                                    verbose=1, **_ignored_hp_kwargs):
+    """
+    Element-wise MEDIAN curve across a set of training instances, linearly
+    resampled to a common canonical length -- no DBA, no DTW alignment, no
+    regression model, no attribute conditioning at all. At predict time the
+    stored median curve is simply linearly resampled to the target duration.
+
+    Used for BOTH naive-floor approaches, which differ only in which curves
+    are pooled before the median is taken (the caller sets the 'approach' tag):
+      * 'median_activity_sensor' ("Median per Activity & Sensor") -- called by
+        _train_curve_only_worker with just this (sensor, activity, object)'s
+        curves.
+      * 'baseline' ("Baseline") -- called from modelling.py's curve-only
+        section with EVERY curve of the sensor pooled across all its
+        activities/objects (the coarser floor).
+
+    **_ignored_hp_kwargs absorbs val_size/models/optimize_hyperparams/
+    n_trials/n_jobs so it can be called with the exact same signature as
+    every other approach builder in _train_curve_only_worker, even though
+    none of them apply here (there is no model to validate or tune).
+
+    Returns a minimal pipeline dict: {'reference_curve', 'fixed_length',
+    'approach'}. The default 'approach' tag is 'baseline' (the per-sensor use);
+    the per-combo worker overrides it to 'median_activity_sensor'.
+    """
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
+    resampled = np.array([
+        np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(c['original_values'])),
+            c['original_values'],
+        )
+        for c in train_curves
+    ])
+    median_curve = np.median(resampled, axis=0)
+
+    if verbose:
+        print(f"  [baseline/median] {len(train_curves)} curves -> "
+              f"median curve, fixed_length={fixed_length}")
+
+    return {
+        'reference_curve': median_curve,
+        'fixed_length':    fixed_length,
+        'approach':        'baseline',
+    }
 
 
 # =============================================================================
@@ -3843,6 +3965,25 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
     return y_raw_pred
 
 
+def predict_raw_curve_median(raw_values, activity, attributes, pipeline):
+    """
+    Predict by linearly resampling the stored median training curve
+    (pipeline['reference_curve'], from build_and_train_pipeline_median) to
+    len(raw_values) -- no model, no DTW warp, no attribute conditioning.
+    The true naive floor.
+    """
+    reference_curve = np.asarray(pipeline['reference_curve'], dtype=float)
+    n = attributes.get('_pred_curve_length', len(raw_values)) if attributes else len(raw_values)
+    n = max(2, int(n))
+    if len(reference_curve) == n:
+        return reference_curve.copy()
+    return np.interp(
+        np.linspace(0, 1, n),
+        np.linspace(0, 1, len(reference_curve)),
+        reference_curve,
+    )
+
+
 # =============================================================================
 # ML LINEAR — ML MODEL WITHOUT ANY DTW
 #
@@ -3852,7 +3993,7 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
 # Everything else (feature matrix, model selection) is identical to baseline.
 # =============================================================================
 
-def build_and_train_pipeline_ml_linear(
+def build_and_train_pipeline_ml_only(
     train_curves,
     variable,
     fixed_length=None,
@@ -4028,7 +4169,7 @@ def build_and_train_pipeline_ml_linear(
               f"(val MAE={all_results[best_name]['val_mae']:.4f})")
 
     return {
-        'approach':             'ml_linear',
+        'approach':             'ml_only',
         'model':                best_model,
         'model_name':           best_name,
         'fixed_length':         fixed_length,
@@ -4042,7 +4183,7 @@ def build_and_train_pipeline_ml_linear(
     }
 
 
-def predict_raw_curve_ml_linear(raw_values, activity, attributes, pipeline):
+def predict_raw_curve_ml_only(raw_values, activity, attributes, pipeline):
     """
     Predict using the ML-linear pipeline (no DTW anywhere).
     Builds canonical feature matrix → ML predict → linear resample to raw length.
@@ -4280,6 +4421,18 @@ def predict_raw_curve_seq2seq_dtw_linear_decode(raw_values, activity, attributes
             df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
 
+    # Missing-attribute robustness: any trained feature absent from `attributes`
+    # (e.g. hour_of_day/day_of_week, injected only at TRAIN time by
+    # split_curves*/split_curves_with_prev_activity and never present in
+    # production object_attributes) is NaN at this point and would silently
+    # propagate through the scaler into the torch tensor, producing an
+    # all-NaN prediction with no error -- confirmed as the actual cause of
+    # every seq2seq* failure in the real complete-curve pipeline (previously
+    # misattributed to needing autoregressive rollout). 0 == training mean
+    # after scaling, mirroring predict_raw_curve's X_ref.fillna(0) for the
+    # sklearn/DTW family.
+    df_seq = df_seq.fillna(0)
+
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
     model.eval()
     with torch.no_grad():
@@ -4414,7 +4567,7 @@ def build_and_train_pipeline_instance_stats(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -4786,7 +4939,7 @@ def build_and_train_pipeline_istats_leakfree(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -5218,7 +5371,7 @@ def build_and_train_pipeline_dtw_phase(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -5897,7 +6050,7 @@ def build_and_train_pipeline_exog(
     Returns a pipeline dict identical to build_and_train_pipeline but with the
     additional keys:
         'exog_cols'  — list[str]  ordered exog column names used at train time
-        'approach'   — 'exog'
+        'approach'   — 'ml_exog'
     """
     if verbose:
         print("\n" + "=" * 80)
@@ -5932,7 +6085,7 @@ def build_and_train_pipeline_exog(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -6056,7 +6209,7 @@ def build_and_train_pipeline_exog(
         'val_mae':             best_val_mae,
         'all_results':         all_results,
         'exog_cols':           exog_cols,
-        'approach':            'exog',
+        'approach':            'ml_exog',
     }
 
 
@@ -6198,7 +6351,7 @@ def build_and_train_pipeline_exog_prev_activity(
         verbose=verbose,
         n_jobs=n_jobs,
     )
-    pipeline['approach'] = 'exog_prev_activity'
+    pipeline['approach'] = 'ml_exog_prev_activity'
 
     # Per-activity training-curve medians — used as first-of-case defaults
     # during autoregressive test-time rollout (no real predecessor available).
@@ -6311,7 +6464,7 @@ def build_and_train_pipeline_amplitude_shape(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -6674,7 +6827,7 @@ def build_and_train_pipeline_amplitude_shape_exog(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -7197,7 +7350,7 @@ def build_and_train_pipeline_seq2seq(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -7385,6 +7538,12 @@ def predict_raw_curve_seq2seq(raw_values, activity, attributes, pipeline):
         if cols_to_scale:
             df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
+
+    # Missing-attribute robustness -- see the identical fillna(0) in the other
+    # seq2seq* predict functions for the full explanation: any trained
+    # feature absent from `attributes` (e.g. hour_of_day/day_of_week) is NaN
+    # here and would silently propagate to an all-NaN prediction otherwise.
+    df_seq = df_seq.fillna(0)
 
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)  # (1,T,F)
 
@@ -7612,6 +7771,18 @@ def predict_raw_curve_seq2seq_only(raw_values, activity, attributes, pipeline):
             df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
 
+    # Missing-attribute robustness: any trained feature absent from `attributes`
+    # (e.g. hour_of_day/day_of_week, injected only at TRAIN time by
+    # split_curves*/split_curves_with_prev_activity and never present in
+    # production object_attributes) is NaN at this point and would silently
+    # propagate through the scaler into the torch tensor, producing an
+    # all-NaN prediction with no error -- confirmed as the actual cause of
+    # every seq2seq* failure in the real complete-curve pipeline (previously
+    # misattributed to needing autoregressive rollout). 0 == training mean
+    # after scaling, mirroring predict_raw_curve's X_ref.fillna(0) for the
+    # sklearn/DTW family.
+    df_seq = df_seq.fillna(0)
+
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
     model.eval()
     with torch.no_grad():
@@ -7757,7 +7928,7 @@ def build_and_train_pipeline_seq2seq_exog(
         for c in train_curves
     ])[:, :, np.newaxis]
 
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
@@ -7948,6 +8119,18 @@ def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
             df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
             df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
 
+    # Missing-attribute robustness: any trained feature absent from `attributes`
+    # (e.g. hour_of_day/day_of_week, injected only at TRAIN time by
+    # split_curves*/split_curves_with_prev_activity and never present in
+    # production object_attributes) is NaN at this point and would silently
+    # propagate through the scaler into the torch tensor, producing an
+    # all-NaN prediction with no error -- confirmed as the actual cause of
+    # every seq2seq* failure in the real complete-curve pipeline (previously
+    # misattributed to needing autoregressive rollout). 0 == training mean
+    # after scaling, mirroring predict_raw_curve's X_ref.fillna(0) for the
+    # sklearn/DTW family.
+    df_seq = df_seq.fillna(0)
+
     X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
     model.eval()
     with torch.no_grad():
@@ -8058,13 +8241,32 @@ def predict_raw_curve_seq2seq_prev_activity(raw_values, activity, attributes, pi
 # =============================================================================
 
 def _dispatch_predict(raw_values, curve, pipeline):
-    """Route prediction to the right function based on pipeline['approach']."""
-    approach = pipeline.get('approach', 'baseline')
+    """Route prediction to the right function based on pipeline['approach'].
+
+    'baseline' vs 'ml_dtw': previously 'baseline' had no explicit
+    branch here and silently fell through to predict_raw_curve (the full
+    DBA+DTW+regression pipeline) via this function's own default -- i.e. the
+    approach NAMED 'baseline' was actually the strong reference, while the
+    table LABEL "Baseline" pointed at a completely separate, unregistered
+    flat-mean predictor ('mean_baseline', computed inline in modelling.py).
+    Both are now explicit and distinct: 'baseline' = the true naive floor
+    (build_and_train_pipeline_median), 'ml_dtw' = the former 'baseline'
+    (build_and_train_pipeline, now explicitly tagged).
+    """
+    approach = pipeline.get('approach', 'ml_dtw')
     act, attrs = curve['activity'], curve['attributes']
-    if approach == 'exog':
+    if approach in ('baseline', 'median_activity_sensor'):
+        # Both are the median-curve predictor; they differ only in how the
+        # stored reference_curve was pooled: 'baseline' = one median per sensor
+        # (all activities pooled), 'median_activity_sensor' = median per
+        # (sensor, activity, object).
+        return predict_raw_curve_median(raw_values, act, attrs, pipeline)
+    if approach == 'ml_dtw':
+        return predict_raw_curve(raw_values, act, attrs, pipeline)
+    if approach == 'ml_exog':
         return predict_raw_curve_exog(raw_values, act, attrs, pipeline,
                                       exog_values=curve.get('exog_values', {}))
-    if approach == 'exog_prev_activity':
+    if approach == 'ml_exog_prev_activity':
         return predict_raw_curve_exog_prev_activity(raw_values, act, attrs, pipeline,
                                                     exog_values=curve.get('exog_values', {}))
     if approach == 'instance_stats':
@@ -8088,8 +8290,8 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'amplitude_shape_exog':
         return predict_raw_curve_amplitude_shape_exog(raw_values, act, attrs, pipeline,
                                                       exog_values=curve.get('exog_values', {}))
-    if approach == 'ml_linear':
-        return predict_raw_curve_ml_linear(raw_values, act, attrs, pipeline)
+    if approach == 'ml_only':
+        return predict_raw_curve_ml_only(raw_values, act, attrs, pipeline)
     if approach == 'ml_dtw_linear_decode':
         return predict_raw_curve_ml_dtw_linear_decode(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_dtw_linear_decode':
@@ -8167,11 +8369,15 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import GradientBoostingRegressor
 
-    _SKLEARN_APPROACHES = {'baseline', 'instance_stats', 'istats_leakfree',
-                           'dtw_phase', 'basis', 'exog', 'amplitude_shape',
-                           'amplitude_shape_exog', 'exog_prev_activity',
-                           'prev_activity',
-                           'ml_linear', 'ml_dtw_linear_decode'}
+    # NOTE: 'baseline' (median per SENSOR, pooled over activities) is NOT here —
+    # it can't be trained by a per-(sensor,activity,object) worker; it is built
+    # separately in modelling.py's curve-only section. This worker trains the
+    # per-combo median under 'median_activity_sensor'.
+    _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree',
+                           'dtw_phase', 'basis', 'ml_exog', 'amplitude_shape',
+                           'amplitude_shape_exog', 'ml_exog_prev_activity',
+                           'ml_prev_activity',
+                           'ml_only', 'ml_dtw_linear_decode'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
     curves, _ = split_curves(
@@ -8194,8 +8400,18 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
 
     _hp_kwargs = dict(optimize_hyperparams=optimize_hyperparams, n_trials=n_trials)
 
-    if 'baseline' in _active:
-        result['baseline'] = build_and_train_pipeline(
+    if 'median_activity_sensor' in _active:
+        # "Median per Activity & Sensor": median training curve for THIS
+        # (sensor, activity, object), no model. (The coarser 'baseline' —
+        # one median per sensor — is built in modelling.py, not here.)
+        _mas_pipe = build_and_train_pipeline_median(
+            curves, variable=sensor, fixed_length=fixed_length, verbose=0,
+        )
+        _mas_pipe['approach'] = 'median_activity_sensor'
+        result['median_activity_sensor'] = _mas_pipe
+    if 'ml_dtw' in _active:
+        # The former 'baseline': DBA barycenter + DTW alignment + regression.
+        result['ml_dtw'] = build_and_train_pipeline(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
@@ -8219,8 +8435,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
-    if 'exog' in _active and ef_cols:
-        result['exog'] = build_and_train_pipeline_exog(
+    if 'ml_exog' in _active and ef_cols:
+        result['ml_exog'] = build_and_train_pipeline_exog(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
@@ -8234,7 +8450,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
-    if 'exog_prev_activity' in _active:
+    if 'ml_exog_prev_activity' in _active:
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
             variable=sensor,
@@ -8245,39 +8461,42 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             exog_columns=ef_cols,
         )
         if len(_prev_curves) >= 5:
-            result['exog_prev_activity'] = build_and_train_pipeline_exog_prev_activity(
+            result['ml_exog_prev_activity'] = build_and_train_pipeline_exog_prev_activity(
                 _prev_curves, variable=sensor,
                 fixed_length=fixed_length, val_size=val_size,
                 models=models, verbose=0, n_jobs=1, **_hp_kwargs,
             )
-        elif 'baseline' in result:
+        elif 'ml_dtw' in result:
             # Fewer than 5 curves survive the stricter prev-activity-context
             # extraction (a separate, narrower filter than the len(curves)<5
-            # check above that already passed for 'baseline') -- previously
-            # this silently left 'exog_prev_activity' unset with no log line
-            # at all, which meant predict_curve_for_instance would return
-            # None for every instance of this (sensor, activity, object) and
-            # leave an unexplained gap in the complete-curve/schedule-profile
-            # curves. Fall back to the plain baseline pipeline (already
-            # trained above, just without previous-activity context) so a
-            # prediction still happens, and log it so the gap has a cause.
-            print(f"  [WARN] exog_prev_activity: only {len(_prev_curves)} curve(s) with "
+            # check above that already passed for 'baseline'/'ml_dtw')
+            # -- previously this silently left 'ml_exog_prev_activity' unset
+            # with no log line at all, which meant predict_curve_for_instance
+            # would return None for every instance of this (sensor, activity,
+            # object) and leave an unexplained gap in the complete-curve/
+            # schedule-profile curves. Fall back to 'ml_dtw' (already
+            # trained above, just without previous-activity context) rather
+            # than the trivial 'baseline' median -- ml_exog_prev_activity's
+            # reassembly always calls predict_raw_curve_exog_prev_activity on
+            # whatever ends up here, and only ml_dtw's pipeline dict
+            # (model/feature_columns/etc.) has the keys that function needs.
+            print(f"  [WARN] ml_exog_prev_activity: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
-                  f"falling back to the baseline pipeline for this combo.")
-            result['exog_prev_activity'] = result['baseline']
+                  f"falling back to the ml_dtw pipeline for this combo.")
+            result['ml_exog_prev_activity'] = result['ml_dtw']
         else:
-            print(f"  [WARN] exog_prev_activity: only {len(_prev_curves)} curve(s) with "
+            print(f"  [WARN] ml_exog_prev_activity: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
-                  f"no baseline pipeline available either -- no prediction possible for this combo.")
-    if 'prev_activity' in _active:
+                  f"no ml_dtw pipeline available either -- no prediction possible for this combo.")
+    if 'ml_prev_activity' in _active:
         # Previous-activity context WITHOUT external factors (exog_columns=None)
         # -- the ablation isolating the prev-activity contribution independent
-        # of the ef_ features. Reuses the exog_prev_activity builder/predictor;
+        # of the ef_ features. Reuses the ml_exog_prev_activity builder/predictor;
         # with no exog_values on the curves, build_and_train_pipeline_exog just
         # yields exog_cols=[] (no external-factor features), while the
         # prev_act_* attributes still flow through the standard attribute path.
-        # The pipeline's internal 'approach' stays 'exog_prev_activity', so all
-        # downstream routing (predict dispatch, eval split, autoregressive
+        # The pipeline's internal 'approach' stays 'ml_exog_prev_activity', so
+        # all downstream routing (predict dispatch, eval split, autoregressive
         # rollout) treats it identically -- only exog is absent.
         _pa_curves, _ = split_curves_with_prev_activity(
             df_train,
@@ -8289,22 +8508,22 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             exog_columns=None,
         )
         if len(_pa_curves) >= 5:
-            result['prev_activity'] = build_and_train_pipeline_exog_prev_activity(
+            result['ml_prev_activity'] = build_and_train_pipeline_exog_prev_activity(
                 _pa_curves, variable=sensor,
                 fixed_length=fixed_length, val_size=val_size,
                 models=models, verbose=0, n_jobs=1, **_hp_kwargs,
             )
-        elif 'baseline' in result:
-            print(f"  [WARN] prev_activity: only {len(_pa_curves)} curve(s) with "
+        elif 'ml_dtw' in result:
+            print(f"  [WARN] ml_prev_activity: only {len(_pa_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
-                  f"falling back to the baseline pipeline for this combo.")
-            result['prev_activity'] = result['baseline']
+                  f"falling back to the ml_dtw pipeline for this combo.")
+            result['ml_prev_activity'] = result['ml_dtw']
         else:
-            print(f"  [WARN] prev_activity: only {len(_pa_curves)} curve(s) with "
+            print(f"  [WARN] ml_prev_activity: only {len(_pa_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
-                  f"no baseline pipeline available either -- no prediction possible for this combo.")
-    if 'ml_linear' in _active:
-        result['ml_linear'] = build_and_train_pipeline_ml_linear(
+                  f"no ml_dtw pipeline available either -- no prediction possible for this combo.")
+    if 'ml_only' in _active:
+        result['ml_only'] = build_and_train_pipeline_ml_only(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
@@ -8396,7 +8615,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                 verbose=False,
             )
         elif 'seq2seq' in result:
-            # Same silent-skip issue as exog_prev_activity above -- fall back
+            # Same silent-skip issue as ml_exog_prev_activity above -- fall back
             # to the plain seq2seq pipeline (no previous-activity context)
             # instead of leaving this (sensor, activity, object) with no
             # prediction and no explanation in the logs.
@@ -8411,7 +8630,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
 
     if 'seq2seq_prev_activity_no_exog' in _active:
         # Seq2Seq prev-activity ablation, WITHOUT external factors -- the
-        # seq2seq counterpart of the sklearn 'prev_activity' approach.
+        # seq2seq counterpart of the sklearn 'ml_prev_activity' approach.
         # exog_columns=None means the curves carry no exog_values, so
         # build_and_train_pipeline_seq2seq_exog (which seq2seq_prev_activity
         # wraps) detects exog_cols=[] and trains with no external-factor
@@ -8742,7 +8961,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     predict_fn = ep.get('predict_fn')
     # exog_cols lives at the top level for the energy-aware modes' pipelines,
     # but is nested under 'full_pipeline' for Curve-Only Evaluation pipelines
-    # (baseline, exog_prev_activity, etc. all wrap the trained pipeline dict
+    # (baseline, ml_exog_prev_activity, etc. all wrap the trained pipeline dict
     # under 'full_pipeline' when reassembled — see modelling.py).
     exog_cols = ep.get('exog_cols') or ep.get('full_pipeline', {}).get('exog_cols')
     exog_vals = {}
@@ -8767,7 +8986,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     # keyword args (raw_values=, activity=, object_attributes=, exog=);
     # Curve-Only Evaluation's plain approaches (baseline, instance_stats...)
     # use positional (rv, act, attrs) with no exog param at all; its
-    # exog-aware approaches (exog_prev_activity, seq2seq_exog...) use
+    # exog-aware approaches (ml_exog_prev_activity, seq2seq_exog...) use
     # positional (rv, act, attrs, exog=None). Try each in turn — a plain
     # 3-arg positional call as the last resort would silently succeed on an
     # exog-aware predict_fn by using its exog=None default, silently
@@ -9476,7 +9695,7 @@ def train_schedule_profile_pipeline(train_cases, fixed_length=None, val_size=0.2
         np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
         for c in bary_cases
     ])[:, :, np.newaxis]
-    dba_barycenter  = dtw_barycenter_averaging(resampled_for_dba, barycenter_size=fixed_length)
+    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
     # Restore the on/off duty cycle DBA averages away (see
     # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
     reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)

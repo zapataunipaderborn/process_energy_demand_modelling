@@ -981,13 +981,25 @@ df = pd.read_parquet(files_folder_silver / "data_prepared_for_analysis.parquet")
 relevant_columns = [
     'datetime',
 
-    'f11_speise_den_kg/m3', '(10)_abluft_temp_c',
-    'f10_speise_den_kg/m3', '(12)_mpt_fb(mpt?)_kg/h', 'f11_speise_mas_kg/h',
-    'f11_speise_vol_l/h', '(6)_nach_recu_reg_temp_c',
+    # 'f11_speise_den_kg/m3',   # dropped: broken instrument channel (see below)
+    '(10)_abluft_temp_c',
+    # 'f10_speise_den_kg/m3',   # dropped: density stuck at 0.0-1.5, unmodellable
+    '(12)_mpt_fb(mpt?)_kg/h',
+    # NOTE: f10/f11_speise_mas stay LOADED (not commented) because they feed the
+    # speise_current -> total_material derivation below (an object_attributes
+    # modelling feature). They are deliberately kept OUT of columns_to_model, so
+    # they are never modelled as targets -- the raw signals are instrument
+    # garbage (mass flow down to -43000 kg/h, ~45% dropout zeros).
+    'f11_speise_mas_kg/h',
+    # 'f11_speise_vol_l/h',     # dropped: same garbage, and unused downstream
+    '(6)_nach_recu_reg_temp_c',
     'dampf_nassmischbereich', '(3)_zuluft_nach_entfeuchter_kon_g/kg',
-    'f10_speise_vol_l/h', '(9)_abluft_kon_g/kg',
-    '(16)_konditionierung_mas_kg/h', '(14)_filter_mas_kg/h',
-    'f10_speise_mas_kg/h', '(5)_vor_vent_hauptzuluft_temp_c',
+    # 'f10_speise_vol_l/h',     # dropped: same garbage, and unused downstream
+    '(9)_abluft_kon_g/kg',
+    '(16)_konditionierung_mas_kg/h',
+    '(14)_filter_mas_kg/h',
+    'f10_speise_mas_kg/h',
+    '(5)_vor_vent_hauptzuluft_temp_c',
     '(7)_zuluft_turm_temp_c', '(2)_zuluft_vor_entfeuchter_kon_g/kg',
     '(13)_lanzen_mas_kg/h', '(8)_abluft_vol_m3/h',
     '(17)_leistung_turmF_luftentfeuchter_kw',
@@ -1168,14 +1180,19 @@ columns_to_model = [
     #    'case_id_log', 'activity_log', 'timestamp_start_log',
     #    'timestamp_end_log', 'datetime_energy', 'object_attributes_log',
     #    'speise_current_kg/h_energy', 'f11_speise_den_kg/m3_energy',
-       '(10)_abluft_temp_c_energy', 'f10_speise_den_kg/m3_energy',
-       '(12)_mpt_fb(mpt?)_kg/h_energy', 'f11_speise_mas_kg/h_energy',
-       'f11_speise_vol_l/h_energy', '(6)_nach_recu_reg_temp_c_energy',
+       '(10)_abluft_temp_c_energy',
+    #    'f10_speise_den_kg/m3_energy',
+       '(12)_mpt_fb(mpt?)_kg/h_energy',
+    #    'f11_speise_mas_kg/h_energy',
+    #    'f11_speise_vol_l/h_energy',
+       '(6)_nach_recu_reg_temp_c_energy',
        'dampf_nassmischbereich_energy',
        '(3)_zuluft_nach_entfeuchter_kon_g/kg_energy',
-       'f10_speise_vol_l/h_energy', '(9)_abluft_kon_g/kg_energy',
+    #    'f10_speise_vol_l/h_energy', 
+       '(9)_abluft_kon_g/kg_energy',
        '(16)_konditionierung_mas_kg/h_energy', '(14)_filter_mas_kg/h_energy',
-       'f10_speise_mas_kg/h_energy', '(5)_vor_vent_hauptzuluft_temp_c_energy',
+    #    'f10_speise_mas_kg/h_energy',
+       '(5)_vor_vent_hauptzuluft_temp_c_energy',
        '(7)_zuluft_turm_temp_c_energy',
        '(2)_zuluft_vor_entfeuchter_kon_g/kg_energy',
        '(13)_lanzen_mas_kg/h_energy', '(8)_abluft_vol_m3/h_energy',

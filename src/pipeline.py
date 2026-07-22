@@ -42,16 +42,23 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    evaluation (process, energy/profile,
                                    schedule-profile) either way.
   curve_approaches      list|None  which curve-fitting models to train, e.g.
-                                   ['exog_prev_activity']. Subset of the
-                                   APPROACHES list in modelling.py ('baseline',
-                                   'exog_prev_activity', 'ml_linear',
-                                   'ml_dtw_linear_decode', 'seq2seq',
-                                   'seq2seq_only', 'seq2seq_prev_activity',
+                                   ['ml_exog_prev_activity']. Subset of the
+                                   APPROACHES list in modelling.py ('baseline'
+                                   — "Baseline", ONE median curve per sensor
+                                   (pooled over all activities, the naive
+                                   floor); 'median_activity_sensor' — "Median
+                                   per Activity & Sensor", median curve per
+                                   sensor+activity+object, no model;
+                                   'ml_dtw' — DBA + DTW +
+                                   regression; 'ml_exog_prev_activity',
+                                   'ml_only', 'ml_dtw_linear_decode',
+                                   'seq2seq', 'seq2seq_only',
+                                   'seq2seq_prev_activity',
                                    'seq2seq_dtw_linear_decode', ...). None
                                    (default) → use modelling.py's own list.
                                    Fewer models = much faster runs. The
                                    schedule-profile / complete-curve eval needs
-                                   'exog_prev_activity' present.
+                                   'ml_exog_prev_activity' present.
   curve_optimize_hyperparams bool  whether curve models run the (slow) Optuna
                                    hyperparameter search. None → modelling.py
                                    default (True). Set False for fast test runs.
@@ -79,7 +86,7 @@ EXPERIMENTS = [
     # },
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_957',
+        'run_name':              'experiment_960',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.35 + BUDGET_MAX_LENGTH_RATIO) and
@@ -89,7 +96,7 @@ EXPERIMENTS = [
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha'],   # matches experiment_944 for apples-to-apples comparison
+        'mining_algorithms':     ['heuristic', 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
@@ -97,34 +104,55 @@ EXPERIMENTS = [
         'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
         'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
         # All standard curve approaches (the uncommented defaults in
-        # modelling.py's APPROACHES list — same set experiment_944 produced).
-        # NOTE: this trains ~8 curve families per (sensor, activity, object)
-        # instead of one, so with Optuna ON this is a big runtime multiplier —
-        # the seq2seq_* families especially are slow. The schedule-profile /
-        # complete-curve eval still keys off 'exog_prev_activity'.
+        # modelling.py's APPROACHES list — same set experiment_944 produced),
+        # renamed to a consistent 'ml_*' prefix for every sklearn/DTW-regression
+        # approach, with each paired against its seq2seq counterpart (see the
+        # full reference table below). NOTE: this trains ~10 curve families per
+        # (sensor, activity, object) instead of one, so with Optuna ON this is a
+        # big runtime multiplier — the seq2seq_* families especially are slow.
+        # The schedule-profile / complete-curve eval still keys off
+        # 'ml_exog_prev_activity'.
         'curve_approaches':      [
-            'baseline',
-            'exog_prev_activity',
-            'prev_activity',   # ablation: prev-activity context WITHOUT external factors
-            'ml_linear',
+            'baseline',              # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
+            'median_activity_sensor', # "Median per Activity & Sensor": median curve per (sensor, activity, object), no model
+            'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
+            'ml_exog',                # DBA + DTW + regression + external factors (no prev-activity)
+            'ml_exog_prev_activity',  # DBA + DTW + regression + external factors + prev-activity
+            'ml_prev_activity',      # ablation: prev-activity context WITHOUT external factors
+            'ml_only',                # no DTW at all (formerly 'ml_linear')
             # 'ml_dtw_linear_decode',
             'seq2seq',
             'seq2seq_only',
+            'seq2seq_exog',           # seq2seq counterpart of ml_exog
             'seq2seq_prev_activity',
-            'seq2seq_prev_activity_no_exog',   # ablation: seq2seq's counterpart of 'prev_activity'
+            'seq2seq_prev_activity_no_exog',   # ablation: seq2seq's counterpart of 'ml_prev_activity'
             # 'seq2seq_dtw_linear_decode',
         ],
         # Full reference — every valid approach name (uncomment to enable the
         # experimental ones, which are commented out in modelling.py by
         # default). Kept here so the whole universe is togglable in future.
-        # The baseline -> prev_activity -> exog -> exog_prev_activity chain
-        # (and its seq2seq counterpart: seq2seq/seq2seq_only ->
+        # Naming: every sklearn/DTW-regression approach now starts with 'ml_'.
+        # One-to-one pairing with the seq2seq family (same conditioning, same
+        # DTW/no-DTW alignment choice, different regressor):
+        #   ml_dtw                <-> seq2seq
+        #   ml_only                <-> seq2seq_only
+        #   ml_exog                <-> seq2seq_exog
+        #   ml_prev_activity       <-> seq2seq_prev_activity_no_exog
+        #   ml_exog_prev_activity  <-> seq2seq_prev_activity
+        #   ml_dtw_linear_decode   <-> seq2seq_dtw_linear_decode
+        # The ml_dtw -> ml_prev_activity -> ml_exog -> ml_exog_prev_activity
+        # chain (and its seq2seq counterpart: seq2seq/seq2seq_only ->
         # seq2seq_prev_activity_no_exog -> seq2seq_exog -> seq2seq_prev_activity)
         # is the external-factor ablation, isolating prev-activity's
-        # contribution independent of external factors:
-        #   'baseline', 'instance_stats', 'istats_leakfree', 'dtw_phase',
-        #   'basis', 'exog', 'prev_activity', 'exog_prev_activity',
-        #   'amplitude_shape', 'ml_linear', 'ml_dtw_linear_decode', 'seq2seq',
+        # contribution independent of external factors. The two median
+        # baselines sit outside that chain as the naive floors everything else
+        # should beat: 'baseline' = "Baseline" (ONE median per sensor, pooled
+        # over all activities/objects — the coarsest floor),
+        # 'median_activity_sensor' = "Median per Activity & Sensor" (median per
+        # sensor+activity+object):
+        #   'baseline', 'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree',
+        #   'dtw_phase', 'basis', 'ml_exog', 'ml_prev_activity', 'ml_exog_prev_activity',
+        #   'amplitude_shape', 'ml_only', 'ml_dtw_linear_decode', 'seq2seq',
         #   'seq2seq_only', 'seq2seq_exog', 'seq2seq_prev_activity_no_exog',
         #   'seq2seq_prev_activity', 'seq2seq_dtw_linear_decode'
         'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
