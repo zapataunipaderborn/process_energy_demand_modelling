@@ -100,7 +100,7 @@ EXPERIMENTS = [
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],#, 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
+        'mining_algorithms':     ['heuristic', 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
