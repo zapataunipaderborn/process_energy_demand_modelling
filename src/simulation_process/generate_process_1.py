@@ -150,6 +150,39 @@ ENERGY_PARAMS = {
     'individual_packaging':  {'base_kW': 25.0,  'noise_std': 1.5},
 }
 
+# ── Standby (idle) draw per sensor, kW ───────────────────────────────────────
+# Every minute belongs to exactly one station's activity, and previously the
+# five *other* sensor columns were written as a hard 0.0. That made the sensors
+# 52-98% exact zeros (bottling_power: 97.5%, only 900 non-zero samples in
+# 36k rows), which is both unphysical and breaks the curve evaluation:
+#   * relative metrics are undefined on an all-zero window (WAPE = 0/0 -> NaN,
+#     silently dropped by the median), and
+#   * absolute metrics are trivially perfect there (MAE = 0 exactly), which
+#     dragged the median MAE for process_1 to 0.000 for most approaches.
+# Real plant equipment never falls to 0 kW between batches — controls, PLCs,
+# circulation pumps, chillers and insulation losses keep drawing. Each value
+# below is ~3% of that sensor's typical operating level for the big thermal
+# users and ~7% for the small electrical ones, with noise at ~8-12% of the
+# standby level (so a negative draw is ~12 sigma away and never clips).
+STANDBY_ENABLED = True   # False restores the old hard-zero behaviour
+STANDBY_KW = {
+    # column                                            (base_kW, noise_std)
+    'destillation_steam_demand_kW_energy_to_model':      (45.0, 4.0),
+    'destillation_cooling_demand_kW_energy_to_model':    (40.0, 3.5),
+    'autoclave_steam_demand_kW_energy_to_model':         (85.0, 7.0),
+    'autoclave_cooling_water_demand_kW_energy_to_model': (12.0, 1.2),
+    'bottling_power_kW_energy_to_model':                 (2.5,  0.25),
+    'individual_packaging_power_kW_energy_to_model':     (1.8,  0.18),
+}
+
+
+def _standby_levels(rng: np.random.Generator) -> dict[str, float]:
+    """One noisy standby draw per sensor column, for a single minute."""
+    if not STANDBY_ENABLED:
+        return {col: 0.0 for col in STANDBY_KW}
+    return {col: max(0.0, base + rng.normal(0, sd))
+            for col, (base, sd) in STANDBY_KW.items()}
+
 REFERENCE_VOLUME_L = 500.0  # volume scaling pivot
 
 # Destillation energy demand comes from the physical model in
@@ -497,6 +530,11 @@ def build_expanded(df_event_log: pd.DataFrame,
                    autoclave_profiles: dict[str, pd.DataFrame],
                    random_seed: int = RANDOM_SEED) -> pd.DataFrame:
     rng = np.random.default_rng(random_seed + 1)
+    # Standby noise draws from its OWN stream. Sharing `rng` would consume draws
+    # inside the per-minute loop and shift every subsequent weather / power-curve
+    # sample, so switching STANDBY_ENABLED would silently re-roll the whole
+    # dataset instead of only adding the idle floor.
+    sb_rng = np.random.default_rng(random_seed + 2)
 
     rows: list[dict] = []
 
@@ -531,13 +569,10 @@ def build_expanded(df_event_log: pd.DataFrame,
                 'datetime_energy':              ts,
                 'ef_temperature_2m_energy':     T_i,
                 'ef_relative_humidity_2m_energy': RH_i,
-                # All sensors default to 0 (only the active one is filled)
-                'destillation_steam_demand_kW_energy_to_model':          0.0,
-                'destillation_cooling_demand_kW_energy_to_model':        0.0,
-                'autoclave_steam_demand_kW_energy_to_model':             0.0,
-                'autoclave_cooling_water_demand_kW_energy_to_model':     0.0,
-                'bottling_power_kW_energy_to_model':                     0.0,
-                'individual_packaging_power_kW_energy_to_model':                    0.0,
+                # Every sensor starts at its standby draw; the station that is
+                # actually running overwrites its own column below (see
+                # STANDBY_KW for why this is not a hard 0.0).
+                **_standby_levels(sb_rng),
                 # Log columns
                 'timestamp_start_log':          ev['timestamp_start'],
                 'timestamp_end_log':            ev['timestamp_end'],
@@ -550,20 +585,35 @@ def build_expanded(df_event_log: pd.DataFrame,
                 'object_attributes_log':        ev['object_attributes'],
             }
 
-            # Fill the correct sensor column
-            val = max(0.0, float(curve[i]))
+            # Fill the correct sensor column. The reading is floored at this
+            # minute's standby draw: a station that is running can still have a
+            # phase where its process demand is 0 (distillation 'emptying'
+            # closes the steam valve, 'preparation' has no cooling), but the
+            # equipment is powered up, so the meter cannot read below standby.
+            # Without this floor those phases put exact zeros back into the
+            # active sensor -- ~4% of destillation_steam rows.
+            def _floor(col, v):
+                return max(row[col], max(0.0, float(v)))
+
+            val = curve[i]
             if station == 'Destillation':
-                row['destillation_steam_demand_kW_energy_to_model'] = val
+                row['destillation_steam_demand_kW_energy_to_model'] = \
+                    _floor('destillation_steam_demand_kW_energy_to_model', val)
                 if dual_curve is not None:
-                    row['destillation_cooling_demand_kW_energy_to_model'] = max(0.0, float(dual_curve[i]))
+                    row['destillation_cooling_demand_kW_energy_to_model'] = \
+                        _floor('destillation_cooling_demand_kW_energy_to_model', dual_curve[i])
             elif station == 'Autoclaving' and act_short in ('heat', 'hold', 'prepare'):
-                row['autoclave_steam_demand_kW_energy_to_model'] = val
+                row['autoclave_steam_demand_kW_energy_to_model'] = \
+                    _floor('autoclave_steam_demand_kW_energy_to_model', val)
             elif station == 'Autoclaving' and act_short == 'cool':
-                row['autoclave_cooling_water_demand_kW_energy_to_model'] = val
+                row['autoclave_cooling_water_demand_kW_energy_to_model'] = \
+                    _floor('autoclave_cooling_water_demand_kW_energy_to_model', val)
             elif station == 'Bottling':
-                row['bottling_power_kW_energy_to_model'] = val
+                row['bottling_power_kW_energy_to_model'] = \
+                    _floor('bottling_power_kW_energy_to_model', val)
             elif station == 'Individual_packaging':
-                row['individual_packaging_power_kW_energy_to_model'] = val
+                row['individual_packaging_power_kW_energy_to_model'] = \
+                    _floor('individual_packaging_power_kW_energy_to_model', val)
 
             rows.append(row)
 

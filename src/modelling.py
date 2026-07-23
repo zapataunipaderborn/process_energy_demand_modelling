@@ -5233,11 +5233,17 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         # ── Master summary table: Process × Sensor × Approach, TRAIN and TEST ─
         display(Markdown("---"))
         display(Markdown("## Model Summary — Train & Test metrics per Process / Sensor / Approach (median over curves)"))
+        # round(6), not round(4): this frame is persisted as
+        # summary_train_test.parquet and read back by the results notebooks.
+        # Sensors with small absolute magnitudes (process_1 bottling /
+        # individual_packaging draw single-digit kW) have median MAEs around
+        # 1e-4, which round(4) flattened to 0.0 in the stored file -- so the
+        # notebooks could not tell "no error at all" from "too small to show".
         _summary = (
             _all_df
             .groupby(['Process', 'Sensor', 'Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
             .median()
-            .round(4)
+            .round(6)
         )
         # Unstack Split so TRAIN / TEST appear as column groups side by side
         _summary_wide = _summary.unstack('Split')
