@@ -5951,13 +5951,15 @@ if _jdur_ready:
         "for matched *(case_rank, activity, occurrence)* pairs in the TEST set only."
     ))
 
-    # ── Pick best process mode per process (lowest TRAIN duration WAPE) ─────
+    # ── Pick best process mode per process (lowest TRAIN duration MAE) ──────
     # Selection on train: the joint eval below reports this mode's numbers on
     # the test cases, so selecting it on test would report a mode chosen for
-    # fitting the evaluation split.
+    # fitting the evaluation split. MAE rather than WAPE — the comparison is
+    # always within one process, where the scale is constant, so WAPE's
+    # normalisation buys nothing and MAE stays in interpretable minutes.
     _jw_col = next(
-        (c for c in ['train_duration_metrics_activity_duration_wape',
-                     'train_duration_metrics_activity_duration_mae']
+        (c for c in ['train_duration_metrics_activity_duration_mae',
+                     'train_duration_metrics_activity_duration_wape']
          if c in evaluation_results_df.columns),
         None
     )
