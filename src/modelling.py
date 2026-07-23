@@ -782,14 +782,12 @@ _run_ts       = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
 _run_name     = os.environ.get('PIPELINE_RUN_NAME', f'experiment_{experiment}')
 _results_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'results')
 _run_dir = os.path.join(_results_root, f"{_run_name}_{_run_ts}")
-_plots_dir           = os.path.join(_run_dir, 'plots')
 _process_results_dir = os.path.join(_run_dir, 'process_results')
 _energy_results_dir  = os.path.join(_run_dir, 'energy_results')
 _predicted_logs_dir  = os.path.join(_run_dir, 'predicted_logs')
 _energy_distribution_dir = os.path.join(_run_dir, 'energy_distribution_results')
 _complete_curve_eval_dir = os.path.join(_run_dir, 'complete_curve_eval_results')
 _schedule_profile_eval_dir = os.path.join(_run_dir, 'schedule_profile_eval_results')
-os.makedirs(_plots_dir, exist_ok=True)
 os.makedirs(_process_results_dir, exist_ok=True)
 os.makedirs(_energy_results_dir, exist_ok=True)
 os.makedirs(_predicted_logs_dir, exist_ok=True)
@@ -1761,6 +1759,15 @@ def _per_case_median_metrics(simulated_df, real_df,
     independently for every case that exists in both logs, then return
     the MEDIAN across cases.  This removes the global-pooling bias where
     a few large cases dominate the aggregate.
+
+    The returned dict also carries the untouched per-case frame under the
+    ``per_case`` key. Every headline process metric here is a median over
+    cases, so the per-case sample is the *only* thing from which a confidence
+    interval can be bootstrapped after the fact -- collapsing it to a single
+    median and throwing the sample away made post-hoc CIs impossible for the
+    process metrics (they were already possible for the curve/profile metrics,
+    which persist one row per curve). It is stripped from the flattened
+    results row before export and written to its own parquet instead.
     """
     # Match by case_id as strings, not raw values — the real and simulated
     # logs can carry the same case_id in different dtypes (e.g. float64 vs
@@ -1860,7 +1867,8 @@ def _per_case_median_metrics(simulated_df, real_df,
         else:
             ef1 = np.nan
 
-        rows.append({'evt_ratio_err': evt_ratio_err,
+        rows.append({'case_id':       cid,
+                     'evt_ratio_err': evt_ratio_err,
                      'dur_err_whole': dur_err_whole,
                      'case_span_err': case_span_err,
                      'case_span_mae': case_span_mae,
@@ -1899,13 +1907,40 @@ def _per_case_median_metrics(simulated_df, real_df,
         'js_div':        float(df['js_div'].median()),
         'edge_f1':       float(df['edge_f1'].median()),
         'n_cases':       len(rows),
+        # Raw per-case sample behind every median above — kept for post-hoc
+        # bootstrap confidence intervals (see docstring).
+        'per_case':      df,
     }
+
+
+# ── Per-case process metrics collector ───────────────────────────────────────
+# Every headline process metric (duration MAE/WAPE/RMSE, case span, event-count
+# ratio, JS divergence, edge-F1) is a MEDIAN over cases. A median alone cannot
+# be turned into a confidence interval after the fact, so the per-case sample it
+# was computed from is collected here and written to
+# process_eval_per_case.parquet — one row per (process, mode, split, case_id).
+# That makes post-hoc bootstrap CIs possible for the process metrics, the way
+# curve_eval_results.parquet already allows for the profile metrics.
+_per_case_process_metrics = []
+
+
+def _collect_per_case_metrics(per_case_df, tag):
+    """Tag a per-case frame with (process, mode, split) and stash it."""
+    if per_case_df is None or not isinstance(per_case_df, pd.DataFrame) or per_case_df.empty:
+        return
+    process, mode, split = tag
+    out = per_case_df.copy()
+    out.insert(0, 'split', split)
+    out.insert(0, 'mode', mode)
+    out.insert(0, 'process', process)
+    _per_case_process_metrics.append(out)
 
 
 def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=None,
                                        case_col='case_id', activity_col='activity',
                                        start_col='timestamp_start', end_col='timestamp_end',
-                                       process_models=None, station_col='higher_level_activity'):
+                                       process_models=None, station_col='higher_level_activity',
+                                       per_case_tag=None):
     """
     Comprehensive evaluation of simulation quality based on process mining literature
     
@@ -2443,6 +2478,16 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
 
     results['overall_error'] = overall_error
     results['quality_assessment'] = quality_assessment
+
+    # Per-case sample behind every median-based process metric above. It is
+    # deliberately NOT put into `results`: callers flatten that dict into one
+    # wide row per (process, mode), and a DataFrame landing in a scalar column
+    # would break the parquet export. Instead it goes straight to the module
+    # level collector, tagged with whatever the caller passed. Callers that
+    # don't pass a tag simply don't contribute per-case rows — a missed call
+    # site loses data for that mode rather than corrupting the run.
+    if per_case_tag is not None:
+        _collect_per_case_metrics(_pc.get('per_case'), per_case_tag)
 
     return results
 
@@ -2996,7 +3041,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("  " + "="*76)
 
         eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train,
-                                                          process_models=mode_pm)
+                                                          process_models=mode_pm,
+                                                          per_case_tag=(process, sim_mode, split_label))
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
         #plot_simulation_comparison(simulated_log_train, df_train)
@@ -3071,7 +3117,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print("  " + "="*76)
 
             eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test,
-                                                              process_models=mode_pm)
+                                                              process_models=mode_pm,
+                                                              per_case_tag=(process, sim_mode, 'TEST'))
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
             #plot_simulation_comparison(simulated_log_test, df_test)
@@ -3199,7 +3246,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 print(f"\n  Simulated log TRAIN ({_mlp_mode}): {len(sim_mlp_train)} events")
 
                 eval_mlp_train = comprehensive_simulation_evaluation(
-                    sim_mlp_train, df_train, process_models=_best_pm
+                    sim_mlp_train, df_train, process_models=_best_pm,
+                    per_case_tag=(process, _mlp_mode, split_label)
                 )
 
                 flattened_mlp = {
@@ -3247,7 +3295,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
                     eval_mlp_test = comprehensive_simulation_evaluation(
-                        sim_mlp_test, _df_test_mlp, process_models=_best_pm
+                        sim_mlp_test, _df_test_mlp, process_models=_best_pm,
+                        per_case_tag=(process, _mlp_mode, 'TEST')
                     )
                     for _cat, _mets in eval_mlp_test.items():
                         if isinstance(_mets, dict):
@@ -3285,7 +3334,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print(f"\n  Simulated log TRAIN (petri_net_median_duration): {len(sim_med_train)} events")
 
             eval_med_train = comprehensive_simulation_evaluation(
-                sim_med_train, df_train, process_models=_med_pm
+                sim_med_train, df_train, process_models=_med_pm,
+                per_case_tag=(process, 'petri_net_median_duration', split_label)
             )
 
             flattened_med = {
@@ -3313,7 +3363,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 print(f"\n  Simulated log TEST  (petri_net_median_duration): {len(sim_med_test)} events")
 
                 eval_med_test = comprehensive_simulation_evaluation(
-                    sim_med_test, _df_test_med, process_models=_med_pm
+                    sim_med_test, _df_test_med, process_models=_med_pm,
+                    per_case_tag=(process, 'petri_net_median_duration', 'TEST')
                 )
                 for _cat, _mets in eval_med_test.items():
                     if isinstance(_mets, dict):
@@ -3377,7 +3428,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 print(f"\n  Simulated log TRAIN ({_algo_mode}): {len(sim_amlp_train)} events")
 
                 eval_amlp_train = comprehensive_simulation_evaluation(
-                    sim_amlp_train, df_train, process_models=_algo_pm
+                    sim_amlp_train, df_train, process_models=_algo_pm,
+                    per_case_tag=(process, _algo_mode, split_label)
                 )
 
                 flattened_amlp = {
@@ -3425,7 +3477,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
                     eval_amlp_test = comprehensive_simulation_evaluation(
-                        sim_amlp_test, _df_test_amlp, process_models=_algo_pm
+                        sim_amlp_test, _df_test_amlp, process_models=_algo_pm,
+                        per_case_tag=(process, _algo_mode, 'TEST')
                     )
                     for _cat, _mets in eval_amlp_test.items():
                         if isinstance(_mets, dict):
@@ -3484,7 +3537,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print(f"\n  Simulated log TRAIN ({_wip_mlp_mode}): {len(sim_wipmlp_train)} events")
 
             eval_wipmlp_train = comprehensive_simulation_evaluation(
-                sim_wipmlp_train, df_train, process_models=_wip_mlp_pm
+                sim_wipmlp_train, df_train, process_models=_wip_mlp_pm,
+                per_case_tag=(process, _wip_mlp_mode, split_label)
             )
             flattened_wipmlp = {
                 'process':          process,
@@ -3528,7 +3582,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
                 eval_wipmlp_test = comprehensive_simulation_evaluation(
-                    sim_wipmlp_test, _df_test_wipmlp, process_models=_wip_mlp_pm
+                    sim_wipmlp_test, _df_test_wipmlp, process_models=_wip_mlp_pm,
+                    per_case_tag=(process, _wip_mlp_mode, 'TEST')
                 )
                 for _cat, _mets in eval_wipmlp_test.items():
                     if isinstance(_mets, dict):
@@ -3592,7 +3647,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print(f"\n  Simulated log TRAIN ({_bud_mode}): {len(sim_budmlp_train)} events")
 
             eval_budmlp_train = comprehensive_simulation_evaluation(
-                sim_budmlp_train, df_train, process_models=_bud_mlp_pm
+                sim_budmlp_train, df_train, process_models=_bud_mlp_pm,
+                per_case_tag=(process, _bud_mode, split_label)
             )
             flattened_budmlp = {
                 'process':          process,
@@ -3637,7 +3693,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
                 eval_budmlp_test = comprehensive_simulation_evaluation(
-                    sim_budmlp_test, _df_test_budmlp, process_models=_bud_mlp_pm
+                    sim_budmlp_test, _df_test_budmlp, process_models=_bud_mlp_pm,
+                    per_case_tag=(process, _bud_mode, 'TEST')
                 )
                 for _cat, _mets in eval_budmlp_test.items():
                     if isinstance(_mets, dict):
@@ -4085,7 +4142,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     # Use _df_expanded_train for energy comparison in comprehensive_simulation_evaluation
                     _eval_train = comprehensive_simulation_evaluation(
                         _energy_sim_train, df_train, real_expanded_df=_df_expanded_train,
-                        process_models=_best_base_pm)
+                        process_models=_best_base_pm,
+                        per_case_tag=(process, _energy_mode, split_label))
 
                     _energy_flattened = {
                         'process':           process,
@@ -4129,7 +4187,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
                             _eval_test = comprehensive_simulation_evaluation(
                                 _energy_sim_test, _df_test, real_expanded_df=_exp_test,
-                                process_models=_best_base_pm)
+                                process_models=_best_base_pm,
+                                per_case_tag=(process, _energy_mode, 'TEST'))
                             for _cat, _met in _eval_test.items():
                                 if _cat == 'energy_metrics' and isinstance(_met, dict):
                                     for _sensor, _vals in _met.items():
@@ -4203,6 +4262,30 @@ if RUN_PROCESS_MODELLING:
         _pm_full_path = os.path.join(_run_dir, 'process_eval_results.parquet')
         evaluation_results_df.to_parquet(_pm_full_path, index=False)
         print(f"Saved process eval results → {_pm_full_path}")
+
+        # ── Per-case process metrics (for post-hoc confidence intervals) ────
+        # process_eval_results.parquet holds ONE aggregated row per
+        # (process, mode) — every process metric in it is a median over cases,
+        # so nothing in that file can produce a CI. This companion file keeps
+        # the underlying sample: one row per (process, mode, split, case_id),
+        # with the same columns the medians are computed from. Bootstrap any
+        # of them directly, e.g.
+        #     d = pd.read_parquet('process_eval_per_case.parquet')
+        #     s = d.query("process=='process_1' and mode=='petri_net_budget' "
+        #                 "and split=='TEST'")['dur_wape'].dropna().to_numpy()
+        #     boot = [np.median(np.random.choice(s, len(s), replace=True))
+        #             for _ in range(10000)]
+        #     lo, hi = np.percentile(boot, [2.5, 97.5])
+        if _per_case_process_metrics:
+            _pc_df = pd.concat(_per_case_process_metrics, ignore_index=True)
+            _pc_path = os.path.join(_run_dir, 'process_eval_per_case.parquet')
+            _pc_df.to_parquet(_pc_path, index=False)
+            print(f"Saved per-case process metrics → {_pc_path} "
+                  f"({len(_pc_df)} rows, "
+                  f"{_pc_df.groupby(['process', 'mode', 'split']).ngroups} groups)")
+        else:
+            print("⚠️  No per-case process metrics collected — "
+                  "process metric CIs will not be computable for this run.")
 
         _core_prefixes = ['process', 'mode', 'split']
         for _pfx in ['train', 'test']:
@@ -5106,15 +5189,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
     importlib.reload(_se)
     from sim_extractor import evaluate_pipeline_on_test, split_curves, split_curves_with_prev_activity
 
-    # _run_dir and _plots_dir are already created at startup
-    _plot_counter = [0]   # mutable counter usable inside nested scopes
-
-    def _savefig(name):
-        _plot_counter[0] += 1
-        _safe = name.replace('/', '_per_').replace('\\', '_')
-        _p = os.path.join(_plots_dir, f"{_plot_counter[0]:02d}_{_safe}.png")
-        plt.savefig(_p, dpi=150, bbox_inches='tight')
-
     display(Markdown("---"))
     display(Markdown("# Curve-Only Evaluation — Baseline vs Approach 2 (B-spline) vs Approach 3 (DTW-phase)"))
 
@@ -5311,8 +5385,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 )
                 ax_wd.grid(True, axis='y', alpha=0.3)
                 plt.tight_layout()
-                if EXPORT_RESULTS and '_run_dir' in dir():
-                    _savefig('wape_distribution')
                 plt.show()
             except Exception as _e:
                 print(f"[WARN] WAPE distribution plot failed: {_e}")
@@ -5349,10 +5421,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     template='plotly_white',
                 )
                 _fig_px.show()
-                if EXPORT_RESULTS and '_plots_dir' in dir():
-                    _px_path = os.path.join(_plots_dir, 'wape_distribution_interactive.html')
-                    _fig_px.write_html(_px_path, include_plotlyjs='cdn')
-                    print(f"Saved interactive plot → {_px_path}")
             except Exception as _e:
                 print(f"[WARN] Plotly WAPE distribution failed: {_e}")
 
@@ -5382,8 +5450,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
                 plt.suptitle('Curve sMAE per Activity — TEST set', fontsize=13, fontweight='bold', y=1.02)
                 plt.tight_layout()
-                if EXPORT_RESULTS and '_run_dir' in dir():
-                    _savefig('smae_heatmap_all_approaches')
                 plt.show()
             except Exception as _e:
                 print(f"[WARN] sMAE heatmap failed: {_e}")
@@ -5454,8 +5520,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     )
                     ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
                     plt.tight_layout()
-                    if EXPORT_RESULTS and '_run_dir' in dir():
-                        _savefig(f'delta_smae_{_delta_label.replace(" ", "_").replace("/", "-")}')
                     plt.show()
             except Exception as _e:
                 print(f"[WARN] Delta sMAE heatmaps failed: {_e}")
@@ -5606,10 +5670,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                             fontsize=12, fontweight='bold'
                         )
                         plt.tight_layout()
-                        if EXPORT_RESULTS and '_run_dir' in dir():
-                            _appr_slug = _appr.replace(" ", "_").replace("+", "p").replace("/", "-")
-                            _gl_slug   = _group_label.replace(" ", "_")
-                            _savefig(f'best_worst_{_appr_slug}_{_gl_slug}')
                         plt.show()
             except Exception as _e:
                 print(f"[WARN] Best/worst plot failed: {_e}")
@@ -5797,7 +5857,6 @@ if _combined_sim_store:
             ]
             fig.legend(handles=_handles, loc='upper right', fontsize=8)
             plt.tight_layout(rect=[0, 0, 1, 0.96])
-            _savefig(f'sim_curves_{_proc}_{_mode}_{_sensor}')
             plt.show()
 else:
     report("  No combined simulation results available for curve plotting.")
@@ -6604,7 +6663,6 @@ else:
         print(f"HTML export skipped: {_e}")
 
     print(f"\nAll outputs in: {os.path.abspath(_run_dir)}")
-    print(f"  plots/  → {os.path.join(_run_dir, 'plots')}")
 
     # ── info.json ─────────────────────────────────────────────────────────────
     import json as _json
