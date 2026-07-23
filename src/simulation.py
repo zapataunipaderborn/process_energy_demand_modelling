@@ -991,10 +991,12 @@ class ProcessSimulation:
 
         # ── Time-budget setup (petri_net_budget mode) ────────────────────
         # Predict this case's total-duration budget B up front from its
-        # attributes. The walk runs exactly as the plain mode (real durations,
-        # real idle, real sequence); afterwards this case's generated timeline
-        # is *placed* onto B (see the post-walk block at the end). Disabled
-        # (None) when no predictor is available -> behaves as the plain mode.
+        # attributes. Every activity keeps the duration it actually sampled —
+        # B is never used to rescale or re-place the finished timeline; it only
+        # steers the walk while it runs (exit transitions discounted/boosted
+        # around B, see the _exit_mult block below), so it decides HOW MANY
+        # activities the case generates. Disabled (None) when no predictor is
+        # available -> behaves as the plain mode.
         _budget_B = None
         if use_time_budget and self.case_duration_pipeline is not None:
             try:

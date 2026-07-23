@@ -3123,14 +3123,19 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
     if combined_candidates and 'petri_net_combined' in MODES_TO_COMPARE:
         def _combined_selection_score(r):
-            """Select best PN on TRAIN: mean of FitnessErr + PrecisionErr + EdgeF1Err (0 = best)."""
-            fit  = float(r.get('train_conformance_metrics_fitness_error',   np.nan))
-            prec = float(r.get('train_conformance_metrics_precision_error',  np.nan))
-            f1   = float(r.get('train_control_flow_metrics_edge_f1_error',   np.nan))
-            vals = [v for v in (fit, prec, f1) if np.isfinite(v)]
-            return float(np.mean(vals)) if vals else np.inf
+            """Select best PN on TRAIN: mean of the four classic process-discovery
+            dimensions — Fitness, Precision, Generalization, Simplicity (1 = best).
 
-        best_row = min(combined_candidates, key=_combined_selection_score)
+            These are quality scores, so the winner is the *maximum*; -inf is the
+            'no usable metric' sentinel. Kept in sync with the Combined-best rule
+            in results_process / results_process_discovery /
+            results_complete_energy_profile."""
+            vals = [float(r.get('train_conformance_metrics_' + k, np.nan))
+                    for k in ('fitness', 'precision', 'generalization', 'simplicity')]
+            vals = [v for v in vals if np.isfinite(v)]
+            return float(np.mean(vals)) if vals else -np.inf
+
+        best_row = max(combined_candidates, key=_combined_selection_score)
 
         combined_row = dict(best_row)
         combined_row['mode'] = 'petri_net_combined'
@@ -3141,7 +3146,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("  ▶ SIMULATION MODE: PETRI_NET_COMBINED")
         print("─"*80)
         print(
-            "  Selected mode based on TRAIN overall 5-metric score (0=best): "
+            "  Selected mode based on TRAIN mean of Fitness/Precision/"
+            "Generalization/Simplicity (1=best): "
             f"{combined_row['selected_mode']} "
             f"(score={_combined_selection_score(best_row):.4f})"
         )
@@ -5042,13 +5048,17 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     # 'ml_exog_prev_activity' numbers for this process's best-fidelity mode as
     # the "Best, mine" comparator — no retraining/resimulating needed for
     # that column, it's already sitting on disk from the loop just above.
+    #
+    # Which mode is "best" is decided on TRAIN. The comparator it feeds is then
+    # scored against real TEST cases, so picking it by test_overall_error would
+    # be choosing the comparator on the very data the comparison reports.
     if RUN_SCHEDULE_PROFILE_EVAL:
         _best_mode_by_process = {}
         _best_error_by_process = {}
         _best_sim_by_process = {}
         _best_core_by_process = {}
         for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
-            _err = _core_p.get('test_overall_error')
+            _err = _core_p.get('train_overall_error')
             if _err is None:
                 continue
             if _proc_p not in _best_error_by_process or _err < _best_error_by_process[_proc_p]:
@@ -5941,10 +5951,13 @@ if _jdur_ready:
         "for matched *(case_rank, activity, occurrence)* pairs in the TEST set only."
     ))
 
-    # ── Pick best process mode per process (lowest test duration WAPE) ──────
+    # ── Pick best process mode per process (lowest TRAIN duration WAPE) ─────
+    # Selection on train: the joint eval below reports this mode's numbers on
+    # the test cases, so selecting it on test would report a mode chosen for
+    # fitting the evaluation split.
     _jw_col = next(
-        (c for c in ['test_duration_metrics_activity_duration_wape',
-                     'test_duration_metrics_activity_duration_mae']
+        (c for c in ['train_duration_metrics_activity_duration_wape',
+                     'train_duration_metrics_activity_duration_mae']
          if c in evaluation_results_df.columns),
         None
     )
