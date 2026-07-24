@@ -46,7 +46,7 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    evaluation (process, energy/profile,
                                    schedule-profile) either way.
   curve_approaches      list|None  which curve-fitting models to train, e.g.
-                                   ['ml_exog_prev_activity']. Subset of the
+                                   ['ml_external']. Subset of the
                                    APPROACHES list in modelling.py ('baseline'
                                    — "Baseline", ONE median curve per sensor
                                    (pooled over all activities, the naive
@@ -54,15 +54,13 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    per Activity & Sensor", median curve per
                                    sensor+activity+object, no model;
                                    'ml_dtw' — DBA + DTW +
-                                   regression; 'ml_exog_prev_activity',
-                                   'ml_only', 'ml_dtw_linear_decode',
-                                   'seq2seq', 'seq2seq_only',
-                                   'seq2seq_prev_activity',
-                                   'seq2seq_dtw_linear_decode', ...). None
+                                   regression; 'ml_external',
+                                   'ml_only', 'seq2seq', 'seq2seq_only',
+                                   'seq2seq_external', ...). None
                                    (default) → use modelling.py's own list.
                                    Fewer models = much faster runs. The
                                    schedule-profile / complete-curve eval needs
-                                   'ml_exog_prev_activity' present.
+                                   'ml_external' present.
   curve_optimize_hyperparams bool  whether curve models run the (slow) Optuna
                                    hyperparameter search. None → modelling.py
                                    default (True). Set False for fast test runs.
@@ -116,22 +114,16 @@ EXPERIMENTS = [
         # (sensor, activity, object) instead of one, so with Optuna ON this is a
         # big runtime multiplier — the seq2seq_* families especially are slow.
         # The schedule-profile / complete-curve eval still keys off
-        # 'ml_exog_prev_activity'.
+        # 'ml_external'.
         'curve_approaches':      [
             'baseline',              # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
             'median_activity_sensor', # "Median per Activity & Sensor": median curve per (sensor, activity, object), no model
             'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
-            #'ml_exog',                # DBA + DTW + regression + external factors (no prev-activity)
-            'ml_exog_prev_activity',  # DBA + DTW + regression + external factors + prev-activity
-            #'ml_prev_activity',      # ablation: prev-activity context WITHOUT external factors
+            'ml_external',  # DBA + DTW + regression + external factors + prev-activity
             'ml_only',                # no DTW at all (formerly 'ml_linear')
-            # 'ml_dtw_linear_decode',
             'seq2seq',
             'seq2seq_only',
-            #'seq2seq_exog',           # seq2seq counterpart of ml_exog
-            'seq2seq_prev_activity',
-            #'seq2seq_prev_activity_no_exog',   # ablation: seq2seq's counterpart of 'ml_prev_activity'
-            # 'seq2seq_dtw_linear_decode',
+            'seq2seq_external',
         ],
         # Full reference — every valid approach name (uncomment to enable the
         # experimental ones, which are commented out in modelling.py by
@@ -139,27 +131,17 @@ EXPERIMENTS = [
         # Naming: every sklearn/DTW-regression approach now starts with 'ml_'.
         # One-to-one pairing with the seq2seq family (same conditioning, same
         # DTW/no-DTW alignment choice, different regressor):
-        #   ml_dtw                <-> seq2seq
+        #   ml_dtw                 <-> seq2seq
         #   ml_only                <-> seq2seq_only
-        #   ml_exog                <-> seq2seq_exog
-        #   ml_prev_activity       <-> seq2seq_prev_activity_no_exog
-        #   ml_exog_prev_activity  <-> seq2seq_prev_activity
-        #   ml_dtw_linear_decode   <-> seq2seq_dtw_linear_decode
-        # The ml_dtw -> ml_prev_activity -> ml_exog -> ml_exog_prev_activity
-        # chain (and its seq2seq counterpart: seq2seq/seq2seq_only ->
-        # seq2seq_prev_activity_no_exog -> seq2seq_exog -> seq2seq_prev_activity)
-        # is the external-factor ablation, isolating prev-activity's
-        # contribution independent of external factors. The two median
-        # baselines sit outside that chain as the naive floors everything else
-        # should beat: 'baseline' = "Baseline" (ONE median per sensor, pooled
-        # over all activities/objects — the coarsest floor),
+        #   ml_external  <-> seq2seq_external
+        # The two median baselines sit outside that chain as the naive floors
+        # everything else should beat: 'baseline' = "Baseline" (ONE median per
+        # sensor, pooled over all activities/objects — the coarsest floor),
         # 'median_activity_sensor' = "Median per Activity & Sensor" (median per
         # sensor+activity+object):
         #   'baseline', 'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree',
-        #   'dtw_phase', 'basis', 'ml_exog', 'ml_prev_activity', 'ml_exog_prev_activity',
-        #   'amplitude_shape', 'ml_only', 'ml_dtw_linear_decode', 'seq2seq',
-        #   'seq2seq_only', 'seq2seq_exog', 'seq2seq_prev_activity_no_exog',
-        #   'seq2seq_prev_activity', 'seq2seq_dtw_linear_decode'
+        #   'dtw_phase', 'basis', 'ml_external', 'amplitude_shape',
+        #   'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
         'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
     },

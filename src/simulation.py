@@ -404,33 +404,23 @@ class ProcessSimulation:
         """
         Predict duration in minutes from ML+ (model, scaler, name) tuple.
 
-        The inversion follows the transform the model was TRAINED with,
-        carried as the 4th tuple element (default 'log' for back-compat):
-          - 'log'    : trained on log1p(duration), inverted with expm1 here.
-                       Predicts the geometric mean (~median); for a right-skewed
-                       activity that is well BELOW the arithmetic mean, which
-                       makes budget mode over-generate (count = budget/duration).
-                       Also amplifies bad extrapolation exponentially -- an
-                       activity with mean ~12 min once predicted 56354 min and
-                       overflowed datetime.fromtimestamp, crashing the run.
-          - 'direct' : trained on raw duration, no expm1. A squared-error
-                       regressor then predicts the arithmetic MEAN (what a time
-                       budget needs) and bad extrapolation stays linear.
+        The model is trained on the RAW duration (see _mlp_fit_model_with_oof),
+        so the prediction needs no back-transform: a squared-error regressor on
+        the raw scale predicts the arithmetic MEAN, which is what budget mode
+        needs (count = budget/duration), and bad extrapolation stays linear.
 
         cap_minutes: optional sane upper bound (see _activity_duration_cap),
         keeps one bad prediction from taking down the simulation while still
         allowing genuinely long activities through.
         """
         m, sc = model_tuple[0], model_tuple[1]
-        transform = model_tuple[3] if len(model_tuple) > 3 else 'log'
-        # 5th element: mean-bias calibration (OOF mean(actual)/mean(pred)),
+        # 4th element: mean-bias calibration (OOF mean(actual)/mean(pred)),
         # re-centers the median-like prediction onto the arithmetic mean that
         # budget mode needs. Defaults to 1.0 (no-op) for tuples trained before
         # this was added. See _mlp_fit_model_with_oof.
-        calib = model_tuple[4] if len(model_tuple) > 4 else 1.0
+        calib = model_tuple[3] if len(model_tuple) > 3 else 1.0
         X = np.array(feature_vec, dtype=float).reshape(1, -1)
         raw = m.predict(sc.transform(X))
-        raw = np.expm1(raw) if transform == 'log' else raw
         pred = float(np.clip(raw, 0, None)[0]) * calib
         if cap_minutes is not None:
             pred = min(pred, cap_minutes)

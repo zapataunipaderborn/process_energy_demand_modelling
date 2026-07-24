@@ -3437,7 +3437,7 @@ def _robust_dtw_barycenter(resampled_curves, barycenter_size, n_iterations=3,
     -- root-caused 2026-07-22 on process_4_1's 'Produktion' activity
     (durations 2..1440 min), where DBA produced an artificial ~30% dip that a
     plain coordinate-wise median of the same curves did not show, and every
-    approach sharing this barycenter (ml_dtw, ml_exog*, seq2seq*) inherited
+    approach sharing this barycenter (ml_dtw, ml_external, seq2seq*) inherited
     the distortion and lost to the naive median-curve baseline as a result.
 
     Same DTW re-alignment DBA does, but each round aggregates with a trimmed
@@ -4240,211 +4240,6 @@ def predict_raw_curve_ml_only(raw_values, activity, attributes, pipeline):
         y_ref_pred,
     )
 
-
-# =============================================================================
-# ML DTW-TRAIN LINEAR-DECODE — DTW ALIGNMENT FOR TRAINING, LINEAR DECODE
-#
-# Same DBA + DTW alignment as the baseline during training, so the ML model
-# learns in the DTW-warped canonical space.
-# At decode time: instead of inverting the DTW path, linearly resample the
-# fixed_length predictions back to raw length.
-# =============================================================================
-
-def build_and_train_pipeline_ml_dtw_linear_decode(
-    train_curves,
-    variable,
-    fixed_length=None,
-    val_size=0.2,
-    random_state=42,
-    models=None,
-    optimize_hyperparams=False,
-    n_trials=50,
-    verbose=1,
-    n_jobs=-1,
-):
-    """
-    Train baseline (DBA + DTW-aligned) ML pipeline, then flag it for linear decode.
-    Identical to build_and_train_pipeline except approach key = 'ml_dtw_linear_decode'.
-    """
-    pipeline = build_and_train_pipeline(
-        train_curves, variable=variable, fixed_length=fixed_length,
-        val_size=val_size, random_state=random_state, models=models,
-        optimize_hyperparams=optimize_hyperparams, n_trials=n_trials,
-        verbose=verbose, n_jobs=n_jobs,
-    )
-    pipeline['approach'] = 'ml_dtw_linear_decode'
-    return pipeline
-
-
-def predict_raw_curve_ml_dtw_linear_decode(raw_values, activity, attributes, pipeline):
-    """
-    Same as baseline predict_raw_curve but decodes with linear resample (no DTW path).
-    """
-    reference_curve      = pipeline['reference_curve']
-    fixed_length         = len(reference_curve)
-    model                = pipeline['model']
-    feature_columns      = pipeline['feature_columns']
-    feature_scaler       = pipeline.get('feature_scaler', None)
-    numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
-    all_keys             = pipeline['all_keys']
-    key_types            = pipeline['key_types']
-
-    _rel_denom = max(fixed_length - 1, 1)
-    rows = []
-    for ref_pos in range(fixed_length):
-        row = {
-            'position_idx': ref_pos,
-            'relative_pos': ref_pos / _rel_denom,
-            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
-            'activity':     activity,
-        }
-        for key in all_keys:
-            value = attributes.get(key, None)
-            if key_types[key] == 'numeric':
-                try:
-                    row[key] = float(value) if value is not None else np.nan
-                except (ValueError, TypeError):
-                    row[key] = np.nan
-            else:
-                row[key] = str(value) if value is not None else 'None'
-        rows.append(row)
-
-    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
-    X_ref = pd.DataFrame(rows)
-    X_ref = pd.get_dummies(X_ref, columns=categorical_cols, drop_first=True)
-    for col in feature_columns:
-        if col not in X_ref.columns:
-            X_ref[col] = 0
-    X_ref = X_ref[feature_columns]
-
-    if feature_scaler is not None and numeric_feature_cols:
-        cols_to_scale = [c for c in numeric_feature_cols if c in X_ref.columns]
-        if cols_to_scale:
-            X_ref[cols_to_scale] = X_ref[cols_to_scale].astype('float64')
-            X_ref.loc[:, cols_to_scale] = feature_scaler.transform(X_ref[cols_to_scale])
-
-    X_ref = X_ref.fillna(0)
-    y_ref_pred = model.predict(X_ref)
-
-    return np.interp(
-        np.linspace(0, 1, len(raw_values)),
-        np.linspace(0, 1, fixed_length),
-        y_ref_pred,
-    )
-
-
-# =============================================================================
-# SEQ2SEQ DTW-TRAIN LINEAR-DECODE — DTW ALIGNMENT FOR TRAINING, LINEAR DECODE
-#
-# Same DBA + DTW alignment as seq2seq during training.
-# Decode: linear resample of fixed_length predictions back to raw length.
-# =============================================================================
-
-def build_and_train_pipeline_seq2seq_dtw_linear_decode(
-    train_curves,
-    variable,
-    fixed_length=None,
-    val_size=0.2,
-    random_state=42,
-    hidden_size=128,
-    num_layers=2,
-    dropout=0.1,
-    epochs=80,
-    batch_size=32,
-    lr=1e-3,
-    teacher_forcing_ratio=0.5,
-    patience=10,
-    verbose=1,
-):
-    """
-    Train standard DTW+Seq2Seq pipeline, then flag it for linear decode.
-    Identical to build_and_train_pipeline_seq2seq except approach = 'seq2seq_dtw_linear_decode'.
-    """
-    pipeline = build_and_train_pipeline_seq2seq(
-        train_curves, variable=variable, fixed_length=fixed_length,
-        val_size=val_size, random_state=random_state,
-        hidden_size=hidden_size, num_layers=num_layers, dropout=dropout,
-        epochs=epochs, batch_size=batch_size, lr=lr,
-        teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
-        verbose=verbose,
-    )
-    pipeline['approach'] = 'seq2seq_dtw_linear_decode'
-    return pipeline
-
-
-def predict_raw_curve_seq2seq_dtw_linear_decode(raw_values, activity, attributes, pipeline):
-    """
-    Same as predict_raw_curve_seq2seq but decodes with linear resample (no DTW path).
-    """
-    fixed_length         = len(pipeline['reference_curve'])
-    model                = pipeline['model']
-    all_keys             = pipeline['all_keys']
-    key_types            = pipeline['key_types']
-    cat_columns          = pipeline['cat_columns']
-    feature_columns      = pipeline['feature_columns']
-    scaler               = pipeline['scaler']
-    numeric_feature_cols = pipeline['numeric_feature_cols']
-    y_mean               = pipeline['y_mean']
-    y_std                = pipeline['y_std']
-    device               = pipeline['device']
-
-    _rel_denom = max(fixed_length - 1, 1)
-    rows = []
-    for pos in range(fixed_length):
-        row = {
-            'position_idx': pos,
-            'relative_pos': pos / _rel_denom,
-            'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
-            'activity':     activity,
-        }
-        for key in all_keys:
-            v = attributes.get(key, None)
-            if key_types[key] == 'numeric':
-                try:
-                    row[key] = float(v) if v is not None else np.nan
-                except (ValueError, TypeError):
-                    row[key] = np.nan
-            else:
-                row[key] = str(v) if v is not None else 'None'
-        rows.append(row)
-
-    df_seq = pd.DataFrame(rows)
-    df_seq = pd.get_dummies(df_seq, columns=cat_columns, drop_first=True)
-    for col in feature_columns:
-        if col not in df_seq.columns:
-            df_seq[col] = 0
-    df_seq = df_seq[feature_columns]
-
-    if scaler is not None and numeric_feature_cols:
-        cols_to_scale = [c for c in numeric_feature_cols if c in df_seq.columns]
-        if cols_to_scale:
-            df_seq[cols_to_scale] = df_seq[cols_to_scale].astype('float64')
-            df_seq[cols_to_scale] = scaler.transform(df_seq[cols_to_scale])
-
-    # Missing-attribute robustness: any trained feature absent from `attributes`
-    # (e.g. hour_of_day/day_of_week, injected only at TRAIN time by
-    # split_curves*/split_curves_with_prev_activity and never present in
-    # production object_attributes) is NaN at this point and would silently
-    # propagate through the scaler into the torch tensor, producing an
-    # all-NaN prediction with no error -- confirmed as the actual cause of
-    # every seq2seq* failure in the real complete-curve pipeline (previously
-    # misattributed to needing autoregressive rollout). 0 == training mean
-    # after scaling, mirroring predict_raw_curve's X_ref.fillna(0) for the
-    # sklearn/DTW family.
-    df_seq = df_seq.fillna(0)
-
-    X = torch.tensor(df_seq.values.astype(np.float32)).unsqueeze(0).to(device)
-    model.eval()
-    with torch.no_grad():
-        y_norm = model(X, targets=None, teacher_forcing_ratio=0.0)
-
-    y_ref_pred = y_norm.squeeze(0).cpu().numpy() * y_std + y_mean
-
-    return np.interp(
-        np.linspace(0, 1, len(raw_values)),
-        np.linspace(0, 1, fixed_length),
-        y_ref_pred,
-    )
 
 
 # =============================================================================
@@ -6351,7 +6146,7 @@ def build_and_train_pipeline_exog_prev_activity(
         verbose=verbose,
         n_jobs=n_jobs,
     )
-    pipeline['approach'] = 'ml_exog_prev_activity'
+    pipeline['approach'] = 'ml_external'
 
     # Per-activity training-curve medians — used as first-of-case defaults
     # during autoregressive test-time rollout (no real predecessor available).
@@ -7193,6 +6988,7 @@ def predict_raw_curve_amplitude_shape_exog(raw_values, activity, attributes, pip
 # Decode back to raw length: identical DTW path inversion as baseline.
 # =============================================================================
 
+import os as _os
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -7241,6 +7037,161 @@ class _Seq2SeqLSTM(nn.Module):
                 prev = pred.detach()
 
         return torch.cat(outputs, dim=1).squeeze(-1)             # (B, T)
+
+
+class _Seq2SeqTransformer(nn.Module):
+    """
+    Transformer counterpart of _Seq2SeqLSTM, with an identical call signature so
+    both are drop-in interchangeable inside the seq2seq family (and behind the
+    same 'seq2seq*' approach names — the cell type is an internal choice, not a
+    new approach).
+
+    Encoder-only and NON-autoregressive: the input features at every timestep
+    (position, curve_length, activity, attributes, exog) are known up front, so
+    there is nothing to condition auto-regressively on. Predicting the whole
+    canonical curve in one pass removes the LSTM's exposure bias (train with
+    teacher forcing, infer on its own predictions) and lets attention run in
+    parallel over timesteps instead of stepping T times.
+
+    `targets` / `teacher_forcing_ratio` are accepted and ignored — they exist
+    only so the training loop can call either cell identically.
+    """
+    def __init__(self, input_size, seq_len, hidden_size=128, num_layers=2, dropout=0.1):
+        super().__init__()
+        # nn.MultiheadAttention requires d_model % nhead == 0.
+        nhead = next((h for h in (8, 4, 2, 1) if hidden_size % h == 0), 1)
+        self.seq_len    = seq_len
+        self.nhead      = nhead
+        self.input_proj = nn.Linear(input_size, hidden_size)
+        # Learned positional embedding, sized to this pipeline's fixed_length so
+        # hundreds of persisted per-combo models stay small.
+        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len, hidden_size))
+        nn.init.normal_(self.pos_emb, std=0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=nhead,
+            dim_feedforward=4 * hidden_size, dropout=dropout,
+            batch_first=True, norm_first=True,
+        )
+        # enable_nested_tensor=False: incompatible with norm_first, and it only
+        # warns per instantiation — noisy across hundreds of per-combo models.
+        self.encoder  = nn.TransformerEncoder(layer, num_layers=num_layers,
+                                              enable_nested_tensor=False)
+        self.out_proj = nn.Linear(hidden_size, 1)
+
+    def forward(self, x, targets=None, teacher_forcing_ratio=0.5):
+        """
+        x       : (B, T, F)
+        targets : ignored (see class docstring)
+        returns : (B, T)
+        """
+        B, T, _ = x.shape
+        if T > self.seq_len:
+            raise ValueError(
+                f"_Seq2SeqTransformer got T={T} > seq_len={self.seq_len}; the "
+                f"positional embedding is sized to the pipeline's fixed_length."
+            )
+        h = self.input_proj(x) + self.pos_emb[:, :T, :]
+        h = self.encoder(h)
+        return self.out_proj(h).squeeze(-1)                       # (B, T)
+
+
+# Which recurrent/attention cells compete inside every seq2seq* approach. Both
+# are trained per (sensor, activity, object) combo and the one with the lower
+# validation loss is kept — same "train both, keep the winner" rule the duration
+# models use. Override with PIPELINE_SEQ2SEQ_CELLS=lstm (or =transformer) to
+# train only one, e.g. to reproduce a pre-transformer run or to halve the cost.
+_SEQ2SEQ_CELL_TYPES = tuple(
+    c.strip().lower()
+    for c in _os.environ.get('PIPELINE_SEQ2SEQ_CELLS', 'lstm,transformer').split(',')
+    if c.strip()
+) or ('lstm',)
+
+
+def _fit_seq2seq_with_selection(
+    X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, seq_len,
+    hidden_size, num_layers, dropout, epochs, batch_size, lr,
+    teacher_forcing_ratio, patience, verbose, cell_types=None,
+):
+    """
+    Train one model per cell type in `cell_types` on identical data/splits and
+    return the one with the lowest validation loss.
+
+    Returns
+    -------
+    (model, best_val_loss, best_cell, val_loss_by_cell)
+        model            — the winning nn.Module, in eval mode, best-epoch weights
+        best_val_loss    — its validation MSE in canonical (normalised) space
+        best_cell        — 'lstm' | 'transformer'
+        val_loss_by_cell — {cell: val_loss} for every candidate that trained
+    """
+    cell_types = tuple(cell_types) if cell_types else _SEQ2SEQ_CELL_TYPES
+    criterion  = nn.MSELoss()
+    loader     = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
+
+    results = {}
+    for cell in cell_types:
+        if cell == 'lstm':
+            model = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
+                                 num_layers=num_layers, dropout=dropout).to(device)
+        elif cell == 'transformer':
+            model = _Seq2SeqTransformer(input_size, seq_len=seq_len,
+                                        hidden_size=hidden_size,
+                                        num_layers=num_layers, dropout=dropout).to(device)
+        else:
+            print(f"    [WARN] unknown seq2seq cell '{cell}' — skipped.")
+            continue
+
+        optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+        best_val_loss, best_state, no_improve = float('inf'), None, 0
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                optimiser.zero_grad()
+                pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
+                loss = criterion(pred, yb)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimiser.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
+                val_loss = criterion(val_pred, y_vl_n.to(device)).item()
+
+            if verbose and epoch % 10 == 0:
+                print(f"    [{cell}] Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
+
+            if val_loss < best_val_loss - 1e-6:
+                best_val_loss = val_loss
+                best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve    = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    if verbose:
+                        print(f"    [{cell}] Early stopping at epoch {epoch}")
+                    break
+
+        if best_state is None:      # never improved on inf → no usable model
+            continue
+        model.load_state_dict(best_state)
+        model.eval()
+        results[cell] = (model, best_val_loss)
+
+    if not results:
+        raise RuntimeError(f"no seq2seq cell trained successfully (tried {cell_types})")
+
+    best_cell = min(results, key=lambda c: results[c][1])
+    model, best_val_loss = results[best_cell]
+    val_loss_by_cell = {c: v for c, (_, v) in results.items()}
+
+    if verbose:
+        _scores = '  '.join(f'{c}={v:.5f}' for c, v in val_loss_by_cell.items())
+        print(f"    Cell selection: {_scores}  ->  {best_cell}")
+
+    return model, best_val_loss, best_cell, val_loss_by_cell
 
 
 def _build_seq2seq_input(curves, all_keys, key_types, fixed_length,
@@ -7419,55 +7370,19 @@ def build_and_train_pipeline_seq2seq(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_size = X_tr.shape[-1]
 
-    model = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
-                         num_layers=num_layers, dropout=dropout).to(device)
-    optimiser = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
-
-    loader = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
-
-    best_val_loss = float('inf')
-    best_state    = None
-    no_improve    = 0
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimiser.zero_grad()
-            pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
-            loss = criterion(pred, yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimiser.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
-            val_loss = criterion(val_pred, y_vl_n.to(device)).item()
-
-        if verbose and epoch % 10 == 0:
-            print(f"    Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
-
-        if val_loss < best_val_loss - 1e-6:
-            best_val_loss = val_loss
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            no_improve    = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                if verbose:
-                    print(f"    Early stopping at epoch {epoch}")
-                break
-
-    model.load_state_dict(best_state)
-    model.eval()
+    model, best_val_loss, best_cell, val_loss_by_cell = _fit_seq2seq_with_selection(
+        X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, fixed_length,
+        hidden_size, num_layers, dropout, epochs, batch_size, lr,
+        teacher_forcing_ratio, patience, verbose,
+    )
 
     if verbose:
-        print(f"    Best val_loss={best_val_loss:.5f}")
+        print(f"    Best val_loss={best_val_loss:.5f}  (cell={best_cell})")
 
     return {
         'approach':            'seq2seq',
+'cell_type':           best_cell,
+'val_loss_by_cell':    val_loss_by_cell,
         'model':               model,
         'reference_curve':     reference_curve,
         'fixed_length':        fixed_length,
@@ -7665,51 +7580,19 @@ def build_and_train_pipeline_seq2seq_only(
 
     device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_size = X_tr.shape[-1]
-    model      = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
-                               num_layers=num_layers, dropout=dropout).to(device)
-    optimiser  = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion  = nn.MSELoss()
-    loader     = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
-
-    best_val_loss, best_state, no_improve = float('inf'), None, 0
-    for epoch in range(1, epochs + 1):
-        model.train()
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimiser.zero_grad()
-            pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
-            loss = criterion(pred, yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimiser.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
-            val_loss = criterion(val_pred, y_vl_n.to(device)).item()
-
-        if verbose and epoch % 10 == 0:
-            print(f"    Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
-
-        if val_loss < best_val_loss - 1e-6:
-            best_val_loss = val_loss
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            no_improve    = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                if verbose:
-                    print(f"    Early stopping at epoch {epoch}")
-                break
-
-    model.load_state_dict(best_state)
-    model.eval()
+    model, best_val_loss, best_cell, val_loss_by_cell = _fit_seq2seq_with_selection(
+        X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, fixed_length,
+        hidden_size, num_layers, dropout, epochs, batch_size, lr,
+        teacher_forcing_ratio, patience, verbose,
+    )
 
     if verbose:
-        print(f"    Best val_loss={best_val_loss:.5f}")
+        print(f"    Best val_loss={best_val_loss:.5f}  (cell={best_cell})")
 
     return {
         'approach':             'seq2seq_only',
+'cell_type':           best_cell,
+'val_loss_by_cell':    val_loss_by_cell,
         'model':                model,
         'fixed_length':         fixed_length,
         'all_keys':             all_keys,
@@ -7990,51 +7873,19 @@ def build_and_train_pipeline_seq2seq_exog(
 
     device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     input_size = X_tr.shape[-1]
-    model      = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
-                               num_layers=num_layers, dropout=dropout).to(device)
-    optimiser  = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion  = nn.MSELoss()
-    loader     = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size, shuffle=True)
-
-    best_val_loss, best_state, no_improve = float('inf'), None, 0
-    for epoch in range(1, epochs + 1):
-        model.train()
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimiser.zero_grad()
-            pred = model(xb, targets=yb, teacher_forcing_ratio=teacher_forcing_ratio)
-            loss = criterion(pred, yb)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimiser.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(X_vl.to(device), targets=None, teacher_forcing_ratio=0.0)
-            val_loss = criterion(val_pred, y_vl_n.to(device)).item()
-
-        if verbose and epoch % 10 == 0:
-            print(f"    Epoch {epoch:4d}/{epochs}  val_loss={val_loss:.5f}")
-
-        if val_loss < best_val_loss - 1e-6:
-            best_val_loss = val_loss
-            best_state    = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            no_improve    = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                if verbose:
-                    print(f"    Early stopping at epoch {epoch}")
-                break
-
-    model.load_state_dict(best_state)
-    model.eval()
+    model, best_val_loss, best_cell, val_loss_by_cell = _fit_seq2seq_with_selection(
+        X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, fixed_length,
+        hidden_size, num_layers, dropout, epochs, batch_size, lr,
+        teacher_forcing_ratio, patience, verbose,
+    )
 
     if verbose:
-        print(f"    Best val_loss={best_val_loss:.5f}")
+        print(f"    Best val_loss={best_val_loss:.5f}  (cell={best_cell})")
 
     return {
         'approach':             'seq2seq_exog',
+'cell_type':           best_cell,
+'val_loss_by_cell':    val_loss_by_cell,
         'model':                model,
         'reference_curve':      reference_curve,
         'fixed_length':         fixed_length,
@@ -8159,7 +8010,7 @@ def predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
     return y_raw_pred
 
 
-def build_and_train_pipeline_seq2seq_prev_activity(
+def build_and_train_pipeline_seq2seq_external(
     train_curves,
     variable,
     fixed_length=None,
@@ -8199,7 +8050,7 @@ def build_and_train_pipeline_seq2seq_prev_activity(
         patience=patience,
         verbose=verbose,
     )
-    pipeline['approach'] = 'seq2seq_prev_activity'
+    pipeline['approach'] = 'seq2seq_external'
 
     # Per-activity training-curve medians for first-of-case autoregressive defaults
     _by_act = {}
@@ -8229,7 +8080,7 @@ def build_and_train_pipeline_seq2seq_prev_activity(
     return pipeline
 
 
-def predict_raw_curve_seq2seq_prev_activity(raw_values, activity, attributes, pipeline,
+def predict_raw_curve_seq2seq_external(raw_values, activity, attributes, pipeline,
                                              exog_values=None):
     """Thin alias — prev_act_* features live in attributes, handled by seq2seq_exog path."""
     return predict_raw_curve_seq2seq_exog(raw_values, activity, attributes, pipeline,
@@ -8263,10 +8114,7 @@ def _dispatch_predict(raw_values, curve, pipeline):
         return predict_raw_curve_median(raw_values, act, attrs, pipeline)
     if approach == 'ml_dtw':
         return predict_raw_curve(raw_values, act, attrs, pipeline)
-    if approach == 'ml_exog':
-        return predict_raw_curve_exog(raw_values, act, attrs, pipeline,
-                                      exog_values=curve.get('exog_values', {}))
-    if approach == 'ml_exog_prev_activity':
+    if approach == 'ml_external':
         return predict_raw_curve_exog_prev_activity(raw_values, act, attrs, pipeline,
                                                     exog_values=curve.get('exog_values', {}))
     if approach == 'instance_stats':
@@ -8279,11 +8127,8 @@ def _dispatch_predict(raw_values, curve, pipeline):
         return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_only':
         return predict_raw_curve_seq2seq_only(raw_values, act, attrs, pipeline)
-    if approach == 'seq2seq_exog':
-        return predict_raw_curve_seq2seq_exog(raw_values, act, attrs, pipeline,
-                                              exog_values=curve.get('exog_values', {}))
-    if approach == 'seq2seq_prev_activity':
-        return predict_raw_curve_seq2seq_prev_activity(raw_values, act, attrs, pipeline,
+    if approach == 'seq2seq_external':
+        return predict_raw_curve_seq2seq_external(raw_values, act, attrs, pipeline,
                                                        exog_values=curve.get('exog_values', {}))
     if approach == 'amplitude_shape':
         return predict_raw_curve_amplitude_shape(raw_values, act, attrs, pipeline)
@@ -8292,10 +8137,6 @@ def _dispatch_predict(raw_values, curve, pipeline):
                                                       exog_values=curve.get('exog_values', {}))
     if approach == 'ml_only':
         return predict_raw_curve_ml_only(raw_values, act, attrs, pipeline)
-    if approach == 'ml_dtw_linear_decode':
-        return predict_raw_curve_ml_dtw_linear_decode(raw_values, act, attrs, pipeline)
-    if approach == 'seq2seq_dtw_linear_decode':
-        return predict_raw_curve_seq2seq_dtw_linear_decode(raw_values, act, attrs, pipeline)
     if approach == 'mean_baseline':
         return np.full(len(raw_values), pipeline.get('train_mean', 0.0))
     return predict_raw_curve(raw_values, act, attrs, pipeline)
@@ -8374,10 +8215,9 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     # separately in modelling.py's curve-only section. This worker trains the
     # per-combo median under 'median_activity_sensor'.
     _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree',
-                           'dtw_phase', 'basis', 'ml_exog', 'amplitude_shape',
-                           'amplitude_shape_exog', 'ml_exog_prev_activity',
-                           'ml_prev_activity',
-                           'ml_only', 'ml_dtw_linear_decode'}
+                           'dtw_phase', 'basis', 'amplitude_shape',
+                           'amplitude_shape_exog', 'ml_external',
+                           'ml_only'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
     curves, _ = split_curves(
@@ -8435,11 +8275,6 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
-    if 'ml_exog' in _active and ef_cols:
-        result['ml_exog'] = build_and_train_pipeline_exog(
-            curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
-        )
     if 'amplitude_shape' in _active:
         result['amplitude_shape'] = build_and_train_pipeline_amplitude_shape(
             curves, variable=sensor, fixed_length=fixed_length,
@@ -8450,7 +8285,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
-    if 'ml_exog_prev_activity' in _active:
+    if 'ml_external' in _active:
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
             variable=sensor,
@@ -8461,7 +8296,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             exog_columns=ef_cols,
         )
         if len(_prev_curves) >= 5:
-            result['ml_exog_prev_activity'] = build_and_train_pipeline_exog_prev_activity(
+            result['ml_external'] = build_and_train_pipeline_exog_prev_activity(
                 _prev_curves, variable=sensor,
                 fixed_length=fixed_length, val_size=val_size,
                 models=models, verbose=0, n_jobs=1, **_hp_kwargs,
@@ -8470,65 +8305,26 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             # Fewer than 5 curves survive the stricter prev-activity-context
             # extraction (a separate, narrower filter than the len(curves)<5
             # check above that already passed for 'baseline'/'ml_dtw')
-            # -- previously this silently left 'ml_exog_prev_activity' unset
+            # -- previously this silently left 'ml_external' unset
             # with no log line at all, which meant predict_curve_for_instance
             # would return None for every instance of this (sensor, activity,
             # object) and leave an unexplained gap in the complete-curve/
             # schedule-profile curves. Fall back to 'ml_dtw' (already
             # trained above, just without previous-activity context) rather
-            # than the trivial 'baseline' median -- ml_exog_prev_activity's
+            # than the trivial 'baseline' median -- ml_external's
             # reassembly always calls predict_raw_curve_exog_prev_activity on
             # whatever ends up here, and only ml_dtw's pipeline dict
             # (model/feature_columns/etc.) has the keys that function needs.
-            print(f"  [WARN] ml_exog_prev_activity: only {len(_prev_curves)} curve(s) with "
+            print(f"  [WARN] ml_external: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
                   f"falling back to the ml_dtw pipeline for this combo.")
-            result['ml_exog_prev_activity'] = result['ml_dtw']
+            result['ml_external'] = result['ml_dtw']
         else:
-            print(f"  [WARN] ml_exog_prev_activity: only {len(_prev_curves)} curve(s) with "
-                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
-                  f"no ml_dtw pipeline available either -- no prediction possible for this combo.")
-    if 'ml_prev_activity' in _active:
-        # Previous-activity context WITHOUT external factors (exog_columns=None)
-        # -- the ablation isolating the prev-activity contribution independent
-        # of the ef_ features. Reuses the ml_exog_prev_activity builder/predictor;
-        # with no exog_values on the curves, build_and_train_pipeline_exog just
-        # yields exog_cols=[] (no external-factor features), while the
-        # prev_act_* attributes still flow through the standard attribute path.
-        # The pipeline's internal 'approach' stays 'ml_exog_prev_activity', so
-        # all downstream routing (predict dispatch, eval split, autoregressive
-        # rollout) treats it identically -- only exog is absent.
-        _pa_curves, _ = split_curves_with_prev_activity(
-            df_train,
-            variable=sensor,
-            activities=[activity],
-            objects=[obj],
-            test_size=0.0,
-            verbose=0,
-            exog_columns=None,
-        )
-        if len(_pa_curves) >= 5:
-            result['ml_prev_activity'] = build_and_train_pipeline_exog_prev_activity(
-                _pa_curves, variable=sensor,
-                fixed_length=fixed_length, val_size=val_size,
-                models=models, verbose=0, n_jobs=1, **_hp_kwargs,
-            )
-        elif 'ml_dtw' in result:
-            print(f"  [WARN] ml_prev_activity: only {len(_pa_curves)} curve(s) with "
-                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
-                  f"falling back to the ml_dtw pipeline for this combo.")
-            result['ml_prev_activity'] = result['ml_dtw']
-        else:
-            print(f"  [WARN] ml_prev_activity: only {len(_pa_curves)} curve(s) with "
+            print(f"  [WARN] ml_external: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no ml_dtw pipeline available either -- no prediction possible for this combo.")
     if 'ml_only' in _active:
         result['ml_only'] = build_and_train_pipeline_ml_only(
-            curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
-        )
-    if 'ml_dtw_linear_decode' in _active:
-        result['ml_dtw_linear_decode'] = build_and_train_pipeline_ml_dtw_linear_decode(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
@@ -8549,8 +8345,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     """
     import torch
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
-    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_exog', 'seq2seq_prev_activity',
-                'seq2seq_prev_activity_no_exog', 'seq2seq_dtw_linear_decode'}
+    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_external'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
         return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
@@ -8587,16 +8382,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             verbose=False,
         )
 
-    if 'seq2seq_exog' in _active and ef_cols:
-        result['seq2seq_exog'] = build_and_train_pipeline_seq2seq_exog(
-            curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
-            dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
-            teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
-            verbose=False,
-        )
-
-    if 'seq2seq_prev_activity' in _active:
+    if 'seq2seq_external' in _active:
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
             variable=sensor,
@@ -8607,7 +8393,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             exog_columns=ef_cols,
         )
         if len(_prev_curves) >= 5:
-            result['seq2seq_prev_activity'] = build_and_train_pipeline_seq2seq_prev_activity(
+            result['seq2seq_external'] = build_and_train_pipeline_seq2seq_external(
                 _prev_curves, variable=sensor, fixed_length=fixed_length,
                 val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
                 dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
@@ -8615,61 +8401,18 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                 verbose=False,
             )
         elif 'seq2seq' in result:
-            # Same silent-skip issue as ml_exog_prev_activity above -- fall back
+            # Same silent-skip issue as ml_external above -- fall back
             # to the plain seq2seq pipeline (no previous-activity context)
             # instead of leaving this (sensor, activity, object) with no
             # prediction and no explanation in the logs.
-            print(f"  [WARN] seq2seq_prev_activity: only {len(_prev_curves)} curve(s) with "
+            print(f"  [WARN] seq2seq_external: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
                   f"falling back to the plain seq2seq pipeline for this combo.")
-            result['seq2seq_prev_activity'] = result['seq2seq']
+            result['seq2seq_external'] = result['seq2seq']
         else:
-            print(f"  [WARN] seq2seq_prev_activity: only {len(_prev_curves)} curve(s) with "
+            print(f"  [WARN] seq2seq_external: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
-
-    if 'seq2seq_prev_activity_no_exog' in _active:
-        # Seq2Seq prev-activity ablation, WITHOUT external factors -- the
-        # seq2seq counterpart of the sklearn 'ml_prev_activity' approach.
-        # exog_columns=None means the curves carry no exog_values, so
-        # build_and_train_pipeline_seq2seq_exog (which seq2seq_prev_activity
-        # wraps) detects exog_cols=[] and trains with no external-factor
-        # features; prev_act_* attributes still flow through unchanged.
-        _prev_curves_ne, _ = split_curves_with_prev_activity(
-            df_train,
-            variable=sensor,
-            activities=[activity],
-            objects=[obj],
-            test_size=0.0,
-            verbose=0,
-            exog_columns=None,
-        )
-        if len(_prev_curves_ne) >= 5:
-            result['seq2seq_prev_activity_no_exog'] = build_and_train_pipeline_seq2seq_prev_activity(
-                _prev_curves_ne, variable=sensor, fixed_length=fixed_length,
-                val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
-                dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
-                teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
-                verbose=False,
-            )
-        elif 'seq2seq' in result:
-            print(f"  [WARN] seq2seq_prev_activity_no_exog: only {len(_prev_curves_ne)} curve(s) with "
-                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5) -- "
-                  f"falling back to the plain seq2seq pipeline for this combo.")
-            result['seq2seq_prev_activity_no_exog'] = result['seq2seq']
-        else:
-            print(f"  [WARN] seq2seq_prev_activity_no_exog: only {len(_prev_curves_ne)} curve(s) with "
-                  f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
-                  f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
-
-    if 'seq2seq_dtw_linear_decode' in _active:
-        result['seq2seq_dtw_linear_decode'] = build_and_train_pipeline_seq2seq_dtw_linear_decode(
-            curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
-            dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
-            teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
-            verbose=False,
-        )
 
     return result
 
@@ -8961,7 +8704,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     predict_fn = ep.get('predict_fn')
     # exog_cols lives at the top level for the energy-aware modes' pipelines,
     # but is nested under 'full_pipeline' for Curve-Only Evaluation pipelines
-    # (baseline, ml_exog_prev_activity, etc. all wrap the trained pipeline dict
+    # (baseline, ml_external, etc. all wrap the trained pipeline dict
     # under 'full_pipeline' when reassembled — see modelling.py).
     exog_cols = ep.get('exog_cols') or ep.get('full_pipeline', {}).get('exog_cols')
     exog_vals = {}
@@ -8986,7 +8729,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     # keyword args (raw_values=, activity=, object_attributes=, exog=);
     # Curve-Only Evaluation's plain approaches (baseline, instance_stats...)
     # use positional (rv, act, attrs) with no exog param at all; its
-    # exog-aware approaches (ml_exog_prev_activity, seq2seq_exog...) use
+    # exog-aware approaches (ml_external, seq2seq_external) use
     # positional (rv, act, attrs, exog=None). Try each in turn — a plain
     # 3-arg positional call as the last resort would silently succeed on an
     # exog-aware predict_fn by using its exog=None default, silently
