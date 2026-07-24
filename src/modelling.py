@@ -72,7 +72,7 @@ constants.SHOW_PROGRESS_BAR = False
 # %%
 import pandas as pd
 from sim_extractor import extract_process, MIN_CURVE_SAMPLES
-from sim_extractor import set_global_seeds, stable_seed, GLOBAL_RANDOM_SEED
+from sim_extractor import set_global_seeds, GLOBAL_RANDOM_SEED
 
 # Seed python/numpy/torch from the master seed now that sim_extractor is
 # importable. Parallel training workers re-seed themselves per combo.
@@ -489,12 +489,6 @@ MODES_TO_COMPARE = [
     'petri_net_inductive',
     'petri_net_inductive_ml_plus_global',
     'petri_net_inductive_ml_plus_per_act',
-    # wip_aware / wip_branching_aware disabled (2026-07-22): excluded from the
-    # ablation study on request. Re-enable by uncommenting if needed.
-    # 'petri_net_wip_aware',   # PN transitions + WIP/RO-aware duration + waiting-time model
-    # 'petri_net_wip_aware_ml_plus_global',    # same, but duration from the ML+ global model
-    # 'petri_net_wip_aware_ml_plus_per_act',   # same, but duration from the ML+ per-activity models
-    # 'petri_net_wip_branching_aware',   # wip_aware + WIP/RO-aware branching (falls back to statistical if not better)
     'petri_net_budget',   # base PN token game, but each case is generated to match its predicted total-duration budget (train_case_duration_pipeline) — folds the "duration-corrected" span-fix into the generator (no post-hoc step)
     'petri_net_budget_ml_plus_global',   # petri_net_budget + ML+ global duration model (better internal timing under the same total-duration budget)
     'petri_net_budget_ml_plus_per_act',  # petri_net_budget + ML+ per-activity duration models
@@ -4461,6 +4455,12 @@ if RUN_CURVE_ONLY_EVALUATION:
                         print(f"  ⚠️  Worker failed {_ws}|{_wa}|{_wo}: {_we}")
             print(f"  sklearn training done in {_time.perf_counter() - _sklearn_t0:.1f}s")
 
+            # Reassemble in a fixed key order, not pool-completion order: each
+            # worker's models are already seeded from its own key, so only the
+            # dict INSERTION order was still schedule-dependent — and that
+            # leaks into the row order of every saved results table.
+            _worker_results.sort(key=lambda r: (str(r['sensor']), str(r['activity']), str(r['object'])))
+
             # Reassemble into per-sensor dicts keyed [sensor][activity][object]
             for _r in _worker_results:
                 _s, _a, _o = _r['sensor'], _r['activity'], _r['object']
@@ -4523,6 +4523,8 @@ if RUN_CURVE_ONLY_EVALUATION:
                     except Exception as _s2s_e:
                         print(f"  ⚠️  Seq2seq worker failed [{_s}|{_a}|{_o}]: {_s2s_e}")
             print(f"  seq2seq training done in {_time.perf_counter() - _s2s_t0:.1f}s")
+            # Same fixed key order as the sklearn pool above.
+            _s2s_results.sort(key=lambda r: (str(r['sensor']), str(r['activity']), str(r['object'])))
 
             for _r2 in _s2s_results:
                 _s, _a, _o = _r2['sensor'], _r2['activity'], _r2['object']

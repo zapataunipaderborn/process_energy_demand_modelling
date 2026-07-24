@@ -1,4 +1,5 @@
 import copy
+import os
 import zlib
 import pandas as pd
 import numpy as np
@@ -160,13 +161,15 @@ class ProcessSimulation:
     process_models : dict | None
         Mined Petri nets from ``sim_extractor.extract_process()``.
         Required when mode='petri_net'.
-    random_seed : int
-        NumPy / random seed for reproducibility.
+    random_seed : int | None
+        NumPy / random seed for reproducibility. None (the default) resolves to
+        the run's master seed, PIPELINE_RANDOM_SEED — so a whole pipeline run,
+        simulation included, is controlled by that single value.
     """
 
     def __init__(self, activity_stats_df, production_plan,
                  mode='statistical', base_simulation_mode='statistical', ml_models=None,
-                 process_models=None, random_seed=42,
+                 process_models=None, random_seed=None,
                  energy_duration_modifiers=None,
                  energy_transition_modifiers=None,
                  energy_state_columns=None,
@@ -226,8 +229,11 @@ class ProcessSimulation:
         print(f"[DEBUG __init__] mode={self.mode}, "
               f"process_models is None: {process_models is None}, "
               f"process_models len: {len(process_models) if process_models else 'N/A'}")
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+        if random_seed is None:
+            random_seed = int(os.environ.get('PIPELINE_RANDOM_SEED', '42'))
+        self.random_seed = int(random_seed)
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
 
         if self.mode in ('ml', 'ml_duration_only',
                         'ml_duration_only_with_activity_past',
@@ -3454,7 +3460,7 @@ class ProcessSimulation:
 
 
 def simulate_with_wip_ro(activity_stats_df, production_plan, ml_models,
-                         reference_mode='petri_net', random_seed=42,
+                         reference_mode='petri_net', random_seed=None,
                          final_mode='petri_net_wip_aware',
                          **kwargs):
     """

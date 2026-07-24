@@ -75,11 +75,12 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    approach, per (sensor, activity, object) —
                                    the best is kept by validation MAE. Subset of
                                    'Linear Regression' | 'Ridge' |
-                                   'Random Forest' | 'XGBoost' | 'MLP' (short
+                                   'Random Forest' | 'XGBoost' |
+                                   'Hist Gradient Boosting' | 'MLP' (short
                                    aliases also accepted: linear, ridge, rf,
-                                   xgb, mlp). None (default) → all five compete.
-                                   Fewer = faster: the curve stage trains one
-                                   model per name per combo, times
+                                   xgb, hgb, mlp). None (default) → all six
+                                   compete. Fewer = faster: the curve stage
+                                   trains one model per name per combo, times
                                    curve_n_optuna_trials.
   seq2seq_cells         list|None  which cells compete inside every seq2seq
                                    approach: 'lstm' and/or 'transformer'. Both
@@ -103,18 +104,10 @@ setting = True
 
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_512',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-    #     'temporal_resolution':   '15min',
-    #     'run_process_modelling': True,
-    #     'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-    #     'run_energy_modelling':  False,   # set False to skip energy profile/curve modelling
-    # },
+
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_964',
+        'run_name':              'experiment_966',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -127,7 +120,7 @@ EXPERIMENTS = [
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
+        'mining_algorithms':     ['heuristic', 'alpha'],#, 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
@@ -172,102 +165,24 @@ EXPERIMENTS = [
         #   'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
         # Regressors competed for every curve approach, per (sensor, activity,
         # object); best kept by validation MAE. Comment a line out to turn that
-        # model off. None / omitted = all five.
+        # model off. None / omitted = all six.
         'curve_models': [
             'Linear Regression',   # unpenalised OLS reference (nothing to tune —
                                    # its Optuna trials are all identical)
             'Ridge',               # penalised counterpart; the one-hot design
                                    # matrix is high-dimensional and collinear
-            'Random Forest',
+            #'Random Forest',
             'XGBoost',             # the gradient-boosting member
-            'MLP',                 # feed-forward net (sklearn MLPRegressor)
+            'Hist Gradient Boosting',  # native-categorical, histogram-binned GB
+            #'MLP',                 # feed-forward net (sklearn MLPRegressor)
         ],
         # Cells competed inside every seq2seq approach; lower validation loss
         # wins. ['lstm'] reproduces the pre-transformer behaviour.
-        'seq2seq_cells': ['lstm', 'transformer'],
+        'seq2seq_cells': ['lstm'],#, 'transformer'],
         'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
     },
 
-
-
-    #{
-    #    'data_experiment':       '1',
-    #    'run_name':              'experiment_936',
-    #    'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
-    #    'temporal_resolution':   '1min',
-    #    'run_process_modelling': True,
-    #    'mining_algorithms':     ['heuristic', 'alpha'],#, 'inductive'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-    #    'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
-    #    'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
-    #    'run_schedule_profile_eval':True, # Best/mine vs. Schedule-direct vs. Stochastic generator, per process
-    #    'save_predicted_curves': True, # persist real/predicted curve arrays for later metrics/plots
-    #    'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
-    #    'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
-    #},
-
-
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_701',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4', 'process_5'],
-    #     'temporal_resolution':   '5min',ok
-    #     'run_process_modelling': True,
-    #     'mining_algorithms':     ['heuristic'],#None,   # e.g. ['heuristic', 'inductive'] to test only those
-    #     'run_energy_modelling':  True,    # set False to skip energy profile/curve modelling
-    #     'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
-    # },
-    
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_401',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':   '1min',
-    #     'run_process_modelling': True,
-    # },
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_301',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':   '1min',
-    #     'run_process_modelling': True,
-    # },
-    # {
-    #     'data_experiment':       '1',
-    #     'run_name':              'experiment_300',
-    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':   'original',
-    #     'run_process_modelling': True,
-    # },
-    # {
-    #     'data_experiment':      '1',
-    #     'run_name':             'experiment_89',
-    #     'processes_to_run':     ['process_3', 'process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':  '15min',
-    #     'run_process_modelling': True,
-    # },
-
-    # {
-    #     'data_experiment':      '1',
-    #     'run_name':             'experiment_81',
-    #     'processes_to_run':     ['process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':  '1min',
-    #     'run_process_modelling': True,
-    # },
-    # {
-    #     'data_experiment':      '1',
-    #     'run_name':             'experiment_66',
-    #     'processes_to_run':     ['process_1', 'process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':  '1min',
-    #     'run_process_modelling': True,
-    # },
-    # {
-    #     'data_experiment':      '1',
-    #     'run_name':             'experiment_24',
-    #     'processes_to_run':     ['process_2', 'process_3', 'process_4'],
-    #     'temporal_resolution':  'original',
-    #     'run_process_modelling': True,
-    # },
 
 ]
 

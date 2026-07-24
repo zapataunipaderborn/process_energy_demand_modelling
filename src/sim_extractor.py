@@ -6318,7 +6318,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
         # The former 'baseline': DBA barycenter + DTW alignment + regression.
         result['ml_dtw'] = build_and_train_pipeline(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
+            val_size=val_size, models=models, verbose=0, n_jobs=1,
+            random_state=_seed, **_hp_kwargs,
         )
     if 'ml_external' in _active:
         # Previous-activity NAME only (event-log fact) + ef_* external factors.
@@ -6337,7 +6338,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             result['ml_external'] = build_and_train_pipeline_exog_prev_activity(
                 _prev_curves, variable=sensor,
                 fixed_length=fixed_length, val_size=val_size,
-                models=models, verbose=0, n_jobs=1, **_hp_kwargs,
+                models=models, verbose=0, n_jobs=1,
+                random_state=_seed, **_hp_kwargs,
             )
         elif 'ml_dtw' in result:
             # Fewer than 5 curves survive the stricter prev-activity-context
@@ -6364,7 +6366,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     if 'ml_only' in _active:
         result['ml_only'] = build_and_train_pipeline_ml_only(
             curves, variable=sensor, fixed_length=fixed_length,
-            val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
+            val_size=val_size, models=models, verbose=0, n_jobs=1,
+            random_state=_seed, **_hp_kwargs,
         )
     return _stamp_train_sensor_median(result, curves)
 
@@ -6385,7 +6388,8 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
     # Per-combo seed (see _train_curve_only_worker) — covers torch weight init,
     # dropout masks and DataLoader shuffling in this process.
-    set_global_seeds(stable_seed('seq2seq', sensor, activity, obj))
+    _s2s_seed = stable_seed('seq2seq', sensor, activity, obj)
+    set_global_seeds(_s2s_seed)
     # Same for the BLAS pool numpy uses while building the feature sequences —
     # torch's setting does not cover it.
     from threadpoolctl import threadpool_limits
@@ -6411,7 +6415,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
 
     if 'seq2seq' in _active:
         result['seq2seq'] = build_and_train_pipeline_seq2seq(
-            curves, variable=sensor, fixed_length=fixed_length,
+            curves, variable=sensor, fixed_length=fixed_length, random_state=_s2s_seed,
             val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
             dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
             teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
@@ -6420,7 +6424,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
 
     if 'seq2seq_only' in _active:
         result['seq2seq_only'] = build_and_train_pipeline_seq2seq_only(
-            curves, variable=sensor, fixed_length=fixed_length,
+            curves, variable=sensor, fixed_length=fixed_length, random_state=_s2s_seed,
             val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
             dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
             teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
@@ -6441,7 +6445,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
         )
         if len(_prev_curves) >= 5:
             result['seq2seq_external'] = build_and_train_pipeline_seq2seq_external(
-                _prev_curves, variable=sensor, fixed_length=fixed_length,
+                _prev_curves, variable=sensor, fixed_length=fixed_length, random_state=_s2s_seed,
                 val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
                 dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
                 teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
