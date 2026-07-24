@@ -24,12 +24,12 @@
 \State Fit the global model $\hat{f}_{\mathrm{global}}$ likewise on all activities pooled, with the median duration of the activity as an additional feature
 \State Set $\mathcal{G} = \{D_t\}_{t \in T}$, with $D_t$ immediate for every $\tau$-transition and, for every visible transition, either sampled from $\hat{p}_{\ell(t)}$ or predicted by $\hat{f}_{\ell(t)}$ or $\hat{f}_{\mathrm{global}}$
 
-\State \textbf{(D) Routing probabilities} $\pi$\textbf{, case behaviour and duration budget}
-\State Set $\pi(\cdot \mid \mathcal{K})$ to the empirical categorical distribution over each conflict set $\mathcal{K} \subseteq T$, given by the relative replay frequency of its transitions
+\State \textbf{(D) Routing weights} $w$\textbf{, case behaviour and duration budget}
+\State Set the routing weight $w(t)$ of every transition to the number of times it fires in the token replay of the training log, and $w(t) = 1$ for transitions that are never replayed, so that unobserved behaviour keeps a small residual probability
 \State For every activity $a$, record the empirical distribution $R_a$ of the number of times $a$ occurs within a case, and the distribution $W_a$ of the idle time preceding it
 \State Regress the observed case duration $B_c$ on the case-level attributes $\mathbf{x}^{\mathrm{attr}}_c$, and keep the regressor as $\hat{f}_B$ if it beats the median duration $\tilde{B}$ on held-out cases, otherwise set $\hat{f}_B \equiv \tilde{B}$
 
-\State \Return \textbf{(i)} the stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, \pi)$ with the case-behaviour distributions $R_a$ and $W_a$, and \textbf{(ii)} the case-level model $\hat{f}_B$, predicting the total time budget a simulated case is generated to fill
+\State \Return \textbf{(i)} the stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, w)$ with the case-behaviour distributions $R_a$ and $W_a$, and \textbf{(ii)} the case-level model $\hat{f}_B$, predicting the total time budget a simulated case is generated to fill
 \end{algorithmic}
 \end{algorithm}
 
@@ -71,7 +71,7 @@
 \caption{Simulation of the process and energy.}
 \label{alg:simulation}
 \begin{algorithmic}[1]
-\Require Stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, \pi)$ with the case-behaviour distributions $R_a$ and $W_a$, and case-duration model $\hat{f}_B$, from Algorithm~\ref{alg:pm_extraction_ml}; curve models $(g, r, S)$ from Algorithm~\ref{algorithm:energy_model_extarction}; production plan $P$ with the attributes $\mathbf{x}^{\mathrm{attr}}_c$ of every planned case and the external factors $\mathbf{x}^{\mathrm{ef}}$; exit discount $\alpha < 1$; step limit $k_{\max}$
+\Require Stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, w)$ with the case-behaviour distributions $R_a$ and $W_a$, and case-duration model $\hat{f}_B$, from Algorithm~\ref{alg:pm_extraction_ml}; curve models $(g, r, S)$ from Algorithm~\ref{algorithm:energy_model_extarction}; production plan $P$ with the attributes $\mathbf{x}^{\mathrm{attr}}_c$ of every planned case and the external factors $\mathbf{x}^{\mathrm{ef}}$; exit discount $\alpha < 1$; step limit $k_{\max}$
 
 \State \textbf{(A) Initialise the case}
 \State Take the row of case $c$ from the production plan $P$ and assemble its feature vector $\mathbf{z}^\star$ from $\mathbf{x}^{\mathrm{attr}}_c$ and $\mathbf{x}^{\mathrm{ef}}$
@@ -81,10 +81,10 @@
 
 \State \textbf{(B) Replay the Petri net}
 \While{$M \neq M_f$, $\Delta < B^\star$ and $k < k_{\max}$}
-    \State Determine the transitions enabled under $M$ and take their weights from $\pi$
+    \State Determine the transitions enabled under $M$ and take their weights from $w$
     \State Multiply by $\alpha$ the weight of the transitions that would lead to the final marking $M_f$, so that the case keeps generating activities while its budget is not spent
     \State Where no budget is used, discount instead the weight of every enabled transition whose activity has already reached its quota, $\nu_a \geq \kappa_a$, as a soft penalty rather than a hard block
-    \State Sample the transition $t^\star$ with probability proportional to its weight and fire it, $M \gets \mathrm{fire}(M, t^\star)$
+    \State Normalise the resulting weights over the enabled transitions, sample $t^\star$ from that distribution and fire it, $M \gets \mathrm{fire}(M, t^\star)$
     \If{$\ell(t^\star) = a$ is a visible activity}
         \State Sample its duration $d^\star$ from $D_{t^\star} \in \mathcal{G}$ and the idle time preceding it, $\delta \sim W_a$
         \State Append the instance $(a,\, \Delta + \delta,\, d^\star)$ to the case log $\mathcal{L}$ and update $\Delta \gets \Delta + \delta + d^\star$ and $\nu_a \gets \nu_a + 1$

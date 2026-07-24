@@ -20,9 +20,7 @@ from scipy.spatial.distance import jensenshannon
 import pm4py
 import tempfile
 import os
-import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
-import pm4py
 from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 
 # --- LOGGING AND REDIRECTION SETUP ---
@@ -50,21 +48,18 @@ class StreamToLogger:
                 self.logger_func(line.strip())
     def flush(self):
         pass
-RANDOM_SEED = 42
-
 import random
 import os
+
+# Master seed for the whole run. pipeline.py exports PIPELINE_RANDOM_SEED (and
+# pins PYTHONHASHSEED to the same value) so a run is reproducible end to end;
+# sim_extractor.set_global_seeds covers python/numpy/torch, and every parallel
+# training task derives its own seed from this one via stable_seed().
+RANDOM_SEED = int(os.environ.get('PIPELINE_RANDOM_SEED', '42'))
 random.seed(RANDOM_SEED)
-import seaborn as sns
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
 np.random.seed(RANDOM_SEED)
 import plotly.io as pio
 from pathlib import Path
-import pm4py
-import matplotlib.image as mpimg
-import tempfile
 
 pio.renderers.default='notebook'
 pd.options.mode.chained_assignment = None
@@ -77,6 +72,18 @@ constants.SHOW_PROGRESS_BAR = False
 # %%
 import pandas as pd
 from sim_extractor import extract_process, MIN_CURVE_SAMPLES
+from sim_extractor import set_global_seeds, stable_seed, GLOBAL_RANDOM_SEED
+
+# Seed python/numpy/torch from the master seed now that sim_extractor is
+# importable. Parallel training workers re-seed themselves per combo.
+set_global_seeds(RANDOM_SEED)
+if GLOBAL_RANDOM_SEED != RANDOM_SEED:
+    print(f"[modelling] WARNING: sim_extractor read seed {GLOBAL_RANDOM_SEED} but this "
+          f"run uses {RANDOM_SEED} — PIPELINE_RANDOM_SEED changed after import.")
+if os.environ.get('PYTHONHASHSEED') is None:
+    print("[modelling] NOTE: PYTHONHASHSEED is unset. Runs launched through "
+          "pipeline.py pin it; a direct `python modelling.py` does not, so "
+          "str-set iteration order may differ between runs.")
 from simulation import ProcessSimulation, simulate_with_wip_ro
 from sim_modeller import SimModeller
 
@@ -90,14 +97,13 @@ from sim_extractor import (
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
     compare_schedule_and_stochastic_profiles,
     train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
-    compare_pooled_value_distributions, compare_population_shape,
+    compare_population_shape,
     compare_population_case_stat, compute_population_coverage,
 )
 from xgboost import XGBRegressor
 
 # %%
 
-from pathlib import Path
 import pandas as pd
 
 experiment          = os.environ.get('PIPELINE_DATA_EXPERIMENT', '5')
@@ -694,7 +700,7 @@ TEMPORAL_SPLIT      = True    # True → split cases into train/test; False → 
 SPLIT_TYPE          = os.environ.get('PIPELINE_SPLIT_TYPE', 'temporal').lower()
 if SPLIT_TYPE not in ('temporal', 'random'):
     raise ValueError(f"PIPELINE_SPLIT_TYPE must be 'temporal' or 'random', got {SPLIT_TYPE!r}")
-RANDOM_SPLIT_SEED   = int(os.environ.get('PIPELINE_RANDOM_SPLIT_SEED', '42'))
+RANDOM_SPLIT_SEED   = int(os.environ.get('PIPELINE_RANDOM_SPLIT_SEED', str(RANDOM_SEED)))
 # Fraction of cases used for training. Override via PIPELINE_TRAIN_RATIO=0.8 (etc).
 TRAIN_RATIO         = float(os.environ.get('PIPELINE_TRAIN_RATIO', '0.70'))
 
@@ -743,14 +749,8 @@ SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false'
 #    'median_activity_sensor'  "Median per Activity & Sensor": median training
 #                        curve per (sensor, activity, object), no model
 #    'ml_dtw'            DTW + position index (sklearn regressor)
-#    'instance_stats'    DTW + per-curve stats  (leaky — known invalid)
-#    'istats_leakfree'   DTW + two-stage leak-free stats
-#    'dtw_phase'         DTW + phase features
-#    'basis'             DTW + B-spline basis expansion
 #    'ml_external'  DTW + external factors (ef_* columns) + prev-activity NAME
 #                   (no lagged meter values — see split_curves_with_prev_activity)
-#    'amplitude_shape'   Separate amplitude (curve_mean) from shape (z-score);
-#                        stage A predicts amplitude from metadata, stage B shape
 #    'seq2seq'           DTW + LSTM encoder-decoder
 #    'seq2seq_only'              LSTM encoder-decoder, no DTW
 #    'ml_only'                 ML (GBM/RF), linear resample encode+decode (no DTW)
@@ -758,12 +758,7 @@ APPROACHES = [
     'baseline',
     'median_activity_sensor',
     'ml_dtw',
-    # 'instance_stats',
-    # 'istats_leakfree',
-    # 'dtw_phase',
-    # 'basis',
     'ml_external',
-    #'amplitude_shape',
     'ml_only',
 
     'seq2seq',
@@ -780,8 +775,7 @@ if _env_curve_approaches:
     _requested = [a.strip() for a in _env_curve_approaches.split(',') if a.strip()]
     # Full universe of valid approach names (not just the currently-uncommented
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
-    _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree', 'dtw_phase',
-              'basis', 'ml_external', 'amplitude_shape',
+    _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
               'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'}
     _unknown = [a for a in _requested if a not in _known]
     if _unknown:
@@ -1405,148 +1399,6 @@ METRICS_HIGHER_IS_BETTER = {
     'control_flow_metrics_start_activities_jaccard',
     'control_flow_metrics_end_activities_jaccard',
 }
-
-def _normalise_metrics(df, cols, lower_set_test_prefixed=None):
-    """Min-max normalise. Inverts lower-is-better metrics so 1 = best."""
-    norm_df = df.copy()
-    
-    # We strip prefixes for the 'lower is better' check to be phase-agnostic
-    base_lower_names = set()
-    if lower_set_test_prefixed:
-        base_lower_names = {s.replace('test_', '').replace('train_', '') for s in lower_set_test_prefixed}
-    
-    # Add our static base names
-    base_lower_names.update(METRICS_LOWER_IS_BETTER)
-
-    for c in cols:
-        vals = df[c].dropna()
-        if len(vals) == 0:
-            continue
-        vmin, vmax = vals.min(), vals.max()
-
-        rng = vmax - vmin if vmax != vmin else 1.0
-        clean_c = c.replace('test_', '').replace('train_', '')
-
-        is_lower = clean_c in base_lower_names or any(m in clean_c for m in ['MAE', 'RMSE', 'WAPE'])
-        if 'R2' in clean_c:
-            is_lower = False
-
-        if is_lower:
-            norm_df[c] = (vmax - df[c]) / rng
-        else:
-            norm_df[c] = (df[c] - vmin) / rng
-    return norm_df
-
-
-def _plot_results_heatmap(cols, title, metric_type='process', local_df=None, save_path=None, agg='mean'):
-    """Displays a normalized heatmap for comparing different simulation modes."""
-    # Use global evaluation_results_df if no local_df is provided
-    target_df = local_df if local_df is not None else globals().get('evaluation_results_df')
-
-    if not cols or target_df is None or target_df.empty or 'mode' not in target_df.columns:
-        return
-
-    # Filter columns that actually exist in the dataframe AND are numeric
-    valid_cols = [
-        c for c in cols
-        if c in target_df.columns and target_df[c].dtype in ('float64', 'float32', 'int64', 'int32')
-    ]
-    if not valid_cols:
-        return
-
-    # Phase-agnostic normalization
-    if agg == 'median':
-        mode_avg = target_df.groupby('mode')[valid_cols].median()
-    else:
-        mode_avg = target_df.groupby('mode')[valid_cols].mean()
-    # We pass higher_is_better if it exists globally, otherwise empty set for base check
-    global_lower = globals().get('lower_is_better', set())
-    mode_avg_norm = _normalise_metrics(mode_avg, valid_cols, global_lower)
-    
-    # Sort by overall error if available (ascending = best first)
-    sort_opts = ['test_overall_error', 'train_overall_error', valid_cols[0]]
-    sort_key = next((k for k in sort_opts if k in mode_avg_norm.columns), valid_cols[0])
-    mode_avg_norm = mode_avg_norm.sort_values(sort_key, ascending=True)
-    
-    # Generate labels dynamically
-    current_labels = {
-        'train_overall_error': 'Overall',
-        'test_overall_error':  'Overall',
-        # Direct sim-vs-real
-        'train_basic_metrics_event_count_error':      'EvtRatioErr',
-        'test_basic_metrics_event_count_error':       'EvtRatioErr',
-        'train_basic_metrics_event_count_ratio':      'EvtRatio',
-        'test_basic_metrics_event_count_ratio':       'EvtRatio',
-        'train_duration_metrics_mean_duration_error': '1-MeanDurErr',
-        'test_duration_metrics_mean_duration_error':  '1-MeanDurErr',
-        'train_duration_metrics_median_duration_error': '1-MedDurErr',
-        'test_duration_metrics_median_duration_error':  '1-MedDurErr',
-        'train_duration_metrics_activity_duration_error': '1-ActDurErr',
-        'test_duration_metrics_activity_duration_error':  '1-ActDurErr',
-        'train_duration_metrics_dur_js_whole':         '1-DurJS(W)',
-        'test_duration_metrics_dur_js_whole':          '1-DurJS(W)',
-        'train_duration_metrics_dur_js_activ':         '1-DurJS(A)',
-        'test_duration_metrics_dur_js_activ':          '1-DurJS(A)',
-        'train_activity_metrics_js_divergence':       '1-JS div',
-        'test_activity_metrics_js_divergence':        '1-JS div',
-        'train_control_flow_metrics_edge_precision':  'EdgePrec',
-        'test_control_flow_metrics_edge_precision':   'EdgePrec',
-        'train_control_flow_metrics_edge_recall':     'EdgeRec',
-        'test_control_flow_metrics_edge_recall':      'EdgeRec',
-        'train_control_flow_metrics_edge_f1_error':   'EdgeF1Err',
-        'test_control_flow_metrics_edge_f1_error':    'EdgeF1Err',
-        'train_control_flow_metrics_edge_f1_score':   'EdgeF1',
-        'test_control_flow_metrics_edge_f1_score':    'EdgeF1',
-        # Process model quality
-        'train_conformance_metrics_fitness':          'Fitness',
-        'test_conformance_metrics_fitness':           'Fitness',
-        'train_conformance_metrics_precision':        'Precision',
-        'test_conformance_metrics_precision':         'Precision',
-        'train_conformance_metrics_generalization':   'Generaliz',
-        'test_conformance_metrics_generalization':    'Generaliz',
-        'train_conformance_metrics_simplicity':       'Simplicity',
-        'test_conformance_metrics_simplicity':        'Simplicity',
-    }
-    
-    for c in valid_cols:
-        if c in current_labels:
-            continue
-        if '_energy_' in c:
-
-            parts = c.split('_')
-            sensor = parts[2]
-            metric = parts[-1]
-            current_labels[c] = f"{sensor[:3]}: {metric}"
-        else:
-            current_labels[c] = c.replace('test_', '').replace('train_', '').replace('_metrics_', ': ').replace('_', ' ').title()
-    
-    disp_cols = [current_labels[c] for c in valid_cols]
-    plot_df = mode_avg_norm[valid_cols].copy()
-    plot_df.columns = disp_cols
-
-    # Annotation shows raw metric values; colour encodes quality (1 = best)
-    annot_df = mode_avg[valid_cols].reindex(mode_avg_norm.index).copy().round(3)
-    annot_df.columns = disp_cols
-
-    fig, ax = plt.subplots(figsize=(max(10, len(valid_cols) * 1.2), max(3, len(mode_avg_norm) * 0.8)))
-    sns.heatmap(plot_df, annot=annot_df, fmt='', cmap='RdYlGn', vmin=0, vmax=1, linewidths=0.5, ax=ax,
-                cbar_kws={'label': 'Normalised score (1 = best)'})
-    ax.set_title(title, fontsize=12, fontweight='bold')
-    ax.set_ylabel('')
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right', fontsize=9)
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
-
-    # Log/Table summary
-    metrics_table = mode_avg[valid_cols].reindex(mode_avg_norm.index).round(4)
-    metrics_table.columns = disp_cols
-    print(f"\n{title.upper()}")
-    print("-" * len(title))
-    with pd.option_context('display.max_columns', None, 'display.width', 200):
-        print(metrics_table.to_string())
-
 
 def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='test'):
     """Short heatmap: error metrics (0=best) + Overall. Works for train or test split."""
@@ -4465,8 +4317,8 @@ if RUN_TEST_EVALUATION and RUN_PROCESS_MODELLING:
 
 # %%
 # ── CURVE-ONLY: train ALL approaches without process modelling ────────────────
-# Trains baseline, Approach 2 (B-spline basis), and Approach 3 (DTW-phase)
-# side by side so results can be compared in the evaluation cell below.
+# Trains every approach in APPROACHES side by side so results can be compared
+# in the evaluation cell below.
 if RUN_CURVE_ONLY_EVALUATION:
     # Only the predictors are needed here: training goes through
     # _train_curve_only_worker / _train_seq2seq_worker in sim_extractor, which
@@ -4477,15 +4329,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         build_and_train_pipeline_median,
         predict_raw_curve,
         predict_raw_curve_median,
-        predict_raw_curve_instance_stats,
-        predict_raw_curve_istats_leakfree,
-        predict_raw_curve_dtw_phase,
-        predict_raw_curve_basis,
         predict_raw_curve_exog,
         predict_raw_curve_exog_prev_activity,
-        predict_raw_curve_amplitude_shape,
         predict_raw_curve_ml_only,
-        # amplitude_shape_exog removed
         predict_raw_curve_seq2seq,
         predict_raw_curve_seq2seq_only,
         predict_raw_curve_seq2seq_external,
@@ -4494,13 +4340,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines                  = {}   # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
     all_energy_pipelines_median_activity_sensor = {}   # "Median per Activity & Sensor": median curve per (sensor, activity, object)
     all_energy_pipelines_ml_dtw    = {}   # ml_dtw (DBA + DTW + regression -- the former 'baseline')
-    all_energy_pipelines_instance_stats  = {}   # Instance Stats (leaky)
-    all_energy_pipelines_istats_leakfree = {}   # Instance Stats (leak-free)
-    all_energy_pipelines_dtw_phase       = {}   # Approach 3
-    all_energy_pipelines_basis           = {}   # Approach 2
     all_energy_pipelines_ml_external   = {}   # DTW + Ext. Factors (+ prev-activity name)
-    all_energy_pipelines_amplitude_shape      = {}   # Amplitude + Shape
-    all_energy_pipelines_amplitude_shape_exog = {}   # removed — kept as empty for safety
     all_energy_pipelines_seq2seq              = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
@@ -4553,8 +4393,8 @@ if RUN_CURVE_ONLY_EVALUATION:
             _objects = ['_all_']
 
         # Detect ef_* columns. They are attached to EVERY curve's 'exog_values',
-        # but only the exog approaches (ml_external, seq2seq_external,
-        # amplitude_shape_exog) actually consume them as features -- that
+        # but only the exog approaches (ml_external, seq2seq_external)
+        # actually consume them as features -- that
         # difference is what the "+ Ext. Factors" comparison isolates.
         _ef_cols = [
             c for c in _df_train_exp.columns
@@ -4573,13 +4413,8 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_baseline            = {}   # per-SENSOR median (built below, pooled)
         _pipelines_median_activity_sensor = {}   # per-(sensor,activity,object) median (from worker)
         _pipelines_ml_dtw        = {}
-        _pipelines_instance_stats      = {}
-        _pipelines_istats_leakfree     = {}
-        _pipelines_dtw_phase           = {}
-        _pipelines_basis               = {}
+
         _pipelines_ml_external   = {}
-        _pipelines_amplitude_shape      = {}
-        _pipelines_amplitude_shape_exog = {}  # removed
         _pipelines_seq2seq                  = {}
         _pipelines_seq2seq_only             = {}
         _pipelines_seq2seq_external    = {}
@@ -4596,8 +4431,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         # worker — it is built separately below. The worker trains the per-combo
         # median under 'median_activity_sensor'.
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'median_activity_sensor','ml_dtw','instance_stats','istats_leakfree','dtw_phase','basis','ml_external','amplitude_shape',
-                                        'ml_only'}]
+                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_external'}]
 
@@ -4647,36 +4481,6 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['ml_dtw']['reference_curve'],
                         'predict_fn':      lambda rv, act, attrs, ep=_r['ml_dtw']: predict_raw_curve(rv, act, attrs, pipeline=ep),
                         'full_pipeline':   _r['ml_dtw'],
-                    }
-                if 'instance_stats' in _r:
-                    _pipelines_instance_stats.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['instance_stats']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['instance_stats']: predict_raw_curve_instance_stats(rv, act, attrs, pipeline=ep),
-                        'full_pipeline':   _r['instance_stats'],
-                    }
-                if 'istats_leakfree' in _r:
-                    _pipelines_istats_leakfree.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['istats_leakfree']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['istats_leakfree']: predict_raw_curve_istats_leakfree(rv, act, attrs, pipeline=ep),
-                        'full_pipeline':   _r['istats_leakfree'],
-                    }
-                if 'dtw_phase' in _r:
-                    _pipelines_dtw_phase.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['dtw_phase']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['dtw_phase']: predict_raw_curve_dtw_phase(rv, act, attrs, pipeline=ep),
-                        'full_pipeline':   _r['dtw_phase'],
-                    }
-                if 'basis' in _r:
-                    _pipelines_basis.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['basis']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['basis']: predict_raw_curve_basis(rv, act, attrs, pipeline=ep),
-                        'full_pipeline':   _r['basis'],
-                    }
-                if 'amplitude_shape' in _r:
-                    _pipelines_amplitude_shape.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['amplitude_shape']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_amplitude_shape(rv, act, attrs, pipeline=ep))(_r['amplitude_shape']),
-                        'full_pipeline':   _r['amplitude_shape'],
                     }
                 if 'ml_external' in _r:
                     _pipelines_ml_external.setdefault(_s, {}).setdefault(_a, {})[_o] = {
@@ -4798,12 +4602,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines[_proc]                   = _pipelines_baseline
         all_energy_pipelines_median_activity_sensor[_proc] = _pipelines_median_activity_sensor
         all_energy_pipelines_ml_dtw[_proc]      = _pipelines_ml_dtw
-        all_energy_pipelines_instance_stats[_proc]   = _pipelines_instance_stats
-        all_energy_pipelines_istats_leakfree[_proc]  = _pipelines_istats_leakfree
-        all_energy_pipelines_dtw_phase[_proc]        = _pipelines_dtw_phase
-        all_energy_pipelines_basis[_proc]            = _pipelines_basis
         all_energy_pipelines_ml_external[_proc]   = _pipelines_ml_external
-        all_energy_pipelines_amplitude_shape[_proc]      = _pipelines_amplitude_shape
 
         all_energy_pipelines_seq2seq[_proc]               = _pipelines_seq2seq
         all_energy_pipelines_seq2seq_only[_proc]          = _pipelines_seq2seq_only
@@ -5554,7 +5353,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
             # ── 5 BEST / 5 WORST curves per approach (TEST WAPE) ────────────────
             try:
-                from sklearn.metrics import mean_absolute_error
                 display(Markdown("---"))
                 display(Markdown("## 5 Best & 5 Worst Curve Fits per Approach — TEST set"))
 

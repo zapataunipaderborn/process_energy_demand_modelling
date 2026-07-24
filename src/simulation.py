@@ -97,6 +97,28 @@ BUDGET_MAX_LENGTH_RATIO = 1.2
 #   boosted instead, so the case closes promptly rather than over-running.
 BUDGET_EXIT_BOOST = 25.0
 
+# ── External-factor (weather) sensitivity of the energy-aware modes ──────────
+# EXOG_EFFECT_SCALE damps how strongly the ef_* external factors move the
+# energy-aware simulation. Each ef_* value handed to a curve pipeline or written
+# into the energy state is shrunk toward the reference level of that column --
+# its mean over all activities, i.e. "average weather" for this process:
+#
+#     ef_used = ref + EXOG_EFFECT_SCALE * (ef_activity - ref)
+#
+# 1.0 reproduces the previous behaviour exactly (no damping); 0.0 removes the
+# weather sensitivity entirely and predicts at average conditions. Values in
+# between keep the direction of the effect and reduce its magnitude, which is
+# what this knob is for: the curve models are fitted per (sensor, activity,
+# object) on few instances, so an ef_* coefficient can pick up more of the
+# between-activity variation than the physics supports, and the simulated
+# profiles then swing with the weather more than the real ones do.
+#
+# NOTE this affects the energy-aware simulation modes only. The evaluations
+# that predict curves after the fact (complete-curve, schedule-profile) read
+# their external factors from the real ef_* series through
+# sim_extractor.build_exog_lookup and do not pass through here.
+EXOG_EFFECT_SCALE = 0.5
+
 
 def _stable_case_seed(case_id) -> int:
     """
@@ -299,6 +321,10 @@ class ProcessSimulation:
         self.energy_state_columns         = energy_state_columns or []
         self.energy_pipelines             = energy_pipelines or {}
         self.activity_exog_means          = activity_exog_means or {}
+        # Reference level each ef_* column is shrunk toward (see
+        # EXOG_EFFECT_SCALE / _shrink_exog): the mean of that column over all
+        # activities, i.e. "average weather" for this process.
+        self._exog_reference_means        = self._compute_exog_reference_means()
         self.duration_scale_clip          = duration_scale_clip
         self.logit_bias_clip              = logit_bias_clip
         self.temporal_resolution_minutes  = float(temporal_resolution_minutes) if temporal_resolution_minutes else 15.0
@@ -412,6 +438,48 @@ class ProcessSimulation:
                 row.append(0.0)
         return row
 
+    def _compute_exog_reference_means(self):
+        """
+        Reference level per ef_* column: its mean across all activities.
+
+        This is the "average weather" the per-activity values are shrunk toward
+        by _shrink_exog. Computed once from activity_exog_means, which is itself
+        a per-activity training mean, so no test data is touched.
+        """
+        if not self.activity_exog_means:
+            return {}
+        acc = defaultdict(list)
+        for _act_means in self.activity_exog_means.values():
+            for col, val in (_act_means or {}).items():
+                try:
+                    acc[col].append(float(val))
+                except (TypeError, ValueError):
+                    continue
+        return {col: float(np.mean(vals)) for col, vals in acc.items() if vals}
+
+    def _shrink_exog(self, exog_mapping):
+        """
+        Damp the external factors toward average conditions (EXOG_EFFECT_SCALE).
+
+        Returns a new {col: value} dict with each ef_* value replaced by
+        ref + scale * (value - ref), where ref is the column's mean over all
+        activities. Columns without a reference, non-numeric values and
+        scale == 1.0 are passed through untouched.
+        """
+        if not exog_mapping or EXOG_EFFECT_SCALE == 1.0:
+            return dict(exog_mapping or {})
+        out = {}
+        for col, val in exog_mapping.items():
+            ref = self._exog_reference_means.get(col)
+            if ref is None:
+                out[col] = val
+                continue
+            try:
+                out[col] = ref + EXOG_EFFECT_SCALE * (float(val) - ref)
+            except (TypeError, ValueError):
+                out[col] = val
+        return out
+
     def _predict_mlp_duration(self, model_tuple, feature_vec, cap_minutes=None):
         """
         Predict duration in minutes from ML+ (model, scaler, name) tuple.
@@ -465,20 +533,6 @@ class ProcessSimulation:
                 return mean * 50.0
         return fallback_mean * 50.0
 
-    def _get_activity_duration(self, activity, object_name, object_type,
-                               higher_level_activity, object_attributes=None,
-                               activity_history=None, activity_index=0):
-        """
-        Generate a sampled duration (minutes) for one activity instance.
-
-        In 'ml' mode the XGBoost duration model is tried first; it falls back
-        to the statistical path when no model exists for this key.
-        In 'ml_duration_only' mode, the ML model provides only the median
-        prediction while the noise (std) comes from the statistical config.
-        In 'ml_duration_only_with_activity_past' mode, same as ml_duration_only
-        but the last 2 activities & durations are passed as extra features.
-        In 'statistical' mode the best-fit distribution stored in
-        """
     def _get_activity_duration(self, activity, object_name, object_type,
                                higher_level_activity=None,
                                object_attributes=None,
@@ -2284,61 +2338,6 @@ class ProcessSimulation:
             print(f"  Completed {object_name} petri_net_statistical_memory "
                   f"with {activity_count} activities")
 
-    def _simulate_statistical_for_object(self, case_id, object_attributes,
-                                          current_sim_time, object_name,
-                                          object_type,
-                                          higher_level_activity):
-        """
-        Statistical simulation for a single object group.
-        Extracted so petri_net mode can fall back to it per-group.
-        """
-        start_activities = self._get_start_activities(
-            object_name, object_type, higher_level_activity
-        )
-        if not start_activities:
-            print(f"  WARNING: No start activities for {object_name} — SKIP")
-            return
-
-        current_activity = random.choice(start_activities)
-        activity_count = 0
-        activity_history = []
-
-        while current_activity:
-            _HIST_MODES = ('ml_duration_only_with_activity_past',
-                           'ml_duration_only_with_activity_past_point_estimate',
-                           'ml_global_model')
-            activity_duration = self._get_activity_duration(
-                current_activity, object_name, object_type,
-                higher_level_activity, object_attributes,
-                activity_history=activity_history if self.mode in _HIST_MODES else None,
-                activity_index=activity_count,
-            )
-
-            start_time_obj = datetime.fromtimestamp(current_sim_time)
-            current_sim_time += activity_duration * 60
-            end_time_obj = datetime.fromtimestamp(current_sim_time)
-
-            self._log_event(
-                case_id=case_id, activity=current_activity,
-                timestamp_start=start_time_obj, timestamp_end=end_time_obj,
-                object_name=object_name, object_type=object_type,
-                higher_level_activity=higher_level_activity,
-                object_attributes=object_attributes,
-            )
-
-            activity_history.insert(0, (current_activity, activity_duration))
-            activity_history = activity_history[:2]
-            activity_count += 1
-
-            next_activity = self._get_next_activity(
-                current_activity, object_name, object_type,
-                higher_level_activity, object_attributes,
-            )
-            if not next_activity:
-                break
-            current_activity = next_activity
-            current_sim_time += 1
-
     def _simulate_petri_net_energy_aware_for_case(
         self, case_id, object_attributes, start_time,
         enable_duration=True, enable_transitions=True,
@@ -2593,7 +2592,11 @@ class ProcessSimulation:
                             # Build exog_values dict for pipelines that use external factors
                             _exog_vals = {}
                             if ep.get('exog_cols') and self.activity_exog_means:
-                                _act_means = self.activity_exog_means.get(chosen_label, {})
+                                # Damped toward average conditions — see
+                                # EXOG_EFFECT_SCALE.
+                                _act_means = self._shrink_exog(
+                                    self.activity_exog_means.get(chosen_label, {})
+                                )
                                 _exog_vals = {
                                     col: np.array([v])
                                     for col, v in _act_means.items()
@@ -2630,9 +2633,14 @@ class ProcessSimulation:
                                 f"activity '{chosen_label}', object '{object_name}': {exc}"
                             ) from exc
 
-                    # Populate ef_* columns from precomputed activity means
+                    # Populate ef_* columns from precomputed activity means,
+                    # damped toward average conditions (EXOG_EFFECT_SCALE) so the
+                    # duration/transition modifiers see the same weather signal
+                    # the curve pipelines above were given.
                     if self.activity_exog_means and chosen_label in self.activity_exog_means:
-                        new_energy_state.update(self.activity_exog_means[chosen_label])
+                        new_energy_state.update(
+                            self._shrink_exog(self.activity_exog_means[chosen_label])
+                        )
                     # Always carry forward any state columns not yet populated (e.g. sensors
                     # with no trained pipeline, or weather sensors absent from energy_pipelines)
                     if current_energy_state:
@@ -3165,255 +3173,6 @@ class ProcessSimulation:
     # Quantile-blend: quantile-conditioned duration + entropy-blended transitions
     # ------------------------------------------------------------------
 
-    def _simulate_petri_net_quantile_blend_for_case(
-        self, case_id, object_attributes, start_time,
-    ):
-        """
-        petri_net_quantile_blend:
-
-        Duration  — ML predicts a quantile q in [0,1] for the fitted distribution;
-                    small Gaussian jitter is added to preserve variance; then
-                    duration = dist.ppf(q).  Falls back to dist.sample() when no
-                    model is stored for the activity.
-
-        Transition — ML predict_proba is entropy-weighted blended with PN stochastic
-                    weights.  High-entropy (uncertain) predictions yield weight ≈ 0
-                    and the simulation behaves like petri_net_inductive.
-        """
-        from sim_extractor import _energy_summary, _DIST_MAP
-        import scipy.stats as _scipy_stats
-
-        current_sim_time = start_time.timestamp()
-        unique_objects = (
-            self.activity_stats[['object', 'object_type', 'higher_level_activity']]
-            .drop_duplicates(subset=['higher_level_activity'])
-        )
-
-        for _, obj_config in unique_objects.iterrows():
-            object_name           = str(obj_config['object']).strip()
-            object_type           = str(obj_config['object_type']).strip()
-            higher_level_activity = (
-                str(obj_config['higher_level_activity']).strip()
-                if pd.notna(obj_config['higher_level_activity']) else None
-            )
-
-            key   = (object_name, object_type, higher_level_activity)
-            model = self.process_models.get(key) if self.process_models else None
-            if model is None:
-                raise RuntimeError(
-                    f"petri_net_quantile_blend: no Petri net for key {key}. "
-                    f"Available: {list(self.process_models.keys()) if self.process_models else []}"
-                )
-
-            net              = model['net']
-            im               = model['im']
-            fm               = model['fm']
-            stochastic_map   = model.get('stochastic_map', {})
-            max_case_length  = model.get('max_case_length', 200)
-
-            marking          = copy.copy(im)
-            activity_count   = 0
-            activity_history = []
-            prev_activity    = None
-            max_steps        = max(max_case_length * 2, 50)
-            step             = 0
-
-            # Seed energy state
-            if self.energy_state_columns:
-                _start_acts = set(self._get_start_activities(
-                    object_name, object_type, higher_level_activity
-                ))
-                all_mods = {**self.energy_duration_modifiers, **self.energy_transition_modifiers}
-                _cands = {k: m for k, m in all_mods.items()
-                          if k in _start_acts and hasattr(m, '_train_feature_mean')}
-                if not _cands:
-                    _cands = {k: m for k, m in all_mods.items()
-                              if hasattr(m, '_train_feature_mean')}
-                _all_means: dict[str, list] = {c: [] for c in self.energy_state_columns}
-                for _mod in _cands.values():
-                    for c, v in _mod._train_feature_mean.items():
-                        if c in _all_means:
-                            _all_means[c].append(v)
-                seed_state = {c: float(np.mean(vs)) if vs else 0.0
-                              for c, vs in _all_means.items()}
-                _prev_act_numeric = {'prev_act_mean', 'prev_act_std',
-                                     'prev_act_max', 'prev_act_end', 'prev_act_len'}
-                for _col in self.energy_state_columns:
-                    if _col.startswith('prev_act_') and _col not in _prev_act_numeric:
-                        seed_state[_col] = 0.0
-                current_energy_state = seed_state if seed_state else None
-            else:
-                current_energy_state = None
-
-            if self.verbose:
-                print(f"\nCase {case_id}: quantile-blend PN simulation "
-                      f"for {object_name} ({object_type})")
-
-            while step < max_steps:
-                step += 1
-
-                if marking == fm:
-                    if self.verbose:
-                        print(f"    Final marking after {activity_count} activities.")
-                    break
-                if all(marking.get(p, 0) >= fm[p] for p in fm) and activity_count > 0:
-                    break
-
-                enabled = self._get_enabled_transitions(net, marking)
-                if not enabled:
-                    if self.verbose:
-                        print(f"    Deadlock after {activity_count} activities.")
-                    break
-
-                enabled_list = sorted(
-                    enabled,
-                    key=lambda t: (str(t.label) if t.label is not None else '', str(t.name)),
-                )
-
-                # ── Transition sampling: entropy-weighted blend ───────
-                chosen_transition = None
-                visible_enabled   = [t for t in enabled_list if t.label is not None]
-
-                if (len(visible_enabled) > 1
-                        and current_energy_state is not None
-                        and prev_activity is not None
-                        and prev_activity in self.energy_transition_modifiers):
-                    clf = self.energy_transition_modifiers[prev_activity]
-                    energy_vec = [current_energy_state.get(c, 0.0)
-                                  for c in self.energy_state_columns]
-                    try:
-                        proba_vec  = clf.predict_proba([energy_vec])[0]
-                        label_prob = dict(zip(clf.classes_, proba_vec))
-
-                        # Entropy-based confidence weight
-                        H       = -float(np.sum(proba_vec * np.log(proba_vec + 1e-10)))
-                        H_max   = np.log(max(len(proba_vec), 2))
-                        conf    = float(np.clip(1.0 - H / H_max, 0.0, 1.0))
-
-                        # Blend: (1-conf)*PN + conf*ML
-                        pn_total = sum(stochastic_map.get(t, 1.0) for t in enabled_list) or 1.0
-                        weights  = []
-                        for t in enabled_list:
-                            pn_w = stochastic_map.get(t, 1.0) / pn_total
-                            if t.label is not None:
-                                ml_p = label_prob.get(str(t.label).strip(), 1e-6)
-                            else:
-                                ml_p = pn_w
-                            weights.append((1.0 - conf) * pn_w + conf * ml_p)
-
-                        total = sum(weights)
-                        if total > 0:
-                            probs = [w / total for w in weights]
-                            chosen_transition = np.random.choice(enabled_list, p=probs)
-                    except Exception as exc:
-                        if self.verbose:
-                            print(f"    WARNING: quantile-blend transition failed: {exc}")
-
-                if chosen_transition is None:
-                    # PN fallback
-                    weights = [stochastic_map.get(t, 1.0) for t in enabled_list]
-                    total   = sum(weights)
-                    if total <= 0:
-                        chosen_transition = random.choice(enabled_list)
-                    else:
-                        probs = [w / total for w in weights]
-                        chosen_transition = np.random.choice(enabled_list, p=probs)
-
-                marking = self._fire_transition(marking, chosen_transition)
-
-                if chosen_transition.label is not None:
-                    chosen_label  = str(chosen_transition.label).strip()
-                    activity_count += 1
-
-                    # ── Duration: quantile-conditioned ───────────────────
-                    act_key = (chosen_label, object_name, object_type, higher_level_activity)
-                    dur_mdl = self.energy_duration_modifiers.get(chosen_label)
-
-                    if (dur_mdl is not None
-                            and getattr(dur_mdl, '_is_quantile', False)
-                            and current_energy_state is not None):
-                        try:
-                            energy_vec = [current_energy_state.get(c, 0.0)
-                                          for c in self.energy_state_columns]
-                            q_pred   = float(np.clip(dur_mdl.predict([energy_vec])[0], 0.01, 0.99))
-                            jitter   = getattr(dur_mdl, '_jitter_std', 0.15)
-                            q_final  = float(np.clip(q_pred + np.random.normal(0, jitter), 0.01, 0.99))
-                            dn       = dur_mdl._dist_name
-                            dp       = dur_mdl._dist_params
-                            dist_obj = _DIST_MAP.get(dn, _scipy_stats.norm)
-                            activity_duration = max(0.1, float(dist_obj.ppf(q_final, *dp)))
-                            if self.verbose:
-                                print(f"    [{chosen_label}] quantile q={q_final:.3f} "
-                                      f"→ {activity_duration:.1f} min")
-                        except Exception as exc:
-                            if self.verbose:
-                                print(f"    WARNING: quantile duration failed: {exc}")
-                            activity_duration = self._get_activity_duration(
-                                chosen_label, object_name, object_type,
-                                higher_level_activity, object_attributes,
-                            )
-                    else:
-                        activity_duration = self._get_activity_duration(
-                            chosen_label, object_name, object_type,
-                            higher_level_activity, object_attributes,
-                        )
-
-                    start_time_obj   = datetime.fromtimestamp(current_sim_time)
-                    current_sim_time += activity_duration * 60
-                    end_time_obj     = datetime.fromtimestamp(current_sim_time)
-
-                    self._log_event(
-                        case_id=case_id, activity=chosen_label,
-                        timestamp_start=start_time_obj, timestamp_end=end_time_obj,
-                        object_name=object_name, object_type=object_type,
-                        higher_level_activity=higher_level_activity,
-                        object_attributes=object_attributes,
-                    )
-
-                    activity_history.insert(0, (chosen_label, activity_duration))
-                    activity_history = activity_history[:2]
-
-                    # Update energy state from pipeline
-                    if self.energy_pipelines and current_energy_state is not None:
-                        new_energy_state = {}
-                        for sensor, act_map in self.energy_pipelines.items():
-                            try:
-                                obj_map   = act_map.get(chosen_label, {})
-                                ep        = obj_map.get(object_name) or (
-                                    next(iter(obj_map.values())) if obj_map else None
-                                )
-                                if ep is None:
-                                    for sfx in ('_mean', '_end', '_std', '_start', '_delta', '_integral'):
-                                        k = f'{sensor}{sfx}'
-                                        if k in current_energy_state:
-                                            new_energy_state[k] = current_energy_state[k]
-                                    continue
-                                ref_curve = ep.get('reference_curve')
-                                if ref_curve is None:
-                                    raise ValueError(f"No reference_curve for {sensor}/{chosen_label}")
-                                new_energy_state.update(_energy_summary(np.array(ref_curve), sensor))
-                            except Exception as exc:
-                                if self.verbose:
-                                    print(f"    WARNING: energy pipeline update failed: {exc}")
-                        if new_energy_state:
-                            current_energy_state = {**current_energy_state, **new_energy_state}
-
-                    # Update prev_act one-hots
-                    _prev_act_numeric = {'prev_act_mean', 'prev_act_std',
-                                         'prev_act_max', 'prev_act_end', 'prev_act_len'}
-                    for _col in self.energy_state_columns:
-                        if _col.startswith('prev_act_') and _col not in _prev_act_numeric:
-                            current_energy_state[_col] = (
-                                1.0 if _col == f'prev_act_{chosen_label}' else 0.0
-                            )
-                    prev_activity = chosen_label
-
-            if step >= max_steps and self.verbose:
-                print(f"    WARNING: max steps ({max_steps}) reached.")
-            if self.verbose:
-                print(f"  Completed {object_name} quantile-blend PN with "
-                      f"{activity_count} activities")
-
     def _simulate_process_for_case(self, case_id, object_attributes, start_time):
         """Simulate process for one case using probabilistic end transitions"""
         print(f"[DEBUG _simulate_process_for_case] self.mode = '{self.mode}'")
@@ -3767,65 +3526,3 @@ def simulate_with_wip_ro(activity_stats_df, production_plan, ml_models,
     return final_df, reference_df
 
 
-def compare_simulation_with_real(simulated_df, real_df):
-    """Compare simulation results with real data"""
-    comparison = {}
-    
-    print("=== SIMULATION vs REAL DATA COMPARISON ===\n")
-    
-    # Basic counts
-    comparison['total_events'] = {
-        'simulated': len(simulated_df),
-        'real': len(real_df)
-    }
-    
-    print(f"Total Events:")
-    print(f"  Simulated: {comparison['total_events']['simulated']}")
-    print(f"  Real: {comparison['total_events']['real']}")
-    print(f"  Difference: {comparison['total_events']['simulated'] - comparison['total_events']['real']}")
-    
-    # Cases
-    sim_cases = simulated_df['case_id'].nunique() if 'case_id' in simulated_df.columns and len(simulated_df) > 0 else 0
-    real_cases = real_df['case_id'].nunique()
-    
-    comparison['total_cases'] = {
-        'simulated': sim_cases,
-        'real': real_cases
-    }
-    
-    print(f"\nTotal Cases:")
-    print(f"  Simulated: {sim_cases}")
-    print(f"  Real: {real_cases}")
-    
-    # Events per case
-    if sim_cases > 0:
-        avg_events_per_case_sim = len(simulated_df) / sim_cases
-        avg_events_per_case_real = len(real_df) / real_cases
-        
-        print(f"\nEvents per Case:")
-        print(f"  Simulated: {avg_events_per_case_sim:.1f} avg")
-        print(f"  Real: {avg_events_per_case_real:.1f} avg")
-    
-    # Activities comparison
-    if not simulated_df.empty:
-        sim_activities = set(simulated_df['activity'].unique())
-        real_activities = set(real_df['activity'].unique())
-        
-        comparison['activities'] = {
-            'simulated': sim_activities,
-            'real': real_activities,
-            'common': sim_activities.intersection(real_activities),
-            'sim_only': sim_activities - real_activities,
-            'real_only': real_activities - sim_activities
-        }
-        
-        print(f"\nActivities:")
-        print(f"  Simulated: {len(sim_activities)} activities")
-        print(f"  Real: {len(real_activities)} activities")
-        print(f"  Common: {len(comparison['activities']['common'])} activities")
-        if comparison['activities']['sim_only']:
-            print(f"  Only in simulation: {comparison['activities']['sim_only']}")
-        if comparison['activities']['real_only']:
-            print(f"  Only in real: {comparison['activities']['real_only']}")
-    
-    return comparison

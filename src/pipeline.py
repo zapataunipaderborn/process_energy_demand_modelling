@@ -41,6 +41,11 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    train/test split (the rest go to test).
                                    e.g. 0.8 for an 80/20 split. Default: 0.70
                                    (modelling.py's own default, used when omitted).
+  random_seed           int        master seed for the whole run — python, numpy,
+                                   torch, the train/test split and every
+                                   per-combo training seed derive from it, and
+                                   PYTHONHASHSEED is pinned to it in the child
+                                   process. Default: 42.
   split_type            str        how cases are assigned to train vs. test:
                                    'temporal' (default) — earliest train_ratio
                                    fraction of cases by start time → train, the
@@ -163,8 +168,7 @@ EXPERIMENTS = [
         # sensor, pooled over all activities/objects — the coarsest floor),
         # 'median_activity_sensor' = "Median per Activity & Sensor" (median per
         # sensor+activity+object):
-        #   'baseline', 'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree',
-        #   'dtw_phase', 'basis', 'ml_external', 'amplitude_shape',
+        #   'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
         #   'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
         # Regressors competed for every curve approach, per (sensor, activity,
         # object); best kept by validation MAE. Comment a line out to turn that
@@ -284,6 +288,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     curve_n_optuna_trials = exp.get('curve_n_optuna_trials')
     train_ratio = exp.get('train_ratio')
     split_type = exp.get('split_type', 'temporal')
+    random_seed = int(exp.get('random_seed', 42))
     if split_type not in ('temporal', 'random'):
         print(f"[pipeline] ERROR: {exp['run_name']} has split_type={split_type!r}, "
               f"must be 'temporal' or 'random'. Stopping.")
@@ -306,10 +311,21 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"seq2seq_cells={seq2seq_cells or '(all)'}  "
           f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
           f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}  "
-          f"split_type={split_type}")
+          f"split_type={split_type}  "
+          f"random_seed={random_seed}")
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
+    # ── Reproducibility ──────────────────────────────────────────────────────
+    # One master seed for the child run: modelling.py seeds python/numpy/torch
+    # from it and derives every per-combo training seed from it.
+    env['PIPELINE_RANDOM_SEED']       = str(random_seed)
+    env['PIPELINE_RANDOM_SPLIT_SEED'] = str(random_seed)
+    # PYTHONHASHSEED only takes effect at interpreter start, so it has to be set
+    # HERE, on the child's environment — str hashing is randomised per process
+    # otherwise, and any set-of-strings iterated without sorting would order
+    # differently between two runs that are identical in every other respect.
+    env['PYTHONHASHSEED']             = str(random_seed)
     env['PIPELINE_DATA_EXPERIMENT']       = exp['data_experiment']
     env['PIPELINE_RUN_NAME']              = exp['run_name']
     env['PIPELINE_PROCESSES_TO_RUN']      = ','.join(exp['processes_to_run'])
