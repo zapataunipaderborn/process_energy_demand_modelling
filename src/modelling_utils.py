@@ -21,14 +21,12 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import seaborn as sns
 import pm4py
-from collections import defaultdict
 from pathlib import Path
 from scipy import stats
 from scipy.spatial.distance import jensenshannon

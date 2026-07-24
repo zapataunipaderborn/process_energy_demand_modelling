@@ -11,14 +11,12 @@ os.environ["TQDM_DISABLE"] = "1"
 
 import logging
 import sys
-import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from scipy.spatial.distance import jensenshannon
-from collections import Counter
 import pm4py
 import tempfile
 import os
@@ -55,21 +53,16 @@ class StreamToLogger:
 RANDOM_SEED = 42
 
 import random
-import itertools
 import os
-from datetime import datetime, timedelta
 random.seed(RANDOM_SEED)
-import simpy
 import seaborn as sns
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 np.random.seed(RANDOM_SEED)
-import chardet
 import plotly.io as pio
 from pathlib import Path
 import pm4py
-import plotly.express as px
 import matplotlib.image as mpimg
 import tempfile
 
@@ -87,7 +80,6 @@ from sim_extractor import extract_process
 from simulation import ProcessSimulation, simulate_with_wip_ro
 from sim_modeller import SimModeller
 
-from sklearn.linear_model import Lasso, LogisticRegression
 from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
 from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
@@ -4411,23 +4403,27 @@ if RUN_TEST_EVALUATION and RUN_PROCESS_MODELLING:
 # Trains baseline, Approach 2 (B-spline basis), and Approach 3 (DTW-phase)
 # side by side so results can be compared in the evaluation cell below.
 if RUN_CURVE_ONLY_EVALUATION:
+    # Only the predictors are needed here: training goes through
+    # _train_curve_only_worker / _train_seq2seq_worker in sim_extractor, which
+    # call the build_and_train_pipeline_* functions themselves.
     from sim_extractor import (
         split_curves,
         split_curves_with_prev_activity,
-        build_and_train_pipeline,            predict_raw_curve,
-        build_and_train_pipeline_median,     predict_raw_curve_median,
-        build_and_train_pipeline_instance_stats, predict_raw_curve_instance_stats,
-        build_and_train_pipeline_istats_leakfree, predict_raw_curve_istats_leakfree,
-        build_and_train_pipeline_dtw_phase,  predict_raw_curve_dtw_phase,
-        build_and_train_pipeline_basis,      predict_raw_curve_basis,
-        build_and_train_pipeline_exog,            predict_raw_curve_exog,
-        build_and_train_pipeline_exog_prev_activity, predict_raw_curve_exog_prev_activity,
-        build_and_train_pipeline_amplitude_shape, predict_raw_curve_amplitude_shape,
-        build_and_train_pipeline_ml_only,           predict_raw_curve_ml_only,
+        build_and_train_pipeline_median,
+        predict_raw_curve,
+        predict_raw_curve_median,
+        predict_raw_curve_instance_stats,
+        predict_raw_curve_istats_leakfree,
+        predict_raw_curve_dtw_phase,
+        predict_raw_curve_basis,
+        predict_raw_curve_exog,
+        predict_raw_curve_exog_prev_activity,
+        predict_raw_curve_amplitude_shape,
+        predict_raw_curve_ml_only,
         # amplitude_shape_exog removed
-        build_and_train_pipeline_seq2seq,         predict_raw_curve_seq2seq,
-        build_and_train_pipeline_seq2seq_only,    predict_raw_curve_seq2seq_only,
-        build_and_train_pipeline_seq2seq_external, predict_raw_curve_seq2seq_external,
+        predict_raw_curve_seq2seq,
+        predict_raw_curve_seq2seq_only,
+        predict_raw_curve_seq2seq_external,
     )
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import GradientBoostingRegressor

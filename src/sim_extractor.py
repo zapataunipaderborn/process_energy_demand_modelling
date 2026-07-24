@@ -8,7 +8,6 @@ import warnings
 # pm4py imports (used when mining_algorithm != 'manual')
 # ---------------------------------------------------------------------------
 import pm4py
-from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 from pm4py.algo.evaluation.generalization import algorithm as generalization_evaluator
 from pm4py.algo.evaluation.simplicity import algorithm as simplicity_evaluator
@@ -1552,7 +1551,7 @@ def extract_energy_modifiers(
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
-    from sklearn.metrics import mean_absolute_error, f1_score
+    from sklearn.metrics import mean_absolute_error
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -1790,7 +1789,7 @@ def extract_energy_direct_models(
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
-    from sklearn.metrics import mean_absolute_error, f1_score
+    from sklearn.metrics import mean_absolute_error
     from sklearn.utils.class_weight import compute_class_weight
     from collections import Counter
     import warnings
@@ -2338,7 +2337,7 @@ def extract_energy_direct_models_global(
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
-    from sklearn.metrics import mean_absolute_error, f1_score
+    from sklearn.metrics import mean_absolute_error
     from sklearn.utils.class_weight import compute_class_weight
     from collections import Counter
     import warnings
@@ -2533,7 +2532,7 @@ def extract_energy_quantile_models(
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import KFold, cross_val_score
     from sklearn.dummy import DummyRegressor, DummyClassifier
-    from sklearn.metrics import mean_absolute_error, f1_score
+    from sklearn.metrics import mean_absolute_error
     from sklearn.utils.class_weight import compute_class_weight
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
@@ -2959,7 +2958,7 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 from dtw import dtw
 import optuna
@@ -5463,7 +5462,7 @@ def predict_raw_curve_dtw_phase(raw_values, activity, attributes, pipeline):
 #   • Inference is O(K) matrix-vector multiply — faster than DTW at test time.
 # =============================================================================
 
-from scipy.interpolate import BSpline, make_interp_spline
+from scipy.interpolate import BSpline
 from sklearn.multioutput import MultiOutputRegressor
 
 
@@ -8496,7 +8495,6 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
     # GRID PLOTTING (3 columns)
     # ------------------------------------------------------------------
     import os as _os
-    import itertools as _itertools
 
     _sensor_slug = (
         pipeline.get('variable_name', 'sensor')

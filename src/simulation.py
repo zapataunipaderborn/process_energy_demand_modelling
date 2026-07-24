@@ -4,10 +4,8 @@ import pandas as pd
 import numpy as np
 import random
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from pm4py.objects.petri_net.obj import PetriNet, Marking
-from pm4py.objects.petri_net import semantics as pn_semantics
 
 from sim_extractor import sample_from_dist, LoadProfile, predict_case_duration
 
