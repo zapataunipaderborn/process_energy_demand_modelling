@@ -111,6 +111,17 @@ _DUR_ACCEPTANCE_RATIO = 0.95   # require ≥5% MAE improvement over baseline
 _TR_ACCEPTANCE_MARGIN = 0.0    # accept any balanced-accuracy lift over baseline
 _TR_BLEND_FULL        = 0.05   # ≥5 pp lift → α = 1.0 (pure ML routing)
 
+# Minimum samples an activity instance must have to become a curve. SHARED by
+# split_curves and split_curves_with_prev_activity so every approach is trained
+# and scored on exactly the same set of curves.
+# Until 2026-07-24 the two disagreed — 2 and 5 respectively — so curves of 2-4
+# samples existed for the plain approaches and not for the *_external ones
+# (experiment_964: 30,080 vs 26,000 TEST curves), and the approach columns of
+# the curve comparison were medians over different populations. Five is the
+# stricter of the two and the more defensible floor: a 2-point "curve" carries
+# no shape for a DBA/DTW pipeline to align.
+MIN_CURVE_SAMPLES = 5
+
 
 def fit_best_distribution(data):
     """
@@ -3112,7 +3123,7 @@ def split_curves(df_expanded, variable, activities, objects,
         values = np.asarray(group[variable].dropna().values).squeeze()
         if values.ndim != 1:
             continue
-        if len(values) >= 2:
+        if len(values) >= MIN_CURVE_SAMPLES:
             _raw_attrs = (
                 group['object_attributes_log'].iloc[0]
                 if not group['object_attributes_log'].empty else {}
@@ -3166,20 +3177,34 @@ def split_curves(df_expanded, variable, activities, objects,
 
 def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
                                     test_size=0.15, random_state=42, verbose=1,
-                                    exog_columns=None):
+                                    exog_columns=None, include_prev_energy=False):
     """
-    Like split_curves() but enriches each curve's 'attributes' with summary
-    statistics from the immediately preceding activity instance in the same case.
+    Like split_curves() but enriches each curve's 'attributes' with context from
+    the immediately preceding activity instance in the same case.
 
-    All added features are known at activity-start time — zero leakage:
-        prev_act_name   — name of the previous activity (str; 'none' if first)
-        prev_act_mean   — mean of target variable during previous activity
-        prev_act_std    — std  of target variable during previous activity
-        prev_act_max    — max  of target variable during previous activity
-        prev_act_end    — last observed value of target variable in previous activity
-        prev_act_length — number of timesteps in previous activity
+    Default (include_prev_energy=False) adds two features:
+        prev_act_name         — name of the previous activity (str; 'none' if first)
+        prev_act_duration_min — wall-clock minutes the previous activity ran
+                                (timestamp_end_log − timestamp_start_log; 0.0 if
+                                no predecessor)
 
-    NaN is used for numeric fields when no preceding activity exists.
+    Both are process-log information: known at activity-start time from the
+    event log alone, with no meter reading involved, so they are available in a
+    pure what-if simulation where no energy has been observed yet. Combined with
+    the ef_* external factors (weather, hour_of_day, day_of_week, …) passed via
+    exog_columns, this is the "ML + Ext. Factors" approach as reported.
+
+    include_prev_energy=True additionally adds lagged statistics of the TARGET
+    SENSOR's own measured energy during the previous activity:
+        prev_act_mean / prev_act_std / prev_act_max / prev_act_end / prev_act_length
+
+    Those are NOT reportable as "external factors". They require a live meter
+    feed for the predecessor, which a simulation does not have, and evaluating
+    them against the real test series is teacher forcing — optimistic relative
+    to a free-running rollout. Kept only for the explicit autoregressive
+    experiment (_run_curve_eval_autoregressive_prev_act), which feeds them from
+    PREDICTED predecessors. Do not switch this on for paper numbers.
+
     Also accepts exog_columns exactly like split_curves().
     """
     if verbose:
@@ -3204,26 +3229,47 @@ def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
     _grp_cols = ['case_id_log', 'activity_log', 'object_log', 'timestamp_start_log']
     _case_timelines = {}   # case_id -> [(ts_start, stats_dict), ...] sorted by ts_start
 
-    if variable in df_expanded.columns:
-        _tl = df_expanded[_grp_cols + ['datetime_energy', variable]].copy()
+    # Only the energy-conditioned variant needs the sensor column; the
+    # name-only default is built from the event log alone.
+    _use_energy = bool(include_prev_energy) and variable in df_expanded.columns
+    _has_end    = 'timestamp_end_log' in df_expanded.columns
+    if _use_energy or not include_prev_energy:
+        _tl_cols = (_grp_cols + ['datetime_energy']
+                    + (['timestamp_end_log'] if _has_end else [])
+                    + ([variable] if _use_energy else []))
+        _tl = df_expanded[[c for c in _tl_cols if c in df_expanded.columns]].copy()
         _tl['timestamp_start_log'] = pd.to_datetime(_tl['timestamp_start_log'])
         _tl['datetime_energy']     = pd.to_datetime(_tl['datetime_energy'])
+        if _has_end:
+            _tl['timestamp_end_log'] = pd.to_datetime(_tl['timestamp_end_log'])
         _tl = _tl.sort_values(['case_id_log', 'timestamp_start_log', 'datetime_energy'])
 
         for (_case_id, _act, _obj, _ts_start), _grp in _tl.groupby(_grp_cols):
-            _vals = np.asarray(_grp[variable].dropna().values, dtype=float)
-            _ts   = pd.to_datetime(_ts_start)
-            # Use 0.0 as numeric sentinel when stats are undefined; the
-            # categorical prev_act_name flag carries the "no predecessor"
-            # signal so models trained without NaN-handling still work.
+            _ts    = pd.to_datetime(_ts_start)
+            # Wall-clock duration of the predecessor — a log fact (start/end
+            # timestamps), not a meter reading. Falls back to the span of the
+            # instance's own timestamps when the log has no end column.
+            if _has_end:
+                _end = _grp['timestamp_end_log'].max()
+            else:
+                _end = _grp['datetime_energy'].max()
+            _dur = (_end - _ts).total_seconds() / 60.0 if pd.notnull(_end) and pd.notnull(_ts) else np.nan
             _stats = {
-                'prev_act_name':   _act,
-                'prev_act_mean':   float(np.mean(_vals))  if len(_vals) >= 1 else 0.0,
-                'prev_act_std':    float(np.std(_vals))   if len(_vals) >= 2 else 0.0,
-                'prev_act_max':    float(np.max(_vals))   if len(_vals) >= 1 else 0.0,
-                'prev_act_end':    float(_vals[-1])       if len(_vals) >= 1 else 0.0,
-                'prev_act_length': float(len(_vals)),
+                'prev_act_name':         _act,
+                'prev_act_duration_min': float(_dur) if np.isfinite(_dur) and _dur >= 0 else 0.0,
             }
+            if _use_energy:
+                _vals = np.asarray(_grp[variable].dropna().values, dtype=float)
+                # Use 0.0 as numeric sentinel when stats are undefined; the
+                # categorical prev_act_name flag carries the "no predecessor"
+                # signal so models trained without NaN-handling still work.
+                _stats.update({
+                    'prev_act_mean':   float(np.mean(_vals))  if len(_vals) >= 1 else 0.0,
+                    'prev_act_std':    float(np.std(_vals))   if len(_vals) >= 2 else 0.0,
+                    'prev_act_max':    float(np.max(_vals))   if len(_vals) >= 1 else 0.0,
+                    'prev_act_end':    float(_vals[-1])       if len(_vals) >= 1 else 0.0,
+                    'prev_act_length': float(len(_vals)),
+                })
             _case_timelines.setdefault(_case_id, []).append((_ts, _stats))
 
     for _cid in _case_timelines:
@@ -3238,14 +3284,16 @@ def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
             else:
                 break
         if prev is None:
-            return {
-                'prev_act_name':   'none',
-                'prev_act_mean':   0.0,
-                'prev_act_std':    0.0,
-                'prev_act_max':    0.0,
-                'prev_act_end':    0.0,
-                'prev_act_length': 0.0,
-            }
+            _none = {'prev_act_name': 'none', 'prev_act_duration_min': 0.0}
+            if include_prev_energy:
+                _none.update({
+                    'prev_act_mean':   0.0,
+                    'prev_act_std':    0.0,
+                    'prev_act_max':    0.0,
+                    'prev_act_end':    0.0,
+                    'prev_act_length': 0.0,
+                })
+            return _none
         return dict(prev)
 
     # ── Extract target curves — identical filtering to split_curves ────────────
@@ -3276,7 +3324,7 @@ def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
     for instance_id, group in df.groupby('activity_instance_id'):
         group  = group.sort_values('datetime_energy').reset_index(drop=True)
         values = np.asarray(group[variable].dropna().values).squeeze()
-        if values.ndim != 1 or len(values) < 5:
+        if values.ndim != 1 or len(values) < MIN_CURVE_SAMPLES:
             continue
 
         case_id  = group['case_id_log'].iloc[0]
@@ -3422,6 +3470,212 @@ def _align_curve_with_dtw(query, reference, min_length_ratio=0.2):
     return aligned
 
 
+class ExternalFactorWindows:
+    """
+    Mean of each ef_* series over a forward window [t, t + w), shared by the
+    duration-model training code and the simulator so both compute the feature
+    the same way.
+
+    Why a *fixed* per-activity window rather than the activity's real duration:
+    the window length would otherwise be the regression target itself, leaking
+    it into the feature — and at generation time the duration is exactly what is
+    being predicted, so the true window is not knowable. Using the activity's
+    median duration as w keeps the feature identical in training and simulation
+    and leak-free in both.
+
+    ef_* are smooth interpolated exogenous series (weather), so a window mean is
+    well behaved even where samples are sparse; windows containing no samples
+    fall back to the column's global mean.
+    """
+
+    def __init__(self, expanded_df, ef_cols, time_col='datetime_energy'):
+        self.ef_cols = [c for c in ef_cols if c in expanded_df.columns]
+        self.means = {}
+        self._t = np.empty(0)
+        self._cum = {}
+        if not self.ef_cols:
+            return
+        d = (expanded_df[[time_col] + self.ef_cols]
+             .dropna(subset=[time_col])
+             .sort_values(time_col))
+        if d.empty:
+            return
+        self._t = d[time_col].astype('int64').to_numpy() / 1e9      # epoch seconds
+        for c in self.ef_cols:
+            v = pd.to_numeric(d[c], errors='coerce').ffill().bfill()
+            self.means[c] = float(v.mean()) if v.notna().any() else 0.0
+            arr = v.fillna(self.means[c]).to_numpy(dtype=float)
+            self._cum[c] = np.concatenate([[0.0], np.cumsum(arr)])
+
+    @property
+    def feature_names(self):
+        """Column names this produces, in a stable order."""
+        return [f'feat_{c}' for c in self.ef_cols]
+
+    def window_means(self, start_epoch, window_seconds):
+        """{feat_<ef_col>: mean over [start, start+window)}; global mean if empty."""
+        if not self.ef_cols or self._t.size == 0:
+            return {}
+        w = max(float(window_seconds or 0.0), 0.0)
+        i0 = np.searchsorted(self._t, float(start_epoch), 'left')
+        i1 = np.searchsorted(self._t, float(start_epoch) + w, 'right')
+        n = i1 - i0
+        if n <= 0:
+            return {f'feat_{c}': self.means[c] for c in self.ef_cols}
+        return {f'feat_{c}': (self._cum[c][i1] - self._cum[c][i0]) / n
+                for c in self.ef_cols}
+
+
+def _make_curve_models():
+    """
+    Candidate regressors competed for every curve approach, per
+    (sensor, activity, object). The best is kept by validation MAE, so adding a
+    candidate costs training time but cannot make the selection worse.
+
+    Single source of truth — imported by modelling.py for reporting and used by
+    _train_curve_only_worker for training. Every name here needs a branch in
+    _curve_model_trial_params, or Optuna spends all its trials on one default
+    configuration.
+
+    Ridge rather than plain OLS is the regularised member: the curve design
+    matrix is one-hot expanded over activity plus the categorical attributes,
+    so it is high-dimensional and collinear. LinearRegression is kept alongside
+    it as the unpenalised reference. XGBoost is the gradient-boosting member
+    (plain GradientBoostingRegressor was dropped as redundant with it).
+    """
+    from sklearn.linear_model import LinearRegression, Ridge
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.neural_network import MLPRegressor
+    from xgboost import XGBRegressor
+    all_models = {
+        'Linear Regression': LinearRegression,
+        'Ridge':             Ridge,
+        'Random Forest':     RandomForestRegressor,
+        'XGBoost':           XGBRegressor,
+        'MLP':               MLPRegressor,
+    }
+
+    # Subset via PIPELINE_CURVE_MODELS (comma-separated), set by pipeline.py's
+    # 'curve_models' key. Accepts the display names above or the short aliases
+    # below, case-insensitively. Unset -> all candidates compete.
+    requested = _os.environ.get('PIPELINE_CURVE_MODELS')
+    if not requested:
+        return all_models
+
+    aliases = {'linear': 'Linear Regression', 'linear_regression': 'Linear Regression',
+               'ols': 'Linear Regression', 'ridge': 'Ridge',
+               'rf': 'Random Forest', 'random_forest': 'Random Forest',
+               'xgb': 'XGBoost', 'xgboost': 'XGBoost',
+               'mlp': 'MLP', 'ffnn': 'MLP'}
+    canonical = {k.lower(): k for k in all_models}
+
+    picked, unknown = [], []
+    for raw in requested.split(','):
+        key = raw.strip().lower().replace(' ', '_')
+        name = canonical.get(raw.strip().lower()) or aliases.get(key)
+        if name is None:
+            unknown.append(raw.strip())
+        elif name not in picked:
+            picked.append(name)
+
+    if unknown:
+        print(f"[sim_extractor] WARNING: PIPELINE_CURVE_MODELS has unknown names "
+              f"{unknown} — valid: {list(all_models)} (or aliases {sorted(aliases)}). Ignoring those.")
+    if not picked:
+        print(f"[sim_extractor] WARNING: PIPELINE_CURVE_MODELS={requested!r} selected no "
+              f"valid model — falling back to all candidates.")
+        return all_models
+    return {name: all_models[name] for name in picked}
+
+
+def _curve_model_trial_params(trial, name, random_state, n_jobs=1):
+    """
+    Optuna search space for one curve regressor, keyed by its display name in
+    _CURVE_MODELS (modelling.py).
+
+    Centralised because the same chain was duplicated across every
+    build_and_train_pipeline_* variant: a model missing from here silently falls
+    through to `{}`, which trains it at library defaults for *every* trial — the
+    search burns n_trials evaluating one identical configuration. Add a model to
+    _CURVE_MODELS and it must be added here too.
+    """
+    if name == 'Gradient Boosting':
+        return {
+            'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
+            'max_depth':     trial.suggest_int('max_depth', 3, 10),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+            'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
+            'random_state':  random_state,
+        }
+    if name == 'Random Forest':
+        return {
+            'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
+            'max_depth':         trial.suggest_int('max_depth', 5, 20),
+            'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
+            'random_state':      random_state,
+            'n_jobs':            n_jobs,
+        }
+    if name == 'XGBoost':
+        return {
+            'n_estimators':     trial.suggest_int('n_estimators', 50, 300),
+            'max_depth':        trial.suggest_int('max_depth', 2, 8),
+            'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample':        trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'reg_lambda':       trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+            'random_state':     random_state,
+            'n_jobs':           n_jobs,
+            'verbosity':        0,
+        }
+    if name == 'Ridge':
+        # The curve feature matrix is one-hot expanded (activity + categorical
+        # attributes), so it is high-dimensional and collinear — the penalty
+        # matters far more here than for the tree models.
+        return {
+            'alpha':        trial.suggest_float('alpha', 1e-3, 1e3, log=True),
+            'random_state': random_state,
+        }
+    if name == 'MLP':
+        # hidden_layer_sizes is suggested as a string key rather than a tuple:
+        # Optuna only stores str/int/float/bool categoricals cleanly, and
+        # _curve_model_finalise_params converts it back to a tuple.
+        arch = trial.suggest_categorical('hidden_layers', ['50', '100', '50_50', '100_50'])
+        return {
+            'hidden_layer_sizes': tuple(int(x) for x in arch.split('_')),
+            'activation':         trial.suggest_categorical('activation', ['relu', 'tanh']),
+            'alpha':              trial.suggest_float('alpha', 1e-6, 1e-1, log=True),
+            'learning_rate_init': trial.suggest_float('learning_rate_init', 1e-4, 1e-2, log=True),
+            'max_iter':           500,
+            'random_state':       random_state,
+        }
+    # 'Linear Regression' lands here on purpose: OLS has no hyperparameters, so
+    # its trials are all identical. Harmless (the fit is cheap) but it means
+    # n_trials is effectively wasted on it — unlike an unlisted model, which
+    # would be an oversight.
+    return {}
+
+
+def _curve_model_finalise_params(name, best_params, random_state, n_jobs=1):
+    """
+    Re-attach the non-searched constructor kwargs Optuna does not return in
+    study.best_params (it only reports suggested values).
+    """
+    best_params = dict(best_params)
+    if name == 'MLP':
+        # 'hidden_layers' is the suggest-name, not an MLPRegressor kwarg.
+        arch = best_params.pop('hidden_layers', '100')
+        best_params['hidden_layer_sizes'] = tuple(int(x) for x in arch.split('_'))
+        best_params['max_iter'] = 500
+    # LinearRegression takes no random_state, so it is deliberately absent here.
+    if name in ('Gradient Boosting', 'Random Forest', 'XGBoost', 'Ridge', 'MLP'):
+        best_params['random_state'] = random_state
+    if name in ('Random Forest', 'XGBoost'):
+        best_params['n_jobs'] = n_jobs
+    if name == 'XGBoost':
+        best_params['verbosity'] = 0
+    return best_params
+
+
 def _robust_dtw_barycenter(resampled_curves, barycenter_size, n_iterations=3,
                             trim_fraction=0.1):
     """
@@ -3491,6 +3745,51 @@ def _infer_key_types(curves):
                     break
         key_types[key] = 'numeric' if is_numeric else 'category'
     return all_keys, key_types
+
+
+def _stamp_train_sensor_median(result, curves):
+    """
+    Attach the leaf's training median of the target sensor to EVERY pipeline in
+    `result`, including approaches that don't use it as a model feature
+    (baseline/median/seq2seq). Training curves only — usable as a level anchor,
+    a sanity check, or a fallback when a pipeline cannot predict.
+    Never overwrites a value a builder already set.
+    """
+    raw = [np.asarray(c['original_values'], dtype=float) for c in curves
+           if len(np.asarray(c['original_values'])) > 0]
+    leaf_median = float(np.median(np.concatenate(raw))) if raw else 0.0
+    for _p in result.values():
+        if isinstance(_p, dict):
+            _p.setdefault('train_sensor_median', leaf_median)
+    return result
+
+
+def _training_median_stats(train_curves, fixed_length, value_key='resampled_values'):
+    """
+    Training-only median statistics for one leaf pipeline (sensor × activity × object).
+
+    Returns (median_curve, sensor_median):
+        median_curve  — np.ndarray[fixed_length], pointwise median of the
+                        DTW-aligned TRAINING curves. This is the typical shape
+                        AND level of the sensor at each canonical position, so a
+                        model conditioned on it only has to learn the deviation.
+        sensor_median — scalar median over every training sample of the sensor.
+
+    Computed from train_curves only (same set the DBA barycenter comes from), so
+    it carries no test information. At inference the stored array is replayed
+    positionwise — nothing is recomputed from the data being predicted.
+    """
+    mats = [
+        np.asarray(c[value_key], dtype=float)
+        for c in train_curves
+        if value_key in c and len(np.asarray(c[value_key])) == fixed_length
+    ]
+    median_curve = (np.median(np.vstack(mats), axis=0) if mats
+                    else np.zeros(fixed_length, dtype=float))
+    raw = [np.asarray(c['original_values'], dtype=float) for c in train_curves
+           if len(np.asarray(c['original_values'])) > 0]
+    sensor_median = float(np.median(np.concatenate(raw))) if raw else 0.0
+    return median_curve, sensor_median
 
 
 def _build_feature_matrix(curves, all_keys, key_types, fixed_length,
@@ -3647,11 +3946,16 @@ def build_and_train_pipeline(
         print(f"     Regression dataset: {len(df_reg)} rows "
               f"({len(train_curves)} curves x {fixed_length} positions)")
 
+    # Training-median anchor: the sensor's typical level at this canonical
+    # position, from train curves only (see _training_median_stats).
+    train_median_curve, train_sensor_median = _training_median_stats(train_curves, fixed_length)
+    df_reg['train_median_at_pos'] = train_median_curve[df_reg['position_idx'].to_numpy()]
+
     # Dummies defined on training data only. Val instances are a subset of
     # train curves so they share the same category levels — no unseen levels
     # can appear in the val set.
     categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
-    X_all = df_reg[['position_idx', 'relative_pos', 'curve_length']].copy()
+    X_all = df_reg[['position_idx', 'relative_pos', 'curve_length', 'train_median_at_pos']].copy()
     X_all = X_all.assign(activity=df_reg['activity'].values)
     for key in all_keys:
         X_all = X_all.assign(**{key: df_reg[key].values})
@@ -3672,9 +3976,10 @@ def build_and_train_pipeline(
 
     feature_columns = X_all.columns.tolist()
 
-    # Scale numeric features (position, curve length, and numeric attributes)
-    # using train-only statistics to avoid leakage.
-    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length'] + [
+    # Scale numeric features (position, curve length, training-median anchor,
+    # and numeric attributes) using train-only statistics to avoid leakage.
+    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length',
+                            'train_median_at_pos'] + [
         k for k in all_keys if key_types[k] == 'numeric'
     ]
     numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
@@ -3709,24 +4014,7 @@ def build_and_train_pipeline(
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
             def objective(trial, name=name, model_class=model_class):
-                if name == 'Gradient Boosting':
-                    params = {
-                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
-                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
-                        'random_state':  random_state,
-                    }
-                elif name == 'Random Forest':
-                    params = {
-                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
-                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-                        'random_state':      random_state,
-                        'n_jobs':            n_jobs,
-                    }
-                else:
-                    params = {}
+                params = _curve_model_trial_params(trial, name, random_state, n_jobs)
                 m = model_class(**params)
                 m.fit(X_train, y_train)
                 return -mean_absolute_error(y_val, m.predict(X_val))
@@ -3735,10 +4023,7 @@ def build_and_train_pipeline(
             study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             best_params = study.best_params
-            if name in ('Gradient Boosting', 'Random Forest'):
-                best_params['random_state'] = random_state
-            if name == 'Random Forest':
-                best_params['n_jobs'] = n_jobs
+            best_params = _curve_model_finalise_params(name, best_params, random_state, n_jobs)
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -3801,6 +4086,8 @@ def build_and_train_pipeline(
         'feature_columns': feature_columns,
         'feature_scaler':  feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
+        'train_median_curve':  train_median_curve,
+        'train_sensor_median': train_sensor_median,
         'val_mae':         all_results[best_name]['val_mae'],
         'all_results':     all_results,
         # Explicit tag (previously relied on _dispatch_predict's implicit
@@ -3897,6 +4184,10 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
     numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
     all_keys        = pipeline['all_keys']
     key_types       = pipeline['key_types']
+    # Training-median anchor, replayed positionwise from the trained pipeline.
+    # Absent on pipelines trained before this feature existed — then the column
+    # is simply not built, and it is not in feature_columns either.
+    train_median_curve = pipeline.get('train_median_curve', None)
 
     # 1) Predict in canonical space (fixed_length points)
     _rel_denom = max(fixed_length - 1, 1)
@@ -3908,6 +4199,8 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
             'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity': activity,
         }
+        if train_median_curve is not None:
+            row['train_median_at_pos'] = float(train_median_curve[ref_pos])
         for key in all_keys:
             value = attributes.get(key, None)
             if key_types[key] == 'numeric':
@@ -4049,8 +4342,13 @@ def build_and_train_pipeline_ml_only(
         print(f"     Regression dataset: {len(df_reg)} rows "
               f"({len(train_curves)} curves × {fixed_length} positions)")
 
+    # Training-median anchor (train curves only, see _training_median_stats).
+    train_median_curve, train_sensor_median = _training_median_stats(train_curves, fixed_length)
+    df_reg['train_median_at_pos'] = train_median_curve[df_reg['position_idx'].to_numpy()]
+
     categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
-    X_all = df_reg[['position_idx', 'relative_pos', 'curve_length']].copy()
+    X_all = df_reg[['position_idx', 'relative_pos', 'curve_length',
+                    'train_median_at_pos']].copy()
     X_all = X_all.assign(activity=df_reg['activity'].values)
     for key in all_keys:
         X_all = X_all.assign(**{key: df_reg[key].values})
@@ -4068,7 +4366,8 @@ def build_and_train_pipeline_ml_only(
 
     feature_columns = X_all.columns.tolist()
 
-    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length'] + [
+    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length',
+                            'train_median_at_pos'] + [
         k for k in all_keys if key_types[k] == 'numeric'
     ]
     numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
@@ -4098,24 +4397,7 @@ def build_and_train_pipeline_ml_only(
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
             def objective(trial, name=name, model_class=model_class):
-                if name == 'Gradient Boosting':
-                    params = {
-                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
-                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
-                        'random_state':  random_state,
-                    }
-                elif name == 'Random Forest':
-                    params = {
-                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
-                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-                        'random_state':      random_state,
-                        'n_jobs':            n_jobs,
-                    }
-                else:
-                    params = {}
+                params = _curve_model_trial_params(trial, name, random_state, n_jobs)
                 m = model_class(**params)
                 m.fit(X_train, y_train)
                 return -mean_absolute_error(y_val, m.predict(X_val))
@@ -4124,10 +4406,7 @@ def build_and_train_pipeline_ml_only(
             study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             best_params = study.best_params
-            if name in ('Gradient Boosting', 'Random Forest'):
-                best_params['random_state'] = random_state
-            if name == 'Random Forest':
-                best_params['n_jobs'] = n_jobs
+            best_params = _curve_model_finalise_params(name, best_params, random_state, n_jobs)
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -4177,6 +4456,8 @@ def build_and_train_pipeline_ml_only(
         'feature_columns':      feature_columns,
         'feature_scaler':       feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
+        'train_median_curve':   train_median_curve,
+        'train_sensor_median':  train_sensor_median,
         'val_mae':              all_results[best_name]['val_mae'],
         'all_results':          all_results,
     }
@@ -4194,6 +4475,8 @@ def predict_raw_curve_ml_only(raw_values, activity, attributes, pipeline):
     numeric_feature_cols = pipeline.get('numeric_feature_cols', [])
     all_keys             = pipeline['all_keys']
     key_types            = pipeline['key_types']
+    # Training-median anchor, replayed positionwise (None on older pipelines).
+    train_median_curve   = pipeline.get('train_median_curve', None)
 
     _rel_denom = max(fixed_length - 1, 1)
     rows = []
@@ -4204,6 +4487,8 @@ def predict_raw_curve_ml_only(raw_values, activity, attributes, pipeline):
             'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity':     activity,
         }
+        if train_median_curve is not None:
+            row['train_median_at_pos'] = float(train_median_curve[ref_pos])
         for key in all_keys:
             value = attributes.get(key, None)
             if key_types[key] == 'numeric':
@@ -4452,24 +4737,7 @@ def build_and_train_pipeline_instance_stats(
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
             def objective(trial, name=name, model_class=model_class):
-                if name == 'Gradient Boosting':
-                    params = {
-                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
-                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
-                        'random_state':  random_state,
-                    }
-                elif name == 'Random Forest':
-                    params = {
-                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
-                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-                        'random_state':      random_state,
-                        'n_jobs':            n_jobs,
-                    }
-                else:
-                    params = {}
+                params = _curve_model_trial_params(trial, name, random_state, n_jobs)
                 m = model_class(**params)
                 m.fit(X_train, y_train)
                 return -mean_absolute_error(y_val, m.predict(X_val))
@@ -4478,10 +4746,7 @@ def build_and_train_pipeline_instance_stats(
             study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             best_params = study.best_params
-            if name in ('Gradient Boosting', 'Random Forest'):
-                best_params['random_state'] = random_state
-            if name == 'Random Forest':
-                best_params['n_jobs'] = n_jobs
+            best_params = _curve_model_finalise_params(name, best_params, random_state, n_jobs)
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -5253,24 +5518,7 @@ def build_and_train_pipeline_dtw_phase(
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
             def objective(trial, name=name, model_class=model_class):
-                if name == 'Gradient Boosting':
-                    params = {
-                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
-                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
-                        'random_state':  random_state,
-                    }
-                elif name == 'Random Forest':
-                    params = {
-                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
-                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-                        'random_state':      random_state,
-                        'n_jobs':            n_jobs,
-                    }
-                else:
-                    params = {}
+                params = _curve_model_trial_params(trial, name, random_state, n_jobs)
                 m = model_class(**params)
                 m.fit(X_train, y_train)
                 return -mean_absolute_error(y_val, m.predict(X_val))
@@ -5279,10 +5527,7 @@ def build_and_train_pipeline_dtw_phase(
             study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             best_params = study.best_params
-            if name in ('Gradient Boosting', 'Random Forest'):
-                best_params['random_state'] = random_state
-            if name == 'Random Forest':
-                best_params['n_jobs'] = n_jobs
+            best_params = _curve_model_finalise_params(name, best_params, random_state, n_jobs)
             if verbose:
                 print(f"     Best params: {best_params}")
             model = model_class(**best_params)
@@ -5619,24 +5864,7 @@ def build_and_train_pipeline_basis(
                 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
             def objective(trial, name=name, model_class=model_class):
-                if name == 'Gradient Boosting':
-                    params = {
-                        'n_estimators':  trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':     trial.suggest_int('max_depth', 3, 10),
-                        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                        'subsample':     trial.suggest_float('subsample', 0.5, 1.0),
-                        'random_state':  random_state,
-                    }
-                elif name == 'Random Forest':
-                    params = {
-                        'n_estimators':      trial.suggest_int('n_estimators', 50, 300),
-                        'max_depth':         trial.suggest_int('max_depth', 5, 20),
-                        'min_samples_split': trial.suggest_int('min_samples_split', 2, 10),
-                        'random_state':      random_state,
-                        'n_jobs':            -1,
-                    }
-                else:
-                    params = {}
+                params = _curve_model_trial_params(trial, name, random_state, -1)
                 base = model_class(**params)
                 m = MultiOutputRegressor(base, n_jobs=n_jobs)
                 m.fit(X_train, Y_train)
@@ -5648,10 +5876,7 @@ def build_and_train_pipeline_basis(
             study = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(objective, n_trials=n_trials)
             best_params = study.best_params
-            if name in ('Gradient Boosting', 'Random Forest'):
-                best_params['random_state'] = random_state
-            if name == 'Random Forest':
-                best_params['n_jobs'] = n_jobs
+            best_params = _curve_model_finalise_params(name, best_params, random_state, n_jobs)
             base_model = model_class(**best_params)
         else:
             if name == 'Gradient Boosting':
@@ -5899,6 +6124,10 @@ def build_and_train_pipeline_exog(
     # ── Attribute key types (train only) ─────────────────────────────────────
     all_keys, key_types = _infer_key_types(train_curves)
 
+    # Training-median anchor: sensor's typical level at each canonical
+    # position, train curves only (see _training_median_stats).
+    train_median_curve, train_sensor_median = _training_median_stats(train_curves, fixed_length)
+
     # ── Feature matrix ────────────────────────────────────────────────────────
     _rel_denom = max(fixed_length - 1, 1)
     rows = []
@@ -5911,6 +6140,7 @@ def build_and_train_pipeline_exog(
                 'position_idx': position_idx,
                 'relative_pos': position_idx / _rel_denom,
                 'curve_length': curve['original_length'],
+                'train_median_at_pos': float(train_median_curve[position_idx]),
                 'y':            curve['resampled_values'][position_idx],
             }
             for key in all_keys:
@@ -5929,7 +6159,8 @@ def build_and_train_pipeline_exog(
     df_reg = pd.DataFrame(rows)
 
     categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
-    X_all = df_reg[['position_idx', 'relative_pos', 'curve_length']].copy()
+    X_all = df_reg[['position_idx', 'relative_pos', 'curve_length',
+                    'train_median_at_pos']].copy()
     X_all = X_all.assign(activity=df_reg['activity'].values)
     for key in all_keys:
         X_all = X_all.assign(**{key: df_reg[key].values})
@@ -5950,7 +6181,8 @@ def build_and_train_pipeline_exog(
 
     feature_columns = X_all.columns.tolist()
 
-    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length'] + \
+    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length',
+                            'train_median_at_pos'] + \
         [k for k in all_keys if key_types[k] == 'numeric'] + exog_cols
     numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
 
@@ -6000,6 +6232,8 @@ def build_and_train_pipeline_exog(
         'feature_columns':     feature_columns,
         'feature_scaler':      feature_scaler,
         'numeric_feature_cols': numeric_feature_cols,
+        'train_median_curve':  train_median_curve,
+        'train_sensor_median': train_sensor_median,
         'val_mae':             best_val_mae,
         'all_results':         all_results,
         'exog_cols':           exog_cols,
@@ -6032,6 +6266,8 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
     all_keys             = pipeline['all_keys']
     key_types            = pipeline['key_types']
     exog_cols            = pipeline.get('exog_cols', [])
+    # Training-median anchor, replayed positionwise (None on older pipelines).
+    train_median_curve   = pipeline.get('train_median_curve', None)
 
     if exog_values is None:
         exog_values = {}
@@ -6053,6 +6289,8 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
             'curve_length': attributes.get('_pred_curve_length', len(raw_values)),
             'activity':     activity,
         }
+        if train_median_curve is not None:
+            row['train_median_at_pos'] = float(train_median_curve[ref_pos])
         for key in all_keys:
             value = attributes.get(key, None)
             if key_types[key] == 'numeric':
@@ -6126,13 +6364,17 @@ def build_and_train_pipeline_exog_prev_activity(
     n_jobs=-1,
 ):
     """
-    DTW + external factors + previous-activity context.
+    DTW + external factors + previous-activity NAME.
 
-    The prev-activity features (prev_act_mean, prev_act_std, prev_act_max,
-    prev_act_end, prev_act_length, prev_act_name) must already be present in
-    each curve's 'attributes' dict — populated by split_curves_with_prev_activity().
-    They flow through the standard attribute path in build_and_train_pipeline_exog(),
-    so no changes to the feature-matrix logic are needed.
+    The prev-activity context must already be present in each curve's
+    'attributes' dict — populated by split_curves_with_prev_activity(), which by
+    default contributes only the categorical prev_act_name. It flows through the
+    standard attribute path in build_and_train_pipeline_exog(), so no changes to
+    the feature-matrix logic are needed.
+
+    The lagged-energy features (prev_act_mean/std/max/end/length) are only
+    present when the splitter was called with include_prev_energy=True — off for
+    reported runs, see that function's docstring.
     """
     pipeline = build_and_train_pipeline_exog(
         train_curves, variable,
@@ -7099,11 +7341,42 @@ class _Seq2SeqTransformer(nn.Module):
 # validation loss is kept — same "train both, keep the winner" rule the duration
 # models use. Override with PIPELINE_SEQ2SEQ_CELLS=lstm (or =transformer) to
 # train only one, e.g. to reproduce a pre-transformer run or to halve the cost.
-_SEQ2SEQ_CELL_TYPES = tuple(
-    c.strip().lower()
-    for c in _os.environ.get('PIPELINE_SEQ2SEQ_CELLS', 'lstm,transformer').split(',')
-    if c.strip()
-) or ('lstm',)
+_SEQ2SEQ_KNOWN_CELLS = ('lstm', 'transformer')
+
+
+def _resolve_seq2seq_cells(spec=None):
+    """
+    Parse PIPELINE_SEQ2SEQ_CELLS (set by pipeline.py's 'seq2seq_cells' key).
+
+    Validated here rather than at training time: an unrecognised cell used to
+    survive into _fit_seq2seq_with_selection, where every candidate is skipped
+    and the run dies with 'no seq2seq cell trained successfully' after the
+    curve stage has already finished.
+    """
+    raw = _os.environ.get('PIPELINE_SEQ2SEQ_CELLS') if spec is None else spec
+    if not raw or not raw.strip():
+        return _SEQ2SEQ_KNOWN_CELLS
+    picked, unknown = [], []
+    for c in raw.split(','):
+        c = c.strip().lower()
+        if not c:
+            continue
+        if c in _SEQ2SEQ_KNOWN_CELLS:
+            if c not in picked:
+                picked.append(c)
+        else:
+            unknown.append(c)
+    if unknown:
+        print(f"[sim_extractor] WARNING: PIPELINE_SEQ2SEQ_CELLS has unknown cells "
+              f"{unknown} — valid: {list(_SEQ2SEQ_KNOWN_CELLS)}. Ignoring those.")
+    if not picked:
+        print(f"[sim_extractor] WARNING: PIPELINE_SEQ2SEQ_CELLS={raw!r} selected no valid "
+              f"cell — falling back to {list(_SEQ2SEQ_KNOWN_CELLS)}.")
+        return _SEQ2SEQ_KNOWN_CELLS
+    return tuple(picked)
+
+
+_SEQ2SEQ_CELL_TYPES = _resolve_seq2seq_cells()
 
 
 def _fit_seq2seq_with_selection(
@@ -8027,12 +8300,16 @@ def build_and_train_pipeline_seq2seq_external(
     n_jobs=-1,
 ):
     """
-    DTW + Seq2Seq + External Factors + Previous-Activity context.
+    DTW + Seq2Seq + External Factors + previous-activity NAME.
 
     prev_act_* features must already be in each curve's 'attributes' dict —
-    populated by split_curves_with_prev_activity(). They flow through
+    populated by split_curves_with_prev_activity(), which by default contributes
+    only the categorical prev_act_name. They flow through
     build_and_train_pipeline_seq2seq_exog unchanged because _infer_key_types
-    picks them up as numeric attributes from the attributes dict.
+    picks them up from the attributes dict.
+
+    Lagged-energy features appear only with include_prev_energy=True on the
+    splitter — off for reported runs, see that function's docstring.
     """
     pipeline = build_and_train_pipeline_seq2seq_exog(
         train_curves, variable,
@@ -8201,14 +8478,12 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     """
     Top-level picklable worker for RUN_CURVE_ONLY_EVALUATION parallel training.
     Trains all sklearn-based approaches for one (sensor, activity, object) combo.
-    Seq2seq approaches are excluded — they use PyTorch and must stay sequential.
+    Seq2seq approaches are excluded — they are trained by _train_seq2seq_worker
+    in its own process pool.
 
     Returns dict keyed by approach name, each value is the raw pipeline dict,
     plus 'sensor'/'activity'/'object' keys for reassembly.
     """
-    from sklearn.linear_model import LinearRegression
-    from sklearn.ensemble import GradientBoostingRegressor
-
     # NOTE: 'baseline' (median per SENSOR, pooled over activities) is NOT here —
     # it can't be trained by a per-(sensor,activity,object) worker; it is built
     # separately in modelling.py's curve-only section. This worker trains the
@@ -8231,10 +8506,20 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     if len(curves) < 5:
         return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
 
-    models = {
-        'Linear Regression': LinearRegression,
-        'Gradient Boosting': GradientBoostingRegressor,
-    }
+    models = _make_curve_models()
+
+    # One BLAS thread per worker. The pool already saturates the machine with
+    # one process per (sensor, activity, object), but OpenBLAS/OpenMP default to
+    # one thread per core *inside each* of them — 16 workers x 16 threads on 16
+    # cores. The tree models are safe (n_jobs=1 is passed explicitly); the
+    # BLAS-bound candidates, MLP above all, oversubscribe badly without this.
+    # Applied AFTER _make_curve_models() on purpose: threadpool_limits only
+    # governs the pools already loaded when it runs, and that call is what
+    # lazily imports sklearn.neural_network / xgboost, each registering its own.
+    # Not a `with` block, so the limit persists across every task this pooled
+    # worker process handles rather than just the first.
+    from threadpoolctl import threadpool_limits
+    threadpool_limits(limits=1)
     result = {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': False}
 
     _hp_kwargs = dict(optimize_hyperparams=optimize_hyperparams, n_trials=n_trials)
@@ -8285,6 +8570,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
     if 'ml_external' in _active:
+        # Previous-activity NAME only (event-log fact) + ef_* external factors.
+        # No lagged meter readings — see split_curves_with_prev_activity docstring.
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
             variable=sensor,
@@ -8293,6 +8580,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             test_size=0.0,
             verbose=0,
             exog_columns=ef_cols,
+            include_prev_energy=False,
         )
         if len(_prev_curves) >= 5:
             result['ml_external'] = build_and_train_pipeline_exog_prev_activity(
@@ -8327,7 +8615,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1, **_hp_kwargs,
         )
-    return result
+    return _stamp_train_sensor_median(result, curves)
 
 
 def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
@@ -8344,6 +8632,10 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     """
     import torch
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
+    # Same for the BLAS pool numpy uses while building the feature sequences —
+    # torch's setting does not cover it.
+    from threadpoolctl import threadpool_limits
+    threadpool_limits(limits=1)
     _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_external'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
@@ -8382,6 +8674,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
         )
 
     if 'seq2seq_external' in _active:
+        # Same as ml_external: previous-activity NAME + ef_* only, no lagged energy.
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
             variable=sensor,
@@ -8390,6 +8683,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             test_size=0.0,
             verbose=0,
             exog_columns=ef_cols,
+            include_prev_energy=False,
         )
         if len(_prev_curves) >= 5:
             result['seq2seq_external'] = build_and_train_pipeline_seq2seq_external(
@@ -8413,7 +8707,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
 
-    return result
+    return _stamp_train_sensor_median(result, curves)
 
 
 def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=1, save_dir=None):
@@ -8670,10 +8964,71 @@ def _clip_physical(curve):
     return np.clip(np.asarray(curve, dtype=float), 0, None)
 
 
+def build_exog_lookup(df_expanded, ef_cols=None, time_col='datetime_energy'):
+    """
+    Time-indexed table of the ef_* external factors, for use at simulation time.
+
+    Weather is exogenous: its value at a timestamp is the same for every case,
+    object and sensor, and it is known for any date without predicting anything.
+    So one table indexed by timestamp is all a simulated activity needs to get
+    the real external conditions over its own window.
+
+    Returns a DataFrame indexed by timestamp (sorted, one row per timestamp,
+    duplicates averaged), or None when no ef_* columns are present.
+    """
+    if df_expanded is None or len(df_expanded) == 0 or time_col not in df_expanded.columns:
+        return None
+    cols = [c for c in (ef_cols or [c for c in df_expanded.columns if c.startswith('ef_')])
+            if c in df_expanded.columns]
+    cols = [c for c in cols if pd.api.types.is_numeric_dtype(df_expanded[c])]
+    if not cols:
+        return None
+    tbl = df_expanded[[time_col] + cols].copy()
+    tbl[time_col] = pd.to_datetime(tbl[time_col])
+    tbl = tbl.dropna(subset=[time_col]).groupby(time_col, as_index=True)[cols].mean()
+    return tbl.sort_index()
+
+
+def _exog_series_for_window(exog_lookup, exog_cols, ts_start, ts_end, n_ts):
+    """
+    Per-timestep external factors over one activity's window: the actual value
+    of each ef_* column at each of the n_ts steps between ts_start and ts_end,
+    read off the time-indexed lookup with nearest-timestamp matching (weather is
+    typically hourly, curve steps are finer).
+
+    Returns {col: np.ndarray(n_ts)}, or {} when it cannot be built.
+    """
+    if exog_lookup is None or exog_lookup.empty or not exog_cols:
+        return {}
+    if ts_start is None or ts_end is None or pd.isnull(ts_start) or pd.isnull(ts_end):
+        return {}
+    cols = [c for c in exog_cols if c in exog_lookup.columns]
+    if not cols:
+        return {}
+    ts_start, ts_end = pd.to_datetime(ts_start), pd.to_datetime(ts_end)
+    if ts_end < ts_start:
+        ts_end = ts_start
+    # A tz-aware simulated log against a tz-naive weather table (or vice versa)
+    # makes the index union below raise; normalise both to naive wall time.
+    _idx_tz = getattr(exog_lookup.index, 'tz', None)
+    if (_idx_tz is not None) != (ts_start.tz is not None):
+        if _idx_tz is not None:
+            exog_lookup = exog_lookup.copy()
+            exog_lookup.index = exog_lookup.index.tz_localize(None)
+        else:
+            ts_start, ts_end = ts_start.tz_localize(None), ts_end.tz_localize(None)
+    grid = pd.date_range(ts_start, ts_end, periods=max(int(n_ts), 1))
+    vals = exog_lookup[cols].reindex(exog_lookup.index.union(grid)).interpolate(
+        method='time', limit_direction='both').reindex(grid)
+    return {c: np.asarray(vals[c].to_numpy(), dtype=float) for c in cols
+            if not vals[c].isna().all()}
+
+
 def predict_curve_for_instance(activity, object_name, duration_minutes,
                                object_attributes, energy_pipelines, sensor,
                                activity_exog_means=None,
-                               temporal_resolution_minutes=15.0):
+                               temporal_resolution_minutes=15.0,
+                               exog_lookup=None, ts_start=None, ts_end=None):
     """
     Predict one sensor's curve for a single (activity, object) instance of a
     given duration, using a trained `energy_pipelines` dict — the same
@@ -8705,15 +9060,26 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     # (baseline, ml_external, etc. all wrap the trained pipeline dict
     # under 'full_pipeline' when reassembled — see modelling.py).
     exog_cols = ep.get('exog_cols') or ep.get('full_pipeline', {}).get('exog_cols')
+
+    n_ts = max(2, round(duration_minutes / temporal_resolution_minutes))
+
+    # External factors over THIS activity's own window, one value per timestep,
+    # read from the real exogenous series at the simulated timestamps. This is
+    # what the pipelines were trained on (ef_* resampled per canonical
+    # position), so it keeps train and simulation inputs the same shape.
     exog_vals = {}
-    if exog_cols and activity_exog_means:
+    if exog_cols:
+        exog_vals = _exog_series_for_window(exog_lookup, exog_cols, ts_start, ts_end, n_ts)
+    if not exog_vals and exog_cols and activity_exog_means:
+        # Fallback only: per-activity training mean, broadcast flat across the
+        # curve. Loses all within-window and seasonal variation — used when no
+        # exog_lookup/timestamps were supplied by the caller.
         act_means = activity_exog_means.get(activity, {})
         exog_vals = {
             col: np.array([v]) for col, v in act_means.items()
             if col in exog_cols
         }
 
-    n_ts = max(2, round(duration_minutes / temporal_resolution_minutes))
     input_curve = np.interp(
         np.linspace(0, 1, n_ts),
         np.linspace(0, 1, len(ref_curve)),
@@ -8753,7 +9119,7 @@ def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
                                    activity_exog_means=None,
                                    temporal_resolution_minutes=15.0,
                                    case_col='case_id', activity_col='activity',
-                                   object_col='object'):
+                                   object_col='object', exog_lookup=None):
     """
     For every activity instance in `simulated_df`, predict each sensor's
     curve (via predict_curve_for_instance) and reduce it to summary stats.
@@ -8775,6 +9141,8 @@ def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
                 row[activity_col], row[object_col], duration_minutes,
                 object_attributes, energy_pipelines, sensor,
                 activity_exog_means, temporal_resolution_minutes,
+                exog_lookup=exog_lookup,
+                ts_start=row['timestamp_start'], ts_end=row['timestamp_end'],
             )
             if curve is None or len(curve) == 0:
                 continue
@@ -8916,7 +9284,7 @@ def pool_simulated_curve_values(simulated_df, energy_pipelines, sensors,
                                 activity_exog_means=None,
                                 temporal_resolution_minutes=15.0,
                                 case_col='case_id', activity_col='activity',
-                                object_col='object'):
+                                object_col='object', exog_lookup=None):
     """
     Pool every predicted sensor curve value (every timestep of every
     predicted instance) per sensor — no per-instance or per-case aggregation.
@@ -8936,6 +9304,8 @@ def pool_simulated_curve_values(simulated_df, energy_pipelines, sensors,
                 row[activity_col], row[object_col], duration_minutes,
                 object_attributes, energy_pipelines, sensor,
                 activity_exog_means, temporal_resolution_minutes,
+                exog_lookup=exog_lookup,
+                ts_start=row['timestamp_start'], ts_end=row['timestamp_end'],
             )
             if curve is None or len(curve) == 0:
                 continue
@@ -9162,7 +9532,8 @@ def _extract_real_case_curves_all_sensors(real_case_df, sensors,
 def _predict_case_curves_all_sensors(sim_case_df, energy_pipelines, sensors,
                                      activity_exog_means=None,
                                      temporal_resolution_minutes=15.0,
-                                     activity_col='activity', object_col='object'):
+                                     activity_col='activity', object_col='object',
+                                     exog_lookup=None):
     """
     Predict every sensor's (relative_time_minutes, value) curve for one
     simulated case (already filtered to that case_id) in a single pass over
@@ -9200,6 +9571,7 @@ def _predict_case_curves_all_sensors(sim_case_df, energy_pipelines, sensors,
                 activity, obj, duration_minutes,
                 object_attributes, energy_pipelines, sensor,
                 activity_exog_means, temporal_resolution_minutes,
+                exog_lookup=exog_lookup, ts_start=ts_start, ts_end=ts_end,
             )
             if curve is None or len(curve) == 0:
                 continue
@@ -9219,7 +9591,7 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
                                  activity_exog_means=None,
                                  temporal_resolution_minutes=15.0,
                                  real_case_col='case_id_log', sim_case_col='case_id',
-                                 save_curves=False):
+                                 save_curves=False, exog_lookup=None):
     """
     Per real test case (matched to the simulated log by case_id), per sensor:
     build the real case's complete profile and the simulated case's complete
@@ -9259,6 +9631,11 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     # a simulated log can carry the same case_id in different dtypes (e.g.
     # float vs str for numeric-looking IDs), which would silently zero out
     # every match under a raw-value set intersection despite full overlap.
+    # The real expanded frame already carries the ef_* series, so the
+    # timestamp-resolved external factors need no extra input from the caller.
+    if exog_lookup is None:
+        exog_lookup = build_exog_lookup(real_expanded_df)
+
     real_ids_str = real_expanded_df[real_case_col].astype(str)
     sim_ids_str  = simulated_df[sim_case_col].astype(str)
     real_valid   = real_expanded_df[real_case_col].notna()
@@ -9291,6 +9668,7 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
         sim_curves = _predict_case_curves_all_sensors(
             sim_g, energy_pipelines, list(real_curves.keys()),
             activity_exog_means, temporal_resolution_minutes,
+            exog_lookup=exog_lookup,
         )
 
         for sensor, (t_real, v_real) in real_curves.items():

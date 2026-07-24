@@ -71,7 +71,7 @@
 \caption{Simulation of the process and energy.}
 \label{alg:simulation}
 \begin{algorithmic}[1]
-\Require Stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, \pi)$ with the case-behaviour distributions $R_a$ and $W_a$, and case-duration model $\hat{f}_B$, from Algorithm~\ref{alg:pm_extraction_ml}; curve models $(g, r, S)$ from Algorithm~\ref{alg:dtw_profile_pipeline}; production plan $P$ with the attributes $\mathbf{x}^{\mathrm{attr}}_c$ of every planned case and the external factors $\mathbf{x}^{\mathrm{ef}}$; exit weights $\alpha < 1 < \beta$; step limit $k_{\max}$
+\Require Stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, \pi)$ with the case-behaviour distributions $R_a$ and $W_a$, and case-duration model $\hat{f}_B$, from Algorithm~\ref{alg:pm_extraction_ml}; curve models $(g, r, S)$ from Algorithm~\ref{algorithm:energy_model_extarction}; production plan $P$ with the attributes $\mathbf{x}^{\mathrm{attr}}_c$ of every planned case and the external factors $\mathbf{x}^{\mathrm{ef}}$; exit discount $\alpha < 1$; step limit $k_{\max}$
 
 \State \textbf{(A) Initialise the case}
 \State Take the row of case $c$ from the production plan $P$ and assemble its feature vector $\mathbf{z}^\star$ from $\mathbf{x}^{\mathrm{attr}}_c$ and $\mathbf{x}^{\mathrm{ef}}$
@@ -82,8 +82,8 @@
 \State \textbf{(B) Replay the Petri net}
 \While{$M \neq M_f$, $\Delta < B^\star$ and $k < k_{\max}$}
     \State Determine the transitions enabled under $M$ and take their weights from $\pi$
-    \State Discount the weight of every enabled transition whose activity has already reached its quota, $\nu_a \geq \kappa_a$, as a soft penalty rather than a hard block
     \State Multiply by $\alpha$ the weight of the transitions that would lead to the final marking $M_f$, so that the case keeps generating activities while its budget is not spent
+    \State Where no budget is used, discount instead the weight of every enabled transition whose activity has already reached its quota, $\nu_a \geq \kappa_a$, as a soft penalty rather than a hard block
     \State Sample the transition $t^\star$ with probability proportional to its weight and fire it, $M \gets \mathrm{fire}(M, t^\star)$
     \If{$\ell(t^\star) = a$ is a visible activity}
         \State Sample its duration $d^\star$ from $D_{t^\star} \in \mathcal{G}$ and the idle time preceding it, $\delta \sim W_a$
@@ -91,11 +91,11 @@
     \EndIf
     \State $k \gets k+1$
 \EndWhile
-\State Once the budget is spent, multiply by $\beta$ the weight of the transitions leading to $M_f$ and replay until the final marking is reached, so that the case closes on a valid end
+\State The case is closed as soon as its budget is spent, at the marking reached at that moment, or earlier if the replay arrives at the final marking $M_f$ on its own
 
 \State \textbf{(C) Predict and place the energy profiles}
 \For{each activity instance $(a, \Delta_a, d^\star) \in \mathcal{L}$ and each sensor}
-    \State Predict its energy profile $\hat{y}^\star$ of length $d^\star$ with Algorithm~\ref{alg:dtw_profile_generation}, from the models $(g, r, S)$ of that sensor and activity, the features $\mathbf{z}^\star$ and the duration $d^\star$
+    \State Predict its energy profile $\hat{y}^\star$ on the canonical timeline with the model $g$ of that sensor and activity, from the features $\mathbf{z}^\star$, the position and the duration $d^\star$, and decode it onto a grid of length $d^\star$ by aligning that grid to the reference curve $r$ by DTW
     \State Insert $\hat{y}^\star$ into the simulated energy timeline $\hat{Y}$ over the interval $[\Delta_a,\, \Delta_a + d^\star]$
 \EndFor
 

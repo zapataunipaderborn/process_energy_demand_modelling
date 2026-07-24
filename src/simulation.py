@@ -159,6 +159,7 @@ class ProcessSimulation:
                  mlp_feat_cols=None,
                  mlp_activity_means=None,
                  mlp_global_mean=0.0,
+                 mlp_ef_windows=None,
                  load_profile=None,
                  case_duration_pipeline=None):
         # Backward-compatible input handling: extract_process now returns
@@ -189,6 +190,11 @@ class ProcessSimulation:
         self.mlp_feat_cols      = mlp_feat_cols or []
         self.mlp_activity_means = mlp_activity_means or {}
         self.mlp_global_mean    = float(mlp_global_mean) if mlp_global_mean else 0.0
+        # sim_extractor.ExternalFactorWindows from _mlp_train_models. Needed to
+        # rebuild the feat_ef_* duration features at generation time; without it
+        # they would silently default to 0.0 in _build_mlp_features while the
+        # model was trained on real values.
+        self.mlp_ef_windows     = mlp_ef_windows
         self.load_profile       = load_profile  # LoadProfile for WIP/RO lookups
         # Trained case-duration predictor (train_case_duration_pipeline output)
         # used by the 'petri_net_budget' mode to get a per-case total-duration
@@ -385,6 +391,14 @@ class ProcessSimulation:
             'feat_case_elapsed': float(elapsed),
             'feat_act_mean_dur': float(act_mean),
         }
+        # External factors: mean over [start, start + median duration of this
+        # activity) — the same window the training join used, so the feature
+        # means the same thing on both sides.
+        if self.mlp_ef_windows is not None and current_sim_ts:
+            feat_dict.update(
+                self.mlp_ef_windows.window_means(current_sim_ts, float(act_mean) * 60.0)
+            )
+
         obj_attrs = object_attributes or {}
         for k, v in obj_attrs.items():
             feat_dict[f'attr_{k}'] = v

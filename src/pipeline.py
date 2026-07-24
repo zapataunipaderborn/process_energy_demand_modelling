@@ -27,6 +27,11 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    rollout rows ("… (autoreg)") to the Curve-Only
                                    Evaluation. Only adds those extra comparison
                                    rows; affects nothing else. Default: False.
+                                   Inert unless the lagged-energy prev-activity
+                                   features are switched on explicitly
+                                   (split_curves_with_prev_activity
+                                   include_prev_energy=True), which reported runs
+                                   do not do.
   save_predicted_curves bool       whether to also persist the actual real/predicted
                                    curve arrays (not just the aggregated Wasserstein
                                    distances) behind complete-curve eval and schedule
@@ -61,6 +66,22 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    Fewer models = much faster runs. The
                                    schedule-profile / complete-curve eval needs
                                    'ml_external' present.
+  curve_models          list|None  which regressors compete for every curve
+                                   approach, per (sensor, activity, object) —
+                                   the best is kept by validation MAE. Subset of
+                                   'Linear Regression' | 'Ridge' |
+                                   'Random Forest' | 'XGBoost' | 'MLP' (short
+                                   aliases also accepted: linear, ridge, rf,
+                                   xgb, mlp). None (default) → all five compete.
+                                   Fewer = faster: the curve stage trains one
+                                   model per name per combo, times
+                                   curve_n_optuna_trials.
+  seq2seq_cells         list|None  which cells compete inside every seq2seq
+                                   approach: 'lstm' and/or 'transformer'. Both
+                                   are trained per combo and the lower
+                                   validation loss wins. None (default) → both.
+                                   Set ['lstm'] to reproduce a pre-transformer
+                                   run or to halve the seq2seq cost.
   curve_optimize_hyperparams bool  whether curve models run the (slow) Optuna
                                    hyperparameter search. None → modelling.py
                                    default (True). Set False for fast test runs.
@@ -91,10 +112,13 @@ EXPERIMENTS = [
         'run_name':              'experiment_964',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
-        # (simulation.py BUDGET_EXIT_DISCOUNT=0.35 + BUDGET_MAX_LENGTH_RATIO) and
-        # the DBA zero-calibration (sim_extractor._zero_calibrate_barycenter)
-        # end-to-end, and is directly comparable to experiment_944 (same split,
-        # same miners) for the before/after leakage check.
+        # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
+        # BUDGET_EXIT_BOOST=25.0 once spent, TIME backstop BUDGET_MAX_TIME_RATIO=1.5;
+        # the activity-count cap BUDGET_MAX_LENGTH_RATIO is OFF, see
+        # BUDGET_USE_LENGTH_CAP) and the DBA zero-calibration
+        # (sim_extractor._zero_calibrate_barycenter) end-to-end, and is directly
+        # comparable to experiment_944 (same split, same miners) for the
+        # before/after leakage check.
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
@@ -119,7 +143,7 @@ EXPERIMENTS = [
             'baseline',              # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
             'median_activity_sensor', # "Median per Activity & Sensor": median curve per (sensor, activity, object), no model
             'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
-            'ml_external',  # DBA + DTW + regression + external factors + prev-activity
+            'ml_external',  # DBA + DTW + regression + external factors + prev-activity NAME (no lagged energy)
             'ml_only',                # no DTW at all (formerly 'ml_linear')
             'seq2seq',
             'seq2seq_only',
@@ -142,6 +166,21 @@ EXPERIMENTS = [
         #   'baseline', 'median_activity_sensor', 'ml_dtw', 'instance_stats', 'istats_leakfree',
         #   'dtw_phase', 'basis', 'ml_external', 'amplitude_shape',
         #   'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
+        # Regressors competed for every curve approach, per (sensor, activity,
+        # object); best kept by validation MAE. Comment a line out to turn that
+        # model off. None / omitted = all five.
+        'curve_models': [
+            'Linear Regression',   # unpenalised OLS reference (nothing to tune —
+                                   # its Optuna trials are all identical)
+            'Ridge',               # penalised counterpart; the one-hot design
+                                   # matrix is high-dimensional and collinear
+            'Random Forest',
+            'XGBoost',             # the gradient-boosting member
+            'MLP',                 # feed-forward net (sklearn MLPRegressor)
+        ],
+        # Cells competed inside every seq2seq approach; lower validation loss
+        # wins. ['lstm'] reproduces the pre-transformer behaviour.
+        'seq2seq_cells': ['lstm', 'transformer'],
         'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
     },
@@ -239,6 +278,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_autoregressive_eval = exp.get('run_autoregressive_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
     curve_approaches = exp.get('curve_approaches')
+    curve_models = exp.get('curve_models')
+    seq2seq_cells = exp.get('seq2seq_cells')
     curve_optimize_hyperparams = exp.get('curve_optimize_hyperparams')
     curve_n_optuna_trials = exp.get('curve_n_optuna_trials')
     train_ratio = exp.get('train_ratio')
@@ -261,6 +302,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"run_autoregressive_eval={run_autoregressive_eval}  "
           f"save_predicted_curves={save_predicted_curves}  "
           f"curve_approaches={curve_approaches or '(default)'}  "
+          f"curve_models={curve_models or '(all)'}  "
+          f"seq2seq_cells={seq2seq_cells or '(all)'}  "
           f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
           f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}  "
           f"split_type={split_type}")
@@ -281,6 +324,10 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
     if curve_approaches:
         env['PIPELINE_CURVE_APPROACHES'] = ','.join(curve_approaches)
+    if curve_models:
+        env['PIPELINE_CURVE_MODELS'] = ','.join(curve_models)
+    if seq2seq_cells:
+        env['PIPELINE_SEQ2SEQ_CELLS'] = ','.join(seq2seq_cells)
     if curve_optimize_hyperparams is not None:
         env['PIPELINE_CURVE_OPTIMIZE_HYPERPARAMS'] = 'true' if curve_optimize_hyperparams else 'false'
     if curve_n_optuna_trials is not None:

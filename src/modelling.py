@@ -76,14 +76,14 @@ constants.SHOW_PROGRESS_BAR = False
 
 # %%
 import pandas as pd
-from sim_extractor import extract_process
+from sim_extractor import extract_process, MIN_CURVE_SAMPLES
 from simulation import ProcessSimulation, simulate_with_wip_ro
 from sim_modeller import SimModeller
 
 from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
 from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
-from sim_extractor import compare_complete_case_curves
+from sim_extractor import compare_complete_case_curves, build_exog_lookup
 from sim_extractor import build_sensor_activity_object_combos
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
@@ -390,8 +390,15 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     return (m, sc, best_name, calib), oof_out
 
 
-def _mlp_train_models(df_train):
+def _mlp_train_models(df_train, expanded_df=None):
     """Train ML+ global and per-act models from the training event log.
+
+    expanded_df: optional per-timestamp frame carrying the ef_* external-factor
+    series. When given, each activity instance gets one feat_ef_* column per
+    series — the mean over [activity start, start + median duration of that
+    activity) — via sim_extractor.ExternalFactorWindows. The event log itself
+    carries no ef_* columns, so without this the duration models see only
+    calendar features (hour/dow/month) and never the external factors.
 
     Returns:
         global_mlp_tuple: (model, scaler, name) or None
@@ -399,6 +406,8 @@ def _mlp_train_models(df_train):
         mlp_feat_cols:    ordered feature column list
         activity_means:   {activity: mean_duration}
         global_mean:      float
+        ef_windows:       ExternalFactorWindows or None (the simulator needs the
+                          same object to rebuild these features at predict time)
     """
     df = df_train.copy()
     df['timestamp_start'] = pd.to_datetime(df['timestamp_start'])
@@ -414,13 +423,41 @@ def _mlp_train_models(df_train):
 
     df['feat_act_mean_dur'] = df['activity'].map(activity_means).fillna(global_mean)
 
+    # ── External factors (ef_*) ───────────────────────────────────────────
+    # Joined from the expanded frame, since the event log has none. Window =
+    # the activity's median duration, so the feature never encodes the target
+    # and is reproducible at generation time (see ExternalFactorWindows).
+    ef_windows = None
+    ef_feat_cols = []
+    if expanded_df is not None and not expanded_df.empty:
+        from sim_extractor import ExternalFactorWindows
+        _ef_cols = [c for c in expanded_df.columns
+                    if c.startswith('ef_')
+                    and pd.api.types.is_numeric_dtype(expanded_df[c])]
+        if _ef_cols and 'datetime_energy' in expanded_df.columns:
+            ef_windows = ExternalFactorWindows(expanded_df, _ef_cols)
+            ef_feat_cols = ef_windows.feature_names
+            if ef_feat_cols:
+                _starts = df['timestamp_start'].astype('int64').to_numpy() / 1e9
+                _windows = (df['activity'].map(activity_means)
+                            .fillna(global_mean).to_numpy(dtype=float) * 60.0)
+                _rows = [ef_windows.window_means(s, w) for s, w in zip(_starts, _windows)]
+                for col in ef_feat_cols:
+                    df[col] = [r.get(col, np.nan) for r in _rows]
+                print(f"  ML+ duration features: added {len(ef_feat_cols)} external-factor "
+                      f"column(s) {ef_feat_cols}")
+
     attr_cols = [c for c in df.columns if c.startswith('attr_')]
     numeric_attr_cols = [
         c for c in attr_cols
         if pd.to_numeric(df[c], errors='coerce').notna().mean() > 0.5
     ]
+    _dropped_attrs = [c for c in attr_cols if c not in numeric_attr_cols]
+    if _dropped_attrs:
+        print(f"  ML+ duration features: dropped {len(_dropped_attrs)} non-numeric "
+              f"attribute(s) {_dropped_attrs} — not encoded, so they carry no signal.")
     mlp_feat_cols = [
-        c for c in (numeric_attr_cols + _MLP_ENG_COLS + ['feat_act_mean_dur'])
+        c for c in (numeric_attr_cols + _MLP_ENG_COLS + ['feat_act_mean_dur'] + ef_feat_cols)
         if c in df.columns
     ]
 
@@ -432,7 +469,8 @@ def _mlp_train_models(df_train):
         if tpl is not None:
             act_mlp_models[act] = tpl
 
-    return global_mlp_tuple, act_mlp_models, mlp_feat_cols, activity_means, global_mean
+    return (global_mlp_tuple, act_mlp_models, mlp_feat_cols,
+            activity_means, global_mean, ef_windows)
 
 
 MODES_TO_COMPARE = [
@@ -615,6 +653,18 @@ ML_OPTUNA_TRIALS        = 20
 #   regressor hyperparameters (learning rate, max_depth, n_estimators, etc.)
 #   instead of using defaults.  Significantly slower but often improves fit.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CURVE-EVAL POPULATION FLOOR
+#   Mirrors sim_extractor.MIN_CURVE_SAMPLES, the floor both curve extractors
+#   now share, so training and scoring cover the same curves for every
+#   approach. Kept as an explicit reporting-side guard: runs produced BEFORE
+#   the extractors were unified (<= experiment_964) still contain 2-4 sample
+#   curves for the non-prev-activity approaches only, and re-reading those
+#   parquets without this filter would compare medians over different
+#   populations. On a fresh run it is a no-op.
+#   The exported curve_eval_results.parquet always keeps every scored curve.
+CURVE_EVAL_MIN_POINTS = MIN_CURVE_SAMPLES
+
 CURVE_OPTIMIZE_HYPERPARAMS = True   # ← Optuna search for sklearn curve models
 CURVE_N_OPTUNA_TRIALS      = 50     # ← trials per (sensor, activity, object) combo
 # Pipeline-config overrides (PIPELINE_CURVE_OPTIMIZE_HYPERPARAMS / _N_OPTUNA_TRIALS)
@@ -697,7 +747,8 @@ SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false'
 #    'istats_leakfree'   DTW + two-stage leak-free stats
 #    'dtw_phase'         DTW + phase features
 #    'basis'             DTW + B-spline basis expansion
-#    'ml_external'  DTW + external factors (ef_* columns) + prev activity
+#    'ml_external'  DTW + external factors (ef_* columns) + prev-activity NAME
+#                   (no lagged meter values — see split_curves_with_prev_activity)
 #    'amplitude_shape'   Separate amplitude (curve_mean) from shape (z-score);
 #                        stage A predicts amplitude from metadata, stage B shape
 #    'seq2seq'           DTW + LSTM encoder-decoder
@@ -904,10 +955,15 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
     if not sensors or simulated_df is None or simulated_df.empty:
         return
 
+    # Timestamp-resolved external factors: the real ef_* series, sampled at
+    # each simulated activity's own timestamps (see build_exog_lookup).
+    _exog_lookup = build_exog_lookup(real_expanded_df)
+
     try:
         sim_stats = annotate_simulated_curve_stats(
             simulated_df, pipelines_for_process, sensors,
             activity_exog_means=globals().get('_activity_exog_means', {}),
+            exog_lookup=_exog_lookup,
         )
         real_stats = extract_real_curve_stats(real_expanded_df, sensors)
         if sim_stats.empty or real_stats.empty:
@@ -923,6 +979,7 @@ def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_exp
         sim_pooled = pool_simulated_curve_values(
             simulated_df, pipelines_for_process, sensors,
             activity_exog_means=globals().get('_activity_exog_means', {}),
+            exog_lookup=_exog_lookup,
         )
         result_pooled = compare_pooled_value_distributions(real_pooled, sim_pooled)
     except Exception as exc:
@@ -3243,8 +3300,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             _best_pm    = extraction_by_algorithm[_best_alg]['process_models']
             _best_stats = extraction_by_algorithm[_best_alg]['activity_stats_df']
 
-            _glb_tpl, _pa_tpls, _mlp_feat_cols, _act_means, _glb_mean = \
-                _mlp_train_models(df_train)
+            _glb_tpl, _pa_tpls, _mlp_feat_cols, _act_means, _glb_mean, _mlp_ef_windows = \
+                _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'))
 
             print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
             print(f"  Global model: {_glb_tpl[2] if _glb_tpl else 'None'}")
@@ -3267,6 +3324,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     mlp_global_tuple=_g_arg,
                     mlp_per_act_tuples=_pa_arg,
                     mlp_feat_cols=_mlp_feat_cols,
+                    mlp_ef_windows=_mlp_ef_windows,
                     mlp_activity_means=_act_means,
                     mlp_global_mean=_glb_mean,
                 ).run()
@@ -3302,6 +3360,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         mlp_global_tuple=_g_arg,
                         mlp_per_act_tuples=_pa_arg,
                         mlp_feat_cols=_mlp_feat_cols,
+                        mlp_ef_windows=_mlp_ef_windows,
                         mlp_activity_means=_act_means,
                         mlp_global_mean=_glb_mean,
                     ).run()
@@ -3414,8 +3473,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("\n" + "─"*80)
         print("  TRAINING ML+ MODELS (shared across all algorithms)")
         print("─"*80)
-        _mlp_glb_tpl, _mlp_pa_tpls, _mlp_feat_cols, _mlp_act_means, _mlp_glb_mean = \
-            _mlp_train_models(df_train)
+        _mlp_glb_tpl, _mlp_pa_tpls, _mlp_feat_cols, _mlp_act_means, _mlp_glb_mean, _mlp_ef_windows = \
+            _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'))
         print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
         print(f"  Global model: {_mlp_glb_tpl[2] if _mlp_glb_tpl else 'None'}")
         print(f"  Per-act models trained: {len(_mlp_pa_tpls)} activities")
@@ -3449,6 +3508,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     mlp_global_tuple=_g_arg,
                     mlp_per_act_tuples=_pa_arg,
                     mlp_feat_cols=_mlp_feat_cols,
+                    mlp_ef_windows=_mlp_ef_windows,
                     mlp_activity_means=_mlp_act_means,
                     mlp_global_mean=_mlp_glb_mean,
                 ).run()
@@ -3484,6 +3544,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         mlp_global_tuple=_g_arg,
                         mlp_per_act_tuples=_pa_arg,
                         mlp_feat_cols=_mlp_feat_cols,
+                        mlp_ef_windows=_mlp_ef_windows,
                         mlp_activity_means=_mlp_act_means,
                         mlp_global_mean=_mlp_glb_mean,
                     ).run()
@@ -3559,6 +3620,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 final_mode=_wip_mlp_mode,
                 mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
                 mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                mlp_ef_windows=_mlp_ef_windows,
                 mlp_global_mean=_mlp_glb_mean,
             )
             print(f"\n  Simulated log TRAIN ({_wip_mlp_mode}): {len(sim_wipmlp_train)} events")
@@ -3590,6 +3652,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     final_mode=_wip_mlp_mode,
                     mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
                     mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                    mlp_ef_windows=_mlp_ef_windows,
                     mlp_global_mean=_mlp_glb_mean,
                 )
                 print(f"\n  Simulated log TEST  ({_wip_mlp_mode}): {len(sim_wipmlp_test)} events")
@@ -3669,6 +3732,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 case_duration_pipeline=_case_duration_pipeline,
                 mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
                 mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                mlp_ef_windows=_mlp_ef_windows,
                 mlp_global_mean=_mlp_glb_mean,
             ).run()
             print(f"\n  Simulated log TRAIN ({_bud_mode}): {len(sim_budmlp_train)} events")
@@ -3701,6 +3765,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     case_duration_pipeline=_case_duration_pipeline,
                     mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
                     mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                    mlp_ef_windows=_mlp_ef_windows,
                     mlp_global_mean=_mlp_glb_mean,
                 ).run()
                 print(f"\n  Simulated log TEST  ({_bud_mode}): {len(sim_budmlp_test)} events")
@@ -4425,8 +4490,6 @@ if RUN_CURVE_ONLY_EVALUATION:
         predict_raw_curve_seq2seq_only,
         predict_raw_curve_seq2seq_external,
     )
-    from sklearn.linear_model import LinearRegression
-    from sklearn.ensemble import GradientBoostingRegressor
 
     all_energy_pipelines                  = {}   # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
     all_energy_pipelines_median_activity_sensor = {}   # "Median per Activity & Sensor": median curve per (sensor, activity, object)
@@ -4435,18 +4498,21 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_istats_leakfree = {}   # Instance Stats (leak-free)
     all_energy_pipelines_dtw_phase       = {}   # Approach 3
     all_energy_pipelines_basis           = {}   # Approach 2
-    all_energy_pipelines_ml_external   = {}   # DTW + Ext. Factors + Prev Activity
+    all_energy_pipelines_ml_external   = {}   # DTW + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_amplitude_shape      = {}   # Amplitude + Shape
     all_energy_pipelines_amplitude_shape_exog = {}   # removed — kept as empty for safety
     all_energy_pipelines_seq2seq              = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
-    all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors + Prev Act
+    all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_ml_only                  = {}   # ML, linear resample encode+decode
 
-    _CURVE_MODELS = {
-        'Linear Regression': LinearRegression,
-        'Gradient Boosting': GradientBoostingRegressor,
-    }
+    # Curve regressors are defined once in sim_extractor._make_curve_models and
+    # used there by _train_curve_only_worker; imported here only so the run log
+    # records which candidates competed.
+    from sim_extractor import _make_curve_models
+    _CURVE_MODELS = _make_curve_models()
+    print(f"  Curve regressors competed per (sensor, activity, object): "
+          f"{', '.join(_CURVE_MODELS)}")
 
     for _proc in process_datasets_to_model.keys():
         _proc_cfg   = process_datasets_to_model_sensors.get(_proc, {}) \
@@ -4486,7 +4552,10 @@ if RUN_CURVE_ONLY_EVALUATION:
                 _df_train_exp['object_attributes_log'] = [{} for _ in range(len(_df_train_exp))]
             _objects = ['_all_']
 
-        # Detect ef_* columns — external factors are always predictors of every curve
+        # Detect ef_* columns. They are attached to EVERY curve's 'exog_values',
+        # but only the exog approaches (ml_external, seq2seq_external,
+        # amplitude_shape_exog) actually consume them as features -- that
+        # difference is what the "+ Ext. Factors" comparison isolates.
         _ef_cols = [
             c for c in _df_train_exp.columns
             if c.startswith('ef_')
@@ -4519,7 +4588,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         # ── Parallel training for all sklearn-based approaches ───────────────
         # One worker per (sensor, activity, object) combo — each trains its own
         # barycenter and model on a homogeneous set of curves.
-        # Seq2seq approaches use PyTorch and run sequentially afterwards.
+        # Seq2seq approaches run afterwards in their own process pool.
         from sim_extractor import _train_curve_only_worker
         import concurrent.futures, os as _os
 
@@ -4788,10 +4857,14 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                 _approach_eval = _fp.get('approach', 'baseline')
                 _exog_cols_eval = _fp.get('exog_cols', []) if _approach_eval in ('ml_external', 'seq2seq_external') else None
                 if _approach_eval in ('ml_external', 'seq2seq_external'):
+                    # Must mirror training: previous-activity NAME + ef_* only.
+                    # include_prev_energy stays False so nothing here reads the
+                    # test set's real meter values for the preceding activity.
                     _curves, _ = split_curves_with_prev_activity(
                         _df, _sensor, _leaf_acts, _leaf_objs,
                         test_size=0.0, verbose=0,
                         exog_columns=_exog_cols_eval,
+                        include_prev_energy=False,
                     )
                 else:
                     _curves, _ = split_curves(_df, _sensor, _leaf_acts, _leaf_objs,
@@ -4837,6 +4910,13 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
                                             df_lookup, activities, objects, save_dir=None):
     """
     Autoregressive evaluator for the ml_external approach.
+
+    ONLY meaningful when the pipelines were trained with
+    split_curves_with_prev_activity(include_prev_energy=True). With the default
+    (name-only prev-activity context, which is what the reported runs use) the
+    model has no lagged-energy feature to chain, so this evaluator returns the
+    same numbers as _run_curve_eval. Kept for the explicit lagged-energy
+    experiment only; RUN_AUTOREGRESSIVE_EVAL is off for paper runs.
 
     For each test case in chronological order:
       • Activity 1 of the case has no real predecessor → uses the pipeline's
@@ -5010,8 +5090,8 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
 # curve pipelines actually exist.
 if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribution_pending:
     # Compare against every curve-fitting approach that actually trained
-    # (not just 'baseline') — 'ml_external' ("DTW + Ext. Factors +
-    # Prev Activity") is usually the strongest approach per Curve-Only
+    # (not just 'baseline') — 'ml_external' ("DTW + ML + Ext. Factors")
+    # is usually the strongest approach per Curve-Only
     # Evaluation, so it's worth comparing energy-distribution fidelity
     # against it too, not only the simplest baseline.
     _energy_approaches_available = ['baseline']
@@ -5051,16 +5131,15 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     # plain seq2seq/seq2seq_only pipeline predicts finite values
     # on real production-shaped attributes.
     #
-    # seq2seq_external remains excluded
-    # for a SEPARATE, still-real reason: their prev_act_* features are meant
-    # to reflect the PREDICTED curve of the previous activity in the case
-    # (see _run_curve_eval_autoregressive_prev_act's explicit chaining), but
-    # predict_curve_for_instance has no case-history state to chain from --
-    # it would silently use whatever prev_act_* happens to already be baked
-    # into object_attributes instead, which is not the same guarantee the
-    # model was built for. Fixing that needs real autoregressive rollout
-    # threaded through the simulation/complete-curve call path, not a
-    # one-line predict fix.
+    # The *_external approaches used to raise a second concern: their
+    # prev_act_* features were lagged energy of the previous activity, which a
+    # simulation cannot know without chaining predictions
+    # (_run_curve_eval_autoregressive_prev_act). That is moot now --
+    # split_curves_with_prev_activity defaults to include_prev_energy=False, so
+    # the only prev-activity feature is the categorical prev_act_name, an event-
+    # log fact the simulator already has. Nothing to chain, nothing to exclude.
+    # (The guard below is a leftover no-op: no APPROACHES key contains
+    # 'prev_activity'.)
     _complete_curve_approaches_available = []
     for _appr_candidate in APPROACHES:
         if _appr_candidate.startswith('seq2seq') and 'prev_activity' in _appr_candidate:
@@ -5169,12 +5248,12 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('Baseline',                          all_energy_pipelines),
             ('Median per Activity & Sensor',      all_energy_pipelines_median_activity_sensor),
             ('ML DTW',                    all_energy_pipelines_ml_dtw),
-            ('ML + Ext. Factors + Prev Act',     all_energy_pipelines_ml_external),
+            ('ML + Ext. Factors',     all_energy_pipelines_ml_external),
             ('ML only (no DTW)',                all_energy_pipelines_ml_only),
 
             ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
             ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
-            ('DTW + Seq2Seq + Ext. Factors + Prev Act', all_energy_pipelines_seq2seq_external),
+            ('DTW + Seq2Seq + Ext. Factors', all_energy_pipelines_seq2seq_external),
         ]:
             if not _pipelines:
                 continue
@@ -5216,11 +5295,30 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
     if _all_records:
         _all_df = pd.DataFrame(_all_records)
 
+        # Level the population across approaches before any comparison table
+        # (see CURVE_EVAL_MIN_POINTS). _all_df itself stays complete — it is
+        # what gets exported to curve_eval_results.parquet.
+        _cmp_df = _all_df[_all_df['N'] >= CURVE_EVAL_MIN_POINTS]
+        _dropped = len(_all_df) - len(_cmp_df)
+        if _dropped:
+            _drop_by_appr = (
+                _all_df[_all_df['N'] < CURVE_EVAL_MIN_POINTS]
+                .groupby('Approach').size().to_dict()
+            )
+            print(f"  ℹ️ Curve comparison levelled to curves with >= {CURVE_EVAL_MIN_POINTS} "
+                  f"samples: {_dropped} of {len(_all_df)} curve rows excluded "
+                  f"({_drop_by_appr}). Full set kept in curve_eval_results.parquet.")
+        _cmp_counts = _cmp_df.groupby(['Approach', 'Split']).size().unstack('Split', fill_value=0)
+        display(Markdown("### Curves scored per approach (after levelling)"))
+        display(_cmp_counts)
+
         # ── Top-level table: Approach × Split (all sensors/processes aggregated) ─
         display(Markdown("---"))
-        display(Markdown("## Approach Comparison — Train & Test (median over ALL sensors, processes, curves)"))
+        display(Markdown(
+            f"## Approach Comparison — Train & Test (median over ALL sensors, processes, "
+            f"curves with >= {CURVE_EVAL_MIN_POINTS} samples)"))
         _appr_summary = (
-            _all_df
+            _cmp_df
             .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
             .median()
             .round(4)
@@ -5244,7 +5342,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         # 1e-4, which round(4) flattened to 0.0 in the stored file -- so the
         # notebooks could not tell "no error at all" from "too small to show".
         _summary = (
-            _all_df
+            _cmp_df
             .groupby(['Process', 'Sensor', 'Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
             .median()
             .round(6)
@@ -5264,7 +5362,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
         display(Markdown("---"))
         display(Markdown("## Detailed comparison — TEST set (median over curves)"))
 
-        _test_df = _all_df[_all_df['Split'] == 'TEST']
+        _test_df = _cmp_df[_cmp_df['Split'] == 'TEST']
         if not _test_df.empty:
             _compare = (
                 _test_df
@@ -5429,7 +5527,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                     ('Seq2Seq only',            'Seq2Seq only (no DTW)'),
                     ('Seq2Seq DTW+Lin Decode', 'Seq2Seq DTW + Linear Decode'),
                     ('DTW + Seq2Seq',          'DTW + Seq2Seq'),
-                    ('ML + Ext. Factors + Prev Act', 'ML + Ext. Factors + Prev Act'),
+                    ('ML + Ext. Factors', 'ML + Ext. Factors'),
                 ]:
                     _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
                         index=['Process', 'Sensor'], columns='Activity', values='sMAE', aggfunc='median'
@@ -5467,7 +5565,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_median_activity_sensor' in dir() else {},
                     'ML DTW':                     all_energy_pipelines_ml_dtw
                         if 'all_energy_pipelines_ml_dtw' in dir() else {},
-                    'ML + Ext. Factors + Prev Act':      all_energy_pipelines_ml_external
+                    'ML + Ext. Factors':      all_energy_pipelines_ml_external
                         if 'all_energy_pipelines_ml_external' in dir() else {},
                     'ML only (no DTW)':                 all_energy_pipelines_ml_only
                         if 'all_energy_pipelines_ml_only' in dir() else {},
@@ -5475,7 +5573,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
                         if 'all_energy_pipelines_seq2seq_only' in dir() else {},
-                    'DTW + Seq2Seq + Ext. Factors + Prev Act': all_energy_pipelines_seq2seq_external
+                    'DTW + Seq2Seq + Ext. Factors': all_energy_pipelines_seq2seq_external
                         if 'all_energy_pipelines_seq2seq_external' in dir() else {},
                 }
 
@@ -5545,6 +5643,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                                     _df_test_bw, _sensor_bw, [_act_bw], [_obj_bw],
                                     test_size=0.0, verbose=0,
                                     exog_columns=_bw_exog,
+                                    include_prev_energy=False,
                                 )
                             else:
                                 _tc_bw, _ = split_curves(
@@ -6085,6 +6184,7 @@ if _jdur_ready:
                         _curves, _ = split_curves_with_prev_activity(
                             _df, _sensor, _leaf_acts, _leaf_objs,
                             test_size=0.0, verbose=0, exog_columns=_exog,
+                            include_prev_energy=False,
                         )
                     else:
                         _curves, _ = split_curves(
@@ -6168,7 +6268,7 @@ if _jdur_ready:
     for _jlabel, _jpips in [
         ('Baseline',                      all_energy_pipelines),
         ('Median per Activity & Sensor',  all_energy_pipelines_median_activity_sensor),
-        ('ML + Ext. Factors + Prev Act', all_energy_pipelines_ml_external),
+        ('ML + Ext. Factors', all_energy_pipelines_ml_external),
     ]:
         if not _jpips:
             continue
@@ -6341,9 +6441,9 @@ if _jdur_ready:
         ('Baseline',                                globals().get('all_energy_pipelines',                {})),
         ('Median per Activity & Sensor',            globals().get('all_energy_pipelines_median_activity_sensor', {})),
         ('ML DTW',                          globals().get('all_energy_pipelines_ml_dtw',   {})),
-        ('ML + Ext. Factors + Prev Act',           globals().get('all_energy_pipelines_ml_external', {})),
+        ('ML + Ext. Factors',           globals().get('all_energy_pipelines_ml_external', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
-        ('DTW + Seq2Seq + Ext. Factors + Prev Act', globals().get('all_energy_pipelines_seq2seq_external', {})),
+        ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
     ]
 
     for _jp_run, _jmodes_run in _jdur_override_by_mode.items():
@@ -6519,10 +6619,14 @@ else:
                 "sMAE and sRMSE standardised by per-sensor std (estimated from R²), "
                 "all three metrics are scale-free and comparable across sensors*"
             ))
-            for _split in sorted(_export_df['Split'].unique()):
+            # Levelled like every other cross-approach comparison — the heatmap
+            # ranks approaches against each other, so it must not mix populations
+            # (see CURVE_EVAL_MIN_POINTS).
+            _hm_df = _export_df[_export_df['N'] >= CURVE_EVAL_MIN_POINTS]
+            for _split in sorted(_hm_df['Split'].unique()):
                 display(Markdown(f"## {_split}"))
-                _plot_curve_energy_heatmap(_export_df, _split, 'median', _energy_results_dir)
-                _plot_curve_energy_heatmap(_export_df, _split, 'mean',   _energy_results_dir)
+                _plot_curve_energy_heatmap(_hm_df, _split, 'median', _energy_results_dir)
+                _plot_curve_energy_heatmap(_hm_df, _split, 'mean',   _energy_results_dir)
 
         _sw = globals().get('_summary_wide')
         if _sw is not None and not _sw.empty:
@@ -6534,7 +6638,7 @@ else:
         if _as is None or _as.empty:
             # rebuild from raw records if the display block didn't produce it
             _as_raw = (
-                _export_df
+                _export_df[_export_df['N'] >= CURVE_EVAL_MIN_POINTS]
                 .groupby(['Approach', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
                 .median()
                 .round(4)

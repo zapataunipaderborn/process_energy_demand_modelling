@@ -1233,6 +1233,15 @@ df_event_log_2 = df_event_log[df_event_log['case_id'] >= split_date_process_4].c
 df_expanded_1 = df_expanded[df_expanded['case_id_log'] < split_date_process_4].copy()
 df_expanded_2 = df_expanded[df_expanded['case_id_log'] >= split_date_process_4].copy()
 
+# (14)_filter_mas_kg/h flatlines at a constant 1500.0 kg/h for the entire
+# test window of process_4_2 (temporal 70/30 split): zero variance, nothing
+# to model, and it would be the only sensor with undefined standardized
+# metrics. Dropped from process_4_2 only — in process_4_1 the same sensor
+# varies normally (std ~420 kg/h) and stays a modelling target.
+df_expanded_2 = df_expanded_2.drop(
+    columns=['(14)_filter_mas_kg/h_energy_to_model'], errors='ignore'
+)
+
 df_production_plan_1 = df_production_plan[df_production_plan['case_id'] < split_date_process_4].copy()
 df_production_plan_2 = df_production_plan[df_production_plan['case_id'] >= split_date_process_4].copy()
 
