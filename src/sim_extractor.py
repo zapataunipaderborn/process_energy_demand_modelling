@@ -5150,6 +5150,24 @@ def _resolve_seq2seq_cells(spec=None):
 _SEQ2SEQ_CELL_TYPES = _resolve_seq2seq_cells()
 
 
+def _seq2seq_device():
+    """
+    Device for seq2seq training and inference — CPU on purpose.
+
+    These models are trained in a pool of *forked* workers
+    (_train_seq2seq_worker), and a fork of a parent that has already touched the
+    CUDA driver can never initialize CUDA — see the fork-poisoning note there.
+
+    CUDA would still be the wrong choice even from a clean fork: the trained
+    nn.Module is pickled back to the parent, so a CUDA model would initialize
+    CUDA in the *parent* and poison the worker pools of every later process.
+    And it buys little — measured 16-wide on 2-layer/128-unit cells over ~100
+    steps, GPU came out only ~1.4x ahead of 16 single-threaded CPU workers,
+    because models this small leave the GPU launch-bound and contended.
+    """
+    return torch.device('cpu')
+
+
 def _fit_seq2seq_with_selection(
     X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, seq_len,
     hidden_size, num_layers, dropout, epochs, batch_size, lr,
@@ -5425,7 +5443,7 @@ def build_and_train_pipeline_seq2seq(
     y_tr_n = (y_tr - y_mean) / y_std
     y_vl_n = (y_vl - y_mean) / y_std
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = _seq2seq_device()
     input_size = X_tr.shape[-1]
 
     model, best_val_loss, best_cell, val_loss_by_cell = _fit_seq2seq_with_selection(
@@ -5637,7 +5655,7 @@ def build_and_train_pipeline_seq2seq_only(
     y_tr_n = (y_tr - y_mean) / y_std
     y_vl_n = (y_vl - y_mean) / y_std
 
-    device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device     = _seq2seq_device()
     input_size = X_tr.shape[-1]
     model, best_val_loss, best_cell, val_loss_by_cell = _fit_seq2seq_with_selection(
         X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, fixed_length,
@@ -5931,7 +5949,7 @@ def build_and_train_pipeline_seq2seq_exog(
     y_tr_n = (y_tr - y_mean) / y_std
     y_vl_n = (y_vl - y_mean) / y_std
 
-    device     = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device     = _seq2seq_device()
     input_size = X_tr.shape[-1]
     model, best_val_loss, best_cell, val_loss_by_cell = _fit_seq2seq_with_selection(
         X_tr, y_tr_n, X_vl, y_vl_n, device, input_size, fixed_length,
@@ -6384,7 +6402,21 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     homogeneous curves from that single combo.
     Returns dict with sensor/activity/object + results keyed by approach name.
     """
-    import torch
+    import os as _os, torch
+    # Make this worker genuinely CPU-only before anything asks torch about CUDA.
+    # We are forked from a parent that has already called torch.cuda.is_available()
+    # (modelling.py's startup set_global_seeds), which PyTorch documents as
+    # fork-poisoning: cuInit has run pre-fork, so every CUDA call here fails.
+    # Hiding the GPUs is not enough on its own — the default availability probe
+    # goes through the CUDA runtime and still answers True-but-unusable, and Adam's
+    # _cuda_graph_capture_health_check then dies with "CUDA error: initialization
+    # error" even though the model sits on CPU. PYTORCH_NVML_BASED_CUDA_CHECK
+    # switches that probe to the NVML path, which reads both env vars at call time
+    # and correctly answers False. Root-caused 2026-07-24: experiment_967 lost all
+    # 390 seq2seq workers to "Cannot re-initialize CUDA in forked subprocess".
+    _os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    _os.environ['PYTORCH_NVML_BASED_CUDA_CHECK'] = '1'
+    torch.cuda._cached_device_count = None   # drop the count inherited from the fork parent
     torch.set_num_threads(1)  # prevent OpenMP/MKL thread-pool contention across workers
     # Per-combo seed (see _train_curve_only_worker) — covers torch weight init,
     # dropout masks and DataLoader shuffling in this process.

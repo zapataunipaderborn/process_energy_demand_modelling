@@ -220,6 +220,12 @@ class ProcessSimulation:
         # they would silently default to 0.0 in _build_mlp_features while the
         # model was trained on real values.
         self.mlp_ef_windows     = mlp_ef_windows
+        # How often an ML+ duration model returned a non-positive prediction and
+        # the statistical fallback took over (see _predict_mlp_duration). Printed
+        # at the end of run() — a high count means the duration model is
+        # extrapolating badly and the ML+ results should not be trusted.
+        self._mlp_nonpositive_predictions = 0
+        self._mlp_prediction_calls        = 0
         self.load_profile       = load_profile  # LoadProfile for WIP/RO lookups
         # Trained case-duration predictor (train_case_duration_pipeline output)
         # used by the 'petri_net_budget' mode to get a per-case total-duration
@@ -498,7 +504,18 @@ class ProcessSimulation:
         cap_minutes: optional sane upper bound (see _activity_duration_cap),
         keeps one bad prediction from taking down the simulation while still
         allowing genuinely long activities through.
+
+        Returns None when the regressor produced a NON-POSITIVE duration, i.e.
+        the model extrapolated off its training range. The caller then falls
+        back to the fitted distribution instead of accepting a floored 0.1-min
+        activity: under petri_net_budget the case ends on elapsed TIME, so a
+        near-zero duration does not shorten the case, it forces the generator to
+        fire another activity to burn the same budget — one bad regressor turns
+        into an event-count explosion (exp 967, process_4_1: 97% of activities
+        at the floor, 25.7 events/case against 13.3 real). Only a non-positive
+        RAW prediction triggers this, so genuinely short activities still pass.
         """
+        self._mlp_prediction_calls += 1
         m, sc = model_tuple[0], model_tuple[1]
         # 4th element: mean-bias calibration (OOF mean(actual)/mean(pred)),
         # re-centers the median-like prediction onto the arithmetic mean that
@@ -507,7 +524,10 @@ class ProcessSimulation:
         calib = model_tuple[3] if len(model_tuple) > 3 else 1.0
         X = np.array(feature_vec, dtype=float).reshape(1, -1)
         raw = m.predict(sc.transform(X))
-        pred = float(np.clip(raw, 0, None)[0]) * calib
+        if not np.isfinite(raw[0]) or raw[0] <= 0:
+            self._mlp_nonpositive_predictions += 1
+            return None
+        pred = float(raw[0]) * calib
         if cap_minutes is not None:
             pred = min(pred, cap_minutes)
         return pred
@@ -642,17 +662,23 @@ class ProcessSimulation:
                 current_sim_ts or 0.0,
                 case_start_ts  or 0.0,
             )
-            if eval_mode == 'petri_net_ml_plus_global' and self.mlp_global_tuple is not None:
+            # A None here means the model extrapolated to a non-positive
+            # duration (see _predict_mlp_duration) — fall through to the fitted
+            # distribution rather than emit a 0.1-min activity.
+            _mlp_tpl = None
+            if eval_mode == 'petri_net_ml_plus_global':
+                _mlp_tpl = self.mlp_global_tuple
+            elif eval_mode == 'petri_net_ml_plus_per_act':
+                _mlp_tpl = self.mlp_per_act_tuples.get(activity)
+                if _mlp_tpl is None:
+                    # no model for this activity (or n < 20): per-activity median
+                    fallback = self.mlp_activity_means.get(activity, self.mlp_global_mean or 10.0)
+                    return max(0.1, float(fallback))
+            if _mlp_tpl is not None:
                 cap = self._activity_duration_cap(key, fallback_mean=self.mlp_global_mean or 10.0)
-                return max(0.1, self._predict_mlp_duration(self.mlp_global_tuple, feat_vec, cap_minutes=cap))
-            if eval_mode == 'petri_net_ml_plus_per_act':
-                tpl = self.mlp_per_act_tuples.get(activity)
-                if tpl is not None:
-                    cap = self._activity_duration_cap(key, fallback_mean=self.mlp_global_mean or 10.0)
-                    return max(0.1, self._predict_mlp_duration(tpl, feat_vec, cap_minutes=cap))
-                # fallback: per-activity median (no model for this activity or n < 20)
-                fallback = self.mlp_activity_means.get(activity, self.mlp_global_mean or 10.0)
-                return max(0.1, float(fallback))
+                _mlp_pred = self._predict_mlp_duration(_mlp_tpl, feat_vec, cap_minutes=cap)
+                if _mlp_pred is not None:
+                    return max(0.1, _mlp_pred)
             # else: fall through to statistical
 
         # ── Statistical path ──────────────────────────────────────────────
@@ -3446,6 +3472,15 @@ class ProcessSimulation:
         print(f"\n{'='*50}")
         print(f"SIMULATION COMPLETED")
         print(f"Total events generated: {len(self.events)}")
+        if self._mlp_prediction_calls:
+            _bad = self._mlp_nonpositive_predictions
+            _sh  = _bad / self._mlp_prediction_calls
+            print(f"ML+ duration predictions: {self._mlp_prediction_calls}, "
+                  f"non-positive (statistical fallback used): {_bad} ({_sh:.1%})")
+            if _sh > 0.05:
+                print(f"⚠️  {_sh:.0%} of ML+ duration predictions were non-positive — the "
+                      f"duration model is extrapolating off its training range. Treat this "
+                      f"mode's results as unreliable (see _predict_mlp_duration).")
         print(f"{'='*50}")
         
         # Convert to DataFrame

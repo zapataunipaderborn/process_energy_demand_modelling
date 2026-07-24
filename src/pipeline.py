@@ -107,7 +107,7 @@ EXPERIMENTS = [
 
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_966',
+        'run_name':              'experiment_968',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -179,7 +179,7 @@ EXPERIMENTS = [
         # Cells competed inside every seq2seq approach; lower validation loss
         # wins. ['lstm'] reproduces the pre-transformer behaviour.
         'seq2seq_cells': ['lstm'],#, 'transformer'],
-        'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
+        'curve_optimize_hyperparams': False,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
     },
 

@@ -270,6 +270,21 @@ _MLP_ENG_COLS = [
     'feat_act_pos', 'feat_prev_dur', 'feat_prev_dur2', 'feat_case_elapsed',
 ]
 
+# ef_* series kept OUT of the ML+ duration features because _MLP_ENG_COLS
+# already carries the same quantity: ef_hour_of_day / ef_day_of_week (added to
+# every expanded frame further up) are window-averaged copies of feat_hour /
+# feat_dayofweek. Feeding both makes the design matrix collinear, which flips
+# the CV winner in _mlp_fit_model_with_oof from a tree to HuberRegressor and
+# lets that linear fit extrapolate to negative minutes on the test period —
+# clipped to 0, then floored at 0.1 min by the simulator. Measured 2026-07-24
+# (exp 967 vs 964), process_4_1 global model: 50.7% of test rows predicted <= 0
+# and a mean of 2509 min against a real mean of 70. Because petri_net_budget
+# stops on elapsed TIME, those 0.1-min activities made it fire 25.7 events per
+# case against 13.3 real, which is what pushed budget/ml_local below plain
+# budget on span and event ratio. Dropping these two restores the tree fit
+# (0% non-positive, mean 92 vs 90.5 real). The genuine weather series stay in.
+_MLP_EF_DUPLICATE_COLS = ('ef_hour_of_day', 'ef_day_of_week')
+
 
 def _mlp_flatten_object_attributes(df):
     if 'object_attributes' not in df.columns:
@@ -396,7 +411,7 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     return (m, sc, best_name, calib), oof_out
 
 
-def _mlp_train_models(df_train, expanded_df=None):
+def _mlp_train_models(df_train, expanded_df=None, ef_expanded_df=None):
     """Train ML+ global and per-act models from the training event log.
 
     expanded_df: optional per-timestamp frame carrying the ef_* external-factor
@@ -405,6 +420,19 @@ def _mlp_train_models(df_train, expanded_df=None):
     activity) — via sim_extractor.ExternalFactorWindows. The event log itself
     carries no ef_* columns, so without this the duration models see only
     calendar features (hour/dow/month) and never the external factors.
+
+    ef_expanded_df: frame the ExternalFactorWindows lookup is BUILT from,
+    defaulting to expanded_df. Pass the unsplit series here: the windows object
+    is handed to the simulator, which queries it at TEST-period timestamps, and
+    a train-only lookup has no samples there — window_means then falls back to
+    the column mean, so every simulated activity is predicted at "average
+    weather" while the model was fitted on real per-activity values (measured
+    2026-07-24: process_4_1 train ends 2025-03-17, test runs to 2025-05-31, so
+    all 48 test cases were generated at a constant 3.62 °C). The ef_* series are
+    exogenous (weather), not process observations, so reading them past the
+    split is not target leakage — the curve evaluations already do exactly this
+    through sim_extractor.build_exog_lookup. Training-row features are
+    unaffected: those timestamps are inside the train period either way.
 
     Returns:
         global_mlp_tuple: (model, scaler, name) or None
@@ -437,11 +465,14 @@ def _mlp_train_models(df_train, expanded_df=None):
     ef_feat_cols = []
     if expanded_df is not None and not expanded_df.empty:
         from sim_extractor import ExternalFactorWindows
+        _ef_src = ef_expanded_df if (ef_expanded_df is not None
+                                     and not ef_expanded_df.empty) else expanded_df
         _ef_cols = [c for c in expanded_df.columns
                     if c.startswith('ef_')
-                    and pd.api.types.is_numeric_dtype(expanded_df[c])]
+                    and pd.api.types.is_numeric_dtype(expanded_df[c])
+                    and c not in _MLP_EF_DUPLICATE_COLS]
         if _ef_cols and 'datetime_energy' in expanded_df.columns:
-            ef_windows = ExternalFactorWindows(expanded_df, _ef_cols)
+            ef_windows = ExternalFactorWindows(_ef_src, _ef_cols)
             ef_feat_cols = ef_windows.feature_names
             if ef_feat_cols:
                 _starts = df['timestamp_start'].astype('int64').to_numpy() / 1e9
@@ -3320,7 +3351,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("  TRAINING ML+ MODELS (shared across all algorithms)")
         print("─"*80)
         _mlp_glb_tpl, _mlp_pa_tpls, _mlp_feat_cols, _mlp_act_means, _mlp_glb_mean, _mlp_ef_windows = \
-            _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'))
+            _mlp_train_models(df_train,
+                              train_datasets.get(process, {}).get('expanded'),
+                              # ef_* lookup over the unsplit series — the
+                              # simulator queries it at test timestamps.
+                              ef_expanded_df=process_datasets_to_model.get(process, {}).get('expanded'))
         print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
         print(f"  Global model: {_mlp_glb_tpl[2] if _mlp_glb_tpl else 'None'}")
         print(f"  Per-act models trained: {len(_mlp_pa_tpls)} activities")
