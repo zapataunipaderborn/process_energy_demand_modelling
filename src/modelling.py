@@ -472,7 +472,13 @@ MODES_TO_COMPARE = [
     # 'petri_net_ilp_ml_plus_per_act',
 
 
-    # 'petri_net_combined',
+    # Best-net selection performed during training by the pipeline itself:
+    # argmax over the miner modes of the TRAIN mean of Fitness/Precision/
+    # Generalization/Simplicity (_combined_selection_score). Emits a
+    # 'petri_net_combined' row carrying selected_mining_algorithm, so the
+    # choice is recorded in the results instead of being recomputed at
+    # reporting time by results_process.ipynb.
+    'petri_net_combined',
     # 'petri_net_combined_ml_plus_global',
     # 'petri_net_combined_ml_plus_per_act',
     # 'petri_net_median_duration',
