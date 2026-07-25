@@ -92,6 +92,7 @@ from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_sta
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from sim_extractor import compare_complete_case_curves, build_exog_lookup
 from sim_extractor import build_sensor_activity_object_combos
+from sim_extractor import predict_raw_curve_exemplar
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
@@ -779,12 +780,18 @@ SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false'
 #    'seq2seq'           DTW + LSTM encoder-decoder
 #    'seq2seq_only'              LSTM encoder-decoder, no DTW
 #    'ml_only'                 ML (GBM/RF), linear resample encode+decode (no DTW)
+#    'exemplar'          Real training curve (DTW medoid of a shape cluster),
+#                        chosen by a classifier over attributes + ef_* external
+#                        factors and scaled by an L1 level model. The only
+#                        approach that never averages, so the only one whose
+#                        output keeps realistic texture (ramps, duty cycling).
 APPROACHES = [
     'baseline',
     'median_activity_sensor',
     'ml_dtw',
     'ml_external',
     'ml_only',
+    'exemplar',
 
     'seq2seq',
     'seq2seq_only',
@@ -801,7 +808,7 @@ if _env_curve_approaches:
     # Full universe of valid approach names (not just the currently-uncommented
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
     _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
-              'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'}
+              'ml_only', 'exemplar', 'seq2seq', 'seq2seq_only', 'seq2seq_external'}
     _unknown = [a for a in _requested if a not in _known]
     if _unknown:
         print(f"[modelling] WARNING: PIPELINE_CURVE_APPROACHES has names not in "
@@ -4374,6 +4381,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_ml_only                  = {}   # ML, linear resample encode+decode
+    all_energy_pipelines_exemplar                 = {}   # real-curve exemplar + shape classifier
 
     # Curve regressors are defined once in sim_extractor._make_curve_models and
     # used there by _train_curve_only_worker; imported here only so the run log
@@ -4448,19 +4456,29 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_seq2seq_only             = {}
         _pipelines_seq2seq_external    = {}
         _pipelines_ml_only                = {}
+        _pipelines_exemplar               = {}   # real-curve exemplar (no averaging)
 
         # ── Parallel training for all sklearn-based approaches ───────────────
         # One worker per (sensor, activity, object) combo — each trains its own
         # barycenter and model on a homogeneous set of curves.
         # Seq2seq approaches run afterwards in their own process pool.
-        from sim_extractor import _train_curve_only_worker
+        from sim_extractor import _train_curve_only_worker, build_prev_activity_energy_map
         import concurrent.futures, os as _os
+
+        # Previous-activity energy levels for 'ml_external': per (sensor, activity)
+        # medians over the TRAINING frame. Built here, once per process and across
+        # ALL activities, because each worker only sees the one activity it trains
+        # on and could never assemble a predecessor's level itself. Train-only by
+        # construction, and stored in the pipeline so predict re-derives it from
+        # the same numbers -- no test information reaches the features.
+        _prev_act_energy_maps = build_prev_activity_energy_map(_df_train_exp, _sensors)
+        print(f"  Prev-activity energy map : {len(_prev_act_energy_maps)}/{len(_sensors)} sensors")
 
         # 'baseline' (per-sensor pooled median) is NOT trained by the per-combo
         # worker — it is built separately below. The worker trains the per-combo
         # median under 'median_activity_sensor'.
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only'}]
+                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_external'}]
 
@@ -4478,7 +4496,8 @@ if RUN_CURVE_ONLY_EVALUATION:
                 _futs = {
                     _pool.submit(_train_curve_only_worker,
                                  s, a, o, _df_train_exp, _sklearn_approaches, _ef_cols,
-                                 None, 0.2, CURVE_OPTIMIZE_HYPERPARAMS, CURVE_N_OPTUNA_TRIALS): (s, a, o)
+                                 None, 0.2, CURVE_OPTIMIZE_HYPERPARAMS, CURVE_N_OPTUNA_TRIALS,
+                                 _prev_act_energy_maps.get(s)): (s, a, o)
                     for s, a, o in _combos
                 }
                 _worker_results = []
@@ -4528,6 +4547,15 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': None,
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep))(_r['ml_only']),
                         'full_pipeline':   _r['ml_only'],
+                    }
+                if 'exemplar' in _r:
+                    # exog-aware signature (rv, act, attrs, exog=None), like
+                    # ml_external -- predict_curve_for_instance tries that form
+                    # before the 3-arg one, so the ef_* values reach the model.
+                    _pipelines_exemplar.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['exemplar']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exemplar(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exemplar']),
+                        'full_pipeline':   _r['exemplar'],
                     }
 
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
@@ -4636,6 +4664,34 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'full_pipeline':   _ep_s,
                     }
 
+        # ── Median-floor report (see sim_extractor.CURVE_MEDIAN_FLOOR) ────────
+        # Every learned leaf is kept only if it beat its own median curve on
+        # held-out instances; the ones that lost now PREDICT that median. Report
+        # how many, because it is the honest read on where the features actually
+        # carry signal — a high share is a finding about the data, not a bug, and
+        # without this line the fallback is invisible in the results tables.
+        _floor_counts = {}
+        for _lbl, _pipes in (('DTW + ML',                _pipelines_ml_dtw),
+                             ('DTW + ML + Ext. Factors', _pipelines_ml_external),
+                             ('ML only (no DTW)',        _pipelines_ml_only),
+                             ('Exemplar (real curve)',   _pipelines_exemplar),
+                             ('DTW + Seq2Seq',           _pipelines_seq2seq),
+                             ('Seq2Seq only (no DTW)',   _pipelines_seq2seq_only),
+                             ('DTW + Seq2Seq + Ext. Factors', _pipelines_seq2seq_external)):
+            _tot = _fell = 0
+            for _sd in _pipes.values():
+                for _ad in _sd.values():
+                    for _entry in _ad.values():
+                        _tot += 1
+                        _fell += bool(_entry.get('full_pipeline', {}).get('median_floor_active'))
+            if _tot:
+                _floor_counts[_lbl] = (_fell, _tot)
+        if _floor_counts:
+            print(f"  [{_proc}] median floor — leaves that lost to their own median curve "
+                  f"and now predict it:")
+            for _lbl, (_fell, _tot) in _floor_counts.items():
+                print(f"      {_lbl:<32} {_fell:>4}/{_tot:<4} ({100.0 * _fell / _tot:5.1f}%)")
+
         all_energy_pipelines[_proc]                   = _pipelines_baseline
         all_energy_pipelines_median_activity_sensor[_proc] = _pipelines_median_activity_sensor
         all_energy_pipelines_ml_dtw[_proc]      = _pipelines_ml_dtw
@@ -4645,6 +4701,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_seq2seq_only[_proc]          = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_external[_proc] = _pipelines_seq2seq_external
         all_energy_pipelines_ml_only[_proc]                 = _pipelines_ml_only
+        all_energy_pipelines_exemplar[_proc]                = _pipelines_exemplar
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4723,20 +4780,39 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                         verbose=1 if show_plots else 0,
                         save_dir=_curve_save,
                     )
+                    # Carry EVERY column evaluate_pipeline_on_test produced into
+                    # the export, not just the five pointwise metrics. That
+                    # includes 'Instance' (so a row can be traced back to one
+                    # activity instance and joined against the event log), the
+                    # shape statistics (std/acf1/zeros/max of both the real and
+                    # the predicted curve — see _curve_shape_stats), and the
+                    # full y_true/y_pred arrays when PIPELINE_SAVE_CURVE_VALUES
+                    # is on. Listing the columns by hand is what made the old
+                    # export a dead end: the values were gone once the run
+                    # finished, so any metric not thought of in advance meant
+                    # re-running the whole pipeline.
+                    _passthrough = [c for c in _metrics_df.columns
+                                    if c not in ('activity', 'n_points', 'MAE',
+                                                 'RMSE', 'WAPE (%)', 'sMAE',
+                                                 'sRMSE', 'instance_id')]
                     for _, _r in _metrics_df.iterrows():
-                        records.append({
+                        _rec = {
                             'Approach': approach_label,
                             'Process':  _proc,
                             'Sensor':   _sensor,
                             'Split':    split_label,
                             'Activity': _r['activity'],
+                            'Instance': _r.get('instance_id'),
                             'N':        _r['n_points'],
                             'MAE':      _r['MAE'],
                             'RMSE':     _r['RMSE'],
                             'WAPE':     _r['WAPE (%)'],
                             'sMAE':     _r.get('sMAE'),
                             'sRMSE':    _r.get('sRMSE'),
-                        })
+                        }
+                        for _c in _passthrough:
+                            _rec[_c] = _r.get(_c)
+                        records.append(_rec)
                 except Exception as _eval_e:
                     print(f"  [ERROR] {approach_label} | {_proc} | {_sensor} | act={_leaf_acts}: {_eval_e}")
     return records
@@ -5086,6 +5162,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('ML DTW',                    all_energy_pipelines_ml_dtw),
             ('ML + Ext. Factors',     all_energy_pipelines_ml_external),
             ('ML only (no DTW)',                all_energy_pipelines_ml_only),
+            ('Exemplar (real curve)',           all_energy_pipelines_exemplar),
 
             ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
             ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
@@ -5404,6 +5481,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_ml_external' in dir() else {},
                     'ML only (no DTW)':                 all_energy_pipelines_ml_only
                         if 'all_energy_pipelines_ml_only' in dir() else {},
+                    'Exemplar (real curve)':            all_energy_pipelines_exemplar
+                        if 'all_energy_pipelines_exemplar' in dir() else {},
                     'DTW + Seq2Seq':                      all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
@@ -6103,6 +6182,7 @@ if _jdur_ready:
     for _jlabel, _jpips in [
         ('Baseline',                      all_energy_pipelines),
         ('Median per Activity & Sensor',  all_energy_pipelines_median_activity_sensor),
+        ('Exemplar (real curve)',         all_energy_pipelines_exemplar),
         ('ML + Ext. Factors', all_energy_pipelines_ml_external),
     ]:
         if not _jpips:
@@ -6277,6 +6357,7 @@ if _jdur_ready:
         ('Median per Activity & Sensor',            globals().get('all_energy_pipelines_median_activity_sensor', {})),
         ('ML DTW',                          globals().get('all_energy_pipelines_ml_dtw',   {})),
         ('ML + Ext. Factors',           globals().get('all_energy_pipelines_ml_external', {})),
+        ('Exemplar (real curve)',           globals().get('all_energy_pipelines_exemplar', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
         ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
     ]
@@ -6526,6 +6607,7 @@ else:
 
     # ── info.json ─────────────────────────────────────────────────────────────
     import json as _json
+    import sim_extractor as _sx
     _info = {
         'run_name': _run_name,
         'run_timestamp': _run_ts,
@@ -6535,6 +6617,10 @@ else:
         'approaches': APPROACHES,
         'split_type': SPLIT_TYPE,
         'train_ratio': TRAIN_RATIO,
+        # Recorded so a results table can never be misread: both of these change
+        # what the numbers mean, not just their value.
+        'curve_loss': _sx.CURVE_MODEL_LOSS,
+        'dtw_shape_blind_decode': _sx.DTW_DECODE_SHAPE_BLIND,
     }
     _info_path = os.path.join(_run_dir, 'info.json')
     with open(_info_path, 'w') as _f:

@@ -93,6 +93,31 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    default (True). Set False for fast test runs.
   curve_n_optuna_trials int|None   Optuna trials per (sensor, activity, object)
                                    when the search is on. None → default (50).
+  curve_loss str|None              Training loss for the sklearn curve models:
+                                   'absolute_error' (default) fits the conditional
+                                   MEDIAN, matching the L1 metrics (sMAE, WAPE)
+                                   and the val-MAE model selection.
+                                   'squared_error' restores the old conditional-
+                                   MEAN behaviour for ablation.
+  dtw_shape_blind_decode bool|None decode canonical predictions back to the test
+                                   timeline using ONLY the curve's length
+                                   (linear resample), instead of DTW-warping
+                                   against the curve's own values. Puts the DTW
+                                   and non-DTW approaches on the same test-time
+                                   information, so DTW is measured purely as a
+                                   training-time representation. None → False
+                                   (original behaviour).
+  save_curve_values     bool|None  persist the full y_true / y_pred array on
+                                   every scored curve in curve_eval_results.parquet,
+                                   so any metric can be computed offline later
+                                   without re-running. None → False. The per-curve
+                                   SHAPE STATISTICS (std / lag-1 acf / zero
+                                   fraction / peak, for both the real and the
+                                   predicted curve) are written either way — those
+                                   are what the realism measures need, and they
+                                   cost ~10 floats a row. Turn this on only when
+                                   you want arbitrary future metrics: it inflates
+                                   the file by roughly the curve length per row.
 """
 
 import os
@@ -107,7 +132,7 @@ EXPERIMENTS = [
 
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_968',
+        'run_name':              'experiment_971',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -143,8 +168,13 @@ EXPERIMENTS = [
             'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
             'ml_external',  # DBA + DTW + regression + external factors + prev-activity NAME (no lagged energy)
             'ml_only',                # no DTW at all (formerly 'ml_linear')
-            'seq2seq',
-            'seq2seq_only',
+            'exemplar',               # real training curve (DTW medoid of a shape cluster),
+                                      # picked by a classifier over attributes + ef_*, scaled
+                                      # by an L1 level model — the only approach that never
+                                      # averages, so the only one whose output keeps realistic
+                                      # texture. Expect WORSE sMAE and a far better std ratio.
+            # 'seq2seq',
+            # 'seq2seq_only',
             'seq2seq_external',
         ],
         # Full reference — every valid approach name (uncomment to enable the
@@ -162,7 +192,12 @@ EXPERIMENTS = [
         # 'median_activity_sensor' = "Median per Activity & Sensor" (median per
         # sensor+activity+object):
         #   'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
-        #   'ml_only', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
+        #   'ml_only', 'exemplar', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
+        # 'exemplar' sits outside the ml_*/seq2seq pairing: it is the only
+        # approach that predicts a REAL measured curve rather than an average of
+        # them, so it is the one to look at when the question is whether the
+        # output resembles a real load profile rather than whether it minimises
+        # pointwise error.
         # Regressors competed for every curve approach, per (sensor, activity,
         # object); best kept by validation MAE. Comment a line out to turn that
         # model off. None / omitted = all six.
@@ -178,11 +213,60 @@ EXPERIMENTS = [
         ],
         # Cells competed inside every seq2seq approach; lower validation loss
         # wins. ['lstm'] reproduces the pre-transformer behaviour.
-        'seq2seq_cells': ['lstm'],#, 'transformer'],
+        'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': False,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
     },
 
+    # ── Exemplar comparison ──────────────────────────────────────────────────
+    # Uncomment this dict to run it. Trains ONLY the cheap approaches plus the
+    # new 'exemplar' one, so it finishes in a fraction of the full run and is a
+    # direct answer to "does the exemplar method produce a curve that looks
+    # real, and what does that cost in pointwise error?".
+    #
+    # What to expect, measured over 90 (sensor, activity, object) leaves and
+    # 4,187 test curves on data_experiment 1 with this same 70/30 temporal split:
+    #
+    #     approach                 sMAE    WAPE %   std ratio (want 1.0)
+    #     median_activity_sensor   0.845   7.70     0.110
+    #     ml_dtw                   0.848   7.70     0.133
+    #     ml_external              0.852   7.71     0.135
+    #     ml_only                  0.844   7.62     0.086
+    #     exemplar                 1.018   8.92     0.738
+    #
+    # i.e. the exemplar curve carries ~74% of the real curves' standard
+    # deviation against ~9-14% for every averaging approach, at a cost of ~20%
+    # on sMAE. That trade is the whole point: sMAE rewards a smooth line through
+    # the middle of a spiky signal, so it cannot see the difference between a
+    # usable load profile and a flat one. Report the two together.
+    #
+    # dtw_shape_blind_decode is left at its default (True) — no approach may use
+    # the test curve's own values to decode, which is the only setting under
+    # which these columns are comparable to each other or reachable in simulation.
+    #
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_970_exemplar',
+    #     'processes_to_run':      ['process_1', 'process_2', 'process_3',
+    #                               'process_4_1', 'process_4_2', 'process_5'],
+    #     'temporal_resolution':   '1min',
+    #     'run_process_modelling': False,   # curve comparison only — no mining needed
+    #     'run_energy_modelling':  True,
+    #     'run_schedule_profile_eval': True,
+    #     'save_predicted_curves': True,    # needed to plot the curves and see the texture
+    #     'train_ratio':           0.70,
+    #     'split_type':            'temporal',
+    #     'curve_approaches':      [
+    #         'median_activity_sensor',   # the floor everything is measured against
+    #         'ml_dtw',                   # the incumbent DTW + regression approach
+    #         'ml_external',              # + external factors, the strongest incumbent
+    #         'exemplar',                 # the new one
+    #     ],
+    #     'curve_models': ['Ridge', 'Hist Gradient Boosting'],
+    #     'curve_optimize_hyperparams': False,
+    #     'save_curve_values': True,   # keep every y_true/y_pred so new metrics
+    #                                  # can be computed from the parquet later
+    # },
 
 ]
 
@@ -201,6 +285,9 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     seq2seq_cells = exp.get('seq2seq_cells')
     curve_optimize_hyperparams = exp.get('curve_optimize_hyperparams')
     curve_n_optuna_trials = exp.get('curve_n_optuna_trials')
+    curve_loss = exp.get('curve_loss')
+    dtw_shape_blind_decode = exp.get('dtw_shape_blind_decode')
+    save_curve_values = exp.get('save_curve_values')
     train_ratio = exp.get('train_ratio')
     split_type = exp.get('split_type', 'temporal')
     random_seed = int(exp.get('random_seed', 42))
@@ -225,6 +312,9 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"curve_models={curve_models or '(all)'}  "
           f"seq2seq_cells={seq2seq_cells or '(all)'}  "
           f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
+          f"curve_loss={curve_loss or '(default absolute_error)'}  "
+          f"dtw_shape_blind_decode={dtw_shape_blind_decode if dtw_shape_blind_decode is not None else '(default True)'}  "
+          f"save_curve_values={save_curve_values if save_curve_values is not None else '(default False)'}  "
           f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}  "
           f"split_type={split_type}  "
           f"random_seed={random_seed}")
@@ -263,6 +353,12 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_CURVE_OPTIMIZE_HYPERPARAMS'] = 'true' if curve_optimize_hyperparams else 'false'
     if curve_n_optuna_trials is not None:
         env['PIPELINE_CURVE_N_OPTUNA_TRIALS'] = str(curve_n_optuna_trials)
+    if curve_loss is not None:
+        env['PIPELINE_CURVE_LOSS'] = str(curve_loss)
+    if dtw_shape_blind_decode is not None:
+        env['PIPELINE_DTW_SHAPE_BLIND_DECODE'] = 'true' if dtw_shape_blind_decode else 'false'
+    if save_curve_values is not None:
+        env['PIPELINE_SAVE_CURVE_VALUES'] = 'true' if save_curve_values else 'false'
     if train_ratio is not None:
         env['PIPELINE_TRAIN_RATIO'] = str(train_ratio)
     env['PIPELINE_SPLIT_TYPE'] = split_type
