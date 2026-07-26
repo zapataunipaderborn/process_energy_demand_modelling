@@ -92,7 +92,7 @@ from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_sta
 from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from sim_extractor import compare_complete_case_curves, build_exog_lookup
 from sim_extractor import build_sensor_activity_object_combos
-from sim_extractor import predict_raw_curve_exemplar
+from sim_extractor import predict_raw_curve_exemplar, predict_raw_curve_exemplar_dtw
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
@@ -792,6 +792,24 @@ APPROACHES = [
     'ml_external',
     'ml_only',
     'exemplar',
+    'exemplar_dtw',
+
+    # ── Train/eval-gap variants of 'ml_external' ─────────────────────────────
+    # Every canonical approach fits a target in barycenter space (DTW-warped,
+    # position-averaged) but is SCORED pointwise on the real curve after a decode
+    # the model never saw. These four attack that gap, one change each, so the
+    # difference against 'ml_external' is attributable:
+    #   ml_external_wcounts  row weight = raw samples folded into that canonical
+    #                        position (they are not equally informative)
+    #   ml_external_wmetric  ... additionally / curve sigma, matching sMAE
+    #   ml_external_calib    raw-space (gain, offset) fitted after the decode,
+    #                        correcting the encode's flattening of peaks
+    #   ml_rawspace          no encode/decode at all: train per raw sample, with
+    #                        DTW/DBA demoted from target transform to feature
+    'ml_external_wcounts',
+    'ml_external_wmetric',
+    'ml_external_calib',
+    'ml_rawspace',
 
     'seq2seq',
     'seq2seq_only',
@@ -808,7 +826,9 @@ if _env_curve_approaches:
     # Full universe of valid approach names (not just the currently-uncommented
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
     _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
-              'ml_only', 'exemplar', 'seq2seq', 'seq2seq_only', 'seq2seq_external'}
+              'ml_only', 'exemplar', 'exemplar_dtw', 'seq2seq', 'seq2seq_only', 'seq2seq_external',
+              'ml_external_wcounts', 'ml_external_wmetric', 'ml_external_calib',
+              'ml_rawspace'}
     _unknown = [a for a in _requested if a not in _known]
     if _unknown:
         print(f"[modelling] WARNING: PIPELINE_CURVE_APPROACHES has names not in "
@@ -4367,6 +4387,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         predict_raw_curve_median,
         predict_raw_curve_exog,
         predict_raw_curve_exog_prev_activity,
+        predict_raw_curve_rawspace,
         predict_raw_curve_ml_only,
         predict_raw_curve_seq2seq,
         predict_raw_curve_seq2seq_only,
@@ -4382,6 +4403,11 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_ml_only                  = {}   # ML, linear resample encode+decode
     all_energy_pipelines_exemplar                 = {}   # real-curve exemplar + shape classifier
+    all_energy_pipelines_exemplar_dtw             = {}   # + DTW k-medoids + predicted time warp
+    all_energy_pipelines_ml_external_wcounts      = {}   # DTW + ML + Ext. (count-weighted)
+    all_energy_pipelines_ml_external_wmetric      = {}   # DTW + ML + Ext. (metric-weighted)
+    all_energy_pipelines_ml_external_calib        = {}   # DTW + ML + Ext. (decode-calibrated)
+    all_energy_pipelines_ml_rawspace              = {}   # Raw-space ML + Ext. (no encode/decode)
 
     # Curve regressors are defined once in sim_extractor._make_curve_models and
     # used there by _train_curve_only_worker; imported here only so the run log
@@ -4412,6 +4438,21 @@ if RUN_CURVE_ONLY_EVALUATION:
         if not _sensors:
             print(f"  Skipping {_proc}: no sensor columns found.")
             continue
+
+        # Scope limiter for cheap end-to-end validation runs: cut the curve stage
+        # to the first N sensors of each process so the whole path (training,
+        # reassembly, evaluation, parquet write) executes in minutes instead of
+        # hours. Unset -> no limit, so a real run is untouched. Deliberately
+        # NOT applied to the energy-modelling section, which is a different stage
+        # with its own sensor resolution.
+        _curve_max_sensors = os.environ.get('PIPELINE_CURVE_MAX_SENSORS')
+        if _curve_max_sensors:
+            _n_keep = max(1, int(_curve_max_sensors))
+            if len(_sensors) > _n_keep:
+                print(f"  ⚠️  PIPELINE_CURVE_MAX_SENSORS={_n_keep}: curve stage limited to "
+                      f"{_n_keep}/{len(_sensors)} sensor(s) for {_proc} — THIS IS A SCOPED "
+                      f"VALIDATION RUN, its results are not comparable to a full run.")
+                _sensors = _sensors[:_n_keep]
 
         if not _activities and 'activity_log' in _df_train_exp.columns:
             _activities = _df_train_exp['activity_log'].dropna().unique().tolist()
@@ -4457,6 +4498,11 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_seq2seq_external    = {}
         _pipelines_ml_only                = {}
         _pipelines_exemplar               = {}   # real-curve exemplar (no averaging)
+        _pipelines_exemplar_dtw           = {}   # + DTW k-medoids + predicted warp
+        _pipelines_ml_external_wcounts      = {}
+        _pipelines_ml_external_wmetric      = {}
+        _pipelines_ml_external_calib        = {}
+        _pipelines_ml_rawspace              = {}
 
         # ── Parallel training for all sklearn-based approaches ───────────────
         # One worker per (sensor, activity, object) combo — each trains its own
@@ -4478,7 +4524,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         # worker — it is built separately below. The worker trains the per-combo
         # median under 'median_activity_sensor'.
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar'}]
+                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar','exemplar_dtw',
+                                        'ml_external_wcounts','ml_external_wmetric',
+                                        'ml_external_calib','ml_rawspace'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_external'}]
 
@@ -4542,11 +4590,36 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_external']),
                         'full_pipeline':   _r['ml_external'],
                     }
+                # Train/eval-gap variants. The three exog ones share
+                # ml_external's predictor (they differ in the FIT, or carry a
+                # stored raw-space correction applied inside it); ml_rawspace has
+                # its own, because it never builds a canonical curve to decode.
+                for _v, _dst in (('ml_external_wcounts', _pipelines_ml_external_wcounts),
+                                 ('ml_external_wmetric', _pipelines_ml_external_wmetric),
+                                 ('ml_external_calib',   _pipelines_ml_external_calib)):
+                    if _v in _r:
+                        _dst.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                            'reference_curve': _r[_v]['reference_curve'],
+                            'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r[_v]),
+                            'full_pipeline':   _r[_v],
+                        }
+                if 'ml_rawspace' in _r:
+                    _pipelines_ml_rawspace.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_rawspace']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_rawspace(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_rawspace']),
+                        'full_pipeline':   _r['ml_rawspace'],
+                    }
                 if 'ml_only' in _r:
                     _pipelines_ml_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': None,
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep))(_r['ml_only']),
                         'full_pipeline':   _r['ml_only'],
+                    }
+                if 'exemplar_dtw' in _r:
+                    _pipelines_exemplar_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['exemplar_dtw']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exemplar_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exemplar_dtw']),
+                        'full_pipeline':   _r['exemplar_dtw'],
                     }
                 if 'exemplar' in _r:
                     # exog-aware signature (rv, act, attrs, exog=None), like
@@ -4675,6 +4748,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                              ('DTW + ML + Ext. Factors', _pipelines_ml_external),
                              ('ML only (no DTW)',        _pipelines_ml_only),
                              ('Exemplar (real curve)',   _pipelines_exemplar),
+                             ('Exemplar + DTW (warped)', _pipelines_exemplar_dtw),
                              ('DTW + Seq2Seq',           _pipelines_seq2seq),
                              ('Seq2Seq only (no DTW)',   _pipelines_seq2seq_only),
                              ('DTW + Seq2Seq + Ext. Factors', _pipelines_seq2seq_external)):
@@ -4702,6 +4776,11 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_seq2seq_external[_proc] = _pipelines_seq2seq_external
         all_energy_pipelines_ml_only[_proc]                 = _pipelines_ml_only
         all_energy_pipelines_exemplar[_proc]                = _pipelines_exemplar
+        all_energy_pipelines_exemplar_dtw[_proc]            = _pipelines_exemplar_dtw
+        all_energy_pipelines_ml_external_wcounts[_proc] = _pipelines_ml_external_wcounts
+        all_energy_pipelines_ml_external_wmetric[_proc] = _pipelines_ml_external_wmetric
+        all_energy_pipelines_ml_external_calib[_proc] = _pipelines_ml_external_calib
+        all_energy_pipelines_ml_rawspace[_proc] = _pipelines_ml_rawspace
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5163,6 +5242,11 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('ML + Ext. Factors',     all_energy_pipelines_ml_external),
             ('ML only (no DTW)',                all_energy_pipelines_ml_only),
             ('Exemplar (real curve)',           all_energy_pipelines_exemplar),
+            ('Exemplar + DTW (warped)',         all_energy_pipelines_exemplar_dtw),
+            ('DTW + ML + Ext. (count-weighted)', all_energy_pipelines_ml_external_wcounts),
+            ('DTW + ML + Ext. (metric-weighted)', all_energy_pipelines_ml_external_wmetric),
+            ('DTW + ML + Ext. (decode-calibrated)', all_energy_pipelines_ml_external_calib),
+            ('Raw-space ML + Ext. (no encode/decode)', all_energy_pipelines_ml_rawspace),
 
             ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
             ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
@@ -5483,6 +5567,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_ml_only' in dir() else {},
                     'Exemplar (real curve)':            all_energy_pipelines_exemplar
                         if 'all_energy_pipelines_exemplar' in dir() else {},
+                    'Exemplar + DTW (warped)':          all_energy_pipelines_exemplar_dtw
+                        if 'all_energy_pipelines_exemplar_dtw' in dir() else {},
                     'DTW + Seq2Seq':                      all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
@@ -6183,6 +6269,7 @@ if _jdur_ready:
         ('Baseline',                      all_energy_pipelines),
         ('Median per Activity & Sensor',  all_energy_pipelines_median_activity_sensor),
         ('Exemplar (real curve)',         all_energy_pipelines_exemplar),
+        ('Exemplar + DTW (warped)',       all_energy_pipelines_exemplar_dtw),
         ('ML + Ext. Factors', all_energy_pipelines_ml_external),
     ]:
         if not _jpips:
@@ -6358,6 +6445,7 @@ if _jdur_ready:
         ('ML DTW',                          globals().get('all_energy_pipelines_ml_dtw',   {})),
         ('ML + Ext. Factors',           globals().get('all_energy_pipelines_ml_external', {})),
         ('Exemplar (real curve)',           globals().get('all_energy_pipelines_exemplar', {})),
+        ('Exemplar + DTW (warped)',         globals().get('all_energy_pipelines_exemplar_dtw', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
         ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
     ]
@@ -6477,6 +6565,28 @@ else:
 
     if _export_df is not None and not _export_df.empty:
         _parquet_path = os.path.join(_run_dir, 'curve_eval_results.parquet')
+
+        # ── Real curves are written ONCE, not once per approach ──────────────
+        # Every approach is scored on the same test curves, so carrying y_true on
+        # every row stores the identical array as many times as there are
+        # approaches -- roughly half the file, duplicated tenfold on a full run.
+        # It is split into its own table keyed on the curve identity instead;
+        # y_pred stays on the per-approach rows, where it genuinely differs.
+        # Join on the key below to recover the pairing.
+        if 'y_true' in _export_df.columns:
+            _rc_key = ['Process', 'Sensor', 'Activity', 'Instance', 'Split']
+            _rc_key = [c for c in _rc_key if c in _export_df.columns]
+            _real_df = (_export_df[_rc_key + ['N', 'y_true']]
+                        .drop_duplicates(subset=_rc_key)
+                        .rename(columns={'y_true': 'y_real'}))
+            _real_path = os.path.join(_run_dir, 'real_test_curves.parquet')
+            _real_df.to_parquet(_real_path, index=False)
+            _export_df = _export_df.drop(columns=['y_true'])
+            print(f"Saved real curves → {_real_path}  "
+                  f"({len(_real_df):,} unique curves, deduplicated from "
+                  f"{len(_export_df):,} scored rows)")
+            print(f"  join key: {' + '.join(_rc_key)}")
+
         _export_df.to_parquet(_parquet_path, index=False)
         print(f"Saved results  → {_parquet_path}")
 

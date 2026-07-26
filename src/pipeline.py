@@ -66,7 +66,13 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    'ml_dtw' — DBA + DTW +
                                    regression; 'ml_external',
                                    'ml_only', 'seq2seq', 'seq2seq_only',
-                                   'seq2seq_external', ...). None
+                                   'seq2seq_external'; plus the train/eval-gap
+                                   variants of ml_external:
+                                   'ml_external_wcounts',
+                                   'ml_external_wmetric',
+                                   'ml_external_calib', 'ml_rawspace' —
+                                   see the EXPERIMENTS block for what each
+                                   changes). None
                                    (default) → use modelling.py's own list.
                                    Fewer models = much faster runs. The
                                    schedule-profile / complete-curve eval needs
@@ -107,10 +113,28 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    information, so DTW is measured purely as a
                                    training-time representation. None → False
                                    (original behaviour).
-  save_curve_values     bool|None  persist the full y_true / y_pred array on
+  curve_median_floor    bool|None  fall back to the "Median per Activity &
+                                   Sensor" curve whenever a trained approach
+                                   fails to beat that leaf's own median on
+                                   held-out curves. None -> False (OFF).
+                                   Acceptance is on POINTWISE error, so turning
+                                   it on deletes any method that trades
+                                   pointwise accuracy for curve realism: it fired
+                                   on 33/40 leaves for 'exemplar', replacing its
+                                   real measured curve with the smooth median.
+                                   Leave it off to see what each approach really
+                                   predicts; turn it on only for a
+                                   "never worse than the naive floor" run, and
+                                   not alongside exemplar*/realism reporting.
+  curve_median_floor_ratio float|None
+                                   margin the model must win by: kept only when
+                                   its held-out MAE < ratio x the floor's.
+                                   None -> 1.0 (strictly better). 0.95 would
+                                   demand a 5% improvement.
+  save_curve_values     bool|None  persist the full predicted / real curve on
                                    every scored curve in curve_eval_results.parquet,
                                    so any metric can be computed offline later
-                                   without re-running. None → False. The per-curve
+                                   without re-running. None → True (ON). The per-curve
                                    SHAPE STATISTICS (std / lag-1 acf / zero
                                    fraction / peak, for both the real and the
                                    predicted curve) are written either way — those
@@ -132,7 +156,7 @@ EXPERIMENTS = [
 
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_971',
+        'run_name':              'experiment_974',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -173,9 +197,29 @@ EXPERIMENTS = [
                                       # by an L1 level model — the only approach that never
                                       # averages, so the only one whose output keeps realistic
                                       # texture. Expect WORSE sMAE and a far better std ratio.
+
+            # ── Train/eval-gap variants of 'ml_external' ──────────────────────
+            # Every canonical approach FITS in barycenter space (DTW-warped,
+            # position-averaged) but is SCORED pointwise on the real curve after
+            # a decode the model never saw. Each of these changes exactly one
+            # thing about that gap, so each is attributable against 'ml_external'
+            # — keep 'ml_external' enabled or there is nothing to compare to.
+            'ml_external_wcounts',    # row weight = how many raw samples the DTW path folded
+                                      # into that canonical position (they are not equally
+                                      # informative, but the fit treats them as if they were)
+            'ml_external_wmetric',    # ... additionally divided by the curve's own sigma,
+                                      # which is exactly what sMAE divides residuals by
+            'ml_external_calib',      # (gain, offset) fitted in RAW space after the decode,
+                                      # correcting the encode's flattening of peaks — the
+                                      # canonical loss cannot see that bias at all
+            'ml_rawspace',            # no encode/decode: one row per raw sample, DTW/DBA
+                                      # demoted from target transform to feature. Fitted
+                                      # objective == evaluated objective. Also immune to
+                                      # dtw_shape_blind_decode, since it has no decode.
+
             # 'seq2seq',
             # 'seq2seq_only',
-            'seq2seq_external',
+            #'seq2seq_external',
         ],
         # Full reference — every valid approach name (uncomment to enable the
         # experimental ones, which are commented out in modelling.py by
@@ -216,6 +260,19 @@ EXPERIMENTS = [
         'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': False,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
+        # Fall back to the per-(sensor, activity, object) median curve whenever a
+        # trained approach loses to it on held-out curves. OFF: acceptance is on
+        # pointwise error, so it deletes the realism-oriented approaches (it fired
+        # on 33/40 leaves for 'exemplar'). Flip to True for a "never worse than the
+        # naive floor" run — but then do not read the realism tables from it.
+        'curve_median_floor': False,
+        # Persist the predicted curve for EVERY scored test curve, so any metric
+        # can be computed from the saved results instead of by re-running.
+        # y_pred goes to curve_eval_results.parquet; the REAL curves are written
+        # once to real_test_curves.parquet (they are shared by every approach) and
+        # the results notebooks re-join them. Set False if a run needs a small file.
+        'save_curve_values': True,
+        # 'curve_median_floor_ratio': 1.0,   # margin required; 0.95 = beat it by 5%
     },
 
     # ── Exemplar comparison ──────────────────────────────────────────────────
@@ -288,6 +345,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     curve_loss = exp.get('curve_loss')
     dtw_shape_blind_decode = exp.get('dtw_shape_blind_decode')
     save_curve_values = exp.get('save_curve_values')
+    curve_median_floor = exp.get('curve_median_floor')
+    curve_median_floor_ratio = exp.get('curve_median_floor_ratio')
     train_ratio = exp.get('train_ratio')
     split_type = exp.get('split_type', 'temporal')
     random_seed = int(exp.get('random_seed', 42))
@@ -314,7 +373,9 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
           f"curve_loss={curve_loss or '(default absolute_error)'}  "
           f"dtw_shape_blind_decode={dtw_shape_blind_decode if dtw_shape_blind_decode is not None else '(default True)'}  "
-          f"save_curve_values={save_curve_values if save_curve_values is not None else '(default False)'}  "
+          f"save_curve_values={save_curve_values if save_curve_values is not None else '(default True)'}  "
+          f"curve_median_floor={curve_median_floor if curve_median_floor is not None else '(default False = OFF)'}  "
+          f"curve_median_floor_ratio={curve_median_floor_ratio if curve_median_floor_ratio is not None else '(default 1.0)'}  "
           f"train_ratio={train_ratio if train_ratio is not None else '(default 0.70)'}  "
           f"split_type={split_type}  "
           f"random_seed={random_seed}")
@@ -359,6 +420,10 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_DTW_SHAPE_BLIND_DECODE'] = 'true' if dtw_shape_blind_decode else 'false'
     if save_curve_values is not None:
         env['PIPELINE_SAVE_CURVE_VALUES'] = 'true' if save_curve_values else 'false'
+    if curve_median_floor is not None:
+        env['PIPELINE_CURVE_MEDIAN_FLOOR'] = 'true' if curve_median_floor else 'false'
+    if curve_median_floor_ratio is not None:
+        env['PIPELINE_CURVE_MEDIAN_FLOOR_RATIO'] = str(curve_median_floor_ratio)
     if train_ratio is not None:
         env['PIPELINE_TRAIN_RATIO'] = str(train_ratio)
     env['PIPELINE_SPLIT_TYPE'] = split_type

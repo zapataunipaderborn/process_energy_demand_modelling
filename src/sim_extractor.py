@@ -3439,9 +3439,18 @@ def split_curves_with_prev_activity(df_expanded, variable, activities, objects,
 # INTERNAL HELPERS
 # =============================================================================
 
-def _align_curve_with_dtw(query, reference, min_length_ratio=0.2):
+def _align_curve_with_dtw(query, reference, min_length_ratio=0.2, return_counts=False):
     """
     DTW-align a single query curve onto the reference grid (train only).
+
+    return_counts=True additionally returns, per canonical position, how many raw
+    query points the DTW path folded into it. That number is the position's real
+    weight in raw space: a canonical point built from 40 raw samples drives 40
+    residuals when the prediction is decoded back, one built from a single sample
+    drives one — yet the regression treats every canonical row as one equally
+    weighted observation. The counts are what the *_wcounts / *_wmetric approaches
+    feed to sample_weight to close that gap. Default False keeps the original
+    single-array return for every existing caller.
 
     Falls back to plain linear interpolation when the query is much shorter
     than the reference. DTW's monotonic path has to hold a handful of query
@@ -3456,11 +3465,18 @@ def _align_curve_with_dtw(query, reference, min_length_ratio=0.2):
     interpolation gives a smooth, honest (if under-resolved) target instead.
     """
     if len(query) < min_length_ratio * len(reference):
-        return np.interp(
+        lin = np.interp(
             np.linspace(0, 1, len(reference)),
             np.linspace(0, 1, len(query)),
             query,
         )
+        if return_counts:
+            # Linear-interp fallback: the query is spread evenly over the grid,
+            # so every canonical position represents the same len(query)/len(ref)
+            # share of raw samples. Uniform weights, normalised the same way as
+            # the DTW branch so the two are on one scale.
+            return lin, np.full(len(reference), len(query) / len(reference))
+        return lin
     alignment = dtw(query, reference, keep_internals=True)
     aligned = np.zeros(len(reference))
     counts  = np.zeros(len(reference))
@@ -3469,6 +3485,8 @@ def _align_curve_with_dtw(query, reference, min_length_ratio=0.2):
         counts[ri]  += 1
     counts  = np.where(counts == 0, 1, counts)
     aligned /= counts
+    if return_counts:
+        return aligned, counts
     return aligned
 
 
@@ -3718,6 +3736,27 @@ CURVE_L1_RANDOM_FOREST = _os_seed.environ.get(
     'PIPELINE_CURVE_L1_RANDOM_FOREST', 'false').lower() == 'true'
 if CURVE_L1_RANDOM_FOREST:
     _CURVE_L1_KWARGS['Random Forest'] = {'criterion': 'absolute_error'}
+
+
+def _fit_with_weight(model, X, y, sample_weight):
+    """
+    model.fit with optional sample weights.
+
+    Every candidate in _make_curve_models accepts sample_weight, but a custom
+    model_class passed by a caller might not — fall back to an unweighted fit
+    rather than killing the whole leaf, and say so, because silently dropping
+    the weights would make a *_wcounts / *_wmetric run look like it had been
+    applied when it had not.
+    """
+    if sample_weight is None:
+        return model.fit(X, y)
+    try:
+        return model.fit(X, y, sample_weight=sample_weight)
+    except TypeError:
+        warnings.warn(f"{type(model).__name__} does not accept sample_weight — "
+                      f"fitting UNWEIGHTED; this leaf is not row-weighted.",
+                      RuntimeWarning)
+        return model.fit(X, y)
 
 
 def _curve_model_loss_kwargs(name, loss=None):
@@ -4596,6 +4635,21 @@ def build_and_train_pipeline_exemplar(train_curves, variable, fixed_length=None,
                              else 'GB level (L1)' if reg
                              else 'GB shape classifier' if clf else 'medoid only'),
     }
+
+    # Median floor, same as every other trained approach. The two internal
+    # do-no-harm checks above validate the CLASSIFIER and the LEVEL model
+    # separately; neither asks whether the assembled pipeline beats simply
+    # predicting this leaf's median curve, which is the comparison the floor
+    # makes. predict_raw_curve_exemplar already consults 'median_floor_active',
+    # so without this call that branch could never fire.
+    _attach_median_floor(
+        pipeline, train_curves,
+        [train_curves[i]['instance_id'] for i in vl_i],
+        lambda rv, c: predict_raw_curve_exemplar(rv, c['activity'], c['attributes'],
+                                                 pipeline,
+                                                 exog_values=c.get('exog_values', {})),
+        label=f' {variable} (exemplar)', verbose=verbose,
+    )
     return pipeline
 
 
@@ -4653,6 +4707,342 @@ def predict_raw_curve_exemplar(raw_values, activity, attributes, pipeline,
 
 
 # =============================================================================
+# EXEMPLAR + DTW — elastic clusters and a PREDICTED time warp
+# =============================================================================
+#
+# Sibling of 'exemplar' with DTW promoted from a tie-breaker to the two places
+# it can actually do structural work. In 'exemplar', DTW picks the medoid inside
+# a cluster and nothing else: the clusters come from Euclidean k-means and the
+# time mapping is a plain index map. Measured, that one use changes the selected
+# curve on 55% of clusters but only moves realism a little.
+#
+#   1. CLUSTERING — k-medoids over a pairwise DTW distance matrix instead of
+#      Euclidean k-means, so the shape groups themselves are defined by elastic
+#      similarity. Two curves with the same profile at different speeds land in
+#      one group rather than two, which is the thing Euclidean distance cannot
+#      see. Medoids are real curves by construction, as k-medoids never averages.
+#
+#   2. TIME WARP — a warping function predicted from the attributes, replacing
+#      the uniform index map.
+#
+# On (2), read this before changing it. DTW aligns two SEQUENCES; it cannot warp
+# a curve to a duration, because a duration is not a sequence. At prediction time
+# the only other sequence in scope is the test curve itself, so "DTW-warp the
+# exemplar onto the target timeline" resolves to aligning against the real values
+# -- precisely the leak removed from the canonical decode, and the reason the old
+# DTW approaches looked better than they were.
+#
+# So DTW runs at TRAINING time only. Every training curve is DTW-aligned to its
+# cluster medoid, the warping path is reduced to a monotone function gamma
+# mapping curve time -> medoid time, gamma is summarised by its value at a few
+# fixed knots, and those knots are regressed on the attributes and ef_* factors.
+# At prediction time the knots are PREDICTED, gamma is rebuilt from them, and the
+# medoid is sampled through it. Nothing but the feature vector and the target
+# length is read, so this is simulation-reachable and leak-free.
+#
+# gamma is applied by index selection, never interpolation, so the exemplar's
+# measured values survive the warp intact (nearest-neighbour preserves std at
+# 1.0002 against 0.9916 for linear interpolation, on 5,346 real resamples).
+#
+# Note this does NOT target the std deficit. That is a variance-matching problem
+# -- one exemplar has its own spread and the target curve has another -- and no
+# reparameterisation of time changes it. What the warp can fix is WHEN the
+# features of the curve occur.
+WARP_KNOTS = (0.25, 0.50, 0.75)     # interior knots of gamma; 0 and 1 are pinned
+
+
+def _dtw_distance_matrix(shapes, max_curves=60, random_state=42):
+    """
+    Symmetric pairwise DTW distance matrix over shape-normalised curves.
+
+    O(n^2) DTW calls, so above `max_curves` a deterministic random subset is used
+    for the clustering and the rest are assigned to the resulting medoids
+    afterwards. Without the cap a single 300-curve leaf would dominate the run.
+    Returns (D, idx) where idx are the rows of `shapes` that D refers to.
+    """
+    n = len(shapes)
+    idx = np.arange(n)
+    if n > max_curves:
+        idx = np.sort(np.random.default_rng(random_state).choice(n, max_curves,
+                                                                 replace=False))
+    sub = shapes[idx]
+    m = len(sub)
+    D = np.zeros((m, m), dtype=float)
+    for i in range(m):
+        for j in range(i + 1, m):
+            try:
+                d = float(dtw(sub[i], sub[j], distance_only=True).normalizedDistance)
+            except Exception:
+                d = float(np.mean(np.abs(sub[i] - sub[j])))
+            D[i, j] = D[j, i] = d
+    return D, idx
+
+
+def _kmedoids(D, k, random_state=42, max_iter=50):
+    """
+    Plain alternating k-medoids on a precomputed distance matrix.
+
+    k-medoids rather than k-means on purpose: the centre of a cluster is one of
+    the actual members, so it stays a real measured curve. k-means would produce
+    an averaged centroid, which is the thing this whole family of approaches
+    exists to avoid.
+    """
+    m = len(D)
+    k = max(1, min(int(k), m))
+    rng = np.random.default_rng(random_state)
+    # k-means++-style seeding on the distance matrix: spread the initial medoids.
+    med = [int(rng.integers(m))]
+    while len(med) < k:
+        d = D[med].min(axis=0)
+        d = np.where(d > 0, d, 0.0)
+        med.append(int(d.argmax()) if d.sum() <= 0 else
+                   int(rng.choice(m, p=d / d.sum())))
+    med = np.array(sorted(set(med)))
+    for _ in range(max_iter):
+        labels = D[med].argmin(axis=0)
+        new = med.copy()
+        for c in range(len(med)):
+            members = np.where(labels == c)[0]
+            if len(members):
+                new[c] = members[D[np.ix_(members, members)].sum(axis=1).argmin()]
+        if np.array_equal(np.sort(new), np.sort(med)):
+            break
+        med = new
+    return D[med].argmin(axis=0), med
+
+
+def _warp_knots_from_path(query, reference, knots=WARP_KNOTS):
+    """
+    DTW-align `query` to `reference` and reduce the path to gamma evaluated at
+    `knots`: gamma(u) = the normalised REFERENCE position matched to normalised
+    QUERY position u. Identity (gamma(u) = u) means the curve runs in step with
+    the medoid; gamma(0.5) < 0.5 means it reaches the medoid's midpoint late.
+    Falls back to the identity when the alignment cannot be computed.
+    """
+    try:
+        al = dtw(query, reference, keep_internals=True)
+        qi = np.asarray(al.index1, dtype=float)
+        ri = np.asarray(al.index2, dtype=float)
+    except Exception:
+        return np.array(knots, dtype=float)
+    if len(qi) < 2 or qi.max() <= 0 or ri.max() <= 0:
+        return np.array(knots, dtype=float)
+    # Several reference indices can match one query index; average them so the
+    # mapping is a function, then read it at the knots.
+    qn, rn = qi / qi.max(), ri / ri.max()
+    order = np.argsort(qn, kind='stable')
+    qn, rn = qn[order], rn[order]
+    uq, inv = np.unique(qn, return_inverse=True)
+    ur = np.zeros(len(uq)); cnt = np.zeros(len(uq))
+    np.add.at(ur, inv, rn); np.add.at(cnt, inv, 1.0)
+    ur /= np.where(cnt == 0, 1.0, cnt)
+    return np.clip(np.interp(np.asarray(knots, dtype=float), uq, ur), 0.0, 1.0)
+
+
+def _apply_warp(exemplar, knots_values, n, knots=WARP_KNOTS):
+    """
+    Sample `exemplar` at `n` points through the monotone warp defined by
+    `knots_values`. Index selection only — no interpolation — so the measured
+    values pass through unchanged. knots_values is sorted and clipped first, so a
+    regressor that predicts a non-monotone gamma still yields a valid warp.
+    """
+    exemplar = np.asarray(exemplar, dtype=float)
+    n = max(2, int(n))
+    L = len(exemplar)
+    if L == 0:
+        return np.zeros(n)
+    g = np.clip(np.sort(np.asarray(knots_values, dtype=float)), 0.0, 1.0)
+    xs = np.concatenate([[0.0], np.asarray(knots, dtype=float), [1.0]])
+    ys = np.concatenate([[0.0], g, [1.0]])
+    u = np.linspace(0.0, 1.0, n)
+    pos = np.interp(u, xs, ys)                       # gamma(u), monotone in [0,1]
+    return exemplar[np.clip(np.round(pos * (L - 1)).astype(int), 0, L - 1)]
+
+
+def build_and_train_pipeline_exemplar_dtw(train_curves, variable, fixed_length=None,
+                                          val_size=0.2, random_state=42, models=None,
+                                          n_shapes=4, verbose=1, n_jobs=1,
+                                          exog_cols=None, **_ignored_hp_kwargs):
+    """
+    Exemplar with DTW k-medoids clustering and a predicted time warp.
+    See the section comment above for why the warp is trained, not aligned.
+
+    Three learned parts, each validated against doing nothing:
+      shape classifier  attributes/ef_* -> which DTW cluster   (vs the majority cluster)
+      level regressor   attributes/ef_* -> mean level          (vs the constant median)
+      warp regressors   attributes/ef_* -> gamma at each knot  (vs the mean warp)
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median(
+            [len(c['original_values']) for c in train_curves]))))
+
+    resampled = np.array([
+        np.interp(np.linspace(0, 1, fixed_length),
+                  np.linspace(0, 1, len(c['original_values'])),
+                  np.asarray(c['original_values'], dtype=float))
+        for c in train_curves
+    ])
+    scale = np.mean(resampled, axis=1, keepdims=True)
+    shapes = resampled / np.where(np.abs(scale) < 1e-12, 1.0, scale)
+
+    # ── 1. DTW k-medoids ─────────────────────────────────────────────────────
+    k = max(1, min(int(n_shapes), len(train_curves) // 5))
+    if k <= 1:
+        labels = np.zeros(len(train_curves), dtype=int)
+        medoid_rows = {0: int(np.argmin(np.abs(shapes - np.median(shapes, axis=0)).sum(axis=1)))}
+    else:
+        D, sub_idx = _dtw_distance_matrix(shapes, random_state=random_state)
+        sub_labels, sub_med = _kmedoids(D, k, random_state=random_state)
+        medoid_rows = {int(c): int(sub_idx[sub_med[c]]) for c in range(len(sub_med))}
+        # Curves left out of the capped distance matrix join the nearest medoid.
+        labels = np.empty(len(train_curves), dtype=int)
+        labels[sub_idx] = sub_labels
+        outside = np.setdiff1d(np.arange(len(train_curves)), sub_idx)
+        for r in outside:
+            labels[r] = min(medoid_rows,
+                            key=lambda c: float(np.mean(np.abs(shapes[r] - shapes[medoid_rows[c]]))))
+
+    medoids = {c: np.asarray(train_curves[r]['original_values'], dtype=float)
+               for c, r in medoid_rows.items()}
+
+    # ── 2. Warp targets: gamma of every curve against its own cluster medoid ──
+    warp = np.array([_warp_knots_from_path(shapes[i], shapes[medoid_rows[int(labels[i])]])
+                     for i in range(len(train_curves))])
+
+    levels = np.array([float(np.mean(c['original_values'])) for c in train_curves])
+    exog_cols = list(exog_cols or [])
+    X = _exemplar_feature_frame(train_curves, exog_cols=exog_cols)
+    feature_columns = list(X.columns)
+
+    n = len(train_curves)
+    idx = np.arange(n)
+    if 0 < val_size < 1 and n >= 10:
+        tr_i, vl_i = train_test_split(idx, test_size=val_size, random_state=random_state)
+    else:
+        tr_i = vl_i = idx
+
+    majority = int(pd.Series(labels).value_counts().idxmax())
+    clf = None
+    if len(np.unique(labels)) > 1 and feature_columns and len(tr_i) >= 8:
+        try:
+            _c = HistGradientBoostingClassifier(max_iter=200, random_state=random_state)
+            _c.fit(X.values[tr_i], labels[tr_i])
+            if float((_c.predict(X.values[vl_i]) == labels[vl_i]).mean()) > \
+               float((labels[vl_i] == majority).mean()):
+                clf = _c
+        except Exception:
+            clf = None
+
+    const_level = float(np.median(levels))
+    reg = None
+    if feature_columns and len(tr_i) >= 8:
+        try:
+            _r = HistGradientBoostingRegressor(loss='absolute_error', max_iter=200,
+                                               random_state=random_state)
+            _r.fit(X.values[tr_i], levels[tr_i])
+            if float(np.mean(np.abs(_r.predict(X.values[vl_i]) - levels[vl_i]))) < \
+               float(np.mean(np.abs(const_level - levels[vl_i]))):
+                reg = _r
+        except Exception:
+            reg = None
+
+    # One regressor per knot. The mean training warp is the fallback, and each
+    # knot keeps its model only if it beats that mean out of sample — so a leaf
+    # whose timing is not predictable degrades to a single average warp rather
+    # than to noise.
+    const_warp = warp.mean(axis=0) if len(warp) else np.array(WARP_KNOTS, dtype=float)
+    warp_models = []
+    for j in range(warp.shape[1] if warp.size else 0):
+        m = None
+        if feature_columns and len(tr_i) >= 8:
+            try:
+                _w = HistGradientBoostingRegressor(loss='absolute_error', max_iter=200,
+                                                   random_state=random_state)
+                _w.fit(X.values[tr_i], warp[tr_i, j])
+                if float(np.mean(np.abs(_w.predict(X.values[vl_i]) - warp[vl_i, j]))) < \
+                   float(np.mean(np.abs(const_warp[j] - warp[vl_i, j]))):
+                    m = _w
+            except Exception:
+                m = None
+        warp_models.append(m)
+
+    if verbose:
+        print(f"  [exemplar_dtw] {len(train_curves)} curves -> {len(medoids)} DTW clusters; "
+              f"classifier={'kept' if clf else 'majority'}, level={'kept' if reg else 'constant'}, "
+              f"warp knots kept={sum(m is not None for m in warp_models)}/{len(warp_models)}")
+
+    return {
+        'approach':         'exemplar_dtw',
+        'reference_curve':  _median_floor_reference(train_curves, fixed_length),
+        'fixed_length':     fixed_length,
+        'medoids':          medoids,
+        'majority_label':   majority,
+        'shape_classifier': clf,
+        'level_model':      reg,
+        'const_level':      const_level,
+        'warp_models':      warp_models,
+        'const_warp':       const_warp,
+        'warp_knots':       list(WARP_KNOTS),
+        'feature_columns':  feature_columns,
+        'exog_cols':        exog_cols,
+        'model_name':       'DTW k-medoids + GB shape/level/warp',
+    }
+
+
+def predict_raw_curve_exemplar_dtw(raw_values, activity, attributes, pipeline,
+                                   exog_values=None):
+    """
+    Predict the cluster, the level and the time warp from the features, then
+    sample that cluster's real medoid through the predicted warp. Reads only the
+    target length from `raw_values`.
+    """
+    _floor = _median_floor_prediction(raw_values, attributes, pipeline)
+    if _floor is not None:
+        return _floor
+
+    attributes = attributes or {}
+    n = max(2, int(attributes.get('_pred_curve_length', len(raw_values))))
+    curve = {'attributes': attributes, 'original_values': np.zeros(n),
+             'exog_values': exog_values or {}}
+    X = _exemplar_feature_frame([curve], pipeline['feature_columns'],
+                                exog_cols=pipeline.get('exog_cols')).values
+
+    label = pipeline['majority_label']
+    clf = pipeline.get('shape_classifier')
+    if clf is not None:
+        try:
+            label = int(clf.predict(X)[0])
+        except Exception:
+            label = pipeline['majority_label']
+    medoids = pipeline['medoids']
+    exemplar = medoids.get(label, next(iter(medoids.values())))
+
+    level = pipeline['const_level']
+    reg = pipeline.get('level_model')
+    if reg is not None:
+        try:
+            level = float(reg.predict(X)[0])
+        except Exception:
+            level = pipeline['const_level']
+
+    knots_val = list(pipeline['const_warp'])
+    for j, m in enumerate(pipeline.get('warp_models') or []):
+        if m is not None:
+            try:
+                knots_val[j] = float(m.predict(X)[0])
+            except Exception:
+                pass
+
+    shaped = _apply_warp(exemplar, knots_val, n, knots=tuple(pipeline['warp_knots']))
+    ex_mean = float(np.mean(shaped))
+    if abs(ex_mean) > 1e-12:
+        shaped = shaped * (level / ex_mean)
+    return shaped
+
+
+# =============================================================================
 # MEDIAN FLOOR — no leaf ships a model that loses to its own median curve
 # =============================================================================
 #
@@ -4680,13 +5070,24 @@ def predict_raw_curve_exemplar(raw_values, activity, attributes, pipeline,
 # averaged per curve, not pooled over points, so long instances do not outvote
 # short ones — the same weighting the per-instance metrics use.
 #
-# Set PIPELINE_CURVE_MEDIAN_FLOOR=false to ablate (models are then kept
-# unconditionally, the previous behaviour). PIPELINE_CURVE_MEDIAN_FLOOR_RATIO
-# raises the bar: the model is kept only when its held-out MAE is below RATIO x
-# the floor's, so 1.0 = "strictly better" and 0.95 = "better by at least 5%",
-# the rule _DUR_ACCEPTANCE_RATIO already applies to the duration models.
+# OFF by default (changed 2026-07-26). The floor accepts a method only if it
+# beats the leaf median on POINTWISE error, so it silently deletes any method
+# that trades pointwise accuracy for curve realism — measured at 33 of 40 leaves
+# for 'exemplar', i.e. on 83% of leaves that method was throwing away its real
+# curve and emitting the smooth median instead, which is the exact output it
+# exists to avoid. With it off, every approach reports what it actually predicts.
+#
+# Set PIPELINE_CURVE_MEDIAN_FLOOR=true (or curve_median_floor=True in
+# pipeline.py) to switch it back on. PIPELINE_CURVE_MEDIAN_FLOOR_RATIO raises the
+# bar: the model is kept only when its held-out MAE is below RATIO x the floor's,
+# so 1.0 = "strictly better" and 0.95 = "better by at least 5%", the rule
+# _DUR_ACCEPTANCE_RATIO already applies to the duration models.
+#
+# If you turn it on for a run that includes 'exemplar'/'exemplar_dtw', know that
+# it applies to them too and will neutralise them — the acceptance test would
+# need a realism term for that to be a fair comparison.
 CURVE_MEDIAN_FLOOR = _os_seed.environ.get(
-    'PIPELINE_CURVE_MEDIAN_FLOOR', 'true').lower() == 'true'
+    'PIPELINE_CURVE_MEDIAN_FLOOR', 'false').lower() == 'true'
 CURVE_MEDIAN_FLOOR_RATIO = float(_os_seed.environ.get(
     'PIPELINE_CURVE_MEDIAN_FLOOR_RATIO', '1.0'))
 
@@ -5337,6 +5738,7 @@ def build_and_train_pipeline_exog(
     verbose=1,
     n_jobs=-1,
     residual_target=None,
+    sample_weight_mode=None,
 ):
     """
     DTW baseline enriched with ef_* external-factor time series as features.
@@ -5362,12 +5764,40 @@ def build_and_train_pipeline_exog(
         stays in the feature set: it still tells the model where on the curve it
         is, which is what modulates how large a deviation to expect.
 
+    sample_weight_mode : None | 'counts' | 'counts_sigma'
+        Reweights the canonical training rows so the fitted objective is a closer
+        surrogate for the metric actually reported, which is computed on the RAW
+        timeline after decoding. See _align_curve_with_dtw(return_counts=True).
+
+        None (default)  — every canonical row weighs 1, the original behaviour.
+        'counts'        — weigh each row by how many raw samples the DTW path
+                          folded into that canonical position. Without this, a
+                          position summarising 40 raw points and one summarising
+                          a single point count equally in the loss, while in raw
+                          space they drive 40 residuals and 1.
+        'counts_sigma'  — additionally divide by the curve's own std, because
+                          sMAE is L1 on residuals divided by exactly that. Curves
+                          already contribute equally (each gives fixed_length
+                          rows), so this is the remaining term. The std is the
+                          TRAINING curve's own, so nothing leaks.
+
+        This narrows the train/eval gap but does not close it: the decode's
+        bucket-mean is a nonlinear step the model still never sees. ml_rawspace
+        is the version with no gap at all.
+
     Returns a pipeline dict identical to build_and_train_pipeline but with the
     additional keys:
-        'exog_cols'       — list[str]  ordered exog column names used at train time
-        'residual_target' — bool       whether 'model' predicts y or y - anchor
-        'approach'        — 'ml_exog'
+        'exog_cols'          — list[str]  ordered exog column names used at train time
+        'residual_target'    — bool       whether 'model' predicts y or y - anchor
+        'sample_weight_mode' — as passed
+        'val_mae'            — weighted when sample_weight_mode is set (it is the
+                               selection criterion, so it must match the fit)
+        'val_mae_unweighted' — always plain MAE, so runs stay comparable
+        'approach'           — 'ml_exog'
     """
+    if sample_weight_mode not in (None, 'counts', 'counts_sigma'):
+        raise ValueError(f"sample_weight_mode must be None|'counts'|'counts_sigma', "
+                         f"got {sample_weight_mode!r}")
     if residual_target is None:
         residual_target = EXOG_RESIDUAL_TARGET
 
@@ -5412,9 +5842,22 @@ def build_and_train_pipeline_exog(
 
     # ── DTW-align train curves ────────────────────────────────────────────────
     for curve in train_curves:
-        curve['resampled_values'] = _align_curve_with_dtw(
-            curve['original_values'], reference_curve
-        )
+        if sample_weight_mode:
+            curve['resampled_values'], _cnts = _align_curve_with_dtw(
+                curve['original_values'], reference_curve, return_counts=True
+            )
+            _w = np.asarray(_cnts, dtype=float)
+            if sample_weight_mode == 'counts_sigma':
+                # sMAE divides residuals by the curve's own std, so the matching
+                # row weight is counts/sigma. Guard the flat-curve case, which
+                # the evaluator scores as NaN anyway.
+                _sd = float(np.std(np.asarray(curve['original_values'], dtype=float)))
+                _w = _w / _sd if _sd > 1e-10 else _w
+            curve['_row_weight'] = _w
+        else:
+            curve['resampled_values'] = _align_curve_with_dtw(
+                curve['original_values'], reference_curve
+            )
         # resample exog signals to fixed_length
         curve['_exog_resampled'] = {
             col: _resample_signal(curve['exog_values'][col], fixed_length)
@@ -5443,6 +5886,8 @@ def build_and_train_pipeline_exog(
                 'curve_length': curve['original_length'],
                 'train_median_at_pos': float(train_median_curve[position_idx]),
                 'y':            curve['resampled_values'][position_idx],
+                '_w':           (float(curve['_row_weight'][position_idx])
+                                 if sample_weight_mode else 1.0),
             }
             for key in all_keys:
                 value = curve['attributes'].get(key, None)
@@ -5483,6 +5928,14 @@ def build_and_train_pipeline_exog(
     X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
     y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
 
+    # Row weights follow the same split. None when unweighted, so every fit /
+    # score call below can pass them through unconditionally.
+    if sample_weight_mode:
+        w_train = df_reg.loc[train_mask, '_w'].to_numpy(dtype=float)
+        w_val   = df_reg.loc[val_mask,   '_w'].to_numpy(dtype=float)
+    else:
+        w_train = w_val = None
+
     feature_columns = X_all.columns.tolist()
 
     numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length',
@@ -5505,6 +5958,7 @@ def build_and_train_pipeline_exog(
     # ── Train models ──────────────────────────────────────────────────────────
     all_results = {}
     best_model, best_name, best_val_mae = None, None, np.inf
+    best_val_mae_unw = np.nan
 
     for name, model_class in models.items():
         if verbose:
@@ -5517,8 +5971,11 @@ def build_and_train_pipeline_exog(
             def objective(trial, name=name, model_class=model_class):
                 params = _curve_model_trial_params(trial, name, random_state, n_jobs)
                 m = model_class(**params)
-                m.fit(X_train, y_train)
-                return -mean_absolute_error(y_val, m.predict(X_val))
+                _fit_with_weight(m, X_train, y_train, w_train)
+                # Search the SAME weighted objective the model is fitted on, or
+                # tuning optimises a different target than training.
+                return -mean_absolute_error(y_val, m.predict(X_val),
+                                            sample_weight=w_val)
 
             sampler = optuna.samplers.TPESampler(seed=random_state)
             study = optuna.create_study(direction='maximize', sampler=sampler)
@@ -5540,16 +5997,24 @@ def build_and_train_pipeline_exog(
                     model = model_class(**_lk)
                 except TypeError:
                     model = model_class()
-        model.fit(X_train, y_train)
+        _fit_with_weight(model, X_train, y_train, w_train)
 
-        train_mae = float(mean_absolute_error(y_train, model.predict(X_train)))
-        val_mae   = float(mean_absolute_error(y_val,   model.predict(X_val)))
+        train_mae = float(mean_absolute_error(y_train, model.predict(X_train),
+                                              sample_weight=w_train))
+        # Weighted when weighting is on: this is the SELECTION criterion, so it
+        # has to match the fit. The unweighted value is kept alongside so runs
+        # with and without weighting stay comparable.
+        val_mae   = float(mean_absolute_error(y_val, model.predict(X_val),
+                                              sample_weight=w_val))
+        val_mae_unw = float(mean_absolute_error(y_val, model.predict(X_val)))
         if verbose:
             print(f"    train MAE={train_mae:.4f}  val MAE={val_mae:.4f}")
 
-        all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae}
+        all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae,
+                             'val_mae_unweighted': val_mae_unw}
         if val_mae < best_val_mae:
             best_val_mae = val_mae
+            best_val_mae_unw = val_mae_unw
             best_model   = model
             best_name    = name
 
@@ -5572,6 +6037,8 @@ def build_and_train_pipeline_exog(
         'all_results':         all_results,
         'exog_cols':           exog_cols,
         'residual_target':     bool(residual_target),
+        'sample_weight_mode':  sample_weight_mode,
+        'val_mae_unweighted':  best_val_mae_unw,
         'approach':            'ml_exog',
     }
 
@@ -5708,6 +6175,7 @@ def build_and_train_pipeline_exog_prev_activity(
     n_jobs=-1,
     prev_act_energy_map=None,
     residual_target=None,
+    sample_weight_mode=None,
 ):
     """
     DTW + external factors + previous-activity NAME and training energy level.
@@ -5751,6 +6219,7 @@ def build_and_train_pipeline_exog_prev_activity(
         verbose=verbose,
         n_jobs=n_jobs,
         residual_target=residual_target,
+        sample_weight_mode=sample_weight_mode,
     )
     pipeline['approach'] = 'ml_external'
     pipeline['prev_act_energy_map'] = prev_act_energy_map or {}
@@ -5799,13 +6268,410 @@ def predict_raw_curve_exog_prev_activity(raw_values, activity, attributes, pipel
     """
     attributes = _inject_prev_act_energy(attributes,
                                          pipeline.get('prev_act_energy_map'))
-    return predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
-                                  exog_values=exog_values or {})
+    y = predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
+                               exog_values=exog_values or {})
+    return _apply_decode_calibration(y, pipeline)
 
 
 # =============================================================================
-# DTW + SEQ2SEQ  —  LSTM encoder-decoder over canonical DBA space
+# DECODE-AWARE CALIBRATION  —  correct the encode/decode round trip in RAW space
 # =============================================================================
+
+def _fit_l1_affine(pred, true, max_points=20000, random_state=42):
+    """
+    Fit (gain, offset) minimising mean |true - (gain*pred + offset)|.
+
+    L1 rather than least squares because every reported metric is L1, and
+    because the residuals here are dominated by a few large spikes — exactly
+    what a squared fit would chase. Two parameters, so Nelder-Mead is enough and
+    avoids pulling in a linear-programming solver. Falls back to the offset-only
+    solution, whose L1 optimum is just the median residual, if the search fails.
+    """
+    pred = np.asarray(pred, dtype=float); true = np.asarray(true, dtype=float)
+    ok = np.isfinite(pred) & np.isfinite(true)
+    pred, true = pred[ok], true[ok]
+    if len(pred) < 10:
+        return 1.0, 0.0
+    if len(pred) > max_points:                      # keep the fit cheap
+        idx = np.random.default_rng(random_state).choice(len(pred), max_points,
+                                                         replace=False)
+        pred, true = pred[idx], true[idx]
+    fallback = (1.0, float(np.median(true - pred)))
+    try:
+        from scipy.optimize import minimize
+        r = minimize(lambda p: float(np.mean(np.abs(true - (p[0] * pred + p[1])))),
+                     x0=np.array([1.0, float(np.median(true - pred))]),
+                     method='Nelder-Mead',
+                     options={'maxiter': 400, 'xatol': 1e-6, 'fatol': 1e-9})
+        if not r.success or not np.all(np.isfinite(r.x)):
+            return fallback
+        gain, offset = float(r.x[0]), float(r.x[1])
+        # A wild gain means the search wandered; the offset-only fit is safer.
+        if not (0.1 <= gain <= 10.0):
+            return fallback
+        # Only keep it if it actually beats the fallback on the same data.
+        if (np.mean(np.abs(true - (gain * pred + offset)))
+                > np.mean(np.abs(true - (fallback[0] * pred + fallback[1])))):
+            return fallback
+        return gain, offset
+    except Exception:
+        return fallback
+
+
+def _apply_decode_calibration(y_raw_pred, pipeline):
+    """Apply a stored (gain, offset) in RAW space. No-op when absent."""
+    cal = pipeline.get('decode_calibration')
+    if not cal:
+        return y_raw_pred
+    return cal['gain'] * np.asarray(y_raw_pred, dtype=float) + cal['offset']
+
+
+def build_and_train_pipeline_exog_calibrated(train_curves, variable, **kwargs):
+    """
+    ml_external plus a decode-aware correction fitted on the RAW timeline.
+
+    The canonical model is trained exactly as ml_external, so this changes
+    nothing about the fit. What it adds is a second stage that closes part of the
+    train/eval gap: the training curves are pushed back through the real predict
+    path (canonical model -> decode) and a (gain, offset) is fitted in raw space,
+    minimising L1 against the untouched original values.
+
+    That gap is real and systematic. _align_curve_with_dtw AVERAGES every raw
+    sample the DTW path folds into a canonical position, so peaks are flattened
+    in the target before the model ever sees them, and predictions come back
+    biased low at spikes. The canonical-space loss cannot see this at all,
+    because it is computed before the decode exists. Fitting the correction on
+    the decoded output is the only place that bias is observable.
+
+    Calibrated on TRAIN curves only, and applied inside
+    predict_raw_curve_exog_prev_activity, so nothing about the test set is used.
+    """
+    prev_map = kwargs.get('prev_act_energy_map')
+    pipeline = build_and_train_pipeline_exog_prev_activity(train_curves, variable, **kwargs)
+    pipeline['approach'] = 'ml_external_calib'
+
+    # Decode the TRAIN curves through the real predict path. Calibration must be
+    # off while doing so, or the fit would chase its own output.
+    pipeline['decode_calibration'] = None
+
+    # If the median floor fired, this leaf predicts its median curve and the
+    # canonical model is not used at all. There is no decode round trip left to
+    # correct, and fitting here would just be re-fitting the floor — which is a
+    # different method than the one this approach is meant to test.
+    if pipeline.get('median_floor_active'):
+        return pipeline
+
+    preds, trues = [], []
+    for c in train_curves:
+        rv = np.asarray(c['original_values'], dtype=float)
+        if len(rv) < 2:
+            continue
+        try:
+            attrs = _inject_prev_act_energy(c['attributes'], prev_map)
+            p = predict_raw_curve_exog(rv, c['activity'], attrs, pipeline,
+                                       exog_values=c.get('exog_values', {}))
+        except Exception:
+            continue
+        preds.append(np.asarray(p, dtype=float)); trues.append(rv)
+
+    if preds:
+        gain, offset = _fit_l1_affine(np.concatenate(preds), np.concatenate(trues),
+                                      random_state=kwargs.get('random_state', 42))
+        pipeline['decode_calibration'] = {'gain': gain, 'offset': offset}
+    return pipeline
+
+
+# =============================================================================
+# RAW-SPACE ML  —  no canonical encode, no decode: train where you evaluate
+# =============================================================================
+
+# Cap on training rows contributed per curve. A curve of n samples would
+# otherwise contribute n rows (vs fixed_length for the canonical approaches), so
+# a leaf of long curves can explode. Sub-SAMPLING is not the same distortion as
+# the canonical encode's averaging: it drops rows, it does not smooth targets.
+RAWSPACE_MAX_ROWS_PER_CURVE = int(_os_seed.environ.get(
+    'PIPELINE_RAWSPACE_MAX_ROWS_PER_CURVE', '400'))
+
+
+def _rawspace_rows(curve_values, curve_length, activity, attributes, exog_values,
+                   reference_curve, train_median_curve, all_keys, key_types,
+                   exog_cols, row_idx=None):
+    """
+    Build raw-timeline feature rows for ONE curve — shared by fit and predict so
+    the two can never drift apart.
+
+    One row per raw sample t. Position is expressed as t/(n-1), and the DTW
+    artefacts enter as FEATURES at the matching canonical position rather than as
+    a transform of the target: the barycenter value and the training-median
+    anchor. So the model still gets everything DBA/DTW learned about the typical
+    shape, while the target stays the untouched raw sample.
+    """
+    n = int(curve_length)
+    L = len(reference_curve)
+    idx = range(n) if row_idx is None else row_idx
+    denom = max(n - 1, 1)
+    rows = []
+    for t in idx:
+        rel = t / denom
+        cpos = int(round(rel * (L - 1)))            # matching canonical position
+        row = {
+            'relative_pos':        rel,
+            'position_idx':        float(t),
+            'curve_length':        float(n),
+            'ref_at_pos':          float(reference_curve[cpos]),
+            'train_median_at_pos': float(train_median_curve[cpos]),
+            'activity':            activity,
+        }
+        if curve_values is not None:
+            row['y'] = float(curve_values[t])
+        for key in all_keys:
+            v = attributes.get(key, None)
+            if key_types[key] == 'numeric':
+                try:
+                    row[key] = float(v) if v is not None else np.nan
+                except (ValueError, TypeError):
+                    row[key] = np.nan
+            else:
+                row[key] = str(v) if v is not None else 'None'
+        for col in exog_cols:
+            sig = exog_values.get(col) if exog_values else None
+            # ef_* are sampled on the curve's own timeline, so index directly
+            # rather than resampling onto a canonical grid.
+            row[col] = float(sig[t]) if sig is not None and t < len(sig) else np.nan
+        rows.append(row)
+    return rows
+
+
+def build_and_train_pipeline_rawspace(
+    train_curves, variable, fixed_length=None, val_size=0.2, random_state=42,
+    models=None, optimize_hyperparams=False, n_trials=50, verbose=1, n_jobs=-1,
+    prev_act_energy_map=None, max_rows_per_curve=None,
+):
+    """
+    Train on the RAW timeline. No canonical encode, no decode.
+
+    Every other curve approach fits a canonical target and then maps the result
+    back, so training minimises a proxy: the loss is computed in barycenter space
+    on DTW-warped, position-averaged values, while the reported metric is
+    computed pointwise on the real curve after a decode the model never saw.
+    Here the target is the raw sample itself, and prediction emits one value per
+    raw sample, so the fitted objective IS the evaluated objective.
+
+    DTW/DBA is not discarded — it is demoted from a target transform to a feature
+    source. The barycenter value and training-median anchor at the matching
+    canonical position ride along as 'ref_at_pos' / 'train_median_at_pos', so the
+    model keeps everything the alignment learned about the typical shape without
+    inheriting the encode's smoothing of peaks.
+
+    A side effect worth stating: with no decode there is no shape-blind question
+    for this approach. It reads only the test curve's LENGTH by construction, so
+    it is on the same test-time footing as median_activity_sensor / ml_only
+    whichever way DTW_DECODE_SHAPE_BLIND is set.
+    """
+    if verbose:
+        print("\n" + "=" * 80)
+        print("STEP 2 — BUILD + TRAIN PIPELINE (raw-space, no encode/decode)")
+        print("=" * 80)
+    if models is None:
+        models = {'Gradient Boosting': GradientBoostingRegressor,
+                  'Random Forest':     RandomForestRegressor}
+    if max_rows_per_curve is None:
+        max_rows_per_curve = RAWSPACE_MAX_ROWS_PER_CURVE
+
+    if prev_act_energy_map:
+        train_curves = [dict(c, attributes=_inject_prev_act_energy(
+            c['attributes'], prev_act_energy_map)) for c in train_curves]
+
+    exog_cols = sorted({col for c in train_curves for col in c.get('exog_values', {}).keys()})
+
+    # Barycenter + anchor are built exactly as elsewhere, but only to be READ as
+    # features below — no training curve is warped onto them.
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median(
+            [len(c['original_values']) for c in train_curves]))))
+    resampled_for_dba = np.array([
+        np.interp(np.linspace(0, 1, fixed_length),
+                  np.linspace(0, 1, len(c['original_values'])), c['original_values'])
+        for c in train_curves])[:, :, np.newaxis]
+    dba = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
+    reference_curve = _zero_calibrate_barycenter(dba[:, 0], resampled_for_dba)
+
+    # Anchor from the linearly length-normalised curves: this approach never
+    # produces 'resampled_values', and a median over the linear grid is the
+    # matching notion of "typical level at this relative position".
+    for c, rs in zip(train_curves, resampled_for_dba):
+        c['_lin_resampled'] = rs[:, 0]
+    train_median_curve, train_sensor_median = _training_median_stats(
+        train_curves, fixed_length, value_key='_lin_resampled')
+
+    all_keys, key_types = _infer_key_types(train_curves)
+
+    rng = np.random.default_rng(random_state)
+    rows = []
+    for c in train_curves:
+        vals = np.asarray(c['original_values'], dtype=float)
+        n = len(vals)
+        if n < 2:
+            continue
+        if n > max_rows_per_curve:      # subsample rows, never average them
+            sel = np.sort(rng.choice(n, max_rows_per_curve, replace=False))
+        else:
+            sel = np.arange(n)
+        for r in _rawspace_rows(vals, n, c['activity'], c['attributes'],
+                                c.get('exog_values', {}), reference_curve,
+                                train_median_curve, all_keys, key_types,
+                                exog_cols, row_idx=sel):
+            r['instance_id'] = c['instance_id']
+            rows.append(r)
+    if not rows:
+        raise ValueError('rawspace: no usable training rows')
+
+    df_reg = pd.DataFrame(rows)
+    categorical_cols = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+    # 'activity' has to be selected here as well as listed in categorical_cols —
+    # get_dummies encodes columns of X_all, not of df_reg. dict.fromkeys keeps
+    # order while dropping any duplicate between all_keys and the fixed columns.
+    feat_cols = list(dict.fromkeys(
+        ['relative_pos', 'position_idx', 'curve_length', 'ref_at_pos',
+         'train_median_at_pos', 'activity'] + list(all_keys) + exog_cols))
+    X_all = df_reg[feat_cols].copy()
+    X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
+    # Residual against the anchor, same reasoning as the canonical pipelines: the
+    # level comes back exactly and is not capped by the training range.
+    y_all = df_reg['y'] - df_reg['train_median_at_pos']
+
+    uniq = df_reg['instance_id'].unique()
+    tr_i, va_i = train_test_split(uniq, test_size=val_size, random_state=random_state)
+    m_tr, m_va = df_reg['instance_id'].isin(tr_i), df_reg['instance_id'].isin(va_i)
+    X_train, X_val = X_all[m_tr].copy(), X_all[m_va].copy()
+    y_train, y_val = y_all[m_tr].copy(), y_all[m_va].copy()
+    feature_columns = X_all.columns.tolist()
+
+    numeric_feature_cols = ['relative_pos', 'position_idx', 'curve_length',
+                            'ref_at_pos', 'train_median_at_pos'] + \
+        [k for k in all_keys if key_types[k] == 'numeric'] + exog_cols
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
+
+    feature_scaler = None
+    if numeric_feature_cols:
+        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
+        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
+        feature_scaler = StandardScaler()
+        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(X_train[numeric_feature_cols])
+        X_val.loc[:, numeric_feature_cols]   = feature_scaler.transform(X_val[numeric_feature_cols])
+
+    all_results, best_model, best_name, best_val_mae = {}, None, None, np.inf
+    for name, model_class in models.items():
+        if verbose:
+            print(f"\n  Training {name}...")
+        if optimize_hyperparams:
+            if not verbose:
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def objective(trial, name=name, model_class=model_class):
+                m = model_class(**_curve_model_trial_params(trial, name, random_state, n_jobs))
+                m.fit(X_train, y_train)
+                return -mean_absolute_error(y_val, m.predict(X_val))
+
+            study = optuna.create_study(direction='maximize',
+                                        sampler=optuna.samplers.TPESampler(seed=random_state))
+            study.optimize(objective, n_trials=n_trials)
+            model = model_class(**_curve_model_finalise_params(
+                name, study.best_params, random_state, n_jobs))
+        else:
+            _lk = _curve_model_loss_kwargs(name)
+            try:
+                model = model_class(random_state=random_state, **_lk)
+            except TypeError:
+                try:
+                    model = model_class(**_lk)
+                except TypeError:
+                    model = model_class()
+        model.fit(X_train, y_train)
+        train_mae = float(mean_absolute_error(y_train, model.predict(X_train)))
+        val_mae   = float(mean_absolute_error(y_val,   model.predict(X_val)))
+        if verbose:
+            print(f"    train MAE={train_mae:.4f}  val MAE={val_mae:.4f}")
+        all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae}
+        if val_mae < best_val_mae:
+            best_val_mae, best_model, best_name = val_mae, model, name
+
+    pipeline = {
+        'model':                best_model,
+        'model_name':           best_name,
+        'reference_curve':      reference_curve,
+        'fixed_length':         fixed_length,
+        'all_keys':             all_keys,
+        'key_types':            key_types,
+        'feature_columns':      feature_columns,
+        'feature_scaler':       feature_scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'train_median_curve':   train_median_curve,
+        'train_sensor_median':  train_sensor_median,
+        'val_mae':              best_val_mae,
+        'all_results':          all_results,
+        'exog_cols':            exog_cols,
+        'residual_target':      True,
+        'prev_act_energy_map':  prev_act_energy_map or {},
+        'approach':             'ml_rawspace',
+    }
+
+    # Median floor on the same terms as every other approach. Without this,
+    # ml_rawspace would be the ONLY unfloored column in the table — its leaves
+    # kept unconditionally while every rival's losing leaves fall back to their
+    # median — and any gap it showed would be unreadable. Scored through its own
+    # predictor, so the raw-space path is what gets judged.
+    _attach_median_floor(
+        pipeline, train_curves, va_i,
+        lambda rv, c: predict_raw_curve_rawspace(rv, c['activity'], c['attributes'],
+                                                 pipeline,
+                                                 exog_values=c.get('exog_values', {})),
+        label=f' {variable} (rawspace)', verbose=verbose,
+    )
+    return pipeline
+
+
+def predict_raw_curve_rawspace(raw_values, activity, attributes, pipeline,
+                               exog_values=None):
+    """
+    Predict directly on the raw timeline — one model call per raw sample, no DTW
+    decode. raw_values is used ONLY for its length (and, via _pred_curve_length,
+    not even that when the caller supplies a simulated duration).
+    """
+    _floor = _median_floor_prediction(raw_values, attributes, pipeline)
+    if _floor is not None:
+        return _floor
+
+    n = int(attributes.get('_pred_curve_length', len(raw_values)) or len(raw_values))
+    n = max(int(n), 1)
+    attributes = _inject_prev_act_energy(attributes, pipeline.get('prev_act_energy_map'))
+
+    rows = _rawspace_rows(None, n, activity, attributes, exog_values or {},
+                          pipeline['reference_curve'], pipeline['train_median_curve'],
+                          pipeline['all_keys'], pipeline['key_types'],
+                          pipeline.get('exog_cols', []))
+    X = pd.DataFrame(rows)
+    anchor = X['train_median_at_pos'].to_numpy(dtype=float)
+
+    cat_cols = ['activity'] + [k for k in pipeline['all_keys']
+                               if pipeline['key_types'][k] == 'category']
+    X = pd.get_dummies(X, columns=cat_cols, drop_first=True)
+    for c in pipeline['feature_columns']:
+        if c not in X.columns:
+            X[c] = 0
+    X = X[pipeline['feature_columns']]
+
+    scaler = pipeline.get('feature_scaler')
+    num = [c for c in pipeline.get('numeric_feature_cols', []) if c in X.columns]
+    if scaler is not None and num:
+        X[num] = X[num].astype('float64')
+        X.loc[:, num] = scaler.transform(X[num])
+    X = X.fillna(0)
+
+    y = np.asarray(pipeline['model'].predict(X), dtype=float)
+    if pipeline.get('residual_target'):
+        y = y + anchor
+    return y
 #
 # Same DBA barycenter + DTW alignment as the baseline, but the model is an
 # LSTM seq2seq that takes the full 100-step context vector as input and
@@ -7027,9 +7893,16 @@ def _dispatch_predict(raw_values, curve, pipeline):
         return predict_raw_curve_median(raw_values, act, attrs, pipeline)
     if approach == 'ml_dtw':
         return predict_raw_curve(raw_values, act, attrs, pipeline)
-    if approach == 'ml_external':
+    if approach in ('ml_external', 'ml_external_wcounts', 'ml_external_wmetric',
+                    'ml_external_calib'):
+        # The three variants differ only in how the canonical model was FITTED
+        # (row weights) or in a stored raw-space correction, both of which are
+        # handled inside the shared predictor.
         return predict_raw_curve_exog_prev_activity(raw_values, act, attrs, pipeline,
                                                     exog_values=curve.get('exog_values', {}))
+    if approach == 'ml_rawspace':
+        return predict_raw_curve_rawspace(raw_values, act, attrs, pipeline,
+                                          exog_values=curve.get('exog_values', {}))
     if approach == 'seq2seq':
         return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_only':
@@ -7042,6 +7915,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'exemplar':
         return predict_raw_curve_exemplar(raw_values, act, attrs, pipeline,
                                           exog_values=curve.get('exog_values', {}))
+    if approach == 'exemplar_dtw':
+        return predict_raw_curve_exemplar_dtw(raw_values, act, attrs, pipeline,
+                                              exog_values=curve.get('exog_values', {}))
     if approach == 'mean_baseline':
         return np.full(len(raw_values), pipeline.get('train_mean', 0.0))
     return predict_raw_curve(raw_values, act, attrs, pipeline)
@@ -7131,7 +8007,10 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     # separately in modelling.py's curve-only section. This worker trains the
     # per-combo median under 'median_activity_sensor'.
     _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'ml_external', 'ml_only',
-                           'exemplar'}
+                           'exemplar', 'exemplar_dtw',
+                           # train/eval-gap variants — see the block below
+                           'ml_external_wcounts', 'ml_external_wmetric',
+                           'ml_external_calib', 'ml_rawspace'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
     curves, _ = split_curves(
@@ -7225,6 +8104,54 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             print(f"  [WARN] ml_external: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no ml_dtw pipeline available either -- no prediction possible for this combo.")
+    # ── Train/eval-gap variants ──────────────────────────────────────────────
+    # All four reuse the ml_external curve set (same features, same prev-activity
+    # context), so any difference against ml_external is attributable to the one
+    # thing each changes. They are additive: the originals above are untouched.
+    _GAP_VARIANTS = ('ml_external_wcounts', 'ml_external_wmetric',
+                     'ml_external_calib', 'ml_rawspace')
+    if any(v in _active for v in _GAP_VARIANTS):
+        _pv, _ = split_curves_with_prev_activity(
+            df_train, variable=sensor, activities=[activity], objects=[obj],
+            test_size=0.0, verbose=0, exog_columns=ef_cols,
+            include_prev_energy=False,
+        )
+        _common = dict(fixed_length=fixed_length, val_size=val_size, models=models,
+                       verbose=0, n_jobs=1, random_state=_seed,
+                       prev_act_energy_map=prev_act_energy_map)
+        if len(_pv) >= 5:
+            for _v in _GAP_VARIANTS:
+                if _v not in _active:
+                    continue
+                try:
+                    if _v == 'ml_rawspace':
+                        result[_v] = build_and_train_pipeline_rawspace(
+                            [dict(c) for c in _pv], variable=sensor,
+                            **_common, **_hp_kwargs)
+                    elif _v == 'ml_external_calib':
+                        result[_v] = build_and_train_pipeline_exog_calibrated(
+                            [dict(c) for c in _pv], variable=sensor,
+                            **_common, **_hp_kwargs)
+                    else:
+                        _mode = ('counts' if _v == 'ml_external_wcounts'
+                                 else 'counts_sigma')
+                        _p = build_and_train_pipeline_exog_prev_activity(
+                            [dict(c) for c in _pv], variable=sensor,
+                            sample_weight_mode=_mode, **_common, **_hp_kwargs)
+                        _p['approach'] = _v
+                        result[_v] = _p
+                except Exception as _e:
+                    # Never let a new variant take the whole leaf down with it —
+                    # the established approaches for this combo must still land.
+                    print(f"  [WARN] {_v} failed for {sensor}|{activity}|{obj}: "
+                          f"{type(_e).__name__}: {_e}")
+        else:
+            print(f"  [WARN] {'/'.join(v for v in _GAP_VARIANTS if v in _active)}: only "
+                  f"{len(_pv)} curve(s) with previous-activity context for "
+                  f"{sensor}|{activity}|{obj} (need >=5) -- skipped. No ml_dtw "
+                  f"fallback here on purpose: substituting a different approach "
+                  f"would silently contaminate the comparison these variants exist for.")
+
     if 'ml_only' in _active:
         result['ml_only'] = build_and_train_pipeline_ml_only(
             curves, variable=sensor, fixed_length=fixed_length,
@@ -7237,6 +8164,14 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
         # the flat output this approach exists to avoid, so falling back to it
         # would silently undo the method on the leaves it is meant for.
         result['exemplar'] = build_and_train_pipeline_exemplar(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, verbose=0, random_state=_seed,
+            exog_cols=ef_cols,
+        )
+    if 'exemplar_dtw' in _active:
+        # Same no-median-floor reasoning as 'exemplar': the floor is a smooth
+        # median curve, which is what this family exists to avoid emitting.
+        result['exemplar_dtw'] = build_and_train_pipeline_exemplar_dtw(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, verbose=0, random_state=_seed,
             exog_cols=ef_cols,
@@ -7356,11 +8291,28 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
 
 # Persist the full y_true / y_pred arrays on every scored curve, so metrics
 # nobody has thought of yet can be computed from the saved results instead of by
-# re-running the pipeline. Off by default because it multiplies
-# curve_eval_results.parquet by ~n_points per row (order 100x); the shape
-# statistics below are always written and are enough for the realism measures.
+# re-running the pipeline.
+#
+# ON by default (changed 2026-07-26). Sized against the last full run: 586k rows
+# across 10 approaches, median 16 points per curve but a mean of 100 and a max of
+# 3,432, so ~117M values -> roughly 0.2-0.3 GB of compressed parquet against the
+# 42 MB the metrics-only file takes. That is a real cost but a bounded one, and
+# it is the difference between choosing a metric later and re-running everything
+# to get it. Set save_curve_values=False in pipeline.py (or
+# PIPELINE_SAVE_CURVE_VALUES=false) if a particular run needs the small file.
+#
+# Stored as float32: these are sensor readings whose own precision is far coarser
+# than 7 significant digits, and it halves the file for no loss that any metric
+# here can detect.
+#
+# y_true is emitted here on every scored row, but modelling.py's export SPLITS it
+# out before writing: every approach is scored on the same curves, so the real
+# array is identical across them and storing it per-row would duplicate roughly
+# half the file once per approach. It lands in real_test_curves.parquet keyed on
+# (Process, Sensor, Activity, Instance, Split); y_pred stays on the per-approach
+# rows. The results notebooks re-join it automatically.
 CURVE_EVAL_SAVE_VALUES = _os_seed.environ.get(
-    'PIPELINE_SAVE_CURVE_VALUES', 'false').lower() == 'true'
+    'PIPELINE_SAVE_CURVE_VALUES', 'true').lower() == 'true'
 
 
 def _curve_shape_stats(y_true, y_pred):
@@ -7372,10 +8324,22 @@ def _curve_shape_stats(y_true, y_pred):
              approaches sit near 0.1, meaning they emit a tenth of the real
              variation
     acf1_*   lag-1 autocorrelation — how smooth the curve is in time
-    zeros_*  fraction of exactly-zero samples — the duty cycle of an
-             intermittent sensor, which averaging destroys
+    rough_*  mean |v[t] - v[t-1]| — jaggedness / switching intensity. It catches
+             the OPPOSITE failure to std_*: a prediction can reach the right
+             standard deviation by adding high-frequency noise instead of
+             reproducing real dynamics, and only this separates "right
+             amplitude, right structure" from "right amplitude, wrong texture".
+             Comparable between the two curves because the prediction is always
+             emitted at the real curve's own length.
     max_*    peak, which sizes equipment and tariffs and is the first thing an
              averaged curve loses
+
+    Deliberately NOT here: a duty-cycle / zero-fraction statistic. The obvious
+    definition (share of exactly-zero samples) is degenerate for every sensor
+    that never switches fully off — the temp_* and Druck_* channels among the
+    modelled sensors never read 0, so it would be 0 for real AND predicted and
+    the ratio undefined. results_complete_energy_profile.ipynb measures duty
+    cycle properly, relative to each curve's own range; use that one.
     """
     def _acf1(x):
         x = np.asarray(x, dtype=float)
@@ -7390,7 +8354,8 @@ def _curve_shape_stats(y_true, y_pred):
         out[f'std_{tag}']   = float(arr.std()) if arr.size else np.nan
         out[f'max_{tag}']   = float(arr.max()) if arr.size else np.nan
         out[f'acf1_{tag}']  = _acf1(arr)
-        out[f'zeros_{tag}'] = float((np.abs(arr) <= 1e-9).mean()) if arr.size else np.nan
+        out[f'rough_{tag}'] = (float(np.abs(np.diff(arr)).mean())
+                               if arr.size >= 2 else np.nan)
     return out
 
 
@@ -7450,15 +8415,20 @@ def evaluate_pipeline_on_test(test_curves, pipeline, max_plot_curves=6, verbose=
         # profile from a flat line through the middle of one -- and once the run
         # is over they cannot be recomputed, because the values are gone. These
         # sufficient statistics are what the realism measures are built from
-        # (std ratio = std_pred/std_real, duty cycle = zeros_pred/zeros_real,
+        # (flatness = std_pred/std_real, texture = rough_pred/rough_real,
         # smoothness = acf1_pred - acf1_real), and they cost 10 floats a curve.
+        # Stored RAW, never as ratios: aggregating the two sides separately and
+        # dividing at the end avoids both the near-zero denominators and the
+        # asymmetry of a per-curve ratio (0.5 and 2.0 are both "factor 2 wrong"
+        # but sit at different distances from 1.0, which under-penalises the
+        # flatness these metrics exist to expose).
         _rec.update(_curve_shape_stats(raw_values, y_pred))
         if CURVE_EVAL_SAVE_VALUES:
             # Full arrays, so ANY future metric can be computed offline without
             # re-running the pipeline. Off by default -- this multiplies the
             # results file by roughly n_points per row.
-            _rec['y_true'] = np.asarray(raw_values, dtype=float).tolist()
-            _rec['y_pred'] = np.asarray(y_pred, dtype=float).tolist()
+            _rec['y_true'] = np.asarray(raw_values, dtype=np.float32)
+            _rec['y_pred'] = np.asarray(y_pred, dtype=np.float32)
         per_curve_metrics.append(_rec)
 
         all_true.extend(raw_values.tolist())
