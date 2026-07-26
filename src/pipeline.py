@@ -173,7 +173,7 @@ EXPERIMENTS = [
 
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_976',
+        'run_name':              'experiment_981',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -186,7 +186,7 @@ EXPERIMENTS = [
         'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha'],#, 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
+        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],#, 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
         'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
         'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
         'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
@@ -221,11 +221,11 @@ EXPERIMENTS = [
             # a decode the model never saw. Each of these changes exactly one
             # thing about that gap, so each is attributable against 'ml_external'
             # — keep 'ml_external' enabled or there is nothing to compare to.
-            'ml_external_wcounts',    # row weight = how many raw samples the DTW path folded
+            #'ml_external_wcounts',    # row weight = how many raw samples the DTW path folded
                                       # into that canonical position (they are not equally
                                       # informative, but the fit treats them as if they were)
             'ml_external_wmetric',    # ... additionally divided by the curve's own sigma,
-                                      # which is exactly what sMAE divides residuals by
+                                      #which is exactly what sMAE divides residuals by
             'ml_external_calib',      # (gain, offset) fitted in RAW space after the decode,
                                       # correcting the encode's flattening of peaks — the
                                       # canonical loss cannot see that bias at all
@@ -234,9 +234,9 @@ EXPERIMENTS = [
                                       # objective == evaluated objective. Also immune to
                                       # dtw_shape_blind_decode, since it has no decode.
 
-            # 'seq2seq',
-            # 'seq2seq_only',
-            #'seq2seq_external',
+            'seq2seq',
+            'seq2seq_only',
+            'seq2seq_external',
         ],
         # Full reference — every valid approach name (uncomment to enable the
         # experimental ones, which are commented out in modelling.py by
@@ -270,12 +270,12 @@ EXPERIMENTS = [
             #'Random Forest',
             'XGBoost',             # the gradient-boosting member
             'Hist Gradient Boosting',  # native-categorical, histogram-binned GB
-            #'MLP',                 # feed-forward net (sklearn MLPRegressor)
+            'MLP',                 # feed-forward net (sklearn MLPRegressor)
         ],
         # Cells competed inside every seq2seq approach; lower validation loss
         # wins. ['lstm'] reproduces the pre-transformer behaviour.
-        'seq2seq_cells': ['lstm'],
-        'curve_optimize_hyperparams': False,  # ON: proper tuned run (slow, publication-grade)
+        'seq2seq_cells': ['lstm', 'transformer'],
+        'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
 
         # ── Which candidate regressor wins each leaf ──────────────────────────

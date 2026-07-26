@@ -5171,9 +5171,15 @@ def _curve_feature(v, name):
     if name == 'std':       return float(np.std(v))
     if name == 'roughness': return float(np.abs(np.diff(v)).mean()) if v.size >= 2 else np.nan
     if name == 'acf1':
-        if v.size < 3 or v.std() < 1e-12:
+        # Guard the two SLICES, not v itself: a curve that is flat except for its
+        # first or last sample has nonzero overall std but a constant slice, which
+        # makes corrcoef divide 0/0 and emit a RuntimeWarning for the same nan.
+        if v.size < 3:
             return np.nan
-        return float(np.corrcoef(v[:-1], v[1:])[0, 1])
+        a, b = v[:-1], v[1:]
+        if a.std() < 1e-12 or b.std() < 1e-12:
+            return np.nan
+        return float(np.corrcoef(a, b)[0, 1])
     raise ValueError(f'unknown curve feature {name!r}')
 
 
@@ -8522,10 +8528,16 @@ def _curve_shape_stats(y_true, y_pred):
     cycle properly, relative to each curve's own range; use that one.
     """
     def _acf1(x):
+        # Guard the two SLICES, not x itself: a curve that is flat except for its
+        # first or last sample has nonzero overall std but a constant slice, which
+        # makes corrcoef divide 0/0 and emit a RuntimeWarning for the same nan.
         x = np.asarray(x, dtype=float)
-        if len(x) < 3 or x.std() < 1e-12:
+        if len(x) < 3:
             return np.nan
-        return float(np.corrcoef(x[:-1], x[1:])[0, 1])
+        a, b = x[:-1], x[1:]
+        if a.std() < 1e-12 or b.std() < 1e-12:
+            return np.nan
+        return float(np.corrcoef(a, b)[0, 1])
 
     out = {}
     for tag, arr in (('real', np.asarray(y_true, dtype=float)),
