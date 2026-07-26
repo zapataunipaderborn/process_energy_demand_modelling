@@ -6731,6 +6731,8 @@ else:
         # what the numbers mean, not just their value.
         'curve_loss': _sx.CURVE_MODEL_LOSS,
         'dtw_shape_blind_decode': _sx.DTW_DECODE_SHAPE_BLIND,
+        'curve_select_by_realism': _sx.CURVE_SELECT_BY_REALISM,
+        'curve_selection_metrics': list(_sx.CURVE_SELECTION_METRICS),
     }
     _info_path = os.path.join(_run_dir, 'info.json')
     with open(_info_path, 'w') as _f:

@@ -4350,6 +4350,15 @@ def build_and_train_pipeline(
     }
 
     # 2f. Median floor — keep the winner only if it beats this leaf's own median
+
+    # Realism-based re-selection — see CURVE_SELECT_BY_REALISM. Scored through
+    # this pipeline's OWN predictor on the held-out curves, so the decode and the
+    # real (never DTW-aligned) values are what decide the winner.
+    if CURVE_SELECT_BY_REALISM:
+        _vc = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+        _select_by_realism(all_results, pipeline, _vc,
+                           lambda rv, c: predict_raw_curve(rv, c['activity'], c['attributes'], pipeline),
+                           best_name, verbose=verbose, label=' ml_dtw')
     # curve on the same held-out instances. See _attach_median_floor.
     _attach_median_floor(
         pipeline, train_curves, val_inst,
@@ -5123,6 +5132,146 @@ def _resample_median_floor(floor_curve, n):
                      np.linspace(0, 1, len(floor_curve)), floor_curve)
 
 
+# ── Realism-based model selection ────────────────────────────────────────────
+# Which candidate regressor wins its leaf is normally decided by validation MAE
+# computed on the CANONICAL rows — a warped, position-averaged surrogate, per row,
+# in raw units. What actually gets reported is a per-CURVE error on the RAW
+# timeline after the decode. Three mismatches at once: space, unit and metric.
+#
+# With CURVE_SELECT_BY_REALISM on, the winner is instead chosen by the same
+# realism score the results notebooks report: each candidate is run through its
+# REAL predictor (decode included) on the held-out validation curves, its
+# per-curve features are compared with the REAL curves' features, and the
+# normalised absolute errors are averaged into one 'Overall'. Lower is better.
+#
+#     err_f = |f(pred) - f(real)| / mean|f(real)|      over this leaf's val curves
+#     Overall = mean over the selected features
+#
+# Off (default) keeps the historical val-MAE selection, so runs stay comparable.
+CURVE_SELECT_BY_REALISM = _os_seed.environ.get(
+    'PIPELINE_CURVE_SELECT_BY_REALISM', 'false').lower() == 'true'
+
+# Which per-curve features go into that average. Change this and the selection
+# objective changes with it — e.g. drop 'sum' to stop rewarding total-energy
+# accuracy, or add 'roughness' to punish smoothed-out dynamics.
+CURVE_SELECTION_METRICS = tuple(
+    m.strip().lower() for m in _os_seed.environ.get(
+        'PIPELINE_CURVE_SELECTION_METRICS', 'sum,max,mean,std').split(',') if m.strip())
+
+
+def _curve_feature(v, name):
+    """One per-curve scalar, matching the notebooks' definitions exactly."""
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return np.nan
+    if name == 'sum':       return float(np.sum(v))
+    if name == 'max':       return float(np.max(v))
+    if name == 'mean':      return float(np.mean(v))
+    if name == 'std':       return float(np.std(v))
+    if name == 'roughness': return float(np.abs(np.diff(v)).mean()) if v.size >= 2 else np.nan
+    if name == 'acf1':
+        if v.size < 3 or v.std() < 1e-12:
+            return np.nan
+        return float(np.corrcoef(v[:-1], v[1:])[0, 1])
+    raise ValueError(f'unknown curve feature {name!r}')
+
+
+def _realism_overall(val_curves, predict_fn, metrics=None, verbose=0, label=''):
+    """
+    'Overall' realism error of a predictor on held-out curves — the selection
+    counterpart of the notebooks' scorecard.
+
+    predict_fn : callable(raw_values, curve) -> np.ndarray, the pipeline's REAL
+                 predictor, so the decode is part of what is scored.
+
+    Scores against curve['original_values'] — the untouched real curve, never the
+    DTW-aligned target. Scale is this leaf's own mean|f(real)|, the direct analogue
+    of the notebooks' per-(process, sensor) scale.
+
+    Returns (overall, {feature: err}); overall is NaN when nothing is scoreable,
+    which the callers treat as "fall back to val MAE" rather than as a win.
+    """
+    metrics = list(metrics if metrics is not None else CURVE_SELECTION_METRICS)
+    reals, preds = [], []
+    for c in val_curves:
+        raw = np.asarray(c['original_values'], dtype=float)
+        if len(raw) < 2:
+            continue
+        try:
+            y = np.asarray(predict_fn(raw, c), dtype=float)
+        except Exception:
+            return np.nan, {}          # a predictor that raises cannot be ranked
+        if len(y) != len(raw) or not np.all(np.isfinite(y)):
+            return np.nan, {}
+        reals.append(raw); preds.append(y)
+    if not reals:
+        return np.nan, {}
+
+    per_feature = {}
+    for f in metrics:
+        rv = np.array([_curve_feature(r, f) for r in reals], dtype=float)
+        pv = np.array([_curve_feature(p, f) for p in preds], dtype=float)
+        ok = np.isfinite(rv) & np.isfinite(pv)
+        if not ok.any():
+            continue
+        scale = float(np.nanmean(np.abs(rv[ok])))
+        # Degenerate-scale guard, as in the notebooks: a feature the real curves
+        # have essentially none of carries no information and would explode.
+        if not np.isfinite(scale) or scale < 1e-6:
+            continue
+        per_feature[f] = float(np.mean(np.abs(pv[ok] - rv[ok])) / scale)
+    if not per_feature:
+        return np.nan, {}
+    overall = float(np.mean(list(per_feature.values())))
+    if verbose:
+        print(f"  [realism-select{label}] Overall={overall:.4f}  "
+              + '  '.join(f'{k}={v:.4f}' for k, v in per_feature.items()))
+    return overall, per_feature
+
+
+def _select_by_realism(all_results, pipeline, val_curves, predict_fn,
+                       fallback_name, verbose=0, label=''):
+    """
+    Re-pick the winning candidate by realism Overall instead of val MAE.
+
+    `pipeline` is mutated in place: pipeline['model'] is swapped to each candidate
+    and `predict_fn` must READ pipeline['model'] at call time (close over the dict,
+    not over a model), so every candidate is scored through the real predict path.
+
+    Falls back to `fallback_name` — the val-MAE winner — whenever nothing is
+    scoreable, so this can never leave a leaf without a model. The chosen scores
+    are recorded on the pipeline for later inspection.
+    """
+    scores = {}
+    for name, res in all_results.items():
+        m = res.get('model')
+        if m is None:
+            continue
+        pipeline['model'] = m
+        ov, per = _realism_overall(val_curves, predict_fn, verbose=0, label=label)
+        all_results[name]['realism_overall'] = ov
+        all_results[name]['realism_per_feature'] = per
+        if np.isfinite(ov):
+            scores[name] = ov
+    if not scores:
+        pipeline['model'] = all_results[fallback_name]['model']
+        pipeline['model_name'] = fallback_name
+        pipeline['selection_criterion'] = 'val_mae (realism unscoreable)'
+        return fallback_name
+    best = min(scores, key=scores.get)
+    pipeline['model'] = all_results[best]['model']
+    pipeline['model_name'] = best
+    pipeline['selection_criterion'] = 'realism_overall'
+    pipeline['selection_metrics'] = list(CURVE_SELECTION_METRICS)
+    pipeline['realism_overall'] = scores[best]
+    pipeline['realism_per_feature'] = all_results[best].get('realism_per_feature', {})
+    if verbose:
+        _alt = f' (val-MAE would have picked {fallback_name})' if best != fallback_name else ''
+        print(f"  [realism-select{label}] {best} Overall={scores[best]:.4f}{_alt}")
+    return best
+
+
 def _attach_median_floor(pipeline, train_curves, val_instance_ids, predict_fn,
                          label='', verbose=0):
     """
@@ -5610,6 +5759,15 @@ def build_and_train_pipeline_ml_only(
         'all_results':          all_results,
     }
 
+
+    # Realism-based re-selection — see CURVE_SELECT_BY_REALISM. Scored through
+    # this pipeline's OWN predictor on the held-out curves, so the decode and the
+    # real (never DTW-aligned) values are what decide the winner.
+    if CURVE_SELECT_BY_REALISM:
+        _vc = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+        _select_by_realism(all_results, pipeline, _vc,
+                           lambda rv, c: predict_raw_curve_ml_only(rv, c['activity'], c['attributes'], pipeline),
+                           best_name, verbose=verbose, label=' ml_only')
     # Median floor — see _attach_median_floor.
     _attach_median_floor(
         pipeline, train_curves, val_inst,
@@ -6011,7 +6169,8 @@ def build_and_train_pipeline_exog(
             print(f"    train MAE={train_mae:.4f}  val MAE={val_mae:.4f}")
 
         all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae,
-                             'val_mae_unweighted': val_mae_unw}
+                             'val_mae_unweighted': val_mae_unw,
+                             'model': model}   # kept so realism re-selection can rank it
         if val_mae < best_val_mae:
             best_val_mae = val_mae
             best_val_mae_unw = val_mae_unw
@@ -6042,6 +6201,16 @@ def build_and_train_pipeline_exog(
         'approach':            'ml_exog',
     }
 
+
+    # Realism-based re-selection — see CURVE_SELECT_BY_REALISM. Scored through
+    # this pipeline's OWN predictor on the held-out curves, so the decode and the
+    # real (never DTW-aligned) values are what decide the winner.
+    if CURVE_SELECT_BY_REALISM:
+        _vc = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+        _select_by_realism(all_results, pipeline, _vc,
+                           lambda rv, c: predict_raw_curve_exog(rv, c['activity'], c['attributes'],
+                                                pipeline, exog_values=c.get('exog_values', {})),
+                           best_name, verbose=verbose, label=' exog')
     # Median floor — see _attach_median_floor. Scored through
     # predict_raw_curve_exog rather than the ml_external wrapper because the
     # prev-activity energy features are already in these curves' attributes
@@ -6592,7 +6761,8 @@ def build_and_train_pipeline_rawspace(
         val_mae   = float(mean_absolute_error(y_val,   model.predict(X_val)))
         if verbose:
             print(f"    train MAE={train_mae:.4f}  val MAE={val_mae:.4f}")
-        all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae}
+        all_results[name] = {'train_mae': train_mae, 'val_mae': val_mae,
+                             'model': model}   # kept for realism re-selection
         if val_mae < best_val_mae:
             best_val_mae, best_model, best_name = val_mae, model, name
 
@@ -6616,6 +6786,16 @@ def build_and_train_pipeline_rawspace(
         'approach':             'ml_rawspace',
     }
 
+
+    # Realism-based re-selection — see CURVE_SELECT_BY_REALISM. Scored through
+    # this pipeline's OWN predictor on the held-out curves, so the decode and the
+    # real (never DTW-aligned) values are what decide the winner.
+    if CURVE_SELECT_BY_REALISM:
+        _vc = [c for c in train_curves if c['instance_id'] in set(va_i)]
+        _select_by_realism(all_results, pipeline, _vc,
+                           lambda rv, c: predict_raw_curve_rawspace(rv, c['activity'], c['attributes'],
+                                                    pipeline, exog_values=c.get('exog_values', {})),
+                           best_name, verbose=verbose, label=' rawspace')
     # Median floor on the same terms as every other approach. Without this,
     # ml_rawspace would be the ONLY unfloored column in the table — its leaves
     # kept unconditionally while every rival's losing leaves fall back to their

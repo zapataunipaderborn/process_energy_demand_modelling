@@ -105,6 +105,23 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    and the val-MAE model selection.
                                    'squared_error' restores the old conditional-
                                    MEAN behaviour for ablation.
+  curve_select_by_realism bool|None which candidate regressor wins each
+                                   (sensor, activity, object) leaf. None/False =
+                                   validation MAE on the CANONICAL rows (the
+                                   historical behaviour). True = the realism
+                                   'Overall' the results notebooks report, scored
+                                   by running each candidate through its REAL
+                                   predictor (decode included) on the held-out
+                                   curves and comparing per-curve features
+                                   against the REAL curve values. Fixes the
+                                   space/unit/metric mismatch between what is
+                                   selected on and what is reported.
+  curve_selection_metrics list|None which per-curve features are averaged into
+                                   that 'Overall'. Subset of 'sum' | 'max' |
+                                   'mean' | 'std' | 'roughness' | 'acf1'.
+                                   None -> ['sum','max','mean','std']. Changing
+                                   this changes the selection objective.
+                                   Only used when curve_select_by_realism.
   dtw_shape_blind_decode bool|None decode canonical predictions back to the test
                                    timeline using ONLY the curve's length
                                    (linear resample), instead of DTW-warping
@@ -156,7 +173,7 @@ EXPERIMENTS = [
 
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_974',
+        'run_name':              'experiment_976',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -260,6 +277,23 @@ EXPERIMENTS = [
         'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': False,  # ON: proper tuned run (slow, publication-grade)
         'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
+
+        # ── Which candidate regressor wins each leaf ──────────────────────────
+        # False (historical): validation MAE on the CANONICAL rows — a warped,
+        #   position-averaged surrogate, scored per ROW, in raw units.
+        # True: the realism 'Overall' the results notebooks report — each
+        #   candidate is run through its REAL predictor (decode included) on the
+        #   held-out curves and its per-curve features are compared against the
+        #   REAL curve values. Selection then measures what the paper measures.
+        # Cheap while dtw_shape_blind_decode is True (the decode is a linear
+        # resample); turning that off makes this a DTW per candidate per curve.
+        'curve_select_by_realism': True,
+        # Which per-curve features are averaged into that 'Overall'. Subset of
+        # 'sum' | 'max' | 'mean' | 'std' | 'roughness' | 'acf1'. Changing this
+        # changes the selection objective -- e.g. ['std'] alone selects purely
+        # for reproducing the amount of variation, ['std', 'roughness'] adds
+        # "and by real dynamics rather than added noise".
+        'curve_selection_metrics': ['sum', 'max', 'mean', 'std', 'roughness'],
         # Fall back to the per-(sensor, activity, object) median curve whenever a
         # trained approach loses to it on held-out curves. OFF: acceptance is on
         # pointwise error, so it deletes the realism-oriented approaches (it fired
@@ -343,6 +377,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     curve_optimize_hyperparams = exp.get('curve_optimize_hyperparams')
     curve_n_optuna_trials = exp.get('curve_n_optuna_trials')
     curve_loss = exp.get('curve_loss')
+    curve_select_by_realism = exp.get('curve_select_by_realism')
+    curve_selection_metrics = exp.get('curve_selection_metrics')
     dtw_shape_blind_decode = exp.get('dtw_shape_blind_decode')
     save_curve_values = exp.get('save_curve_values')
     curve_median_floor = exp.get('curve_median_floor')
@@ -372,6 +408,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"seq2seq_cells={seq2seq_cells or '(all)'}  "
           f"curve_optimize_hyperparams={curve_optimize_hyperparams if curve_optimize_hyperparams is not None else '(default)'}  "
           f"curve_loss={curve_loss or '(default absolute_error)'}  "
+          f"curve_select_by_realism={curve_select_by_realism if curve_select_by_realism is not None else '(default False)'}  "
+          f"curve_selection_metrics={curve_selection_metrics or '(default sum,max,mean,std)'}  "
           f"dtw_shape_blind_decode={dtw_shape_blind_decode if dtw_shape_blind_decode is not None else '(default True)'}  "
           f"save_curve_values={save_curve_values if save_curve_values is not None else '(default True)'}  "
           f"curve_median_floor={curve_median_floor if curve_median_floor is not None else '(default False = OFF)'}  "
@@ -416,6 +454,10 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_CURVE_N_OPTUNA_TRIALS'] = str(curve_n_optuna_trials)
     if curve_loss is not None:
         env['PIPELINE_CURVE_LOSS'] = str(curve_loss)
+    if curve_select_by_realism is not None:
+        env['PIPELINE_CURVE_SELECT_BY_REALISM'] = 'true' if curve_select_by_realism else 'false'
+    if curve_selection_metrics:
+        env['PIPELINE_CURVE_SELECTION_METRICS'] = ','.join(curve_selection_metrics)
     if dtw_shape_blind_decode is not None:
         env['PIPELINE_DTW_SHAPE_BLIND_DECODE'] = 'true' if dtw_shape_blind_decode else 'false'
     if save_curve_values is not None:
