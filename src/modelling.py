@@ -93,6 +93,7 @@ from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, c
 from sim_extractor import compare_complete_case_curves, build_exog_lookup
 from sim_extractor import build_sensor_activity_object_combos
 from sim_extractor import predict_raw_curve_exemplar, predict_raw_curve_exemplar_dtw
+from sim_extractor import predict_raw_curve_ml_cluster_dtw
 from sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
@@ -769,6 +770,33 @@ RUN_AUTOREGRESSIVE_EVAL = os.environ.get('PIPELINE_RUN_AUTOREGRESSIVE_EVAL', 'fa
 # eval. See compare_complete_case_curves / compare_schedule_and_stochastic_profiles.
 SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false').lower() == 'true'
 
+# Upper bound on worker processes for the parallel training pools. Default: one
+# per core, the historical behaviour.
+#
+# This matters more than a core count suggests. modelling.py is a SCRIPT with no
+# `if __name__ == "__main__"` guard, and ProcessPoolExecutor uses the 'spawn'
+# start method on macOS, so every worker RE-IMPORTS this module and re-executes
+# it top to bottom — including reloading the process data. Peak memory is
+# therefore roughly (workers + 1) x the resident size of one full load, not the
+# one copy a fork-based pool would share. On a machine with many cores and
+# little RAM the pool is killed with no traceback, which looks exactly like a
+# silent hang. Set PIPELINE_MAX_WORKERS to fit the pool to available memory
+# rather than to the CPU.
+_MAX_WORKERS_ENV = os.environ.get('PIPELINE_MAX_WORKERS')
+MAX_WORKERS = int(_MAX_WORKERS_ENV) if _MAX_WORKERS_ENV else None
+if MAX_WORKERS is not None:
+    print(f"[modelling] Worker pools capped at {MAX_WORKERS} process(es) "
+          f"(PIPELINE_MAX_WORKERS); machine has {os.cpu_count()} core(s).")
+
+
+def _pool_workers(n_tasks):
+    """Worker count for a pool over `n_tasks`: one per core, capped by
+    PIPELINE_MAX_WORKERS when set, and never more than there is work for."""
+    n = min(int(n_tasks), os.cpu_count() or 4)
+    if MAX_WORKERS is not None:
+        n = min(n, MAX_WORKERS)
+    return max(1, n)
+
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          "Baseline": ONE median curve per SENSOR, pooled over
 #                        all activities/objects (the coarser naive floor)
@@ -785,6 +813,15 @@ SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false'
 #                        factors and scaled by an L1 level model. The only
 #                        approach that never averages, so the only one whose
 #                        output keeps realistic texture (ramps, duty cycling).
+#    'exemplar_only'     the no-DTW ablation of 'exemplar': the cluster medoid is
+#                        picked by mean absolute difference instead of DTW
+#                        distance. Everything else is identical, so the gap to
+#                        'exemplar' is attributable to DTW alone.
+#    'ml_cluster_dtw'    ml_external fitted PER DTW shape cluster and decoded
+#                        through a warp predicted from the attributes instead of
+#                        a uniform resample. Keeps exemplar_dtw's clustering and
+#                        learned warp but predicts every value with a regression,
+#                        so the curve is novel rather than a replayed one.
 APPROACHES = [
     'baseline',
     'median_activity_sensor',
@@ -792,7 +829,9 @@ APPROACHES = [
     'ml_external',
     'ml_only',
     'exemplar',
+    'exemplar_only',
     'exemplar_dtw',
+    'ml_cluster_dtw',
 
     # ── Train/eval-gap variants of 'ml_external' ─────────────────────────────
     # Every canonical approach fits a target in barycenter space (DTW-warped,
@@ -826,7 +865,8 @@ if _env_curve_approaches:
     # Full universe of valid approach names (not just the currently-uncommented
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
     _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
-              'ml_only', 'exemplar', 'exemplar_dtw', 'seq2seq', 'seq2seq_only', 'seq2seq_external',
+              'ml_only', 'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
+              'seq2seq', 'seq2seq_only', 'seq2seq_external',
               'ml_external_wcounts', 'ml_external_wmetric', 'ml_external_calib',
               'ml_rawspace'}
     _unknown = [a for a in _requested if a not in _known]
@@ -4003,7 +4043,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             _combos = build_sensor_activity_object_combos(
                                 _df_expanded_train, _sensors, _activities_list, _objects_list
                             )
-                            _n_workers = min(len(_combos), os.cpu_count() or 4)
+                            _n_workers = _pool_workers(len(_combos))
                             print(f"\n  ℹ️ Training {len(_combos)} pipelines across {_n_workers} workers"
                                   f" ({'with' if _ef_ep_cols else 'without'} external factors)...")
                             print(f"     sensors={_sensors}")
@@ -4403,7 +4443,9 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_ml_only                  = {}   # ML, linear resample encode+decode
     all_energy_pipelines_exemplar                 = {}   # real-curve exemplar + shape classifier
+    all_energy_pipelines_exemplar_only            = {}   # exemplar without DTW (Euclidean medoid)
     all_energy_pipelines_exemplar_dtw             = {}   # + DTW k-medoids + predicted time warp
+    all_energy_pipelines_ml_cluster_dtw           = {}   # ml_external per shape cluster + predicted warp
     all_energy_pipelines_ml_external_wcounts      = {}   # DTW + ML + Ext. (count-weighted)
     all_energy_pipelines_ml_external_wmetric      = {}   # DTW + ML + Ext. (metric-weighted)
     all_energy_pipelines_ml_external_calib        = {}   # DTW + ML + Ext. (decode-calibrated)
@@ -4498,7 +4540,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_seq2seq_external    = {}
         _pipelines_ml_only                = {}
         _pipelines_exemplar               = {}   # real-curve exemplar (no averaging)
+        _pipelines_exemplar_only          = {}   # exemplar without DTW (Euclidean medoid)
         _pipelines_exemplar_dtw           = {}   # + DTW k-medoids + predicted warp
+        _pipelines_ml_cluster_dtw         = {}   # ml_external per shape cluster + predicted warp
         _pipelines_ml_external_wcounts      = {}
         _pipelines_ml_external_wmetric      = {}
         _pipelines_ml_external_calib        = {}
@@ -4524,7 +4568,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         # worker — it is built separately below. The worker trains the per-combo
         # median under 'median_activity_sensor'.
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar','exemplar_dtw',
+                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar',
+                                        'exemplar_only','exemplar_dtw',
+                                        'ml_cluster_dtw',
                                         'ml_external_wcounts','ml_external_wmetric',
                                         'ml_external_calib','ml_rawspace'}]
         _seq2seq_approaches = [a for a in APPROACHES
@@ -4534,7 +4580,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         # carries signal — e.g. process_1's destillation sensors have nothing to do
         # with autoclaving activities, so don't train/evaluate that cross product.
         _combos    = build_sensor_activity_object_combos(_df_train_exp, _sensors, _activities, _objects)
-        _n_workers = min(len(_combos), _os.cpu_count() or 4)
+        _n_workers = _pool_workers(len(_combos))
 
         if _sklearn_approaches and _combos:
             print(f"\n  Parallel sklearn training: {len(_combos)} combos × {len(_sklearn_approaches)} approaches "
@@ -4615,6 +4661,23 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep))(_r['ml_only']),
                         'full_pipeline':   _r['ml_only'],
                     }
+                if 'ml_cluster_dtw' in _r:
+                    # exog-aware signature like ml_external: the cluster
+                    # classifier and the warp regressors both read ef_* window
+                    # means, so the values have to reach the predictor.
+                    _pipelines_ml_cluster_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_cluster_dtw']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_ml_cluster_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_cluster_dtw']),
+                        'full_pipeline':   _r['ml_cluster_dtw'],
+                    }
+                if 'exemplar_only' in _r:
+                    # Shares predict_raw_curve_exemplar with 'exemplar' — the two
+                    # differ only in how the stored medoid was chosen at training.
+                    _pipelines_exemplar_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['exemplar_only']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exemplar(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exemplar_only']),
+                        'full_pipeline':   _r['exemplar_only'],
+                    }
                 if 'exemplar_dtw' in _r:
                     _pipelines_exemplar_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': _r['exemplar_dtw']['reference_curve'],
@@ -4634,7 +4697,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
         if _seq2seq_approaches and _combos:
             from sim_extractor import _train_seq2seq_worker
-            _s2s_n_workers = min(len(_combos), _os.cpu_count() or 4)
+            _s2s_n_workers = _pool_workers(len(_combos))
             print(f"\n  Parallel seq2seq training: {len(_combos)} combos × "
                   f"{len(_seq2seq_approaches)} approaches across {_s2s_n_workers} workers...")
             _s2s_t0 = _time.perf_counter()
@@ -4748,7 +4811,9 @@ if RUN_CURVE_ONLY_EVALUATION:
                              ('DTW + ML + Ext. Factors', _pipelines_ml_external),
                              ('ML only (no DTW)',        _pipelines_ml_only),
                              ('Exemplar (real curve)',   _pipelines_exemplar),
+                             ('Exemplar (no DTW)', _pipelines_exemplar_only),
                              ('Exemplar + DTW (warped)', _pipelines_exemplar_dtw),
+                             ('Cluster DTW + ML + Ext.', _pipelines_ml_cluster_dtw),
                              ('DTW + Seq2Seq',           _pipelines_seq2seq),
                              ('Seq2Seq only (no DTW)',   _pipelines_seq2seq_only),
                              ('DTW + Seq2Seq + Ext. Factors', _pipelines_seq2seq_external)):
@@ -4776,7 +4841,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_seq2seq_external[_proc] = _pipelines_seq2seq_external
         all_energy_pipelines_ml_only[_proc]                 = _pipelines_ml_only
         all_energy_pipelines_exemplar[_proc]                = _pipelines_exemplar
+        all_energy_pipelines_exemplar_only[_proc]           = _pipelines_exemplar_only
         all_energy_pipelines_exemplar_dtw[_proc]            = _pipelines_exemplar_dtw
+        all_energy_pipelines_ml_cluster_dtw[_proc]          = _pipelines_ml_cluster_dtw
         all_energy_pipelines_ml_external_wcounts[_proc] = _pipelines_ml_external_wcounts
         all_energy_pipelines_ml_external_wmetric[_proc] = _pipelines_ml_external_wmetric
         all_energy_pipelines_ml_external_calib[_proc] = _pipelines_ml_external_calib
@@ -4827,8 +4894,21 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
             for _leaf_acts, _leaf_objs, _ep in _leaf_eps:
                 _fp = _ep.get('full_pipeline', {})
                 _approach_eval = _fp.get('approach', 'baseline')
-                _exog_cols_eval = _fp.get('exog_cols', []) if _approach_eval in ('ml_external', 'seq2seq_external') else None
-                if _approach_eval in ('ml_external', 'seq2seq_external'):
+                # Which approaches need ef_* attached to the evaluation curves,
+                # and which splitter mirrors how they were TRAINED. Getting this
+                # wrong does not raise: the curves simply arrive without
+                # 'exog_values', the ef_* features go in as NaN, and the approach
+                # is silently scored without the external factors it was fitted
+                # with. The exemplar family was in exactly that state before —
+                # trained on ef_* through split_curves(exog_columns=ef_cols), but
+                # evaluated without them.
+                #   _exog_prev_approaches — trained on split_curves_with_prev_activity
+                #   _exog_plain_approaches — trained on plain split_curves + ef_*
+                _exog_prev_approaches  = ('ml_external', 'seq2seq_external', 'ml_cluster_dtw')
+                _exog_plain_approaches = ('exemplar', 'exemplar_only', 'exemplar_dtw')
+                _exog_approaches = _exog_prev_approaches + _exog_plain_approaches
+                _exog_cols_eval = _fp.get('exog_cols', []) if _approach_eval in _exog_approaches else None
+                if _approach_eval in _exog_prev_approaches:
                     # Must mirror training: previous-activity NAME + ef_* only.
                     # include_prev_energy stays False so nothing here reads the
                     # test set's real meter values for the preceding activity.
@@ -5242,7 +5322,9 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('ML + Ext. Factors',     all_energy_pipelines_ml_external),
             ('ML only (no DTW)',                all_energy_pipelines_ml_only),
             ('Exemplar (real curve)',           all_energy_pipelines_exemplar),
+            ('Exemplar (no DTW)',     all_energy_pipelines_exemplar_only),
             ('Exemplar + DTW (warped)',         all_energy_pipelines_exemplar_dtw),
+            ('Cluster DTW + ML + Ext.',         all_energy_pipelines_ml_cluster_dtw),
             ('DTW + ML + Ext. (count-weighted)', all_energy_pipelines_ml_external_wcounts),
             ('DTW + ML + Ext. (metric-weighted)', all_energy_pipelines_ml_external_wmetric),
             ('DTW + ML + Ext. (decode-calibrated)', all_energy_pipelines_ml_external_calib),
@@ -5567,8 +5649,12 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_ml_only' in dir() else {},
                     'Exemplar (real curve)':            all_energy_pipelines_exemplar
                         if 'all_energy_pipelines_exemplar' in dir() else {},
+                    'Exemplar (no DTW)':      all_energy_pipelines_exemplar_only
+                        if 'all_energy_pipelines_exemplar_only' in dir() else {},
                     'Exemplar + DTW (warped)':          all_energy_pipelines_exemplar_dtw
                         if 'all_energy_pipelines_exemplar_dtw' in dir() else {},
+                    'Cluster DTW + ML + Ext.':          all_energy_pipelines_ml_cluster_dtw
+                        if 'all_energy_pipelines_ml_cluster_dtw' in dir() else {},
                     'DTW + Seq2Seq':                      all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
@@ -6269,7 +6355,9 @@ if _jdur_ready:
         ('Baseline',                      all_energy_pipelines),
         ('Median per Activity & Sensor',  all_energy_pipelines_median_activity_sensor),
         ('Exemplar (real curve)',         all_energy_pipelines_exemplar),
+        ('Exemplar (no DTW)',   all_energy_pipelines_exemplar_only),
         ('Exemplar + DTW (warped)',       all_energy_pipelines_exemplar_dtw),
+        ('Cluster DTW + ML + Ext.',       all_energy_pipelines_ml_cluster_dtw),
         ('ML + Ext. Factors', all_energy_pipelines_ml_external),
     ]:
         if not _jpips:
@@ -6445,7 +6533,9 @@ if _jdur_ready:
         ('ML DTW',                          globals().get('all_energy_pipelines_ml_dtw',   {})),
         ('ML + Ext. Factors',           globals().get('all_energy_pipelines_ml_external', {})),
         ('Exemplar (real curve)',           globals().get('all_energy_pipelines_exemplar', {})),
+        ('Exemplar (no DTW)',     globals().get('all_energy_pipelines_exemplar_only', {})),
         ('Exemplar + DTW (warped)',         globals().get('all_energy_pipelines_exemplar_dtw', {})),
+        ('Cluster DTW + ML + Ext.',         globals().get('all_energy_pipelines_ml_cluster_dtw', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
         ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
     ]

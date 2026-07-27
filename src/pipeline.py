@@ -171,9 +171,89 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
+    # ── Cluster-DTW comparison ───────────────────────────────────────────────
+    # Focused run for the NEW 'ml_cluster_dtw' approach: ml_external fitted per
+    # DTW shape cluster and decoded through a warp predicted from the attributes
+    # instead of a uniform resample (sim_extractor.build_and_train_pipeline_ml_cluster_dtw).
+    #
+    # Only two curve approaches are trained — the new one and the naive floor it
+    # has to beat — so the run is a fraction of a full one. The other methods are
+    # NOT retrained: the point is to read this run's curve table against the
+    # previous full run's, which used the same data_experiment, the same 70/30
+    # temporal split and the same seed, so the numbers are directly comparable.
+    #
+    # What to look for in the Curve-Only Evaluation table, against the previous
+    # run's rows for 'ML + Ext. Factors' and 'Median per Activity & Sensor':
+    #   sMAE / WAPE        should be at or slightly better than ml_external's —
+    #                      clustering removes the shape heterogeneity that made
+    #                      one pooled barycenter average incompatible profiles
+    #   std / roughness     should be clearly ABOVE ml_external's ~0.13 std ratio
+    #     ratio            and below 'exemplar'-s ~0.74. A conditional mean stays
+    #                      smoother than a real curve; landing between the two is
+    #                      the expected outcome, not a failure.
+    # Also check the per-leaf log lines '[ml_cluster_dtw] N curves -> K shape
+    # clusters': a leaf that collapses to K=1 has degraded to ml_external with a
+    # nearest-neighbour decode, so it contributes nothing to the comparison.
+    #
+    # Only per-step predictors can be read against each other on pointwise error:
+    # 'ml_external' and 'ml_cluster_dtw' predict a value at every position, while
+    # 'median_activity_sensor' and the exemplar family emit stored/measured curves
+    # (the exemplar family predicts only which curve, its level and — for
+    # exemplar_dtw — its timing). Both kinds are in the run on purpose: the first
+    # pair answers "does the per-cluster fit help", the second answers "how much
+    # realism does never averaging buy".
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_981',
+        'run_name':              'experiment_982_cluster_dtw',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3',
+                                  'process_4_1', 'process_4_2', 'process_5'],
+        'temporal_resolution':   '1min',
+        'run_process_modelling': True,
+        'mining_algorithms':     ['heuristic'],   # heuristic only, as requested
+        'run_energy_modelling':  True,
+        'run_joint_duration_eval':  False,  # slow per-instance-matched heatmaps
+        'run_schedule_profile_eval': True,  # keys off 'ml_external', which is now trained
+        'run_autoregressive_eval':   False,
+        'save_predicted_curves': True,
+        'train_ratio':           0.70,
+        'split_type':            'temporal',
+        'random_seed':           42,     # same seed as the full runs, so the
+                                         # train/test split is bit-identical
+        'curve_approaches': [
+            'median_activity_sensor',   # the naive floor
+            'ml_external',              # the INCUMBENT per-step predictor and the direct parent
+                                        # of ml_cluster_dtw. In the run so the key comparison is
+                                        # self-contained: without it the table cannot say whether
+                                        # the per-cluster fit and the predicted warp help, and
+                                        # splicing the number in from experiment_981 would ride
+                                        # on nothing else having drifted (the eval-time exog
+                                        # handling did change — see _run_curve_eval)
+            'ml_cluster_dtw',           # new: ml_external per shape cluster + predicted warp
+            'exemplar_only',            # new: the no-DTW exemplar ablation — same clusters,
+                                        # same classifier over attributes + ef_*, same L1 level
+                                        # model, same nearest-neighbour time map; only the
+                                        # medoid distance changes (mean absolute difference
+                                        # instead of DTW)
+            'exemplar',                 # kept so 'exemplar_only' has its DTW counterpart to be
+                                        # read against — without it the ablation says nothing,
+                                        # and it is one of the cheapest approaches to train.
+                                        # The three rungs isolate DTW:
+                                        #   exemplar_only  no DTW anywhere
+                                        #   exemplar       DTW picks the medoid
+                                        #   exemplar_dtw   DTW also defines the clusters + warp
+        ],
+        'curve_optimize_hyperparams': False,   # OFF, as requested
+        'curve_median_floor':    False,  # must stay OFF: the floor accepts on
+                                         # POINTWISE error, so it would delete the
+                                         # realism gain this approach exists for
+        'save_curve_values':     True,   # keep y_true/y_pred so the realism
+                                         # metrics can be recomputed offline
+    },
+
+    # ── Previous full run (kept for reference; uncomment to re-run) ───────────
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_981',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
         # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
@@ -183,17 +263,17 @@ EXPERIMENTS = [
         # (sim_extractor._zero_calibrate_barycenter) end-to-end, and is directly
         # comparable to experiment_944 (same split, same miners) for the
         # before/after leakage check.
-        'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
-        'temporal_resolution':   '1min',
-        'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],#, 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
-        'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
-        'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
-        'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
-        'run_autoregressive_eval': False, # OFF: skip the "… (autoreg)" curve-eval rows
-        'save_predicted_curves': setting, # ON: persists predicted_curves.parquet the schedule-profile comparison reads
-        'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
-        'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
+    #     'processes_to_run':      ['process_1', 'process_2', 'process_3', 'process_4_1', 'process_4_2', 'process_5'],
+    #     'temporal_resolution':   '1min',
+    #     'run_process_modelling': True,
+    #     'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],#, 'alpha'],#, 'alpha'],   # matches experiment_944 for apples-to-apples comparison
+    #     'run_energy_modelling':  setting,    # ON: needed so the curve pipelines exist for the schedule-profile "Best, mine" comparison
+    #     'run_joint_duration_eval': False, # slow, per-instance-matched heatmaps; superseded by energy_distribution_results
+    #     'run_schedule_profile_eval':setting, # ON: Best/mine vs. Schedule-direct vs. Stochastic generator, per process
+    #     'run_autoregressive_eval': False, # OFF: skip the "… (autoreg)" curve-eval rows
+    #     'save_predicted_curves': setting, # ON: persists predicted_curves.parquet the schedule-profile comparison reads
+    #     'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
+    #     'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
         # All standard curve approaches (the uncommented defaults in
         # modelling.py's APPROACHES list — same set experiment_944 produced),
         # renamed to a consistent 'ml_*' prefix for every sklearn/DTW-regression
@@ -203,17 +283,26 @@ EXPERIMENTS = [
         # big runtime multiplier — the seq2seq_* families especially are slow.
         # The schedule-profile / complete-curve eval still keys off
         # 'ml_external'.
-        'curve_approaches':      [
-            'baseline',              # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
-            'median_activity_sensor', # "Median per Activity & Sensor": median curve per (sensor, activity, object), no model
-            'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
-            'ml_external',  # DBA + DTW + regression + external factors + prev-activity NAME (no lagged energy)
-            'ml_only',                # no DTW at all (formerly 'ml_linear')
-            'exemplar',               # real training curve (DTW medoid of a shape cluster),
+    #     'curve_approaches':      [
+    #         'baseline',              # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
+    #         'median_activity_sensor', # "Median per Activity & Sensor": median curve per (sensor, activity, object), no model
+    #         'ml_dtw',                # DBA barycenter + DTW alignment + regression (formerly just 'baseline')
+    #         'ml_external',  # DBA + DTW + regression + external factors + prev-activity NAME (no lagged energy)
+    #         'ml_only',                # no DTW at all (formerly 'ml_linear')
+    #         'exemplar',               # real training curve (DTW medoid of a shape cluster),
                                       # picked by a classifier over attributes + ef_*, scaled
                                       # by an L1 level model — the only approach that never
                                       # averages, so the only one whose output keeps realistic
                                       # texture. Expect WORSE sMAE and a far better std ratio.
+    #         'ml_cluster_dtw',         # 'ml_external' fitted PER DTW shape cluster and decoded
+                                      # through a warp PREDICTED from the attributes instead of
+                                      # a uniform resample. Keeps exemplar_dtw's two structural
+                                      # DTW uses (elastic clustering, learned warp) but every
+                                      # output value comes from a regression, so the curve is
+                                      # novel instead of a replayed one. Expect sMAE at or a
+                                      # little better than 'ml_external', and a std ratio
+                                      # between it and 'exemplar' — a conditional mean stays
+                                      # smoother than any single real curve.
 
             # ── Train/eval-gap variants of 'ml_external' ──────────────────────
             # Every canonical approach FITS in barycenter space (DTW-warped,
@@ -224,20 +313,20 @@ EXPERIMENTS = [
             #'ml_external_wcounts',    # row weight = how many raw samples the DTW path folded
                                       # into that canonical position (they are not equally
                                       # informative, but the fit treats them as if they were)
-            'ml_external_wmetric',    # ... additionally divided by the curve's own sigma,
+    #         'ml_external_wmetric',    # ... additionally divided by the curve's own sigma,
                                       #which is exactly what sMAE divides residuals by
-            'ml_external_calib',      # (gain, offset) fitted in RAW space after the decode,
+    #         'ml_external_calib',      # (gain, offset) fitted in RAW space after the decode,
                                       # correcting the encode's flattening of peaks — the
                                       # canonical loss cannot see that bias at all
-            'ml_rawspace',            # no encode/decode: one row per raw sample, DTW/DBA
+    #         'ml_rawspace',            # no encode/decode: one row per raw sample, DTW/DBA
                                       # demoted from target transform to feature. Fitted
                                       # objective == evaluated objective. Also immune to
                                       # dtw_shape_blind_decode, since it has no decode.
 
-            'seq2seq',
-            'seq2seq_only',
-            'seq2seq_external',
-        ],
+    #         'seq2seq',
+    #         'seq2seq_only',
+    #         'seq2seq_external',
+    #     ],
         # Full reference — every valid approach name (uncomment to enable the
         # experimental ones, which are commented out in modelling.py by
         # default). Kept here so the whole universe is togglable in future.
@@ -253,7 +342,8 @@ EXPERIMENTS = [
         # 'median_activity_sensor' = "Median per Activity & Sensor" (median per
         # sensor+activity+object):
         #   'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
-        #   'ml_only', 'exemplar', 'seq2seq', 'seq2seq_only', 'seq2seq_external'
+        #   'ml_only', 'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
+        #   'seq2seq', 'seq2seq_only', 'seq2seq_external'
         # 'exemplar' sits outside the ml_*/seq2seq pairing: it is the only
         # approach that predicts a REAL measured curve rather than an average of
         # them, so it is the one to look at when the question is whether the
@@ -262,21 +352,21 @@ EXPERIMENTS = [
         # Regressors competed for every curve approach, per (sensor, activity,
         # object); best kept by validation MAE. Comment a line out to turn that
         # model off. None / omitted = all six.
-        'curve_models': [
-            'Linear Regression',   # unpenalised OLS reference (nothing to tune —
+    #     'curve_models': [
+    #         'Linear Regression',   # unpenalised OLS reference (nothing to tune —
                                    # its Optuna trials are all identical)
-            'Ridge',               # penalised counterpart; the one-hot design
+    #         'Ridge',               # penalised counterpart; the one-hot design
                                    # matrix is high-dimensional and collinear
             #'Random Forest',
-            'XGBoost',             # the gradient-boosting member
-            'Hist Gradient Boosting',  # native-categorical, histogram-binned GB
-            'MLP',                 # feed-forward net (sklearn MLPRegressor)
-        ],
+    #         'XGBoost',             # the gradient-boosting member
+    #         'Hist Gradient Boosting',  # native-categorical, histogram-binned GB
+    #         'MLP',                 # feed-forward net (sklearn MLPRegressor)
+    #     ],
         # Cells competed inside every seq2seq approach; lower validation loss
         # wins. ['lstm'] reproduces the pre-transformer behaviour.
-        'seq2seq_cells': ['lstm', 'transformer'],
-        'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
-        'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
+    #     'seq2seq_cells': ['lstm', 'transformer'],
+    #     'curve_optimize_hyperparams': True,  # ON: proper tuned run (slow, publication-grade)
+    #     'curve_n_optuna_trials': 10,         # trials per (sensor, activity, object)
 
         # ── Which candidate regressor wins each leaf ──────────────────────────
         # False (historical): validation MAE on the CANONICAL rows — a warped,
@@ -287,27 +377,27 @@ EXPERIMENTS = [
         #   REAL curve values. Selection then measures what the paper measures.
         # Cheap while dtw_shape_blind_decode is True (the decode is a linear
         # resample); turning that off makes this a DTW per candidate per curve.
-        'curve_select_by_realism': True,
+    #     'curve_select_by_realism': True,
         # Which per-curve features are averaged into that 'Overall'. Subset of
         # 'sum' | 'max' | 'mean' | 'std' | 'roughness' | 'acf1'. Changing this
         # changes the selection objective -- e.g. ['std'] alone selects purely
         # for reproducing the amount of variation, ['std', 'roughness'] adds
         # "and by real dynamics rather than added noise".
-        'curve_selection_metrics': ['sum', 'max', 'mean', 'std', 'roughness'],
+    #     'curve_selection_metrics': ['sum', 'max', 'mean', 'std', 'roughness'],
         # Fall back to the per-(sensor, activity, object) median curve whenever a
         # trained approach loses to it on held-out curves. OFF: acceptance is on
         # pointwise error, so it deletes the realism-oriented approaches (it fired
         # on 33/40 leaves for 'exemplar'). Flip to True for a "never worse than the
         # naive floor" run — but then do not read the realism tables from it.
-        'curve_median_floor': False,
+    #     'curve_median_floor': False,
         # Persist the predicted curve for EVERY scored test curve, so any metric
         # can be computed from the saved results instead of by re-running.
         # y_pred goes to curve_eval_results.parquet; the REAL curves are written
         # once to real_test_curves.parquet (they are shared by every approach) and
         # the results notebooks re-join them. Set False if a run needs a small file.
-        'save_curve_values': True,
+    #     'save_curve_values': True,
         # 'curve_median_floor_ratio': 1.0,   # margin required; 0.95 = beat it by 5%
-    },
+    # },
 
     # ── Exemplar comparison ──────────────────────────────────────────────────
     # Uncomment this dict to run it. Trains ONLY the cheap approaches plus the

@@ -4462,7 +4462,8 @@ def _nn_time_map(curve, n):
     return curve[idx]
 
 
-def _curve_shape_clusters(train_curves, fixed_length, n_shapes, random_state):
+def _curve_shape_clusters(train_curves, fixed_length, n_shapes, random_state,
+                          use_dtw=True):
     """
     Cluster the leaf's curves by SHAPE and return (labels, medoid_curves).
 
@@ -4470,9 +4471,19 @@ def _curve_shape_clusters(train_curves, fixed_length, n_shapes, random_state):
     only — the level is the other model's job, and leaving it in would just make
     the clusters a coarse quantisation of magnitude.
 
-    The medoid of a cluster is the member minimising total DTW distance to the
+    The medoid of a cluster is the member minimising total distance to the
     others, i.e. the most typical REAL curve of that group. Its original (unresampled)
     values are what gets stored, so no resampling smooths it before use.
+
+    use_dtw : bool
+        True  — that distance is DTW, so two curves with the same profile at
+                different speeds count as similar ('exemplar').
+        False — plain mean absolute difference, index against index
+                ('exemplar_only'). This is the no-DTW ablation of the exemplar
+                family: everything else is identical, so the difference between
+                the two columns is attributable to the distance alone. The
+                clustering itself is Euclidean k-means in BOTH cases — only
+                exemplar_dtw makes the clusters elastic too.
     """
     from sklearn.cluster import KMeans
 
@@ -4499,12 +4510,15 @@ def _curve_shape_clusters(train_curves, fixed_length, n_shapes, random_state):
             medoids[int(lab)] = np.asarray(
                 train_curves[members[0]]['original_values'], dtype=float)
             continue
-        # Total DTW distance to the other members, on the common grid.
+        # Total distance to the other members, on the common grid.
         best_i, best_d = members[0], np.inf
         for i in members:
             d = 0.0
             for j in members:
                 if i == j:
+                    continue
+                if not use_dtw:
+                    d += float(np.mean(np.abs(shapes[i] - shapes[j])))
                     continue
                 try:
                     d += float(dtw(shapes[i], shapes[j],
@@ -4558,10 +4572,18 @@ def _exemplar_feature_frame(curves, columns=None, exog_cols=None):
 def build_and_train_pipeline_exemplar(train_curves, variable, fixed_length=None,
                                       val_size=0.2, random_state=42, models=None,
                                       n_shapes=4, verbose=1, n_jobs=1,
-                                      exog_cols=None, **_ignored_hp_kwargs):
+                                      exog_cols=None, use_dtw=True,
+                                      **_ignored_hp_kwargs):
     """
     Exemplar pipeline: shape clusters + a classifier that picks one, and an
     L1 regressor for the level. See the section comment above.
+
+    use_dtw=False builds the 'exemplar_only' ablation instead: the medoid of each
+    cluster is picked by mean absolute difference rather than DTW distance, so
+    the approach uses no DTW anywhere. Everything else — the clustering, the
+    classifier, the level model, the nearest-neighbour time map — is unchanged,
+    which is what makes the pair attributable to the distance alone. Shares
+    predict_raw_curve_exemplar, since neither variant uses DTW at predict time.
 
     `models` and the hyper-parameter kwargs are accepted and ignored so this can
     be called with the same signature as every other builder in
@@ -4580,8 +4602,10 @@ def build_and_train_pipeline_exemplar(train_curves, variable, fixed_length=None,
             [len(c['original_values']) for c in train_curves]))))
 
     labels, medoids = _curve_shape_clusters(train_curves, fixed_length,
-                                            n_shapes, random_state)
+                                            n_shapes, random_state,
+                                            use_dtw=use_dtw)
     levels = np.array([float(np.mean(c['original_values'])) for c in train_curves])
+    _tag = 'exemplar' if use_dtw else 'exemplar_only'
 
     exog_cols = list(exog_cols or [])
     X = _exemplar_feature_frame(train_curves, exog_cols=exog_cols)
@@ -4605,11 +4629,11 @@ def build_and_train_pipeline_exemplar(train_curves, variable, fixed_length=None,
             if acc_model > acc_const:
                 clf = _c
             if verbose:
-                print(f"  [exemplar] shape classifier val acc={acc_model:.3f} vs "
+                print(f"  [{_tag}] shape classifier val acc={acc_model:.3f} vs "
                       f"majority {acc_const:.3f} -> {'kept' if clf else 'dropped'}")
         except Exception as exc:
             if verbose:
-                print(f"  [exemplar] shape classifier failed ({exc!r}) — using the majority shape")
+                print(f"  [{_tag}] shape classifier failed ({exc!r}) — using the majority shape")
 
     const_level = float(np.median(levels))
     reg = None
@@ -4623,14 +4647,14 @@ def build_and_train_pipeline_exemplar(train_curves, variable, fixed_length=None,
             if mae_model < mae_const:
                 reg = _r
             if verbose:
-                print(f"  [exemplar] level regressor val MAE={mae_model:.4f} vs "
+                print(f"  [{_tag}] level regressor val MAE={mae_model:.4f} vs "
                       f"constant {mae_const:.4f} -> {'kept' if reg else 'dropped'}")
         except Exception as exc:
             if verbose:
-                print(f"  [exemplar] level regressor failed ({exc!r}) — using the constant level")
+                print(f"  [{_tag}] level regressor failed ({exc!r}) — using the constant level")
 
     pipeline = {
-        'approach':         'exemplar',
+        'approach':         'exemplar' if use_dtw else 'exemplar_only',
         'reference_curve':  _median_floor_reference(train_curves, fixed_length),
         'fixed_length':     fixed_length,
         'medoids':          medoids,
@@ -4657,7 +4681,7 @@ def build_and_train_pipeline_exemplar(train_curves, variable, fixed_length=None,
         lambda rv, c: predict_raw_curve_exemplar(rv, c['activity'], c['attributes'],
                                                  pipeline,
                                                  exog_values=c.get('exog_values', {})),
-        label=f' {variable} (exemplar)', verbose=verbose,
+        label=f' {variable} ({_tag})', verbose=verbose,
     )
     return pipeline
 
@@ -6233,26 +6257,21 @@ def build_and_train_pipeline_exog(
     return pipeline
 
 
-def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
-                            exog_values=None):
+def _exog_canonical_prediction(raw_values, activity, attributes, pipeline,
+                               exog_values=None):
     """
-    Predict for a single raw curve using the external-factors pipeline.
+    The exog pipeline's prediction in CANONICAL (barycenter) space —
+    `fixed_length` points, before any decode onto the raw timeline.
 
-    Parameters
-    ----------
-    raw_values  : np.ndarray
-    activity    : str
-    attributes  : dict
-    pipeline    : dict  — from build_and_train_pipeline_exog()
-    exog_values : dict | None
-        {col: np.ndarray} — raw ef_* time series for this activity window,
-        same length as raw_values (will be resampled internally).
-        Missing columns are filled with 0.
+    Split out of predict_raw_curve_exog so a caller can substitute its own decode
+    for the built-in one. ml_cluster_dtw does exactly that: it replaces the
+    uniform resample with a warp predicted from the attributes, so the canonical
+    curve has to be reachable without being decoded first. The only thing read
+    from `raw_values` here is its length, via the 'curve_length' feature.
+
+    Does NOT consult the median floor — that is a decision about the finished
+    raw-space prediction, so it stays in the callers.
     """
-    _floor = _median_floor_prediction(raw_values, attributes, pipeline)
-    if _floor is not None:
-        return _floor
-
     reference_curve      = pipeline['reference_curve']
     fixed_length         = len(reference_curve)
     model                = pipeline['model']
@@ -6328,9 +6347,36 @@ def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
     if pipeline.get('residual_target') and train_median_curve is not None:
         y_ref_pred = y_ref_pred + np.asarray(train_median_curve, dtype=float)
 
+    return y_ref_pred
+
+
+def predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
+                            exog_values=None):
+    """
+    Predict for a single raw curve using the external-factors pipeline.
+
+    Parameters
+    ----------
+    raw_values  : np.ndarray
+    activity    : str
+    attributes  : dict
+    pipeline    : dict  — from build_and_train_pipeline_exog()
+    exog_values : dict | None
+        {col: np.ndarray} — raw ef_* time series for this activity window,
+        same length as raw_values (will be resampled internally).
+        Missing columns are filled with 0.
+    """
+    _floor = _median_floor_prediction(raw_values, attributes, pipeline)
+    if _floor is not None:
+        return _floor
+
+    y_ref_pred = _exog_canonical_prediction(raw_values, activity, attributes,
+                                            pipeline, exog_values=exog_values)
+
     # DTW decode canonical → raw length
+    reference_curve = pipeline['reference_curve']
     return _decode_canonical_to_raw(y_ref_pred, raw_values, reference_curve,
-                                    fixed_length)
+                                    len(reference_curve))
 
 
 # =============================================================================
@@ -6446,6 +6492,348 @@ def predict_raw_curve_exog_prev_activity(raw_values, activity, attributes, pipel
     y = predict_raw_curve_exog(raw_values, activity, attributes, pipeline,
                                exog_values=exog_values or {})
     return _apply_decode_calibration(y, pipeline)
+
+
+# =============================================================================
+# CLUSTER DTW — ml_external fitted PER SHAPE CLUSTER, decoded through a
+#               PREDICTED warp instead of a uniform resample
+# =============================================================================
+#
+# The exemplar family showed that a real curve keeps its texture and an averaged
+# one does not, but it pays for that by replaying a measured curve verbatim: at
+# most n_shapes distinct profiles per leaf, and no value in the output was
+# produced by a model. This approach keeps the two structural ideas that made
+# exemplar_dtw work and drops the replay — every output value comes out of a
+# regression, so the curve is novel and responds continuously to attribute
+# values never seen in training.
+#
+# It is 'ml_external' with two changes, each aimed at one of the two reasons that
+# approach predicts a nearly flat curve (std ratio ~0.135 against the real
+# curves):
+#
+#   1. FIT PER CLUSTER. ml_external builds ONE DBA barycenter over every curve of
+#      the leaf, so a double-peak curve and a duty-cycling curve are averaged into
+#      the same canonical target and cancel each other out. Here the leaf is first
+#      split by shape with DTW k-medoids (the same clustering exemplar_dtw uses),
+#      and a full DBA + DTW + regression pipeline is fitted INSIDE each cluster.
+#      Each barycenter then averages curves that actually share a profile, so far
+#      less structure cancels. Which cluster a new instance belongs to is
+#      predicted by a classifier over the same attributes + ef_* features.
+#
+#   2. DECODE THROUGH A PREDICTED WARP. ml_external DTW-aligns its training curves
+#      to sharpen the canonical target, then decodes with a uniform linear
+#      resample (DTW_DECODE_SHAPE_BLIND) — so the alignment is thrown away at
+#      predict time and the prediction is emitted in canonical phase rather than
+#      in the instance's own. The warp regressors from exemplar_dtw close that
+#      loop: gamma is fitted at training time from real DTW paths, PREDICTED from
+#      the features at inference, and the canonical curve is sampled through it.
+#      Nothing reads the test curve's values, so this stays simulation-reachable.
+#
+# What it does NOT fix is the remaining std deficit. A conditional mean is
+# smoother than any single real curve no matter how well the space is partitioned
+# or the time axis parameterised, because the high-frequency part of a load curve
+# is genuinely not predictable from the attributes. Expect this to land between
+# ml_external and exemplar on realism, and at or slightly better than ml_external
+# pointwise. Restoring the last of the variance needs a sampled residual term,
+# which is a different (stochastic) object and is deliberately not in here.
+#
+# Sampling through gamma is index selection, never interpolation — the same
+# nearest-neighbour rule the exemplar family uses, so whatever texture the
+# regression did produce survives the decode instead of being averaged away.
+
+# A cluster smaller than this cannot support its own barycenter + regression, so
+# it is merged into its nearest surviving neighbour rather than fitted on noise.
+CLUSTER_DTW_MIN_CURVES = 8
+
+
+def _cluster_dtw_shape_clusters(train_curves, fixed_length, n_shapes, random_state):
+    """
+    DTW k-medoids over the leaf's shapes, with clusters too small to fit merged
+    into the nearest survivor. Returns (labels, shapes) with labels relabelled to
+    0..K-1 and every cluster guaranteed at least CLUSTER_DTW_MIN_CURVES members
+    (unless the whole leaf is smaller, in which case there is one cluster).
+    """
+    resampled = np.array([
+        np.interp(np.linspace(0, 1, fixed_length),
+                  np.linspace(0, 1, len(c['original_values'])),
+                  np.asarray(c['original_values'], dtype=float))
+        for c in train_curves
+    ])
+    scale = np.mean(resampled, axis=1, keepdims=True)
+    shapes = resampled / np.where(np.abs(scale) < 1e-12, 1.0, scale)
+
+    k = max(1, min(int(n_shapes), len(train_curves) // CLUSTER_DTW_MIN_CURVES))
+    if k <= 1:
+        return np.zeros(len(train_curves), dtype=int), shapes
+
+    D, sub_idx = _dtw_distance_matrix(shapes, random_state=random_state)
+    sub_labels, sub_med = _kmedoids(D, k, random_state=random_state)
+    medoid_rows = {int(c): int(sub_idx[sub_med[c]]) for c in range(len(sub_med))}
+
+    labels = np.empty(len(train_curves), dtype=int)
+    labels[sub_idx] = sub_labels
+    for r in np.setdiff1d(np.arange(len(train_curves)), sub_idx):
+        labels[r] = min(medoid_rows,
+                        key=lambda c: float(np.mean(np.abs(shapes[r] - shapes[medoid_rows[c]]))))
+
+    # Merge the undersized clusters into the nearest kept one, by medoid distance.
+    counts = pd.Series(labels).value_counts()
+    keep = [int(c) for c in counts.index if counts[c] >= CLUSTER_DTW_MIN_CURVES]
+    if not keep:
+        keep = [int(counts.index[0])]
+    for c in [int(c) for c in counts.index if c not in keep]:
+        nearest = min(keep, key=lambda k2: float(np.mean(np.abs(
+            shapes[medoid_rows[c]] - shapes[medoid_rows[k2]]))))
+        labels[labels == c] = nearest
+
+    remap = {old: new for new, old in enumerate(sorted(set(labels.tolist())))}
+    return np.array([remap[int(l)] for l in labels], dtype=int), shapes
+
+
+def build_and_train_pipeline_ml_cluster_dtw(
+    train_curves,
+    variable,
+    fixed_length=None,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+    n_jobs=-1,
+    prev_act_energy_map=None,
+    n_shapes=4,
+    residual_target=None,
+):
+    """
+    ml_external fitted per DTW shape cluster, decoded through a predicted warp.
+    See the section comment above for what each part is for.
+
+    Four learned parts. The three that are new relative to ml_external are each
+    validated against doing nothing, in the same do-no-harm spirit as the median
+    floor, so a leaf whose shape or timing is simply not predictable degrades to
+    the pooled behaviour rather than to noise:
+
+        per-cluster exog pipelines  the DBA + DTW + regression stack, one per shape
+        shape classifier   attributes/ef_* -> which cluster  (vs the majority cluster)
+        warp regressors    attributes/ef_* -> gamma at each knot (vs the mean warp)
+
+    With one surviving cluster and no kept warp model this is ml_external with a
+    nearest-neighbour decode, which is the intended floor rather than a failure.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+
+    # Same prev-activity energy injection as build_and_train_pipeline_exog_prev_activity,
+    # done here so the features are identical to ml_external's and the comparison
+    # against it isolates the clustering and the warp.
+    if prev_act_energy_map:
+        train_curves = [dict(_c, attributes=_inject_prev_act_energy(
+            _c['attributes'], prev_act_energy_map)) for _c in train_curves]
+
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median(
+            [len(c['original_values']) for c in train_curves]))))
+
+    labels, shapes = _cluster_dtw_shape_clusters(train_curves, fixed_length,
+                                                 n_shapes, random_state)
+    n_clusters = int(labels.max()) + 1
+
+    # ── 1. One full exog pipeline per cluster ────────────────────────────────
+    # Curves are copied because the exog builder writes 'resampled_values' and
+    # '_exog_resampled' onto them, and the caller reuses the same list for the
+    # other approaches. fixed_length is pinned so every cluster's canonical space
+    # has the same size — the warp knots and the decode assume that.
+    cluster_pipelines = {}
+    for lab in range(n_clusters):
+        members = [dict(train_curves[i]) for i in np.where(labels == lab)[0]]
+        try:
+            sub = build_and_train_pipeline_exog(
+                members, variable,
+                fixed_length=fixed_length, val_size=val_size,
+                random_state=random_state, models=models,
+                optimize_hyperparams=optimize_hyperparams, n_trials=n_trials,
+                verbose=0, n_jobs=n_jobs, residual_target=residual_target,
+            )
+        except Exception as exc:
+            if verbose:
+                print(f"  [ml_cluster_dtw] cluster {lab} failed to fit ({exc!r}) — dropped")
+            continue
+        # The sub-pipelines' own median floors are neutralised: this predictor
+        # calls _exog_canonical_prediction directly, which bypasses the floor
+        # check inside predict_raw_curve_exog, so a per-cluster floor would be
+        # recorded and then silently never fire. One floor is attached at the end
+        # of this function instead, scored through the real predictor.
+        sub['median_floor_active'] = False
+        cluster_pipelines[lab] = sub
+
+    if not cluster_pipelines:
+        raise RuntimeError('ml_cluster_dtw: no cluster produced a pipeline')
+
+    # ── 2. Warp targets: gamma of every curve against ITS cluster's barycenter ──
+    # The barycenter, not the medoid: it is the space the per-cluster regression
+    # predicts in, so it is the space the warp has to map onto. Level is divided
+    # out of both sides so the alignment is driven by shape alone.
+    bary_shapes = {}
+    for lab, sub in cluster_pipelines.items():
+        b = np.asarray(sub['reference_curve'], dtype=float)
+        m = float(np.mean(b))
+        bary_shapes[lab] = b / (m if abs(m) > 1e-12 else 1.0)
+
+    warp = np.array([
+        _warp_knots_from_path(shapes[i], bary_shapes[int(labels[i])])
+        if int(labels[i]) in bary_shapes else np.array(WARP_KNOTS, dtype=float)
+        for i in range(len(train_curves))
+    ])
+
+    # ── 3. Cluster classifier and warp regressors ────────────────────────────
+    exog_cols = sorted({col for c in train_curves
+                        for col in (c.get('exog_values') or {}).keys()})
+    X = _exemplar_feature_frame(train_curves, exog_cols=exog_cols)
+    feature_columns = list(X.columns)
+
+    n = len(train_curves)
+    idx = np.arange(n)
+    if 0 < val_size < 1 and n >= 10:
+        tr_i, vl_i = train_test_split(idx, test_size=val_size, random_state=random_state)
+    else:
+        tr_i = vl_i = idx
+
+    majority = int(pd.Series(labels).value_counts().idxmax())
+    if majority not in cluster_pipelines:
+        majority = next(iter(cluster_pipelines))
+
+    clf = None
+    if len(cluster_pipelines) > 1 and feature_columns and len(tr_i) >= 8:
+        try:
+            _c = HistGradientBoostingClassifier(max_iter=200, random_state=random_state)
+            _c.fit(X.values[tr_i], labels[tr_i])
+            acc_model = float((_c.predict(X.values[vl_i]) == labels[vl_i]).mean())
+            acc_const = float((labels[vl_i] == majority).mean())
+            if acc_model > acc_const:
+                clf = _c
+            if verbose:
+                print(f"  [ml_cluster_dtw] cluster classifier val acc={acc_model:.3f} vs "
+                      f"majority {acc_const:.3f} -> {'kept' if clf else 'dropped'}")
+        except Exception as exc:
+            if verbose:
+                print(f"  [ml_cluster_dtw] cluster classifier failed ({exc!r}) — using the majority cluster")
+
+    const_warp = warp.mean(axis=0) if warp.size else np.array(WARP_KNOTS, dtype=float)
+    warp_models = []
+    for j in range(warp.shape[1] if warp.size else 0):
+        m = None
+        if feature_columns and len(tr_i) >= 8:
+            try:
+                _w = HistGradientBoostingRegressor(loss='absolute_error', max_iter=200,
+                                                   random_state=random_state)
+                _w.fit(X.values[tr_i], warp[tr_i, j])
+                if float(np.mean(np.abs(_w.predict(X.values[vl_i]) - warp[vl_i, j]))) < \
+                   float(np.mean(np.abs(const_warp[j] - warp[vl_i, j]))):
+                    m = _w
+            except Exception:
+                m = None
+        warp_models.append(m)
+
+    _sizes = {int(l): int((labels == l).sum()) for l in sorted(cluster_pipelines)}
+    if verbose:
+        print(f"  [ml_cluster_dtw] {len(train_curves)} curves -> {len(cluster_pipelines)} "
+              f"shape clusters {_sizes}; classifier={'kept' if clf else 'majority'}, "
+              f"warp knots kept={sum(m is not None for m in warp_models)}/{len(warp_models)}")
+
+    pipeline = {
+        'approach':           'ml_cluster_dtw',
+        # The majority cluster's barycenter stands in as THE reference curve for
+        # the reassembly and reporting code, which expects one per leaf. Each
+        # cluster's own barycenter lives in its sub-pipeline and is what actually
+        # gets used at predict time.
+        'reference_curve':    cluster_pipelines[majority]['reference_curve'],
+        'fixed_length':       fixed_length,
+        'cluster_pipelines':  cluster_pipelines,
+        'cluster_sizes':      _sizes,
+        'majority_label':     majority,
+        'shape_classifier':   clf,
+        'warp_models':        warp_models,
+        'const_warp':         const_warp,
+        'warp_knots':         list(WARP_KNOTS),
+        'feature_columns':    feature_columns,
+        'exog_cols':          exog_cols,
+        'prev_act_energy_map': prev_act_energy_map or {},
+        'model_name':         (f"{len(cluster_pipelines)}x[" +
+                               '/'.join(sorted({str(p.get('model_name'))
+                                                for p in cluster_pipelines.values()})) +
+                               '] + predicted warp'),
+        # Reported per cluster; there is no single canonical val MAE for the leaf
+        # because each cluster fits its own space.
+        'val_mae':            float(np.mean([p.get('val_mae', np.nan)
+                                             for p in cluster_pipelines.values()])),
+    }
+
+    _attach_median_floor(
+        pipeline, train_curves,
+        [train_curves[i]['instance_id'] for i in vl_i],
+        lambda rv, c: predict_raw_curve_ml_cluster_dtw(
+            rv, c['activity'], c['attributes'], pipeline,
+            exog_values=c.get('exog_values', {})),
+        label=f' {variable} (ml_cluster_dtw)', verbose=verbose,
+    )
+    return pipeline
+
+
+def predict_raw_curve_ml_cluster_dtw(raw_values, activity, attributes, pipeline,
+                                     exog_values=None):
+    """
+    Predict the shape cluster and the time warp from the features, run that
+    cluster's own regression to get a canonical curve, and sample it through the
+    predicted warp onto the target length.
+
+    Reads only the feature vector and the target length from the instance — the
+    test curve's values are never touched, so this runs unchanged inside the
+    simulation.
+    """
+    _floor = _median_floor_prediction(raw_values, attributes, pipeline)
+    if _floor is not None:
+        return _floor
+
+    attributes = _inject_prev_act_energy(attributes,
+                                         pipeline.get('prev_act_energy_map'))
+    attributes = attributes or {}
+    n = max(2, int(attributes.get('_pred_curve_length', len(raw_values))))
+
+    curve = {'attributes': attributes, 'original_values': np.zeros(n),
+             'exog_values': exog_values or {}}
+    X = _exemplar_feature_frame([curve], pipeline['feature_columns'],
+                                exog_cols=pipeline.get('exog_cols')).values
+
+    cluster_pipelines = pipeline['cluster_pipelines']
+    label = pipeline['majority_label']
+    clf   = pipeline.get('shape_classifier')
+    if clf is not None:
+        try:
+            _l = int(clf.predict(X)[0])
+            if _l in cluster_pipelines:
+                label = _l
+        except Exception:
+            label = pipeline['majority_label']
+    sub = cluster_pipelines.get(label) or next(iter(cluster_pipelines.values()))
+
+    # The chosen cluster's regression, in its own canonical space.
+    y_can = _exog_canonical_prediction(raw_values, activity, attributes, sub,
+                                       exog_values=exog_values or {})
+
+    # Predicted warp. A knot whose model was dropped falls back to the mean
+    # training warp, so an unpredictable leaf gets one average timing rather than
+    # a noisy per-instance one; all knots dropped and gamma is a constant curve,
+    # which _apply_warp reduces to a nearest-neighbour resample.
+    gamma = np.asarray(pipeline['const_warp'], dtype=float).copy()
+    for j, m in enumerate(pipeline.get('warp_models', [])):
+        if m is None:
+            continue
+        try:
+            gamma[j] = float(m.predict(X)[0])
+        except Exception:
+            pass
+
+    return _apply_warp(y_can, gamma, n, knots=tuple(pipeline.get('warp_knots', WARP_KNOTS)))
 
 
 # =============================================================================
@@ -8089,6 +8477,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'ml_rawspace':
         return predict_raw_curve_rawspace(raw_values, act, attrs, pipeline,
                                           exog_values=curve.get('exog_values', {}))
+    if approach == 'ml_cluster_dtw':
+        return predict_raw_curve_ml_cluster_dtw(raw_values, act, attrs, pipeline,
+                                                exog_values=curve.get('exog_values', {}))
     if approach == 'seq2seq':
         return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_only':
@@ -8098,7 +8489,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
                                                        exog_values=curve.get('exog_values', {}))
     if approach == 'ml_only':
         return predict_raw_curve_ml_only(raw_values, act, attrs, pipeline)
-    if approach == 'exemplar':
+    if approach in ('exemplar', 'exemplar_only'):
+        # Same predictor: neither variant uses DTW at predict time, they differ
+        # only in how the stored medoid was chosen at training time.
         return predict_raw_curve_exemplar(raw_values, act, attrs, pipeline,
                                           exog_values=curve.get('exog_values', {}))
     if approach == 'exemplar_dtw':
@@ -8193,7 +8586,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     # separately in modelling.py's curve-only section. This worker trains the
     # per-combo median under 'median_activity_sensor'.
     _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'ml_external', 'ml_only',
-                           'exemplar', 'exemplar_dtw',
+                           'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
                            # train/eval-gap variants — see the block below
                            'ml_external_wcounts', 'ml_external_wmetric',
                            'ml_external_calib', 'ml_rawspace'}
@@ -8295,7 +8688,11 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     # context), so any difference against ml_external is attributable to the one
     # thing each changes. They are additive: the originals above are untouched.
     _GAP_VARIANTS = ('ml_external_wcounts', 'ml_external_wmetric',
-                     'ml_external_calib', 'ml_rawspace')
+                     'ml_external_calib', 'ml_rawspace',
+                     # Not a train/eval-gap variant, but it needs the same
+                     # prev-activity curve set so its only difference against
+                     # ml_external is the per-cluster fit and the predicted warp.
+                     'ml_cluster_dtw')
     if any(v in _active for v in _GAP_VARIANTS):
         _pv, _ = split_curves_with_prev_activity(
             df_train, variable=sensor, activities=[activity], objects=[obj],
@@ -8310,7 +8707,11 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                 if _v not in _active:
                     continue
                 try:
-                    if _v == 'ml_rawspace':
+                    if _v == 'ml_cluster_dtw':
+                        result[_v] = build_and_train_pipeline_ml_cluster_dtw(
+                            [dict(c) for c in _pv], variable=sensor,
+                            **_common, **_hp_kwargs)
+                    elif _v == 'ml_rawspace':
                         result[_v] = build_and_train_pipeline_rawspace(
                             [dict(c) for c in _pv], variable=sensor,
                             **_common, **_hp_kwargs)
@@ -8353,6 +8754,14 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, verbose=0, random_state=_seed,
             exog_cols=ef_cols,
+        )
+    if 'exemplar_only' in _active:
+        # No-DTW ablation of 'exemplar': identical apart from the medoid
+        # distance (mean absolute difference instead of DTW).
+        result['exemplar_only'] = build_and_train_pipeline_exemplar(
+            curves, variable=sensor, fixed_length=fixed_length,
+            val_size=val_size, verbose=0, random_state=_seed,
+            exog_cols=ef_cols, use_dtw=False,
         )
     if 'exemplar_dtw' in _active:
         # Same no-median-floor reasoning as 'exemplar': the floor is a smooth
