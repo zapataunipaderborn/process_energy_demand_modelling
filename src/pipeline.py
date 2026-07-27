@@ -204,7 +204,7 @@ EXPERIMENTS = [
     # realism does never averaging buy".
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_982_cluster_dtw',
+        'run_name':              'experiment_982',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
