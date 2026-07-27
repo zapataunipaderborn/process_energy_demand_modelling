@@ -1,13 +1,13 @@
 """
-modelling_utils.py
+utils/modelling_utils.py
 ==================
-Standalone utility functions extracted from modelling.py so they can be
+Standalone utility functions extracted from 02_modelling.py so they can be
 imported into notebooks or other scripts without executing the full pipeline.
 
 Quick start in a notebook::
 
     import sys; sys.path.insert(0, 'src')
-    from modelling_utils import (
+    from .modelling_utils import (
         load_process_datasets,
         _split_process_datasets,
         comprehensive_simulation_evaluation,

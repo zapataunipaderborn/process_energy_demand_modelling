@@ -8,7 +8,7 @@ from collections import defaultdict
 from datetime import datetime
 
 
-from sim_extractor import sample_from_dist, LoadProfile, predict_case_duration
+from .sim_extractor import sample_from_dist, LoadProfile, predict_case_duration
 
 
 # ── Case-length / event-count / idle tuning knobs ───────────────────────
@@ -547,7 +547,7 @@ class ProcessSimulation:
             if dist_params:
                 try:
                     import scipy.stats as _scipy_stats
-                    from sim_extractor import _DIST_MAP
+                    from .sim_extractor import _DIST_MAP
                     dist = _DIST_MAP.get(dist_name, _scipy_stats.norm)
                     cap = float(dist.ppf(0.999, *dist_params))
                     if np.isfinite(cap) and cap > 0:
@@ -2389,7 +2389,7 @@ class ProcessSimulation:
         (mean, end, std) per sensor and stored as `current_energy_state`.
         A ValueError is raised if any expected feature column is missing.
         """
-        from sim_extractor import _energy_summary
+        from .sim_extractor import _energy_summary
 
         current_sim_time = start_time.timestamp()
         unique_objects = (
@@ -2657,7 +2657,7 @@ class ProcessSimulation:
                                     self.events[-1]['simulated_energy_curves'] = {}
                                 self.events[-1]['simulated_energy_curves'][sensor] = curve
 
-                            from sim_extractor import _energy_summary
+                            from .sim_extractor import _energy_summary
                             new_energy_state.update(_energy_summary(curve, sensor))
                         except Exception as exc:
                             raise ValueError(
@@ -3142,7 +3142,7 @@ class ProcessSimulation:
                                         self.events[-1]['simulated_energy_curves'] = {}
                                     self.events[-1]['simulated_energy_curves'][sensor] = curve
 
-                                from sim_extractor import _energy_summary
+                                from .sim_extractor import _energy_summary
                                 new_energy_state.update(_energy_summary(curve, sensor))
                             except Exception as exc:
                                 raise ValueError(

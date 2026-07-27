@@ -1,5 +1,5 @@
 """
-pipeline.py — Orchestrate multiple modelling.py runs with different configurations.
+01_pipeline.py — Orchestrate multiple 02_modelling.py runs with different configurations.
 
 Each entry in EXPERIMENTS defines one run. Fields:
   data_experiment       str        which gold data folder to load  (e.g. '1' → data/gold/experiment_1)
@@ -10,7 +10,7 @@ Each entry in EXPERIMENTS defines one run. Fields:
   mining_algorithms     list|None  which pm4py process-discovery algorithms to test/compare,
                                    e.g. ['heuristic', 'inductive']. Subset of
                                    'alpha' | 'heuristic' | 'inductive' | 'ilp'.
-                                   None (default) → use modelling.py's own default list.
+                                   None (default) → use 02_modelling.py's own default list.
   run_energy_modelling  bool       whether to run energy profile/curve modelling
                                    (sensor curve fitting + curve-quality benchmark).
                                    Set False to run process modelling only. Default: True.
@@ -40,7 +40,7 @@ Each entry in EXPERIMENTS defines one run. Fields:
   train_ratio           float      fraction of cases used for training in the
                                    train/test split (the rest go to test).
                                    e.g. 0.8 for an 80/20 split. Default: 0.70
-                                   (modelling.py's own default, used when omitted).
+                                   (02_modelling.py's own default, used when omitted).
   random_seed           int        master seed for the whole run — python, numpy,
                                    torch, the train/test split and every
                                    per-combo training seed derive from it, and
@@ -57,7 +57,7 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    schedule-profile) either way.
   curve_approaches      list|None  which curve-fitting models to train, e.g.
                                    ['ml_external']. Subset of the
-                                   APPROACHES list in modelling.py ('baseline'
+                                   APPROACHES list in 02_modelling.py ('baseline'
                                    — "Baseline", ONE median curve per sensor
                                    (pooled over all activities, the naive
                                    floor); 'median_activity_sensor' — "Median
@@ -73,7 +73,7 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    'ml_external_calib', 'ml_rawspace' —
                                    see the EXPERIMENTS block for what each
                                    changes). None
-                                   (default) → use modelling.py's own list.
+                                   (default) → use 02_modelling.py's own list.
                                    Fewer models = much faster runs. The
                                    schedule-profile / complete-curve eval needs
                                    'ml_external' present.
@@ -95,7 +95,7 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    Set ['lstm'] to reproduce a pre-transformer
                                    run or to halve the seq2seq cost.
   curve_optimize_hyperparams bool  whether curve models run the (slow) Optuna
-                                   hyperparameter search. None → modelling.py
+                                   hyperparameter search. None → 02_modelling.py
                                    default (True). Set False for fast test runs.
   curve_n_optuna_trials int|None   Optuna trials per (sensor, activity, object)
                                    when the search is on. None → default (50).
@@ -256,7 +256,7 @@ EXPERIMENTS = [
     #     'run_name':              'experiment_981',
         # FULL REPORTABLE RUN: all 6 processes, heuristic + alpha miners, Optuna
         # hyperparameter search ON. Tests the budget over-generation fix
-        # (simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
+        # (utils/simulation.py BUDGET_EXIT_DISCOUNT=0.02 while under budget,
         # BUDGET_EXIT_BOOST=25.0 once spent, TIME backstop BUDGET_MAX_TIME_RATIO=1.5;
         # the activity-count cap BUDGET_MAX_LENGTH_RATIO is OFF, see
         # BUDGET_USE_LENGTH_CAP) and the DBA zero-calibration
@@ -275,7 +275,7 @@ EXPERIMENTS = [
     #     'train_ratio':           0.70, # fraction of cases used for training (e.g. 0.8 for 80/20)
     #     'split_type':            'temporal',#'temporal', # 'temporal' (default, no leakage) or 'random' (fixed-seed shuffle)
         # All standard curve approaches (the uncommented defaults in
-        # modelling.py's APPROACHES list — same set experiment_944 produced),
+        # 02_modelling.py's APPROACHES list — same set experiment_944 produced),
         # renamed to a consistent 'ml_*' prefix for every sklearn/DTW-regression
         # approach, with each paired against its seq2seq counterpart (see the
         # full reference table below). NOTE: this trains ~10 curve families per
@@ -328,7 +328,7 @@ EXPERIMENTS = [
     #         'seq2seq_external',
     #     ],
         # Full reference — every valid approach name (uncomment to enable the
-        # experimental ones, which are commented out in modelling.py by
+        # experimental ones, which are commented out in 02_modelling.py by
         # default). Kept here so the whole universe is togglable in future.
         # Naming: every sklearn/DTW-regression approach now starts with 'ml_'.
         # One-to-one pairing with the seq2seq family (same conditioning, same
@@ -452,7 +452,7 @@ EXPERIMENTS = [
 ]
 
 # ── Runner ────────────────────────────────────────────────────────────────────
-modelling_script = Path(__file__).parent / 'modelling.py'
+modelling_script = Path(__file__).parent / '02_modelling.py'
 
 for i, exp in enumerate(EXPERIMENTS, start=1):
     mining_algorithms = exp.get('mining_algorithms')
@@ -511,7 +511,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
 
     env = os.environ.copy()
     # ── Reproducibility ──────────────────────────────────────────────────────
-    # One master seed for the child run: modelling.py seeds python/numpy/torch
+    # One master seed for the child run: 02_modelling.py seeds python/numpy/torch
     # from it and derives every per-combo training seed from it.
     env['PIPELINE_RANDOM_SEED']       = str(random_seed)
     env['PIPELINE_RANDOM_SPLIT_SEED'] = str(random_seed)

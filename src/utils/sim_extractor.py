@@ -11,7 +11,7 @@ import hashlib as _hashlib
 import os as _os_seed
 import random as _random_seed
 
-#: Master seed. Override for a whole run with PIPELINE_RANDOM_SEED (pipeline.py
+#: Master seed. Override for a whole run with PIPELINE_RANDOM_SEED (01_pipeline.py
 #: sets it in the child environment). Everything stochastic in this codebase
 #: derives from it, so a run is a pure function of (data, config, this seed).
 GLOBAL_RANDOM_SEED = int(_os_seed.environ.get('PIPELINE_RANDOM_SEED', '42'))
@@ -43,7 +43,7 @@ def set_global_seeds(seed=None, deterministic_torch=True):
     RNG, and (when torch is importable) CPU + all CUDA devices.
 
     NOTE on PYTHONHASHSEED: it only takes effect at interpreter start, so
-    setting it here would be useless — pipeline.py exports it for the child
+    setting it here would be useless — 01_pipeline.py exports it for the child
     process instead. Without it, iteration order of str sets can vary between
     runs even though every RNG is seeded.
 
@@ -840,7 +840,7 @@ def _extract_duration_and_raw(group, object_name, object_type,
         # ── Resource (machine/object) this activity runs on ───────────
         # Real historical frequency of every resource this activity actually
         # ran on, e.g. {'autoclave_1': 0.55, 'autoclave_2': 0.45} -- used to
-        # SAMPLE a resource per simulated instance (see simulation.py's
+        # SAMPLE a resource per simulated instance (see utils/simulation.py's
         # _log_event) instead of hardcoding whichever resource happened to
         # be most frequent for every single simulated case. Hardcoding the
         # mode meant ~all cases that historically ran on the minority
@@ -869,7 +869,7 @@ def _extract_duration_and_raw(group, object_name, object_type,
         # Also accumulate this activity's real waiting-time samples (gap
         # before it starts) so the base petri_net simulation can reproduce
         # idle time between activities instead of butting them back-to-back
-        # (see MODEL_BASE_IDLE in simulation.py).
+        # (see MODEL_BASE_IDLE in utils/simulation.py).
         _waiting_samples = []
         for case_id, case_acts in case_sorted.items():
             current_indices = case_acts[case_acts['activity'] == activity].index
@@ -3552,7 +3552,7 @@ def _make_curve_models():
     (sensor, activity, object). The best is kept by validation MAE, so adding a
     candidate costs training time but cannot make the selection worse.
 
-    Single source of truth — imported by modelling.py for reporting and used by
+    Single source of truth — imported by 02_modelling.py for reporting and used by
     _train_curve_only_worker for training. Every name here needs a branch in
     _curve_model_trial_params, or Optuna spends all its trials on one default
     configuration.
@@ -3576,7 +3576,7 @@ def _make_curve_models():
         'MLP':               MLPRegressor,
     }
 
-    # Subset via PIPELINE_CURVE_MODELS (comma-separated), set by pipeline.py's
+    # Subset via PIPELINE_CURVE_MODELS (comma-separated), set by 01_pipeline.py's
     # 'curve_models' key. Accepts the display names above or the short aliases
     # below, case-insensitively. Unset -> all candidates compete.
     requested = _os.environ.get('PIPELINE_CURVE_MODELS')
@@ -3625,7 +3625,7 @@ def _curve_model_trial_params(trial, name, random_state, n_jobs=1):
 def _curve_model_search_space(trial, name, random_state, n_jobs=1):
     """
     Optuna search space for one curve regressor, keyed by its display name in
-    _CURVE_MODELS (modelling.py).
+    _CURVE_MODELS (02_modelling.py).
 
     Centralised because the same chain was duplicated across every
     build_and_train_pipeline_* variant: a model missing from here silently falls
@@ -4382,7 +4382,7 @@ def build_and_train_pipeline_median(train_curves, variable, fixed_length=None,
       * 'median_activity_sensor' ("Median per Activity & Sensor") -- called by
         _train_curve_only_worker with just this (sensor, activity, object)'s
         curves.
-      * 'baseline' ("Baseline") -- called from modelling.py's curve-only
+      * 'baseline' ("Baseline") -- called from 02_modelling.py's curve-only
         section with EVERY curve of the sensor pooled across all its
         activities/objects (the coarser floor).
 
@@ -5111,7 +5111,7 @@ def predict_raw_curve_exemplar_dtw(raw_values, activity, attributes, pipeline,
 # exists to avoid. With it off, every approach reports what it actually predicts.
 #
 # Set PIPELINE_CURVE_MEDIAN_FLOOR=true (or curve_median_floor=True in
-# pipeline.py) to switch it back on. PIPELINE_CURVE_MEDIAN_FLOOR_RATIO raises the
+# 01_pipeline.py) to switch it back on. PIPELINE_CURVE_MEDIAN_FLOOR_RATIO raises the
 # bar: the model is kept only when its held-out MAE is below RATIO x the floor's,
 # so 1.0 = "strictly better" and 0.95 = "better by at least 5%", the rule
 # _DUR_ACCEPTANCE_RATIO already applies to the duration models.
@@ -5391,7 +5391,7 @@ def _median_floor_prediction(raw_values, attributes, pipeline):
 
     Called first thing by every learned predictor rather than once inside
     _dispatch_predict, because that router is only one of the paths into them —
-    modelling.py binds predict_raw_curve* into predict_fn lambdas directly, and
+    02_modelling.py binds predict_raw_curve* into predict_fn lambdas directly, and
     predict_curve_for_instance calls those lambdas. Hooking the predictors
     themselves is what makes the fallback hold in the simulation as well as in
     the curve-only evaluation. A no-op unless _attach_median_floor decided the
@@ -7376,7 +7376,7 @@ _SEQ2SEQ_KNOWN_CELLS = ('lstm', 'transformer')
 
 def _resolve_seq2seq_cells(spec=None):
     """
-    Parse PIPELINE_SEQ2SEQ_CELLS (set by pipeline.py's 'seq2seq_cells' key).
+    Parse PIPELINE_SEQ2SEQ_CELLS (set by 01_pipeline.py's 'seq2seq_cells' key).
 
     Validated here rather than at training time: an unrecognised cell used to
     survive into _fit_seq2seq_with_selection, where every candidate is skipped
@@ -8452,7 +8452,7 @@ def _dispatch_predict(raw_values, curve, pipeline):
     DBA+DTW+regression pipeline) via this function's own default -- i.e. the
     approach NAMED 'baseline' was actually the strong reference, while the
     table LABEL "Baseline" pointed at a completely separate, unregistered
-    flat-mean predictor ('mean_baseline', computed inline in modelling.py).
+    flat-mean predictor ('mean_baseline', computed inline in 02_modelling.py).
     Both are now explicit and distinct: 'baseline' = the true naive floor
     (build_and_train_pipeline_median), 'ml_dtw' = the former 'baseline'
     (build_and_train_pipeline, now explicitly tagged).
@@ -8567,7 +8567,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     in its own process pool.
 
     prev_act_energy_map is THIS sensor's sub-map from
-    build_prev_activity_energy_map() — built once per process in modelling.py
+    build_prev_activity_energy_map() — built once per process in 02_modelling.py
     rather than here, because it spans every activity while this worker only sees
     one, and recomputing it per combo would repeat the same groupby for every
     (activity, object) of the sensor.
@@ -8583,7 +8583,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
 
     # NOTE: 'baseline' (median per SENSOR, pooled over activities) is NOT here —
     # it can't be trained by a per-(sensor,activity,object) worker; it is built
-    # separately in modelling.py's curve-only section. This worker trains the
+    # separately in 02_modelling.py's curve-only section. This worker trains the
     # per-combo median under 'median_activity_sensor'.
     _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'ml_external', 'ml_only',
                            'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
@@ -8625,7 +8625,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     if 'median_activity_sensor' in _active:
         # "Median per Activity & Sensor": median training curve for THIS
         # (sensor, activity, object), no model. (The coarser 'baseline' —
-        # one median per sensor — is built in modelling.py, not here.)
+        # one median per sensor — is built in 02_modelling.py, not here.)
         _mas_pipe = build_and_train_pipeline_median(
             curves, variable=sensor, fixed_length=fixed_length, verbose=0,
         )
@@ -8789,7 +8789,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     import os as _os, torch
     # Make this worker genuinely CPU-only before anything asks torch about CUDA.
     # We are forked from a parent that has already called torch.cuda.is_available()
-    # (modelling.py's startup set_global_seeds), which PyTorch documents as
+    # (02_modelling.py's startup set_global_seeds), which PyTorch documents as
     # fork-poisoning: cuInit has run pre-fork, so every CUDA call here fails.
     # Hiding the GPUs is not enough on its own — the default availability probe
     # goes through the CUDA runtime and still answers True-but-unusable, and Adam's
@@ -8893,14 +8893,14 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
 # 3,432, so ~117M values -> roughly 0.2-0.3 GB of compressed parquet against the
 # 42 MB the metrics-only file takes. That is a real cost but a bounded one, and
 # it is the difference between choosing a metric later and re-running everything
-# to get it. Set save_curve_values=False in pipeline.py (or
+# to get it. Set save_curve_values=False in 01_pipeline.py (or
 # PIPELINE_SAVE_CURVE_VALUES=false) if a particular run needs the small file.
 #
 # Stored as float32: these are sensor readings whose own precision is far coarser
 # than 7 significant digits, and it halves the file for no loss that any metric
 # here can detect.
 #
-# y_true is emitted here on every scored row, but modelling.py's export SPLITS it
+# y_true is emitted here on every scored row, but 02_modelling.py's export SPLITS it
 # out before writing: every approach is scored on the same curves, so the real
 # array is identical across them and storing it per-row would duplicate roughly
 # half the file once per approach. It lands in real_test_curves.parquet keyed on
@@ -8933,7 +8933,7 @@ def _curve_shape_stats(y_true, y_pred):
     definition (share of exactly-zero samples) is degenerate for every sensor
     that never switches fully off — the temp_* and Druck_* channels among the
     modelled sensors never read 0, so it would be 0 for real AND predicted and
-    the ratio undefined. results_complete_energy_profile.ipynb measures duty
+    the ratio undefined. 05_results_complete_energy_profile.ipynb measures duty
     cycle properly, relative to each curve's own range; use that one.
     """
     def _acf1(x):
@@ -9303,7 +9303,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     Predict one sensor's curve for a single (activity, object) instance of a
     given duration, using a trained `energy_pipelines` dict — the same
     prediction mechanism ProcessSimulation's energy-aware modes use
-    internally (see simulation.py's "Update energy state" step), exposed
+    internally (see utils/simulation.py's "Update energy state" step), exposed
     standalone so it can be applied *after the fact* to the output of any
     simulation mode, not just petri_net_energy_*/petri_net_energy_direct*.
 
@@ -9328,7 +9328,7 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     # exog_cols lives at the top level for the energy-aware modes' pipelines,
     # but is nested under 'full_pipeline' for Curve-Only Evaluation pipelines
     # (baseline, ml_external, etc. all wrap the trained pipeline dict
-    # under 'full_pipeline' when reassembled — see modelling.py).
+    # under 'full_pipeline' when reassembled — see 02_modelling.py).
     exog_cols = ep.get('exog_cols') or ep.get('full_pipeline', {}).get('exog_cols')
 
     n_ts = max(2, round(duration_minutes / temporal_resolution_minutes))
