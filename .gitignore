@@ -6,3 +6,4 @@ __pycache__/
 results/*
 nohup.out
 text.md
+text_highlights.md
