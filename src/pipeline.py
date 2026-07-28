@@ -171,48 +171,45 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── Cluster-DTW comparison ───────────────────────────────────────────────
-    # Focused run for the NEW 'ml_cluster_dtw' approach: ml_external fitted per
-    # DTW shape cluster and decoded through a warp predicted from the attributes
-    # instead of a uniform resample (sim_extractor.build_and_train_pipeline_ml_cluster_dtw).
+    # ── Step-DTW comparison ──────────────────────────────────────────────────
+    # Focused run for the NEW 'ml_step_dtw' approach — the segment-parameter
+    # answer to why 'ml_cluster_dtw' failed in experiment_982. There the
+    # per-cluster fit + predicted warp bought essentially NO texture (roughness
+    # ratio 0.25 vs ml_external's 0.21, against exemplar's 0.50) and a worse
+    # tail (q99 sMAE 51.7 vs 45.3): a conditional mean PER POSITION stays
+    # smooth however the leaf is partitioned, and the hard cluster routing sent
+    # whole instances to models fitted on a different profile.
     #
-    # Only two curve approaches are trained — the new one and the naive floor it
-    # has to beat — so the run is a fraction of a full one. The other methods are
-    # NOT retrained: the point is to read this run's curve table against the
-    # previous full run's, which used the same data_experiment, the same 70/30
-    # temporal split and the same seed, so the numbers are directly comparable.
+    # ml_step_dtw changes the regression TARGET instead of the partition: the
+    # leaf's DTW medoid is change-point segmented once, the breakpoints are
+    # carried onto every training curve through DTW, and the models predict
+    # per-instance segment DURATIONS and LEVELS. The curve is reconstructed
+    # from those parameters, so step edges are sharp by construction — the
+    # averaging happens in parameter space, where it is harmless. No shape
+    # classifier on purpose: no hard routing, no ml_cluster_dtw tail.
     #
-    # What to look for in the Curve-Only Evaluation table, against the previous
-    # run's rows for 'ML + Ext. Factors' and 'Median per Activity & Sensor':
-    #   sMAE / WAPE        should be at or slightly better than ml_external's —
-    #                      clustering removes the shape heterogeneity that made
-    #                      one pooled barycenter average incompatible profiles
-    #   std / roughness     should be clearly ABOVE ml_external's ~0.13 std ratio
-    #     ratio            and below 'exemplar'-s ~0.74. A conditional mean stays
-    #                      smoother than a real curve; landing between the two is
-    #                      the expected outcome, not a failure.
-    # Also check the per-leaf log lines '[ml_cluster_dtw] N curves -> K shape
-    # clusters': a leaf that collapses to K=1 has degraded to ml_external with a
-    # nearest-neighbour decode, so it contributes nothing to the comparison.
-    #
-    # Only per-step predictors can be read against each other on pointwise error:
-    # 'ml_external' and 'ml_cluster_dtw' predict a value at every position, while
-    # 'median_activity_sensor' and the exemplar family emit stored/measured curves
-    # (the exemplar family predicts only which curve, its level and — for
-    # exemplar_dtw — its timing). Both kinds are in the run on purpose: the first
-    # pair answers "does the per-cluster fit help", the second answers "how much
-    # realism does never averaging buy".
+    # What to look for in the Curve-Only Evaluation table:
+    #   sMAE / WAPE     should stay in ml_external's range — mis-sized segments
+    #                   cost pointwise error the way a smooth curve does not,
+    #                   so parity is already a win
+    #   std / roughness should land clearly ABOVE ml_external's (~0.32/0.21
+    #     ratios        median in 982) and approach exemplar's (~0.59/0.50):
+    #                   between-segment level jumps carry the std, and the
+    #                   medoid segment fill carries the within-step texture
+    # Also check the per-leaf log lines '[ml_step_dtw] N curves -> M segment(s)':
+    # a leaf that comes back with 1 segment found no step structure and degrades
+    # to a level-scaled medoid — fine for a flat sensor, suspicious if common.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_982',
+        'run_name':              'experiment_984',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],   # heuristic only, as requested
+        'mining_algorithms':     ['heuristic'],
         'run_energy_modelling':  True,
         'run_joint_duration_eval':  False,  # slow per-instance-matched heatmaps
-        'run_schedule_profile_eval': True,  # keys off 'ml_external', which is now trained
+        'run_schedule_profile_eval': True,  # keys off 'ml_external', which is trained
         'run_autoregressive_eval':   False,
         'save_predicted_curves': True,
         'train_ratio':           0.70,
@@ -221,28 +218,17 @@ EXPERIMENTS = [
                                          # train/test split is bit-identical
         'curve_approaches': [
             'median_activity_sensor',   # the naive floor
-            'ml_external',              # the INCUMBENT per-step predictor and the direct parent
-                                        # of ml_cluster_dtw. In the run so the key comparison is
-                                        # self-contained: without it the table cannot say whether
-                                        # the per-cluster fit and the predicted warp help, and
-                                        # splicing the number in from experiment_981 would ride
-                                        # on nothing else having drifted (the eval-time exog
-                                        # handling did change — see _run_curve_eval)
-            'ml_cluster_dtw',           # new: ml_external per shape cluster + predicted warp
-            'exemplar_only',            # new: the no-DTW exemplar ablation — same clusters,
-                                        # same classifier over attributes + ef_*, same L1 level
-                                        # model, same nearest-neighbour time map; only the
-                                        # medoid distance changes (mean absolute difference
-                                        # instead of DTW)
-            'exemplar',                 # kept so 'exemplar_only' has its DTW counterpart to be
-                                        # read against — without it the ablation says nothing,
-                                        # and it is one of the cheapest approaches to train.
-                                        # The three rungs isolate DTW:
-                                        #   exemplar_only  no DTW anywhere
-                                        #   exemplar       DTW picks the medoid
-                                        #   exemplar_dtw   DTW also defines the clusters + warp
+            #'ml_external',              # the incumbent per-position predictor — the
+                                        # direct parent; same curve set, same features,
+                                        # so the gap is attributable to the segment
+                                        # reparameterisation alone
+            #'ml_cluster_dtw',           # kept from 982 so the two fixes to the same
+                                        # diagnosis (partition vs target) sit in one table
+            'ml_step_dtw',              # NEW: segment durations+levels via DTW
+                                        # correspondence, reconstruction instead of decode
+            'exemplar',                 # the realism ceiling any learned approach chases
         ],
-        'curve_optimize_hyperparams': False,   # OFF, as requested
+        'curve_optimize_hyperparams': False,
         'curve_median_floor':    False,  # must stay OFF: the floor accepts on
                                          # POINTWISE error, so it would delete the
                                          # realism gain this approach exists for

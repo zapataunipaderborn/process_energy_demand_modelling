@@ -6837,6 +6837,366 @@ def predict_raw_curve_ml_cluster_dtw(raw_values, activity, attributes, pipeline,
 
 
 # =============================================================================
+# STEP DTW — the leaf's STEP STRUCTURE is the regression target
+# =============================================================================
+#
+# ml_cluster_dtw kept the canonical-space pointwise regression and tried to fix
+# its smoothness from the outside (a finer partition, a predicted warp). Run 982
+# measured that this does not work: its roughness/std ratios landed on top of
+# ml_external's (0.25/0.46 vs 0.21/0.32 median, against ~0.50/0.59 for the real
+# exemplar), because a conditional mean PER POSITION stays smooth no matter how
+# the space is partitioned — the members' step edges never line up exactly, and
+# averaging across a misaligned edge always produces a ramp.
+#
+# This approach changes the TARGET instead of the partition. A process-step load
+# profile is, to first order, a sequence of segments: hold a level for a while,
+# then move to the next. So the leaf is parameterised as M segments, and the
+# regression predicts per instance the segment DURATIONS (fractions of the
+# activity) and the segment LEVELS (raw units) — 2M numbers instead of
+# fixed_length positions. The curve is RECONSTRUCTED from those parameters, so a
+# step edge sits exactly where the duration models put it and is sharp by
+# construction. Averaging still happens, but in PARAMETER space (a typical
+# duration, a typical level), where it is harmless — not in value space, where
+# it is what erases the steps.
+#
+# Where the segments come from:
+#   1. the leaf's DTW medoid — a real measured curve — is segmented ONCE by
+#      change-point detection: exact dynamic programming under an L2 cost, the
+#      number of segments picked by a BIC-style penalty, so a featureless leaf
+#      comes back with one segment instead of an arbitrary staircase;
+#   2. every training curve is DTW-aligned to the medoid and the medoid's
+#      breakpoints are carried through the alignment onto the curve's OWN
+#      timeline — the same gamma-through-the-path mechanic as exemplar_dtw's
+#      warp, evaluated at the breakpoints instead of at fixed knots;
+#   3. that gives every training curve the same M segments in its own time, and
+#      with them the per-curve targets: M duration fractions and M raw levels.
+#
+# Every duration/level model is validated against its constant fallback (the
+# training mean/median of that parameter), the same do-no-harm rule the
+# exemplar/warp models follow — an unpredictable parameter degrades to the
+# leaf's typical value, never to noise.
+#
+# Within a segment the output is filled from the medoid's own samples for that
+# segment, rescaled to the predicted level (segment_fill='medoid'), so ramps and
+# duty cycling INSIDE a step survive; 'flat' emits the predicted level as a
+# constant, which makes every output value purely model-generated and the curve
+# an actual step function. Either way the defining property holds: WHERE each
+# step is and HOW HIGH it sits is predicted per instance, never replayed.
+#
+# One deliberate non-feature: no shape classifier. Hard-routing whole instances
+# between per-cluster models is what gave ml_cluster_dtw its catastrophic tail
+# (q99 sMAE 51.7 vs ml_external's 45.3; a wrong route lands on a model fitted to
+# a different profile). Here every instance flows through the same segment
+# models, so the worst failure is a mis-sized segment — local and bounded.
+
+STEP_DTW_MAX_SEGMENTS = 8
+
+# 'medoid' | 'flat' — see the section comment. 'medoid' is the default because
+# within-step texture (decay ramps, duty cycling) is real signal the flat fill
+# throws away; switch to 'flat' for the fully-model-generated ablation.
+STEP_DTW_SEGMENT_FILL = _os_seed.environ.get(
+    'PIPELINE_STEP_DTW_SEGMENT_FILL', 'medoid').strip().lower()
+
+
+def _stepdtw_segment_medoid(shape, max_segments=STEP_DTW_MAX_SEGMENTS, min_seg=None):
+    """
+    Interior breakpoints (fractions in (0,1)) of the best piecewise-constant
+    approximation of `shape` — exact DP under an L2 cost, one pass per segment
+    count, the count chosen by a BIC-style penalty. Empty array = one segment.
+    """
+    y = np.asarray(shape, dtype=float)
+    y = np.where(np.isfinite(y), y, 0.0)
+    L = len(y)
+    if min_seg is None:
+        # Short enough to catch a brief step, long enough that a single spike
+        # does not become its own segment.
+        min_seg = max(2, L // 25)
+    m_max = int(max(1, min(int(max_segments), L // min_seg)))
+    if m_max <= 1 or L < 2 * min_seg:
+        return np.array([], dtype=float)
+
+    c1 = np.concatenate([[0.0], np.cumsum(y)])
+    c2 = np.concatenate([[0.0], np.cumsum(y * y)])
+
+    INF = np.inf
+    cost = np.full((m_max + 1, L + 1), INF)
+    back = np.zeros((m_max + 1, L + 1), dtype=int)
+    cost[0, 0] = 0.0
+    for m in range(1, m_max + 1):
+        for j in range(m * min_seg, L + 1):
+            i = np.arange((m - 1) * min_seg, j - min_seg + 1)
+            n_ = j - i
+            s = c1[j] - c1[i]
+            tot = cost[m - 1, i] + (c2[j] - c2[i]) - s * s / n_
+            a = int(np.argmin(tot))
+            cost[m, j], back[m, j] = tot[a], i[a]
+
+    # Each extra segment buys residual sum of squares but costs two parameters
+    # (a breakpoint and a level). max() guards the log when the fit is exact.
+    rss = cost[1:, L]
+    ms = np.arange(1, m_max + 1)
+    bic = L * np.log(np.maximum(rss, 1e-12) / L) + 2.0 * ms * np.log(L)
+    best_m = int(ms[int(np.argmin(bic))])
+
+    cuts = []
+    j = L
+    for m in range(best_m, 0, -1):
+        i = int(back[m, j])
+        if 0 < i < L:
+            cuts.append(i)
+        j = i
+    return np.array(sorted(c / L for c in cuts), dtype=float)
+
+
+def _stepdtw_targets(shapes, medoid_row, breaks, train_curves):
+    """
+    Carry the medoid's breakpoints onto every training curve through DTW and
+    read off the per-curve targets. Returns (durations, levels): durations are
+    fractions of the curve summing to 1 per row (a segment the curve does not
+    have comes out ~0, which is informative, not an error); levels are means of
+    the RAW values inside each segment, in raw units.
+    """
+    M = len(breaks) + 1
+    n_curves = len(train_curves)
+    durations = np.zeros((n_curves, M))
+    levels = np.zeros((n_curves, M))
+    med_shape = shapes[medoid_row]
+    for r in range(n_curves):
+        if M > 1:
+            if r == medoid_row:
+                pos = np.asarray(breaks, dtype=float).copy()
+            else:
+                pos = _warp_knots_from_path(med_shape, shapes[r],
+                                            knots=tuple(breaks))
+            pos = np.clip(np.maximum.accumulate(np.asarray(pos, dtype=float)),
+                          0.0, 1.0)
+        else:
+            pos = np.array([], dtype=float)
+        edges = np.concatenate([[0.0], pos, [1.0]])
+        durations[r] = np.diff(edges)
+
+        v = np.asarray(train_curves[r]['original_values'], dtype=float)
+        Lr = len(v)
+        for m in range(M):
+            i0 = min(int(np.floor(edges[m] * Lr)), Lr - 1)
+            i1 = min(max(int(np.ceil(edges[m + 1] * Lr)), i0 + 1), Lr)
+            if i1 <= i0:
+                i0, i1 = Lr - 1, Lr
+            with np.errstate(invalid='ignore'):
+                levels[r, m] = float(np.nanmean(v[i0:i1]))
+    # A curve of NaNs inside one segment must not poison the whole bank.
+    if not np.all(np.isfinite(levels)):
+        _fb = float(np.nanmedian(levels)) if np.any(np.isfinite(levels)) else 0.0
+        levels = np.where(np.isfinite(levels), levels, _fb)
+    return durations, levels
+
+
+def build_and_train_pipeline_step_dtw(
+    train_curves,
+    variable,
+    fixed_length=None,
+    val_size=0.2,
+    random_state=42,
+    models=None,
+    optimize_hyperparams=False,
+    n_trials=50,
+    verbose=1,
+    n_jobs=1,
+    prev_act_energy_map=None,
+    max_segments=STEP_DTW_MAX_SEGMENTS,
+    segment_fill=None,
+    **_ignored_hp_kwargs,
+):
+    """
+    Segment-parameter regression via DTW correspondence — see the section
+    comment. `models` and the hyper-parameter kwargs are accepted and ignored,
+    like the exemplar builders: the 2M models here are fixed (absolute-error
+    gradient boosting), one per duration and one per level.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    # Same prev-activity energy injection as ml_external / ml_cluster_dtw, so
+    # the features are identical and the comparison isolates the target change.
+    if prev_act_energy_map:
+        train_curves = [dict(_c, attributes=_inject_prev_act_energy(
+            _c['attributes'], prev_act_energy_map)) for _c in train_curves]
+
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median(
+            [len(c['original_values']) for c in train_curves]))))
+
+    resampled = np.array([
+        np.interp(np.linspace(0, 1, fixed_length),
+                  np.linspace(0, 1, len(c['original_values'])),
+                  np.asarray(c['original_values'], dtype=float))
+        for c in train_curves
+    ])
+    scale = np.mean(resampled, axis=1, keepdims=True)
+    shapes = resampled / np.where(np.abs(scale) < 1e-12, 1.0, scale)
+
+    # ── 1. The leaf's DTW medoid — the curve the segmentation is read from ──
+    if len(train_curves) > 2:
+        D, sub_idx = _dtw_distance_matrix(shapes, random_state=random_state)
+        medoid_row = int(sub_idx[int(D.sum(axis=1).argmin())])
+    else:
+        medoid_row = 0
+
+    # ── 2. Segment the medoid, 3. carry the breakpoints onto every curve ────
+    breaks = _stepdtw_segment_medoid(shapes[medoid_row], max_segments=max_segments)
+    n_segments = len(breaks) + 1
+    durations, levels = _stepdtw_targets(shapes, medoid_row, breaks, train_curves)
+
+    # ── 4. One L1 gradient-boosting model per parameter, do-no-harm kept ────
+    exog_cols = sorted({col for c in train_curves
+                        for col in (c.get('exog_values') or {}).keys()})
+    X = _exemplar_feature_frame(train_curves, exog_cols=exog_cols)
+    feature_columns = list(X.columns)
+
+    n = len(train_curves)
+    idx = np.arange(n)
+    if 0 < val_size < 1 and n >= 10:
+        tr_i, vl_i = train_test_split(idx, test_size=val_size, random_state=random_state)
+    else:
+        tr_i = vl_i = idx
+
+    const_durations = durations.mean(axis=0)
+    const_levels = np.median(levels, axis=0)
+
+    def _fit_bank(targets, const):
+        bank = []
+        for j in range(targets.shape[1]):
+            m_ = None
+            if feature_columns and len(tr_i) >= 8:
+                try:
+                    _m = HistGradientBoostingRegressor(loss='absolute_error',
+                                                       max_iter=200,
+                                                       random_state=random_state)
+                    _m.fit(X.values[tr_i], targets[tr_i, j])
+                    if float(np.mean(np.abs(_m.predict(X.values[vl_i]) - targets[vl_i, j]))) < \
+                       float(np.mean(np.abs(const[j] - targets[vl_i, j]))):
+                        m_ = _m
+                except Exception:
+                    m_ = None
+            bank.append(m_)
+        return bank
+
+    duration_models = (_fit_bank(durations, const_durations)
+                       if n_segments > 1 else [None] * n_segments)
+    level_models = _fit_bank(levels, const_levels)
+
+    if verbose:
+        print(f"  [ml_step_dtw] {n} curves -> {n_segments} segment(s); "
+              f"duration models kept {sum(m is not None for m in duration_models)}/{n_segments}, "
+              f"level models kept {sum(m is not None for m in level_models)}/{n_segments}")
+
+    pipeline = {
+        'approach':          'ml_step_dtw',
+        'reference_curve':   _median_floor_reference(train_curves, fixed_length),
+        'fixed_length':      fixed_length,
+        'medoid_values':     np.asarray(train_curves[medoid_row]['original_values'],
+                                        dtype=float),
+        'break_fracs':       np.asarray(breaks, dtype=float),
+        'n_segments':        n_segments,
+        'const_durations':   const_durations,
+        'const_levels':      const_levels,
+        'duration_models':   duration_models,
+        'level_models':      level_models,
+        'segment_fill':      (segment_fill or STEP_DTW_SEGMENT_FILL),
+        'feature_columns':   feature_columns,
+        'exog_cols':         exog_cols,
+        'prev_act_energy_map': prev_act_energy_map or {},
+        'model_name':        f'{n_segments} segments x GB(L1) durations+levels',
+    }
+
+    _attach_median_floor(
+        pipeline, train_curves,
+        [train_curves[i]['instance_id'] for i in vl_i],
+        lambda rv, c: predict_raw_curve_step_dtw(
+            rv, c['activity'], c['attributes'], pipeline,
+            exog_values=c.get('exog_values', {})),
+        label=f' {variable} (ml_step_dtw)', verbose=verbose,
+    )
+    return pipeline
+
+
+def predict_raw_curve_step_dtw(raw_values, activity, attributes, pipeline,
+                               exog_values=None):
+    """
+    Predict the segment durations and levels from the features and reassemble
+    the curve. Reads only the feature vector and the target length from the
+    instance — the test curve's values are never touched, so this runs
+    unchanged inside the simulation.
+    """
+    _floor = _median_floor_prediction(raw_values, attributes, pipeline)
+    if _floor is not None:
+        return _floor
+
+    attributes = _inject_prev_act_energy(attributes,
+                                         pipeline.get('prev_act_energy_map'))
+    attributes = attributes or {}
+    n = max(2, int(attributes.get('_pred_curve_length', len(raw_values))))
+
+    curve = {'attributes': attributes, 'original_values': np.zeros(n),
+             'exog_values': exog_values or {}}
+    X = _exemplar_feature_frame([curve], pipeline['feature_columns'],
+                                exog_cols=pipeline.get('exog_cols')).values
+
+    n_segments = int(pipeline['n_segments'])
+    d = np.asarray(pipeline['const_durations'], dtype=float).copy()
+    for j, m in enumerate(pipeline.get('duration_models') or []):
+        if m is None:
+            continue
+        try:
+            d[j] = float(m.predict(X)[0])
+        except Exception:
+            pass
+    d = np.clip(d, 0.0, None)
+    d = d / d.sum() if d.sum() > 0 else np.full(n_segments, 1.0 / n_segments)
+
+    lv = np.asarray(pipeline['const_levels'], dtype=float).copy()
+    for j, m in enumerate(pipeline.get('level_models') or []):
+        if m is None:
+            continue
+        try:
+            lv[j] = float(m.predict(X)[0])
+        except Exception:
+            pass
+    lv = np.where(np.isfinite(lv), lv, 0.0)
+
+    # A predicted duration of ~0 simply skips that segment for this instance;
+    # monotone cumulative edges pinned to [0, n] guarantee full coverage.
+    edges = np.round(np.cumsum(np.concatenate([[0.0], d])) * n).astype(int)
+    edges[0], edges[-1] = 0, n
+    edges = np.maximum.accumulate(edges)
+
+    med = np.asarray(pipeline.get('medoid_values', []), dtype=float)
+    med_edges = np.concatenate([[0.0],
+                                np.asarray(pipeline.get('break_fracs', []), dtype=float),
+                                [1.0]])
+    Lm = len(med)
+    fill = pipeline.get('segment_fill', 'medoid')
+
+    y = np.empty(n, dtype=float)
+    for m in range(n_segments):
+        a, b = int(edges[m]), int(edges[m + 1])
+        if b <= a:
+            continue
+        if fill == 'medoid' and Lm >= 1:
+            i0 = min(int(np.floor(med_edges[m] * Lm)), Lm - 1)
+            i1 = min(max(int(np.ceil(med_edges[m + 1] * Lm)), i0 + 1), Lm)
+            seg = med[i0:i1]
+            # Index selection, never interpolation — same rule as the exemplar
+            # family, so the medoid's within-segment texture survives.
+            seg = seg[np.clip(np.round(np.linspace(0, len(seg) - 1, b - a)).astype(int),
+                              0, len(seg) - 1)]
+            mu = float(np.mean(seg))
+            y[a:b] = seg * (lv[m] / mu) if abs(mu) > 1e-12 else lv[m]
+        else:
+            y[a:b] = lv[m]
+    return y
+
+
+# =============================================================================
 # DECODE-AWARE CALIBRATION  —  correct the encode/decode round trip in RAW space
 # =============================================================================
 
@@ -8480,6 +8840,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'ml_cluster_dtw':
         return predict_raw_curve_ml_cluster_dtw(raw_values, act, attrs, pipeline,
                                                 exog_values=curve.get('exog_values', {}))
+    if approach == 'ml_step_dtw':
+        return predict_raw_curve_step_dtw(raw_values, act, attrs, pipeline,
+                                          exog_values=curve.get('exog_values', {}))
     if approach == 'seq2seq':
         return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_only':
@@ -8587,6 +8950,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     # per-combo median under 'median_activity_sensor'.
     _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'ml_external', 'ml_only',
                            'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
+                           'ml_step_dtw',
                            # train/eval-gap variants — see the block below
                            'ml_external_wcounts', 'ml_external_wmetric',
                            'ml_external_calib', 'ml_rawspace'}
@@ -8692,7 +9056,11 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                      # Not a train/eval-gap variant, but it needs the same
                      # prev-activity curve set so its only difference against
                      # ml_external is the per-cluster fit and the predicted warp.
-                     'ml_cluster_dtw')
+                     'ml_cluster_dtw',
+                     # Same reasoning: identical curve set and features, so the
+                     # gap to ml_external is attributable to the segment-target
+                     # reparameterisation alone.
+                     'ml_step_dtw')
     if any(v in _active for v in _GAP_VARIANTS):
         _pv, _ = split_curves_with_prev_activity(
             df_train, variable=sensor, activities=[activity], objects=[obj],
@@ -8709,6 +9077,10 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                 try:
                     if _v == 'ml_cluster_dtw':
                         result[_v] = build_and_train_pipeline_ml_cluster_dtw(
+                            [dict(c) for c in _pv], variable=sensor,
+                            **_common, **_hp_kwargs)
+                    elif _v == 'ml_step_dtw':
+                        result[_v] = build_and_train_pipeline_step_dtw(
                             [dict(c) for c in _pv], variable=sensor,
                             **_common, **_hp_kwargs)
                     elif _v == 'ml_rawspace':
