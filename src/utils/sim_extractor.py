@@ -8392,6 +8392,443 @@ def predict_raw_curve_seq2seq_only(raw_values, activity, attributes, pipeline):
 
 
 # =============================================================================
+# SEQ2SEQ IOM  —  Woerrlein & Strassburger's "Iterating over Metrics" baseline
+# =============================================================================
+# Faithful port of the competing method (SNE 34(4) 2024, DOI 10.11128/sne.34.tn.10713)
+# rather than of its architecture alone. What makes IOM a method is not the
+# encoder-decoder -- 'seq2seq_only' already has that -- but WHERE DTW enters:
+#
+#   seq2seq       DTW builds the training TARGET (curves warped onto a barycenter)
+#   seq2seq_only  no DTW at all; select by validation MSE against the own target
+#   seq2seq_iom   train on vanilla/ambiguous targets like seq2seq_only, but use a
+#                 softDTW barycenter as the SCORING REFERENCE, and select the
+#                 model by generating full curves at fixed checkpoints and
+#                 comparing them to that reference (their Fig. 4, steps 3-6)
+#
+# So IOM sits between the two variants this repo already had, and neither of them
+# is it. Their argument is that a per-timestep softmax/pointwise loss cannot see
+# a whole time series, and that ambiguous data (identical labels, non-identical
+# curves) has no single ground-truth curve to select against -- the DTW average
+# supplies one.
+#
+# Deliberate deviations, all disclosed:
+#
+#  1. Continuous regression under MSE instead of their discretised values +
+#     softmax + categorical cross-entropy. This makes the baseline STRONGER, so
+#     it is the safe direction to deviate in: 'ml_step_dtw' beating a regression
+#     IOM is a stronger claim than beating a classification IOM.
+#  2. Equal training budget. They train 1000 epochs with no early stopping; here
+#     IOM gets the same `epochs` every other seq2seq approach gets (default 80),
+#     checkpointed every SEQ2SEQ_IOM_EPOCHS_PER_ITER epochs. Their 1000 epochs
+#     were tuned for 10k synthetic sequence pairs, not for per-leaf curve counts
+#     in the dozens, and an equal budget is what makes the comparison fair. IOM
+#     does keep their no-early-stopping rule: the whole point is that a late
+#     iteration may score better than the best-so-far under the metric.
+#  3. Sigma length is DEGENERATE here and is reported, not relied on -- see
+#     _iom_sigma_length.
+#
+# Everything else -- feature sequences, cells, decode, median floor -- is shared
+# with 'seq2seq_only', so the gap between the two is attributable to the
+# selection rule alone.
+#
+# KNOWN PROPERTY OF THE METHOD (not of this port). IOM scores every generated
+# curve against ONE reference per leaf -- the analogue of their one reference per
+# NC-code variant. That is sound only while the leaf is unimodal. Measured here
+# on synthetic leaves, 40 epochs, checkpoints every 10:
+#
+#   homogeneous leaf (one shape, noise+length vary -- their setting):
+#       iom_mse falls 0.123 -> 0.004 alongside pointwise 0.139 -> 0.013;
+#       IOM selects the fully-trained checkpoint, same as pointwise would.
+#   heterogeneous leaf (attributes genuinely differentiate curves within it):
+#       iom_mse 0.374 at epoch 10 then 0.93 for the rest, while pointwise keeps
+#       falling 0.493 -> 0.021; IOM selects the BARELY-TRAINED epoch-10 model.
+#
+# The second case is not a defect in the port -- a single-reference metric
+# rewards predicting the average, so it penalises exactly the within-leaf
+# conditioning this repo's approaches add. Their model conditions only on the
+# variant label, so within a variant it has nothing to differentiate and the
+# situation cannot arise for them. Expect IOM to look worst on the leaves where
+# attributes carry the most signal; that is the method's own limitation and is
+# the honest thing for the comparison to show.
+# =============================================================================
+
+# Epochs per IOM iteration. Their paper folds 10 epochs into one iteration for
+# storage reasons and scores only the last epoch of each; the same figure here
+# turns the default 80-epoch budget into 8 scored checkpoints.
+SEQ2SEQ_IOM_EPOCHS_PER_ITER = 10
+
+# Build the scoring reference with tslearn's softDTW barycenter (their [11],
+# Cuturi & Blondel) rather than this repo's _robust_dtw_barycenter. The reference
+# is the one part of IOM that is genuinely theirs, so it is built their way; the
+# repo's duration-robust variant and its _zero_calibrate_barycenter duty-cycle
+# fix are deliberately NOT applied, because editorialising the baseline's own
+# reference would make any gap against it unattributable. Set False to swap in
+# the repo barycenter and measure what that choice alone is worth.
+SEQ2SEQ_IOM_SOFTDTW = True
+
+
+def _iom_reference_curve(resampled_curves, fixed_length, verbose=0):
+    """
+    The DTW reference time series IOM scores generated curves against (their
+    step 2). softDTW barycenter over the train curves, resampled to a common
+    grid -- computed from TRAIN curves only, like every other reference here.
+
+    resampled_curves : (n_curves, fixed_length, 1) -- same input
+                       _robust_dtw_barycenter takes.
+
+    Returns (fixed_length,) float array.
+    """
+    if SEQ2SEQ_IOM_SOFTDTW:
+        try:
+            from tslearn.barycenters import softdtw_barycenter
+            # gamma is softDTW's smoothing: it is a squared-distance scale, so it
+            # has to follow the magnitude of these curves (energy readings run to
+            # thousands, where gamma=1.0 would degenerate to hard DTW and lose the
+            # error tolerance that is the whole reason they chose softDTW).
+            _scale = float(np.var(resampled_curves[:, :, 0])) or 1.0
+            bary = softdtw_barycenter(resampled_curves, gamma=0.1 * _scale,
+                                      max_iter=50, tol=1e-3)
+            return np.asarray(bary, dtype=float).reshape(-1)
+        except Exception as exc:
+            # tslearn's L-BFGS can fail to converge on degenerate leaves (all-flat
+            # curves, n=5). Falling back keeps the leaf trainable; it is logged
+            # because it silently changes which barycenter the baseline was scored
+            # against.
+            if verbose:
+                print(f"    [WARN] softdtw_barycenter failed ({exc}) -- "
+                      f"falling back to _robust_dtw_barycenter.")
+    return _robust_dtw_barycenter(resampled_curves,
+                                  barycenter_size=fixed_length)[:, 0]
+
+
+def _iom_sigma_length(pred, reference_n):
+    """
+    Their second metric: len(generated) / len(reference), optimum 1.
+
+    DEGENERATE IN THIS PORT, on purpose. Their decoder emits an end-of-sequence
+    symbol, so the generated series owns its length and sigma varies across
+    iterations (their Fig. 10 legends show predicted lengths differing from the
+    reference). Here every curve is generated on the fixed canonical grid and the
+    RAW length comes from the simulation's duration model downstream
+    (_pred_curve_length), never from the network -- so this ratio is 1.0 by
+    construction and their two-step selection collapses to its MSE half.
+
+    Computed and returned anyway for two reasons: it is logged, so the constant
+    is visible in the results instead of being a silent omission; and the
+    selection rule below is written as their full two-key rule, so adding a stop
+    head later makes sigma bind without touching the selection code.
+    """
+    return float(pred.shape[1]) / float(reference_n.shape[0])
+
+
+def _fit_seq2seq_iom(
+    X_tr, y_tr_n, X_vl, y_vl_n, reference_n, device, input_size, seq_len,
+    hidden_size, num_layers, dropout, epochs, batch_size, lr,
+    teacher_forcing_ratio, verbose, epochs_per_iteration=None, cell_types=None,
+    random_state=None,
+):
+    """
+    IOM training loop: train in fixed-length iterations, and at the end of each
+    one GENERATE full curves and score them against the DTW reference, instead of
+    scoring per-timestep predictions against each instance's own target the way
+    _fit_seq2seq_with_selection does.
+
+    reference_n : (seq_len,) tensor -- the DTW reference in the SAME normalised
+                  canonical space as y_tr_n/y_vl_n.
+
+    Selection follows their two-step rule: among all checkpoints take those with
+    sigma length closest to 1, and among those the lowest MSE. Checkpoints are
+    pooled across cells, so the cell competition rides along on the same rule.
+
+    No early stopping -- their method deliberately trains the full budget,
+    because a later iteration may score better under the metric than an earlier
+    one that had a lower pointwise loss.
+
+    Returns
+    -------
+    (model, best_iom_mse, best_cell, val_loss_by_cell, history)
+        history — list of per-checkpoint dicts, saved on the pipeline so the
+                  metric trajectory of their Fig. 9 can be replotted.
+    """
+    cell_types = tuple(cell_types) if cell_types else _SEQ2SEQ_CELL_TYPES
+    if epochs_per_iteration is None:
+        epochs_per_iteration = SEQ2SEQ_IOM_EPOCHS_PER_ITER
+    epochs_per_iteration = max(1, int(epochs_per_iteration))
+    n_iterations = max(1, int(np.ceil(epochs / epochs_per_iteration)))
+
+    criterion   = nn.MSELoss()
+    reference_n = reference_n.to(device)
+
+    _seed = GLOBAL_RANDOM_SEED if random_state is None else int(random_state)
+    _loader_gen = torch.Generator()
+    _loader_gen.manual_seed(_seed)
+    loader = DataLoader(TensorDataset(X_tr, y_tr_n), batch_size=batch_size,
+                        shuffle=True, generator=_loader_gen)
+
+    X_vl_d, y_vl_d = X_vl.to(device), y_vl_n.to(device)
+
+    results, history = {}, []
+    for cell in cell_types:
+        # Re-seed per cell exactly as _fit_seq2seq_with_selection does, so which
+        # cell wins cannot depend on which trained first.
+        torch.manual_seed(_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_seed)
+        _loader_gen.manual_seed(_seed)
+        if cell == 'lstm':
+            model = _Seq2SeqLSTM(input_size, hidden_size=hidden_size,
+                                 num_layers=num_layers, dropout=dropout).to(device)
+        elif cell == 'transformer':
+            model = _Seq2SeqTransformer(input_size, seq_len=seq_len,
+                                        hidden_size=hidden_size,
+                                        num_layers=num_layers, dropout=dropout).to(device)
+        else:
+            print(f"    [WARN] unknown seq2seq cell '{cell}' — skipped.")
+            continue
+
+        optimiser = torch.optim.Adam(model.parameters(), lr=lr)
+        # Running best under their rule. The key is the full two-key tuple so a
+        # future stop head makes sigma bind with no change here.
+        best_key, best_state, best_record = None, None, None
+
+        for iteration in range(1, n_iterations + 1):
+            model.train()
+            for _ in range(epochs_per_iteration):
+                for xb, yb in loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    optimiser.zero_grad()
+                    pred = model(xb, targets=yb,
+                                 teacher_forcing_ratio=teacher_forcing_ratio)
+                    loss = criterion(pred, yb)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimiser.step()
+
+            # --- their step 4: generate, then compare to the DTW reference ----
+            model.eval()
+            with torch.no_grad():
+                gen = model(X_vl_d, targets=None, teacher_forcing_ratio=0.0)
+                # Mean over curves of the per-curve MSE against the reference --
+                # their "aggregate the mean of applied metrics over all time
+                # series samples". NOT the pointwise loss against each curve's
+                # own target: that is the metric IOM exists to replace.
+                iom_mse = float(((gen - reference_n.unsqueeze(0)) ** 2)
+                                .mean(dim=1).mean())
+                sigma   = _iom_sigma_length(gen, reference_n)
+                # Kept only as a diagnostic, so the IOM checkpoint can be read
+                # against what the ordinary selection rule would have said.
+                pointwise = float(criterion(gen, y_vl_d))
+
+            record = {'cell': cell, 'iteration': iteration,
+                      'epoch': iteration * epochs_per_iteration,
+                      'iom_mse': iom_mse, 'sigma_length': sigma,
+                      'pointwise_val_loss': pointwise}
+            history.append(record)
+            if verbose:
+                print(f"    [{cell}] iter {iteration:3d}/{n_iterations} "
+                      f"(epoch {record['epoch']:4d})  iom_mse={iom_mse:.5f}  "
+                      f"sigma={sigma:.3f}  pointwise={pointwise:.5f}")
+
+            key = (abs(sigma - 1.0), iom_mse)
+            if best_key is None or key < best_key:
+                best_key    = key
+                best_record = record
+                best_state  = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if best_state is None:
+            continue
+        model.load_state_dict(best_state)
+        model.eval()
+        results[cell] = (model, best_key, best_record)
+
+    if not results:
+        raise RuntimeError(f"no seq2seq IOM cell trained successfully (tried {cell_types})")
+
+    best_cell = min(results, key=lambda c: results[c][1])
+    model, best_key, best_record = results[best_cell]
+    val_loss_by_cell = {c: rec['iom_mse'] for c, (_, _, rec) in results.items()}
+
+    if verbose:
+        _scores = '  '.join(f'{c}={v:.5f}' for c, v in val_loss_by_cell.items())
+        print(f"    IOM cell selection: {_scores}  ->  {best_cell} "
+              f"(iteration {best_record['iteration']}, epoch {best_record['epoch']})")
+
+    return model, best_record['iom_mse'], best_cell, val_loss_by_cell, history, best_record
+
+
+def build_and_train_pipeline_seq2seq_iom(
+    train_curves,
+    variable,
+    fixed_length=None,
+    val_size=0.2,
+    random_state=42,
+    hidden_size=128,
+    num_layers=2,
+    dropout=0.1,
+    epochs=80,
+    batch_size=32,
+    lr=1e-3,
+    teacher_forcing_ratio=0.5,
+    epochs_per_iteration=None,
+    verbose=1,
+):
+    """
+    Seq2Seq with Iterating-over-Metrics selection (Woerrlein & Strassburger).
+
+    Target  : raw curve linearly resampled to fixed_length -- the ambiguous
+              "vanilla" data their paper trains on. DTW never touches it.
+    Input   : [phase, curve_length, activity_ohe, attrs] sequence, as seq2seq_only.
+    Select  : softDTW barycenter as reference; generate + score every
+              SEQ2SEQ_IOM_EPOCHS_PER_ITER epochs; pick by (|sigma-1|, MSE).
+    Decode  : linear resample back to raw length -- identical to seq2seq_only.
+
+    Differs from build_and_train_pipeline_seq2seq_only in the selection rule and
+    nothing else, by design.
+    """
+    from sklearn.model_selection import train_test_split as _tts
+
+    if verbose:
+        print("\n" + "=" * 80)
+        print("STEP 2 — BUILD + TRAIN SEQ2SEQ-IOM PIPELINE  (vanilla targets, DTW-scored)")
+        print("=" * 80)
+
+    if fixed_length is None:
+        fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
+
+    # Training target: plain resample, NO DTW alignment (their step 1 -- the
+    # model is deliberately shown the ambiguity).
+    for curve in train_curves:
+        curve['resampled_values'] = np.interp(
+            np.linspace(0, 1, fixed_length),
+            np.linspace(0, 1, len(curve['original_values'])),
+            curve['original_values'],
+        ).astype(np.float32)
+
+    # Their step 2: the DTW reference, from the same synthesised/observed set the
+    # training uses. Scoring only -- it is never a target.
+    resampled_for_dtw = np.array([c['resampled_values'] for c in train_curves],
+                                 dtype=float)[:, :, np.newaxis]
+    reference_curve = _iom_reference_curve(resampled_for_dtw, fixed_length,
+                                           verbose=verbose)
+    if verbose:
+        print(f"    IOM reference length: {len(reference_curve)} "
+              f"({'softDTW' if SEQ2SEQ_IOM_SOFTDTW else 'robust DBA'})")
+
+    # Feature setup — same as seq2seq_only, fit on train only
+    all_keys, key_types = _infer_key_types(train_curves)
+    cat_columns = ['activity'] + [k for k in all_keys if key_types[k] == 'category']
+
+    _df_ref = _build_feature_matrix(
+        train_curves, all_keys, key_types, fixed_length,
+        value_key='resampled_values', include_target=False,
+    )
+    _df_ref = _df_ref.drop(columns=['instance_id'], errors='ignore')
+    _df_ohe = pd.get_dummies(_df_ref, columns=cat_columns, drop_first=True)
+    feature_columns = _df_ohe.columns.tolist()
+
+    numeric_feature_cols = ['position_idx', 'relative_pos', 'curve_length'] + [
+        k for k in all_keys if key_types[k] == 'numeric'
+    ]
+    numeric_feature_cols = [c for c in numeric_feature_cols if c in _df_ohe.columns]
+
+    scaler = StandardScaler()
+    _df_ohe[numeric_feature_cols] = scaler.fit_transform(_df_ohe[numeric_feature_cols])
+
+    # Val split by instance
+    unique_instances = list({c['instance_id'] for c in train_curves})
+    train_inst, val_inst = _tts(unique_instances, test_size=val_size, random_state=random_state)
+    tr_curves = [c for c in train_curves if c['instance_id'] in set(train_inst)]
+    vl_curves = [c for c in train_curves if c['instance_id'] in set(val_inst)]
+
+    X_tr, y_tr = _build_seq2seq_input(tr_curves, all_keys, key_types, fixed_length,
+                                       cat_columns, feature_columns, scaler,
+                                       numeric_feature_cols)
+    X_vl, y_vl = _build_seq2seq_input(vl_curves, all_keys, key_types, fixed_length,
+                                       cat_columns, feature_columns, scaler,
+                                       numeric_feature_cols)
+
+    if verbose:
+        print(f"    Train: {len(tr_curves)} curves | Val: {len(vl_curves)} curves")
+
+    y_mean = float(y_tr.mean())
+    y_std  = float(y_tr.std()) + 1e-8
+    y_tr_n = (y_tr - y_mean) / y_std
+    y_vl_n = (y_vl - y_mean) / y_std
+    # The reference has to live in the same normalised space as the generated
+    # curves, or the IOM metric would compare raw units against z-scores.
+    reference_n = torch.tensor((np.asarray(reference_curve, dtype=np.float32) - y_mean) / y_std,
+                               dtype=torch.float32)
+
+    device     = _seq2seq_device()
+    input_size = X_tr.shape[-1]
+    (model, best_iom_mse, best_cell,
+     val_loss_by_cell, iom_history, best_record) = _fit_seq2seq_iom(
+        X_tr, y_tr_n, X_vl, y_vl_n, reference_n, device, input_size, fixed_length,
+        hidden_size, num_layers, dropout, epochs, batch_size, lr,
+        teacher_forcing_ratio, verbose,
+        epochs_per_iteration=epochs_per_iteration,
+        random_state=random_state,
+    )
+
+    if verbose:
+        print(f"    Best iom_mse={best_iom_mse:.5f}  (cell={best_cell}, "
+              f"epoch={best_record['epoch']})")
+
+    pipeline = {
+        'approach':             'seq2seq_iom',
+        'cell_type':            best_cell,
+        'val_loss_by_cell':     val_loss_by_cell,
+        'model':                model,
+        'fixed_length':         fixed_length,
+        'all_keys':             all_keys,
+        'key_types':            key_types,
+        'cat_columns':          cat_columns,
+        'feature_columns':      feature_columns,
+        'scaler':               scaler,
+        'numeric_feature_cols': numeric_feature_cols,
+        'y_mean':               y_mean,
+        'y_std':                y_std,
+        'device':               device,
+        # Scoring reference only -- predict never reads it (no DTW decode here).
+        # Stored so the selected model can be plotted against what selected it.
+        'reference_curve':      np.asarray(reference_curve, dtype=float),
+        # val_loss is the IOM metric, NOT the pointwise validation MSE the other
+        # seq2seq approaches report under the same key. Same key so the shared
+        # logging/report code works; the two are not comparable across approaches,
+        # hence 'val_loss_pointwise' alongside it for anyone who needs the
+        # like-for-like number.
+        'val_loss':             best_iom_mse,
+        'val_loss_pointwise':   best_record['pointwise_val_loss'],
+        'iom_sigma_length':     best_record['sigma_length'],
+        'iom_iteration':        best_record['iteration'],
+        'iom_epoch':            best_record['epoch'],
+        'iom_epochs_per_iteration': (epochs_per_iteration or SEQ2SEQ_IOM_EPOCHS_PER_ITER),
+        # Full metric trajectory -- their Fig. 9 is replottable from this.
+        'iom_history':          iom_history,
+    }
+
+    # Median floor — see _attach_median_floor. Applied exactly as to every other
+    # learned approach, so none is protected while another is not.
+    _attach_median_floor(
+        pipeline, train_curves, val_inst,
+        lambda rv, c: predict_raw_curve_seq2seq_iom(rv, c['activity'], c['attributes'], pipeline),
+        label=f' {variable} (iom)', verbose=verbose,
+    )
+
+    return pipeline
+
+
+def predict_raw_curve_seq2seq_iom(raw_values, activity, attributes, pipeline):
+    """
+    Predict with the IOM pipeline. Generation and decode are identical to
+    'seq2seq_only' -- IOM changes which weights got selected, not how the
+    selected model is run -- so this delegates rather than duplicating, keeping
+    the two approaches guaranteed-identical at inference.
+    """
+    return predict_raw_curve_seq2seq_only(raw_values, activity, attributes, pipeline)
+
+
+# =============================================================================
 # DTW + SEQ2SEQ + EXT. FACTORS  —  same as DTW+Seq2Seq but ef_* appended to input
 # =============================================================================
 # Each position's feature vector gains one value per ef_ column (resampled to
@@ -9182,7 +9619,7 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     # torch's setting does not cover it.
     from threadpoolctl import threadpool_limits
     threadpool_limits(limits=1)
-    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_external'}
+    _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_external', 'seq2seq_iom'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
         return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
@@ -9216,6 +9653,17 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
             dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
             teacher_forcing_ratio=teacher_forcing_ratio, patience=patience,
+            verbose=False,
+        )
+
+    if 'seq2seq_iom' in _active:
+        # No `patience`: IOM trains the full budget by design (see the section
+        # header) -- early stopping is the rule it replaces, not one it inherits.
+        result['seq2seq_iom'] = build_and_train_pipeline_seq2seq_iom(
+            curves, variable=sensor, fixed_length=fixed_length, random_state=_s2s_seed,
+            val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
+            dropout=dropout, epochs=epochs, batch_size=batch_size, lr=lr,
+            teacher_forcing_ratio=teacher_forcing_ratio,
             verbose=False,
         )
 

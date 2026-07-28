@@ -771,6 +771,18 @@ RUN_AUTOREGRESSIVE_EVAL = os.environ.get('PIPELINE_RUN_AUTOREGRESSIVE_EVAL', 'fa
 # eval. See compare_complete_case_curves / compare_schedule_and_stochastic_profiles.
 SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false').lower() == 'true'
 
+# Restrict the COMPLETE-CURVE eval (and with it the schedule-profile eval's
+# "Best, mine" comparator) to a subset of the trained approaches. Unset ->
+# every trained approach is evaluated, the historical behaviour. Set e.g. to
+# 'ml_step_dtw' to assemble complete case profiles for that one approach only —
+# the complete-curve loop is (process x mode x approach) inference over every
+# simulated case, so each dropped approach cuts that stage's runtime by a full
+# share. The schedule-profile comparator prefers 'ml_external' when it is in
+# the list (the historical column), otherwise the FIRST listed approach.
+_ccap_env = os.environ.get('PIPELINE_COMPLETE_CURVE_APPROACHES')
+COMPLETE_CURVE_APPROACHES = ([a.strip() for a in _ccap_env.split(',') if a.strip()]
+                             if _ccap_env else None)
+
 # Upper bound on worker processes for the parallel training pools. Default: one
 # per core, the historical behaviour.
 #
@@ -808,6 +820,13 @@ def _pool_workers(n_tasks):
 #                   (no lagged meter values — see split_curves_with_prev_activity)
 #    'seq2seq'           DTW + LSTM encoder-decoder
 #    'seq2seq_only'              LSTM encoder-decoder, no DTW
+#    'seq2seq_iom'       Woerrlein & Strassburger's "Iterating over Metrics":
+#                        trained on vanilla targets like seq2seq_only, but the
+#                        model is SELECTED by generating whole curves every 10
+#                        epochs and scoring them against a softDTW barycenter
+#                        (MSE + sigma length) instead of by validation loss.
+#                        The faithful port of the competing paper -- see the
+#                        SEQ2SEQ IOM section in sim_extractor for the deviations.
 #    'ml_only'                 ML (GBM/RF), linear resample encode+decode (no DTW)
 #    'exemplar'          Real training curve (DTW medoid of a shape cluster),
 #                        chosen by a classifier over attributes + ef_* external
@@ -862,6 +881,7 @@ APPROACHES = [
     'seq2seq',
     'seq2seq_only',
     'seq2seq_external',
+    'seq2seq_iom',
 ]
 
 # Override the curve models to fit from the pipeline config
@@ -876,7 +896,7 @@ if _env_curve_approaches:
     _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
               'ml_only', 'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
               'ml_step_dtw',
-              'seq2seq', 'seq2seq_only', 'seq2seq_external',
+              'seq2seq', 'seq2seq_only', 'seq2seq_external', 'seq2seq_iom',
               'ml_external_wcounts', 'ml_external_wmetric', 'ml_external_calib',
               'ml_rawspace'}
     _unknown = [a for a in _requested if a not in _known]
@@ -1183,7 +1203,8 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
 
 def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, sensors, ef_cols,
                                 output_root, best_mode_safe=None, complete_curve_dir=None,
-                                predicted_logs_dir=None, budget_mode_safe=None):
+                                predicted_logs_dir=None, budget_mode_safe=None,
+                                comparator_approach='ml_external'):
     """
     "Schedule Profile Evaluation" — see utils/sim_extractor.py's Schedule Profile
     Evaluation section for the design. Per sensor: trains a schedule-only
@@ -1223,16 +1244,19 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
     def _load_mode_curve_sources(_mode_safe):
         """(per_case_df, curves_parquet_path) for one simulation mode's
-        already-computed 'ml_external' complete-curve outputs."""
+        already-computed complete-curve outputs of `comparator_approach`
+        (historically always 'ml_external'; follows the complete-curve
+        restriction when that approach was not evaluated)."""
         _case_df, _curve_path = None, None
+        _sfx = '' if comparator_approach == 'baseline' else f'_{comparator_approach}'
         if _mode_safe and complete_curve_dir:
             _p = os.path.join(complete_curve_dir, process, _mode_safe,
-                              'per_case_complete_curve_ml_external.csv')
+                              f'per_case_complete_curve{_sfx}.csv')
             if os.path.exists(_p):
                 _case_df = pd.read_csv(_p)
                 _case_df['case_id'] = _case_df['case_id'].astype(str)
             _cp = os.path.join(complete_curve_dir, process, _mode_safe,
-                               'predicted_curves_ml_external.parquet')
+                               f'predicted_curves{_sfx}.parquet')
             if os.path.exists(_cp):
                 _curve_path = _cp
         return _case_df, _curve_path
@@ -4442,6 +4466,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         predict_raw_curve_seq2seq,
         predict_raw_curve_seq2seq_only,
         predict_raw_curve_seq2seq_external,
+        predict_raw_curve_seq2seq_iom,
     )
 
     all_energy_pipelines                  = {}   # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
@@ -4451,6 +4476,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_seq2seq              = {}   # DTW + Seq2Seq
     all_energy_pipelines_seq2seq_only         = {}   # Seq2Seq only (no DTW)
     all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
+    all_energy_pipelines_seq2seq_iom          = {}   # Seq2Seq + IOM selection (Woerrlein & Strassburger)
     all_energy_pipelines_ml_only                  = {}   # ML, linear resample encode+decode
     all_energy_pipelines_exemplar                 = {}   # real-curve exemplar + shape classifier
     all_energy_pipelines_exemplar_only            = {}   # exemplar without DTW (Euclidean medoid)
@@ -4549,6 +4575,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_seq2seq                  = {}
         _pipelines_seq2seq_only             = {}
         _pipelines_seq2seq_external    = {}
+        _pipelines_seq2seq_iom              = {}
         _pipelines_ml_only                = {}
         _pipelines_exemplar               = {}   # real-curve exemplar (no averaging)
         _pipelines_exemplar_only          = {}   # exemplar without DTW (Euclidean medoid)
@@ -4586,7 +4613,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                                         'ml_external_wcounts','ml_external_wmetric',
                                         'ml_external_calib','ml_rawspace'}]
         _seq2seq_approaches = [a for a in APPROACHES
-                               if a in {'seq2seq','seq2seq_only','seq2seq_external'}]
+                               if a in {'seq2seq','seq2seq_only','seq2seq_external','seq2seq_iom'}]
 
         # Restrict per-sensor to the objects/activities where that sensor actually
         # carries signal — e.g. process_1's destillation sensors have nothing to do
@@ -4770,6 +4797,23 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'full_pipeline':   _ep,
                     }
                     print(f"  [{_s}|{_a}|{_o}] seq2seq_only  val_loss={_ep['val_loss']:.5f}  cell={_ep.get('cell_type', 'lstm')}  ({_s_elapsed:.1f}s)")
+                if 'seq2seq_iom' in _r2:
+                    _ep = _r2['seq2seq_iom']
+                    _ep['variable_name'] = _s
+                    _pipelines_seq2seq_iom.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        # The softDTW reference this leaf was SELECTED against —
+                        # metadata only, the predictor does no DTW decode.
+                        'reference_curve': _ep['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq_iom(rv, act, attrs, pipeline=ep))(_ep),
+                        'full_pipeline':   _ep,
+                    }
+                    # val_loss here is the IOM metric (MSE vs the DTW reference),
+                    # not the pointwise validation loss the lines above print —
+                    # both are shown so they are never silently conflated.
+                    print(f"  [{_s}|{_a}|{_o}] seq2seq_iom   iom_mse={_ep['val_loss']:.5f}  "
+                          f"pointwise={_ep.get('val_loss_pointwise', float('nan')):.5f}  "
+                          f"sigma={_ep.get('iom_sigma_length', float('nan')):.3f}  "
+                          f"epoch={_ep.get('iom_epoch')}  cell={_ep.get('cell_type', 'lstm')}  ({_s_elapsed:.1f}s)")
                 if 'seq2seq_external' in _r2:
                     _ep = _r2['seq2seq_external']
                     _ep['variable_name'] = _s
@@ -4838,6 +4882,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                              ('Step DTW + ML + Ext.',    _pipelines_ml_step_dtw),
                              ('DTW + Seq2Seq',           _pipelines_seq2seq),
                              ('Seq2Seq only (no DTW)',   _pipelines_seq2seq_only),
+                             ('Seq2Seq IOM (DTW-selected)', _pipelines_seq2seq_iom),
                              ('DTW + Seq2Seq + Ext. Factors', _pipelines_seq2seq_external)):
             _tot = _fell = 0
             for _sd in _pipes.values():
@@ -4861,6 +4906,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_seq2seq[_proc]               = _pipelines_seq2seq
         all_energy_pipelines_seq2seq_only[_proc]          = _pipelines_seq2seq_only
         all_energy_pipelines_seq2seq_external[_proc] = _pipelines_seq2seq_external
+        all_energy_pipelines_seq2seq_iom[_proc]           = _pipelines_seq2seq_iom
         all_energy_pipelines_ml_only[_proc]                 = _pipelines_ml_only
         all_energy_pipelines_exemplar[_proc]                = _pipelines_exemplar
         all_energy_pipelines_exemplar_only[_proc]           = _pipelines_exemplar_only
@@ -5245,6 +5291,23 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     if not _complete_curve_approaches_available:
         _complete_curve_approaches_available = ['baseline']
 
+    # Opt-in restriction — see COMPLETE_CURVE_APPROACHES. Intersected with what
+    # actually trained, so a typo or a not-trained approach cannot silently
+    # produce an empty eval; it falls back to everything with a warning.
+    if COMPLETE_CURVE_APPROACHES is not None:
+        _cc_missing = [a for a in COMPLETE_CURVE_APPROACHES
+                       if a not in _complete_curve_approaches_available]
+        _cc_kept = [a for a in COMPLETE_CURVE_APPROACHES
+                    if a in _complete_curve_approaches_available]
+        if _cc_missing:
+            print(f"  ⚠️ PIPELINE_COMPLETE_CURVE_APPROACHES: {_cc_missing} not among the "
+                  f"trained approaches {_complete_curve_approaches_available} — ignored.")
+        if _cc_kept:
+            _complete_curve_approaches_available = _cc_kept
+        else:
+            print(f"  ⚠️ PIPELINE_COMPLETE_CURVE_APPROACHES left nothing evaluable — "
+                  f"keeping all trained approaches instead.")
+
     print("\n" + "="*50)
     print(f"COMPLETE-CURVE EVAL ({len(_energy_distribution_pending)} process/mode combos "
           f"x {len(_complete_curve_approaches_available)} approach(es): {_complete_curve_approaches_available})")
@@ -5306,6 +5369,16 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
                  if m in MODES_TO_COMPARE),
                 None,
             )
+            # "Best, mine" reads the complete-curve outputs from disk, so its
+            # source approach must be one the (possibly restricted) loop above
+            # actually wrote: ml_external when available — the historical
+            # column — otherwise the first evaluated approach.
+            _sched_comparator = ('ml_external'
+                                 if 'ml_external' in _complete_curve_approaches_available
+                                 else _complete_curve_approaches_available[0])
+            if _sched_comparator != 'ml_external':
+                print(f"  ℹ️ Schedule-profile 'Best, mine' comparator: "
+                      f"'{_sched_comparator}' (ml_external not in the complete-curve eval).")
             _save_schedule_profile_eval(
                 _proc_p, _train_exp_p, _test_exp_p, _sensors_p, _ef_cols_p,
                 _schedule_profile_eval_dir,
@@ -5313,6 +5386,7 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
                 complete_curve_dir=_complete_curve_eval_dir,
                 predicted_logs_dir=_predicted_logs_dir,
                 budget_mode_safe=_budget_mode_pin,
+                comparator_approach=_sched_comparator,
             )
 
 
@@ -5357,6 +5431,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
             ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
             ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
+            ('Seq2Seq IOM (DTW-selected)',         all_energy_pipelines_seq2seq_iom),
             ('DTW + Seq2Seq + Ext. Factors', all_energy_pipelines_seq2seq_external),
         ]:
             if not _pipelines:
@@ -5686,6 +5761,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
                         if 'all_energy_pipelines_seq2seq_only' in dir() else {},
+                    'Seq2Seq IOM (DTW-selected)':         all_energy_pipelines_seq2seq_iom
+                        if 'all_energy_pipelines_seq2seq_iom' in dir() else {},
                     'DTW + Seq2Seq + Ext. Factors': all_energy_pipelines_seq2seq_external
                         if 'all_energy_pipelines_seq2seq_external' in dir() else {},
                 }
@@ -6566,6 +6643,7 @@ if _jdur_ready:
         ('Cluster DTW + ML + Ext.',         globals().get('all_energy_pipelines_ml_cluster_dtw', {})),
         ('Step DTW + ML + Ext.',            globals().get('all_energy_pipelines_ml_step_dtw', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
+        ('Seq2Seq IOM (DTW-selected)',              globals().get('all_energy_pipelines_seq2seq_iom',    {})),
         ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
     ]
 

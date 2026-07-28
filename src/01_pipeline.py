@@ -37,6 +37,18 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    distances) behind complete-curve eval and schedule
                                    profile eval, for recomputing other metrics or
                                    plotting later. Default: False.
+  complete_curve_approaches list|None restrict the complete-curve eval to these
+                                   approaches only. None (default) → every
+                                   trained approach is assembled into complete
+                                   case profiles and scored, per simulation
+                                   mode. e.g. ['ml_step_dtw'] evaluates just
+                                   that one — the complete-curve stage is
+                                   (process × mode × approach) inference over
+                                   every simulated case, so each dropped
+                                   approach cuts that stage proportionally.
+                                   The schedule-profile "Best, mine" comparator
+                                   follows: it uses 'ml_external' when listed,
+                                   otherwise the first listed approach.
   train_ratio           float      fraction of cases used for training in the
                                    train/test split (the rest go to test).
                                    e.g. 0.8 for an 80/20 split. Default: 0.70
@@ -66,7 +78,10 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    'ml_dtw' — DBA + DTW +
                                    regression; 'ml_external',
                                    'ml_only', 'seq2seq', 'seq2seq_only',
-                                   'seq2seq_external'; plus the train/eval-gap
+                                   'seq2seq_external', 'seq2seq_iom' (the
+                                   competing paper's own selection rule:
+                                   generate + score against a softDTW reference
+                                   every 10 epochs); plus the train/eval-gap
                                    variants of ml_external:
                                    'ml_external_wcounts',
                                    'ml_external_wmetric',
@@ -171,44 +186,29 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── Step-DTW comparison ──────────────────────────────────────────────────
-    # Focused run for the NEW 'ml_step_dtw' approach — the segment-parameter
-    # answer to why 'ml_cluster_dtw' failed in experiment_982. There the
-    # per-cluster fit + predicted warp bought essentially NO texture (roughness
-    # ratio 0.25 vs ml_external's 0.21, against exemplar's 0.50) and a worse
-    # tail (q99 sMAE 51.7 vs 45.3): a conditional mean PER POSITION stays
-    # smooth however the leaf is partitioned, and the hard cluster routing sent
-    # whole instances to models fitted on a different profile.
-    #
-    # ml_step_dtw changes the regression TARGET instead of the partition: the
-    # leaf's DTW medoid is change-point segmented once, the breakpoints are
-    # carried onto every training curve through DTW, and the models predict
-    # per-instance segment DURATIONS and LEVELS. The curve is reconstructed
-    # from those parameters, so step edges are sharp by construction — the
-    # averaging happens in parameter space, where it is harmless. No shape
-    # classifier on purpose: no hard routing, no ml_cluster_dtw tail.
-    #
-    # What to look for in the Curve-Only Evaluation table:
-    #   sMAE / WAPE     should stay in ml_external's range — mis-sized segments
-    #                   cost pointwise error the way a smooth curve does not,
-    #                   so parity is already a win
-    #   std / roughness should land clearly ABOVE ml_external's (~0.32/0.21
-    #     ratios        median in 982) and approach exemplar's (~0.59/0.50):
-    #                   between-segment level jumps carry the std, and the
-    #                   medoid segment fill carries the within-step texture
-    # Also check the per-leaf log lines '[ml_step_dtw] N curves -> M segment(s)':
-    # a leaf that comes back with 1 segment found no step structure and degrades
-    # to a level-scaled medoid — fine for a flat sensor, suspicious if common.
+    # ── Reportable comparison: Step DTW vs incumbents vs literature ─────────
+    # experiment_984 established ml_step_dtw (std/rough ratios 0.74/0.67 vs
+    # exemplar's 0.59/0.50, sMAE mean 4.05 beating exemplar 4.12 and 982's
+    # ml_external 4.43, best tail q99 43.5). This run assembles the reportable
+    # table in ONE eval pass:
+    #   the two naive floors, the pointwise incumbent (ml_external — also the
+    #   target ablation for ml_step_dtw: same features, per-position target),
+    #   the literature baseline 'seq2seq' (DTW + encoder-decoder, the
+    #   competing-paper approach ml_step_dtw has to beat), the realism
+    #   reference 'exemplar', and ml_step_dtw itself.
+    # Also turns the (slow) per-instance-matched Joint Duration + Profile
+    # Evaluation ON so the complete-profile heatmaps come out of this run too.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_984',
+        'run_name':              'experiment_986',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],
+        'mining_algorithms':     ['heuristic', 'alpha'],
         'run_energy_modelling':  True,
-        'run_joint_duration_eval':  False,  # slow per-instance-matched heatmaps
+        'run_joint_duration_eval':  True,   # ON: full per-instance-matched
+                                            # complete-profile evaluation (slow)
         'run_schedule_profile_eval': True,  # keys off 'ml_external', which is trained
         'run_autoregressive_eval':   False,
         'save_predicted_curves': True,
@@ -217,18 +217,41 @@ EXPERIMENTS = [
         'random_seed':           42,     # same seed as the full runs, so the
                                          # train/test split is bit-identical
         'curve_approaches': [
-            'median_activity_sensor',   # the naive floor
-            #'ml_external',              # the incumbent per-position predictor — the
+            'baseline',                 # coarsest floor: ONE median per sensor
+            'median_activity_sensor',   # the per-leaf naive floor
+            'ml_external',              # the incumbent per-position predictor — the
                                         # direct parent; same curve set, same features,
                                         # so the gap is attributable to the segment
                                         # reparameterisation alone
-            #'ml_cluster_dtw',           # kept from 982 so the two fixes to the same
-                                        # diagnosis (partition vs target) sit in one table
-            'ml_step_dtw',              # NEW: segment durations+levels via DTW
+            'ml_only',                  # plain ML on the curve: linear resample encode +
+                                        # decode, no DBA and no DTW anywhere. The no-DTW
+                                        # ablation — pairs with ml_dtw the way
+                                        # seq2seq_only pairs with seq2seq, so the two
+                                        # together price what DTW is worth on its own
+            #'seq2seq',                  # DTW + encoder-decoder — the competing-paper
+                                        # baseline ml_step_dtw has to beat; LSTM and
+                                        # transformer cells compete per leaf (see
+                                        # 'seq2seq_cells' to pin one)
+            'seq2seq_iom',              # the competing paper run THEIR way: vanilla
+                                        # targets + IOM selection against a softDTW
+                                        # reference. Reports "beats the paper as
+                                        # published" rather than "beats its
+                                        # architecture"; trains the full epoch budget
+                                        # (no early stopping — that is the rule IOM
+                                        # replaces).
+            'ml_step_dtw',              # segment durations+levels via DTW
                                         # correspondence, reconstruction instead of decode
-            'exemplar',                 # the realism ceiling any learned approach chases
+            'exemplar',                 # the realism reference (real replayed curve)
         ],
         'curve_optimize_hyperparams': False,
+        'complete_curve_approaches': ['ml_step_dtw'],  # complete-profile coupling for the
+                                         # new method ONLY — every approach still gets the
+                                         # Curve-Only Evaluation, but only ml_step_dtw is
+                                         # assembled into complete case profiles per mode,
+                                         # cutting the simulation-eval stage to 1/N.
+                                         # Comment this line out to evaluate all of them.
+                                         # 'Best, mine' in the schedule-profile eval then
+                                         # sources ml_step_dtw instead of ml_external.
         'curve_median_floor':    False,  # must stay OFF: the floor accepts on
                                          # POINTWISE error, so it would delete the
                                          # realism gain this approach exists for
@@ -448,6 +471,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     run_autoregressive_eval = exp.get('run_autoregressive_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
     curve_approaches = exp.get('curve_approaches')
+    complete_curve_approaches = exp.get('complete_curve_approaches')
     curve_models = exp.get('curve_models')
     seq2seq_cells = exp.get('seq2seq_cells')
     curve_optimize_hyperparams = exp.get('curve_optimize_hyperparams')
@@ -520,6 +544,8 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_MINING_ALGORITHMS'] = ','.join(mining_algorithms)
     if curve_approaches:
         env['PIPELINE_CURVE_APPROACHES'] = ','.join(curve_approaches)
+    if complete_curve_approaches:
+        env['PIPELINE_COMPLETE_CURVE_APPROACHES'] = ','.join(complete_curve_approaches)
     if curve_models:
         env['PIPELINE_CURVE_MODELS'] = ','.join(curve_models)
     if seq2seq_cells:
