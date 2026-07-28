@@ -6897,12 +6897,32 @@ STEP_DTW_MAX_SEGMENTS = 8
 STEP_DTW_SEGMENT_FILL = _os_seed.environ.get(
     'PIPELINE_STEP_DTW_SEGMENT_FILL', 'medoid').strip().lower()
 
+# Do-no-harm fallback gate. A leaf whose signal is not step-shaped (smooth
+# ramps: process_4_2's temperature/mass-flow sensors in experiment_984) pays
+# for the step template with a heavy pointwise tail — 22/351 leaves came out
+# >2 sMAE worse than ml_external there. When the builder is handed the leaf's
+# already-trained ml_external pipeline, it compares the two on ITS OWN held-out
+# validation curves and routes the leaf to the fallback iff the step pipeline
+# loses CLEARLY: val MAE > ratio x the fallback's. The margin is wide on
+# purpose — a smooth conditional median beats a textured curve slightly on
+# pointwise error even where the steps are real (the median-floor lesson), and
+# a near-tie must go to the step model or the realism gain is deleted leaf by
+# leaf. Raise the ratio towards infinity to disable the gate.
+STEP_DTW_FALLBACK_RATIO = float(_os_seed.environ.get(
+    'PIPELINE_STEP_DTW_FALLBACK_RATIO', '1.25'))
+
 
 def _stepdtw_segment_medoid(shape, max_segments=STEP_DTW_MAX_SEGMENTS, min_seg=None):
     """
     Interior breakpoints (fractions in (0,1)) of the best piecewise-constant
     approximation of `shape` — exact DP under an L2 cost, one pass per segment
     count, the count chosen by a BIC-style penalty. Empty array = one segment.
+
+    Returns (breakpoints, explained): `explained` is the fraction of the
+    one-segment residual the chosen segmentation removes (0 when it stays at
+    one segment). A diagnostic, not a gate: a staircase approximates even a
+    smooth ramp well, so this cannot by itself tell steps from ramps — the
+    fallback decision below is made on held-out prediction error instead.
     """
     y = np.asarray(shape, dtype=float)
     y = np.where(np.isfinite(y), y, 0.0)
@@ -6913,7 +6933,7 @@ def _stepdtw_segment_medoid(shape, max_segments=STEP_DTW_MAX_SEGMENTS, min_seg=N
         min_seg = max(2, L // 25)
     m_max = int(max(1, min(int(max_segments), L // min_seg)))
     if m_max <= 1 or L < 2 * min_seg:
-        return np.array([], dtype=float)
+        return np.array([], dtype=float), 0.0
 
     c1 = np.concatenate([[0.0], np.cumsum(y)])
     c2 = np.concatenate([[0.0], np.cumsum(y * y)])
@@ -6945,7 +6965,8 @@ def _stepdtw_segment_medoid(shape, max_segments=STEP_DTW_MAX_SEGMENTS, min_seg=N
         if 0 < i < L:
             cuts.append(i)
         j = i
-    return np.array(sorted(c / L for c in cuts), dtype=float)
+    explained = float(np.clip(1.0 - rss[best_m - 1] / max(rss[0], 1e-12), 0.0, 1.0))
+    return np.array(sorted(c / L for c in cuts), dtype=float), explained
 
 
 def _stepdtw_targets(shapes, medoid_row, breaks, train_curves):
@@ -7005,6 +7026,7 @@ def build_and_train_pipeline_step_dtw(
     prev_act_energy_map=None,
     max_segments=STEP_DTW_MAX_SEGMENTS,
     segment_fill=None,
+    fallback_pipeline=None,
     **_ignored_hp_kwargs,
 ):
     """
@@ -7012,6 +7034,15 @@ def build_and_train_pipeline_step_dtw(
     comment. `models` and the hyper-parameter kwargs are accepted and ignored,
     like the exemplar builders: the 2M models here are fixed (absolute-error
     gradient boosting), one per duration and one per level.
+
+    fallback_pipeline : the leaf's already-trained ml_external pipeline, or
+    None. When given, the assembled step pipeline is compared against it on
+    this builder's own held-out validation curves and the leaf is routed to the
+    fallback iff the step pipeline loses by more than STEP_DTW_FALLBACK_RATIO —
+    see that constant for why the margin is wide. Both builders receive the
+    same curve list, the same val_size and the same random_state, so their
+    train/validation partitions coincide and neither side is scored on curves
+    it fitted.
     """
     from sklearn.ensemble import HistGradientBoostingRegressor
 
@@ -7042,7 +7073,8 @@ def build_and_train_pipeline_step_dtw(
         medoid_row = 0
 
     # ── 2. Segment the medoid, 3. carry the breakpoints onto every curve ────
-    breaks = _stepdtw_segment_medoid(shapes[medoid_row], max_segments=max_segments)
+    breaks, seg_explained = _stepdtw_segment_medoid(shapes[medoid_row],
+                                                    max_segments=max_segments)
     n_segments = len(breaks) + 1
     durations, levels = _stepdtw_targets(shapes, medoid_row, breaks, train_curves)
 
@@ -7106,7 +7138,52 @@ def build_and_train_pipeline_step_dtw(
         'exog_cols':         exog_cols,
         'prev_act_energy_map': prev_act_energy_map or {},
         'model_name':        f'{n_segments} segments x GB(L1) durations+levels',
+        'segment_explained': seg_explained,
+        'fallback_active':   False,
     }
+
+    # ── Do-no-harm fallback gate — see STEP_DTW_FALLBACK_RATIO ──────────────
+    # Scored through both REAL predictors on the held-out curves, decode and
+    # floor semantics included, exactly like _attach_median_floor scores.
+    if fallback_pipeline is not None and len(vl_i) > 0:
+        _step_err, _fb_err = [], []
+        for _i in vl_i:
+            _c = train_curves[int(_i)]
+            _raw = np.asarray(_c['original_values'], dtype=float)
+            if len(_raw) < 2:
+                continue
+            try:
+                _ys = np.asarray(predict_raw_curve_step_dtw(
+                    _raw, _c['activity'], _c['attributes'], pipeline,
+                    exog_values=_c.get('exog_values', {})), dtype=float)
+                _yf = np.asarray(predict_raw_curve_exog_prev_activity(
+                    _raw, _c['activity'], _c['attributes'], fallback_pipeline,
+                    exog_values=_c.get('exog_values', {})), dtype=float)
+            except Exception:
+                _step_err, _fb_err = [], []   # unscoreable -> keep the step model
+                break
+            for _y, _acc in ((_ys, _step_err), (_yf, _fb_err)):
+                if len(_y) != len(_raw):
+                    _y = np.interp(np.linspace(0, 1, len(_raw)),
+                                   np.linspace(0, 1, len(_y)), _y)
+                _acc.append(float(np.abs(_clip_physical(_y) - _raw).mean()))
+        if _step_err and _fb_err:
+            _step_mae = float(np.mean(_step_err))
+            _fb_mae = float(np.mean(_fb_err))
+            _fired = _step_mae > STEP_DTW_FALLBACK_RATIO * _fb_mae
+            pipeline['fallback_step_mae'] = _step_mae
+            pipeline['fallback_ml_external_mae'] = _fb_mae
+            pipeline['fallback_active'] = _fired
+            if _fired:
+                # Stored only when it fires, so a leaf that keeps the step
+                # model does not drag a second full pipeline through pickling.
+                pipeline['fallback_pipeline'] = fallback_pipeline
+                pipeline['model_name'] += ' -> ml_external fallback'
+            if verbose:
+                print(f"  [ml_step_dtw] fallback gate: step val MAE={_step_mae:.4f} vs "
+                      f"ml_external {_fb_mae:.4f} (ratio {STEP_DTW_FALLBACK_RATIO}, "
+                      f"explained={seg_explained:.2f}) -> "
+                      f"{'ML_EXTERNAL FALLBACK' if _fired else 'step model kept'}")
 
     _attach_median_floor(
         pipeline, train_curves,
@@ -7130,6 +7207,13 @@ def predict_raw_curve_step_dtw(raw_values, activity, attributes, pipeline,
     _floor = _median_floor_prediction(raw_values, attributes, pipeline)
     if _floor is not None:
         return _floor
+
+    # Leaf routed to ml_external by the do-no-harm gate — the step template
+    # lost clearly on this leaf's held-out curves (see STEP_DTW_FALLBACK_RATIO).
+    if pipeline.get('fallback_active') and pipeline.get('fallback_pipeline') is not None:
+        return predict_raw_curve_exog_prev_activity(
+            raw_values, activity, attributes, pipeline['fallback_pipeline'],
+            exog_values=exog_values or {})
 
     attributes = _inject_prev_act_energy(attributes,
                                          pipeline.get('prev_act_energy_map'))
@@ -9517,8 +9601,12 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                             [dict(c) for c in _pv], variable=sensor,
                             **_common, **_hp_kwargs)
                     elif _v == 'ml_step_dtw':
+                        # The leaf's ml_external (trained above when active) is
+                        # handed in as the do-no-harm fallback; None when this
+                        # run doesn't train ml_external, which disables the gate.
                         result[_v] = build_and_train_pipeline_step_dtw(
                             [dict(c) for c in _pv], variable=sensor,
+                            fallback_pipeline=result.get('ml_external'),
                             **_common, **_hp_kwargs)
                     elif _v == 'ml_rawspace':
                         result[_v] = build_and_train_pipeline_rawspace(
