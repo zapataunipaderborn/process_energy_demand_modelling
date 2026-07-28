@@ -1,0 +1,28 @@
+% Overview table of the process_1 discrete-event simulation (process part only;
+% energy simulation to be added later). Source of the values: generate_process_1.py
+% (PROCESS_SEQUENCE, NUM_RESOURCES, PROCESS_CONFIG, AUTOCLAVE_CYCLE_BASE_MIN,
+% simulate() rework/skip probabilities).
+
+\begin{table}[width=.9\linewidth,cols=5,pos=h]
+\caption{Overview of the discrete-event simulation of \texttt{process\_1}. Base durations refer to the standard recipe and are the means of the sampled normal distributions; the autoclave phase durations follow from its sampled cycle length and fixed phase split.}
+\label{table:process1_simulation}
+\footnotesize
+\begin{tabular}{lclll}
+\toprule
+station & \makecell{parallel\\resources} & machine activities & \makecell[l]{base durations\\(min)} & \makecell[l]{volume-\\scaled} \\
+\midrule
+Water supply         & 1 & prepare, working                & 0.06, 1.2        & \checkmark \\
+Distillation         & 1 & \makecell[l]{preparation, production,\\emptying, maintenance$^{\ast}$} & 3, 25, 4, 15 & \checkmark \\
+Bottling             & 1 & prepare, working, cool          & 0.06, 0.67, 0.06 & \checkmark \\
+Autoclaving          & 3 & prepare, heat, hold, cool       & \makecell[l]{2; cycle $\approx$ 60,\\split 27/53/19\,\%} & \checkmark \\
+Individual packaging & 1 & prepare, working                & 5, 5             & \checkmark \\
+Warehousing          & 1 & prepare, working                & 5, 5             & -- \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\parbox{\linewidth}{%
+\footnotesize
+300 batches are released every 4 hours over roughly one year, each with a batch volume drawn uniformly from 200--800~L that scales the durations of the volume-scaled stations. Control-flow variability: 20\% of batches skip Individual packaging; 40\% fail the quality check at Warehousing and rework packaging and warehousing; 15\% of autoclave cycles trigger a rework of heat--hold--cool (half of them including prepare); $^{\ast}$maintenance is inserted after emptying with 1\% probability. Batches queue for the earliest free resource; the autoclave is picked by a weighted random choice favouring autoclave~2.
+}
+\end{table}

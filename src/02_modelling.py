@@ -51,7 +51,7 @@ class StreamToLogger:
 import random
 import os
 
-# Master seed for the whole run. pipeline.py exports PIPELINE_RANDOM_SEED (and
+# Master seed for the whole run. 01_pipeline.py exports PIPELINE_RANDOM_SEED (and
 # pins PYTHONHASHSEED to the same value) so a run is reproducible end to end;
 # sim_extractor.set_global_seeds covers python/numpy/torch, and every parallel
 # training task derives its own seed from this one via stable_seed().
@@ -71,8 +71,8 @@ constants.SHOW_PROGRESS_BAR = False
 
 # %%
 import pandas as pd
-from sim_extractor import extract_process, MIN_CURVE_SAMPLES
-from sim_extractor import set_global_seeds, GLOBAL_RANDOM_SEED
+from utils.sim_extractor import extract_process, MIN_CURVE_SAMPLES
+from utils.sim_extractor import set_global_seeds, GLOBAL_RANDOM_SEED
 
 # Seed python/numpy/torch from the master seed now that sim_extractor is
 # importable. Parallel training workers re-seed themselves per combo.
@@ -82,20 +82,20 @@ if GLOBAL_RANDOM_SEED != RANDOM_SEED:
           f"run uses {RANDOM_SEED} — PIPELINE_RANDOM_SEED changed after import.")
 if os.environ.get('PYTHONHASHSEED') is None:
     print("[modelling] NOTE: PYTHONHASHSEED is unset. Runs launched through "
-          "pipeline.py pin it; a direct `python modelling.py` does not, so "
+          "01_pipeline.py pin it; a direct `python 02_modelling.py` does not, so "
           "str-set iteration order may differ between runs.")
-from simulation import ProcessSimulation, simulate_with_wip_ro
-from sim_modeller import SimModeller
+from utils.simulation import ProcessSimulation, simulate_with_wip_ro
+from utils.sim_modeller import SimModeller
 
-from sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
-from sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
-from sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
-from sim_extractor import compare_complete_case_curves, build_exog_lookup
-from sim_extractor import build_sensor_activity_object_combos
-from sim_extractor import predict_raw_curve_exemplar, predict_raw_curve_exemplar_dtw
-from sim_extractor import predict_raw_curve_ml_cluster_dtw
-from sim_extractor import predict_raw_curve_step_dtw
-from sim_extractor import (
+from utils.sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
+from utils.sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
+from utils.sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
+from utils.sim_extractor import compare_complete_case_curves, build_exog_lookup
+from utils.sim_extractor import build_sensor_activity_object_combos
+from utils.sim_extractor import predict_raw_curve_exemplar, predict_raw_curve_exemplar_dtw
+from utils.sim_extractor import predict_raw_curve_ml_cluster_dtw
+from utils.sim_extractor import predict_raw_curve_step_dtw
+from utils.sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
     compare_schedule_and_stochastic_profiles,
@@ -467,7 +467,7 @@ def _mlp_train_models(df_train, expanded_df=None, ef_expanded_df=None):
     ef_windows = None
     ef_feat_cols = []
     if expanded_df is not None and not expanded_df.empty:
-        from sim_extractor import ExternalFactorWindows
+        from utils.sim_extractor import ExternalFactorWindows
         _ef_src = ef_expanded_df if (ef_expanded_df is not None
                                      and not ef_expanded_df.empty) else expanded_df
         _ef_cols = [c for c in expanded_df.columns
@@ -536,7 +536,7 @@ MODES_TO_COMPARE = [
     # Generalization/Simplicity (_combined_selection_score). Emits a
     # 'petri_net_combined' row carrying selected_mining_algorithm, so the
     # choice is recorded in the results instead of being recomputed at
-    # reporting time by results_process.ipynb.
+    # reporting time by 03_results_process.ipynb.
     'petri_net_combined',
     # 'petri_net_combined_ml_plus_global',
     # 'petri_net_combined_ml_plus_per_act',
@@ -753,7 +753,7 @@ RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', '
 # reference generator, both compared against the same real test cases used by
 # the complete-curve eval. Off by default — trains one extra model per
 # (process, sensor), on top of everything else. Does NOT affect any other
-# evaluation. See sim_extractor.py's "Schedule Profile Evaluation" section.
+# evaluation. See utils/sim_extractor.py's "Schedule Profile Evaluation" section.
 RUN_SCHEDULE_PROFILE_EVAL = os.environ.get('PIPELINE_RUN_SCHEDULE_PROFILE_EVAL', 'false').lower() == 'true'
 
 # Autoregressive test-time rollout of the prev-activity curve approaches
@@ -774,7 +774,7 @@ SAVE_PREDICTED_CURVES = os.environ.get('PIPELINE_SAVE_PREDICTED_CURVES', 'false'
 # Upper bound on worker processes for the parallel training pools. Default: one
 # per core, the historical behaviour.
 #
-# This matters more than a core count suggests. modelling.py is a SCRIPT with no
+# This matters more than a core count suggests. 02_modelling.py is a SCRIPT with no
 # `if __name__ == "__main__"` guard, and ProcessPoolExecutor uses the 'spawn'
 # start method on macOS, so every worker RE-IMPORTS this module and re-executes
 # it top to bottom — including reloading the process data. Peak memory is
@@ -1110,7 +1110,7 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
                                       output_root, approach='baseline'):
     """
     Complete-curve (per real test case) evaluation — see
-    compare_complete_case_curves in sim_extractor.py for the metric itself.
+    compare_complete_case_curves in utils/sim_extractor.py for the metric itself.
 
     Additional, standalone evaluation: does NOT touch/replace the
     energy_distribution_results metrics above. For each real test case
@@ -1185,7 +1185,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
                                 output_root, best_mode_safe=None, complete_curve_dir=None,
                                 predicted_logs_dir=None, budget_mode_safe=None):
     """
-    "Schedule Profile Evaluation" — see sim_extractor.py's Schedule Profile
+    "Schedule Profile Evaluation" — see utils/sim_extractor.py's Schedule Profile
     Evaluation section for the design. Per sensor: trains a schedule-only
     case-level predictor and a stochastic reference generator on TRAIN cases,
     evaluates both against REAL TEST cases, and (if available) merges in the
@@ -1760,7 +1760,7 @@ def _per_case_median_metrics(simulated_df, real_df,
     # logs can carry the same case_id in different dtypes (e.g. float64 vs
     # object/str for numeric-looking IDs), which silently zeroes out every
     # match under a raw-value set intersection despite full overlap. Same
-    # fix already applied in compare_complete_case_curves (sim_extractor.py)
+    # fix already applied in compare_complete_case_curves (utils/sim_extractor.py)
     # for the identical failure mode. Confirmed to actually happen: process_5
     # real case_id is float64 (10708907.0), its simulated log's is object
     # ('10708907.0') — 0/16 cases matched raw, 16/16 matched as strings.
@@ -3931,7 +3931,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             if m in _ENERGY_QUANTILE_MODES | _ENERGY_BLEND_DUR_MODES
                         ]
                         if _quantile_modes_requested:
-                            from sim_extractor import extract_energy_quantile_models
+                            from utils.sim_extractor import extract_energy_quantile_models
                             _quantile_dur_mods, _quantile_tr_mods, _quantile_energy_state_cols, _quantile_report = \
                                 extract_energy_quantile_models(
                                     df_expanded=_df_expanded_train,
@@ -3960,7 +3960,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                             m for m in _energy_modes_requested if m in _ENERGY_TEST2_MODES
                         ]
                         if _test2_modes_requested:
-                            from sim_extractor import extract_energy_test2_models
+                            from utils.sim_extractor import extract_energy_test2_models
                             _test2_dur_mods, _test2_tr_mods, _test2_energy_state_cols, _test2_report = \
                                 extract_energy_test2_models(
                                     df_expanded=_df_expanded_train,
@@ -4005,7 +4005,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         # Only run this if we actually want to evaluate on Test results
                         # as this DTW-based training is the slowest part of the pipeline.
                         if RUN_TEST_EVALUATION:
-                            from sim_extractor import (predict_raw_curve, predict_raw_curve_exog,
+                            from utils.sim_extractor import (predict_raw_curve, predict_raw_curve_exog,
                                                        _train_energy_pipeline_worker)
                             import concurrent.futures, os
 
@@ -4429,7 +4429,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     # Only the predictors are needed here: training goes through
     # _train_curve_only_worker / _train_seq2seq_worker in sim_extractor, which
     # call the build_and_train_pipeline_* functions themselves.
-    from sim_extractor import (
+    from utils.sim_extractor import (
         split_curves,
         split_curves_with_prev_activity,
         build_and_train_pipeline_median,
@@ -4465,7 +4465,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     # Curve regressors are defined once in sim_extractor._make_curve_models and
     # used there by _train_curve_only_worker; imported here only so the run log
     # records which candidates competed.
-    from sim_extractor import _make_curve_models
+    from utils.sim_extractor import _make_curve_models
     _CURVE_MODELS = _make_curve_models()
     print(f"  Curve regressors competed per (sensor, activity, object): "
           f"{', '.join(_CURVE_MODELS)}")
@@ -4564,7 +4564,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         # One worker per (sensor, activity, object) combo — each trains its own
         # barycenter and model on a homogeneous set of curves.
         # Seq2seq approaches run afterwards in their own process pool.
-        from sim_extractor import _train_curve_only_worker, build_prev_activity_energy_map
+        from utils.sim_extractor import _train_curve_only_worker, build_prev_activity_energy_map
         import concurrent.futures, os as _os
 
         # Previous-activity energy levels for 'ml_external': per (sensor, activity)
@@ -4717,7 +4717,7 @@ if RUN_CURVE_ONLY_EVALUATION:
 
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
         if _seq2seq_approaches and _combos:
-            from sim_extractor import _train_seq2seq_worker
+            from utils.sim_extractor import _train_seq2seq_worker
             _s2s_n_workers = _pool_workers(len(_combos))
             print(f"\n  Parallel seq2seq training: {len(_combos)} combos × "
                   f"{len(_seq2seq_approaches)} approaches across {_s2s_n_workers} workers...")
@@ -4883,9 +4883,9 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
     Evaluate every (process, sensor) in pipelines_dict against curves from
     df_lookup.  Returns a list of per-curve metric dicts.
     """
-    import importlib, sim_extractor as _se
+    import importlib, utils.sim_extractor as _se
     importlib.reload(_se)
-    from sim_extractor import (
+    from utils.sim_extractor import (
         evaluate_pipeline_on_test,
         split_curves,
         split_curves_with_prev_activity,
@@ -5021,9 +5021,9 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
       • If an intermediate activity has no trained pipeline (or its curve is
         too short), the next activity is treated as first-of-case (prev reset).
     """
-    import importlib, sim_extractor as _se
+    import importlib, utils.sim_extractor as _se
     importlib.reload(_se)
-    from sim_extractor import _dispatch_predict
+    from utils.sim_extractor import _dispatch_predict
     from sklearn.metrics import mean_squared_error, mean_absolute_error
 
     records = []
@@ -5317,9 +5317,9 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
 
 
 if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_pipelines:
-    import importlib, sim_extractor as _se
+    import importlib, utils.sim_extractor as _se
     importlib.reload(_se)
-    from sim_extractor import evaluate_pipeline_on_test, split_curves, split_curves_with_prev_activity
+    from utils.sim_extractor import evaluate_pipeline_on_test, split_curves, split_curves_with_prev_activity
 
     display(Markdown("---"))
     display(Markdown("# Curve-Only Evaluation — Baseline vs Approach 2 (B-spline) vs Approach 3 (DTW-phase)"))
@@ -5817,9 +5817,9 @@ elif RUN_CURVE_ONLY_EVALUATION:
 
 # %%
 # ── STANDALONE PROFILE EVALUATION (TRAIN & TEST) ──────────────────────────────
-import importlib, sim_extractor as _se
+import importlib, utils.sim_extractor as _se
 importlib.reload(_se)
-from sim_extractor import evaluate_pipeline_on_test, split_curves
+from utils.sim_extractor import evaluate_pipeline_on_test, split_curves
 profile_summary_records = []
 
 if 'process_datasets_to_model_sensors' in dir():
@@ -6230,9 +6230,9 @@ if _jdur_ready:
     def _run_curve_eval_joint_duration(pipelines_dict, approach_label,
                                        df_lookup, act_map, obj_map,
                                        dur_override, best_modes):
-        import importlib, sim_extractor as _se
+        import importlib, utils.sim_extractor as _se
         importlib.reload(_se)
-        from sim_extractor import (split_curves, split_curves_with_prev_activity,
+        from utils.sim_extractor import (split_curves, split_curves_with_prev_activity,
                                    evaluate_pipeline_joint_duration)
         records = []
         for _proc, _sensors in pipelines_dict.items():
@@ -6836,7 +6836,7 @@ else:
 
     # ── info.json ─────────────────────────────────────────────────────────────
     import json as _json
-    import sim_extractor as _sx
+    import utils.sim_extractor as _sx
     _info = {
         'run_name': _run_name,
         'run_timestamp': _run_ts,

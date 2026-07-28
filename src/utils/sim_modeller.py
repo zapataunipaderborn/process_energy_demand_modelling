@@ -1,5 +1,5 @@
 """
-sim_modeller.py
+utils/sim_modeller.py
 ===============
 Trains regression / classification models that power the 'ml' simulation mode.
 
@@ -326,7 +326,7 @@ class SimModeller:
         self.waiting_std_models:  dict = {}   # key -> (model, feature_cols, model_type)
         # key -> sane upper bound (minutes) for predict_waiting_time, derived
         # from the 99.9th percentile of that key's own observed waiting_time
-        # samples -- same rationale as _activity_duration_cap in simulation.py:
+        # samples -- same rationale as _activity_duration_cap in utils/simulation.py:
         # a WIP/RO combination outside the training range can push a tree
         # regressor to extrapolate to an unbounded leaf value, and unlike
         # duration this had no cap at all, so a single degenerate key could
