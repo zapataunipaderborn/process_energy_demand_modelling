@@ -5407,6 +5407,29 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
 
     _all_records = []
 
+    # Crash-safe checkpointing: each approach's rows land on disk the moment
+    # its eval finishes, as one shard per (split, approach), so a failure in a
+    # later approach or stage cannot lose the finished ones (experiment_986
+    # lost 7 hours to exactly that — a hang after training left NOTHING on
+    # disk). The final curve_eval_results.parquet is still written as before
+    # and supersedes these; the shards are raw per-curve records (y_true still
+    # on every row — the dedup into real_test_curves.parquet happens only in
+    # the final export) meant for salvage, not for the notebooks.
+    _curve_ckpt_dir = os.path.join(_run_dir, 'curve_eval_checkpoints')
+    def _ckpt_curve_eval(_recs_c, _split_c, _label_c):
+        if not _recs_c:
+            return
+        try:
+            os.makedirs(_curve_ckpt_dir, exist_ok=True)
+            _safe_c = ''.join(ch if ch.isalnum() else '_' for ch in _label_c).strip('_')
+            _fp_c = os.path.join(_curve_ckpt_dir, f'{_split_c}_{_safe_c}.parquet')
+            pd.DataFrame(_recs_c).to_parquet(_fp_c, index=False)
+            print(f"  💾 Checkpoint: {len(_recs_c)} rows → curve_eval_checkpoints/"
+                  f"{os.path.basename(_fp_c)}")
+        except Exception as _ck_exc:
+            # A checkpoint must never take down the run it exists to protect.
+            print(f"  [WARN] curve-eval checkpoint failed for {_split_c}/{_label_c}: {_ck_exc}")
+
     # ── Evaluate both approaches on TRAIN and TEST ───────────────────────────
     for _split_label, _df_src in [('TRAIN', train_datasets),
                                    ('TEST',  test_datasets if TEMPORAL_SPLIT else train_datasets)]:
@@ -5443,6 +5466,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 save_dir=None,
             )
             _all_records.extend(_recs)
+            _ckpt_curve_eval(_recs, _split_label, _approach_label)
 
         # ── Autoregressive rollout for ml_external ───────────────────
         if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_ml_external:
@@ -5455,6 +5479,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 save_dir=None,
             )
             _all_records.extend(_ar_recs)
+            _ckpt_curve_eval(_ar_recs, _split_label, 'ml_external_autoreg')
 
         # ── Autoregressive rollout for seq2seq_external ─────────────────
         if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_seq2seq_external:
@@ -5467,6 +5492,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                 save_dir=None,
             )
             _all_records.extend(_ar_s2s_recs)
+            _ckpt_curve_eval(_ar_s2s_recs, _split_label, 'seq2seq_external_autoreg')
 
     # ── Side-by-side comparison table ───────────────────────────────────────
     if not _all_records:

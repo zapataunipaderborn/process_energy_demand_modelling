@@ -200,12 +200,12 @@ EXPERIMENTS = [
     # Evaluation ON so the complete-profile heatmaps come out of this run too.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_986',
+        'run_name':              'experiment_988',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha'],
+        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],
         'run_energy_modelling':  True,
         'run_joint_duration_eval':  True,   # ON: full per-instance-matched
                                             # complete-profile evaluation (slow)
@@ -232,18 +232,27 @@ EXPERIMENTS = [
                                         # baseline ml_step_dtw has to beat; LSTM and
                                         # transformer cells compete per leaf (see
                                         # 'seq2seq_cells' to pin one)
-            'seq2seq_iom',              # the competing paper run THEIR way: vanilla
-                                        # targets + IOM selection against a softDTW
-                                        # reference. Reports "beats the paper as
-                                        # published" rather than "beats its
-                                        # architecture"; trains the full epoch budget
-                                        # (no early stopping — that is the rule IOM
-                                        # replaces).
+            #'seq2seq_iom',              # OFF after experiment_986: the seq2seq worker
+                                        # pool deadlocked on fork (7h, all workers in
+                                        # futex_wait). The CUDA-hiding env fix below is
+                                        # in place but unvalidated — run the seq2seq
+                                        # family in a separate dedicated run first, so
+                                        # a repeat cannot take the main table with it.
+                                        # (Was: the competing paper run THEIR way —
+                                        # vanilla targets + IOM selection against a
+                                        # softDTW reference, full epoch budget.)
             'ml_step_dtw',              # segment durations+levels via DTW
                                         # correspondence, reconstruction instead of decode
             'exemplar',                 # the realism reference (real replayed curve)
         ],
-        'curve_optimize_hyperparams': False,
+        'curve_optimize_hyperparams': True,   # Optuna search per (sensor, activity,
+                                              # object) — publication-grade fits
+        'curve_n_optuna_trials': 10,          # 10 trials like the previous full
+                                              # reportable runs; the default 50 is a
+                                              # ~5x multiplier on the whole ml_external
+                                              # training stage for marginal gains.
+                                              # Note: ml_step_dtw/exemplar have fixed
+                                              # models and ignore the search entirely.
         'complete_curve_approaches': ['ml_step_dtw'],  # complete-profile coupling for the
                                          # new method ONLY — every approach still gets the
                                          # Curve-Only Evaluation, but only ml_step_dtw is
@@ -520,6 +529,17 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
+    # ── CPU-only, fork-safe child ────────────────────────────────────────────
+    # Hide the GPUs from the modelling child BEFORE torch is ever imported.
+    # Everything in the run is CPU-only by design, but a parent that has merely
+    # probed CUDA (set_global_seeds' torch.cuda.is_available at startup) forks
+    # poisoned children: experiment_986 lost 7 hours with all 16 seq2seq
+    # workers and the parent stuck in futex_wait at 4s CPU each — the
+    # in-worker guards (_train_seq2seq_worker) run only AFTER the fork, which
+    # is too late for locks inherited FROM the fork. With no visible GPU the
+    # parent never initialises CUDA and there is nothing to inherit.
+    env['CUDA_VISIBLE_DEVICES']           = ''
+    env['PYTORCH_NVML_BASED_CUDA_CHECK']  = '1'
     # ── Reproducibility ──────────────────────────────────────────────────────
     # One master seed for the child run: 02_modelling.py seeds python/numpy/torch
     # from it and derives every per-combo training seed from it.
