@@ -200,7 +200,7 @@ EXPERIMENTS = [
     # Evaluation ON so the complete-profile heatmaps come out of this run too.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_988',
+        'run_name':              'experiment_989',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
@@ -253,12 +253,23 @@ EXPERIMENTS = [
                                               # training stage for marginal gains.
                                               # Note: ml_step_dtw/exemplar have fixed
                                               # models and ignore the search entirely.
-        'complete_curve_approaches': ['ml_step_dtw'],  # complete-profile coupling for the
-                                         # new method ONLY — every approach still gets the
-                                         # Curve-Only Evaluation, but only ml_step_dtw is
+        'complete_curve_approaches': ['ml_step_dtw', 'baseline'],
+                                         # complete-profile coupling for the new method
+                                         # PLUS the naive floor — every approach still gets
+                                         # the Curve-Only Evaluation, but only these two are
                                          # assembled into complete case profiles per mode,
-                                         # cutting the simulation-eval stage to 1/N.
+                                         # cutting the simulation-eval stage to 2/N.
                                          # Comment this line out to evaluate all of them.
+                                         # 'baseline' is what the complete-profile notebook
+                                         # (05) reports as its Baseline row: the same
+                                         # simulated process with ONE median curve per
+                                         # sensor, so the Baseline-vs-ml_step_dtw gap is
+                                         # attributable to the curve generator alone. The
+                                         # 988 run of 2026-07-28 listed ml_step_dtw only,
+                                         # which is why that row came out empty ('--').
+                                         # It costs one more pass of
+                                         # (process × mode) inference over every simulated
+                                         # case (~1.5-2h at this run's size).
                                          # 'Best, mine' in the schedule-profile eval then
                                          # sources ml_step_dtw instead of ml_external.
         'curve_median_floor':    False,  # must stay OFF: the floor accepts on
@@ -266,6 +277,57 @@ EXPERIMENTS = [
                                          # realism gain this approach exists for
         'save_curve_values':     True,   # keep y_true/y_pred so the realism
                                          # metrics can be recomputed offline
+    },
+
+    # ── Dedicated seq2seq_iom run — the isolation the 988 comment asks for ────
+    # experiment_986 lost 7 hours to the fork deadlock (all 16 seq2seq workers in
+    # futex_wait) and the CUDA-hiding env fix in the runner below has never been
+    # exercised. This run exists to exercise it on the cheapest configuration that
+    # still produces the literature baseline's numbers, and it is deliberately
+    # SEPARATE so a repeat of that hang cannot take the reportable table with it.
+    #
+    # Curve-Only Evaluation exclusively: no mining, no simulation, no
+    # complete-profile or schedule-profile stage — those need neither seq2seq_iom
+    # nor each other, and every one of them is a multiple of the curve stage.
+    # Same data_experiment / processes / train_ratio / split_type / random_seed as
+    # 988, so the train/test partition is bit-identical and the resulting
+    # curve-only rows drop straight into 988's comparison table.
+    #
+    # NOTE on 'curve_optimize_hyperparams': Optuna only ever touches the sklearn
+    # curve workers — seq2seq trains from the SEQ2SEQ_* module constants in
+    # 02_modelling.py (hidden 128, 2 layers, 80 epochs, patience 10), which no
+    # pipeline key overrides. The flag is set False anyway so the run stays
+    # tuning-free if an sklearn approach is ever added to the list.
+    #
+    # To run ONLY this one, comment out the experiment_988 block above —
+    # EXPERIMENTS runs top to bottom and 988 is a ~13h job.
+    {
+        'data_experiment':       '1',
+        'run_name':              'experiment_989_seq2seq_iom',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3',
+                                  'process_4_1', 'process_4_2', 'process_5'],
+        'temporal_resolution':   '1min',
+        'run_process_modelling': False,  # curve comparison only — no mining, no simulation
+        'run_energy_modelling':  True,
+        'run_joint_duration_eval':    False,
+        'run_schedule_profile_eval':  False,  # needs a complete-curve approach; not this run's job
+        'run_autoregressive_eval':    False,
+        'save_predicted_curves': False,  # nothing downstream of the curve eval to persist for
+        'train_ratio':           0.70,
+        'split_type':            'temporal',
+        'random_seed':           42,     # identical split to 988 — the rows are comparable
+        'curve_approaches':      ['seq2seq_iom'],   # the competing paper run THEIR way:
+                                         # vanilla targets, model SELECTED every 10 epochs by
+                                         # generating whole curves and scoring them against a
+                                         # softDTW barycenter (MSE + sigma length)
+        'seq2seq_cells':         ['lstm'],   # Woerrlein & Strassburger's own cell, and it
+                                             # halves the cost. Drop this line to let the
+                                             # transformer compete per leaf as in 988.
+        'curve_optimize_hyperparams': False,  # see the NOTE above — no-op for seq2seq today
+        'save_curve_values':     True,   # keep y_true/y_pred so the realism metrics can be
+                                         # recomputed offline without re-running
+        'curve_median_floor':    False,  # same reason as 988: the floor accepts on POINTWISE
+                                         # error and would overwrite the texture being measured
     },
 
     # ── Previous full run (kept for reference; uncomment to re-run) ───────────
