@@ -186,60 +186,139 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── experiment_996: canonical smooth run (global-warp reconstruction) ─────
-    # Clean rerun after the 995 detour. 995 (DEAD END — do not cite) swapped the
-    # smooth variant's global medoid warp for per-segment resampling +
-    # interpolated gains; it RE-TERRACED the simulated heat declines (tread
-    # pairs + ~1050 kW cliffs vs the warp's steady ~500 kW/min; near-flat-frac
-    # 0.50 vs 0.35) because the leaf medoid is too coarse for any per-segment
-    # replay once instances run longer than it. The warp also costs nothing on
-    # levels (steam Wasserstein value median 73.3 warp vs 74.6 per-segment).
-    # sim_extractor was reverted to the warp, so this run should reproduce
-    # 994's outputs (same data/split/seed/code path).
+    # ── experiment_998: the full comparison table, tuned ──────────────────────
+    # Everything that belongs in the reportable curve table, in ONE eval pass, on
+    # the schedule-coupled process_1 data (994/997 generation):
+    #   two naive floors      — 'baseline' (ONE median per sensor, pooled over
+    #                           activities) and 'median_activity_sensor' (the
+    #                           per-leaf median: sensor x activity x object)
+    #   the pointwise incumbent — 'ml_external', which is also the direct ablation
+    #                           of the method: same curves, same features, but a
+    #                           per-position target instead of segment structure,
+    #                           so the gap is attributable to the reparameterisation
+    #   the no-DTW ablation    — 'ml_only' (linear resample encode/decode, no DBA,
+    #                           no DTW anywhere): prices what DTW is worth on its own
+    #   the method             — 'ml_step_dtw' and 'ml_step_dtw_smooth', the same
+    #                           trained model with constant vs interpolated segment
+    #                           gains at reconstruction. 994 put them at sMAE
+    #                           0.941/0.925 and roughness 0.93x/0.74x, i.e. NOT a
+    #                           ranked pair — they are two points on the pointwise-
+    #                           vs-texture trade-off and both belong in the table
+    #   the realism reference  — 'exemplar' (a real curve replayed)
     #
-    # (994 context:) first run on the process_1 data regenerated
-    # 2026-07-29 with the holding duty tied to the schedule. Two generator
-    # changes measured there, both in simulation_process/:
-    #   * hold level: sterilization_profile now takes a `hold_duty_factor`, and
-    #     generate_process_1 derives it from how long that autoclave sat idle since
-    #     its own previous cycle (1 - 0.35*exp(-idle_min/480)). A vessel that starts
-    #     straight after the last batch is still hot and loses less. The gap is
-    #     written to every event as object_attributes['idle_min'], so it is IN the
-    #     feature frame — the holding level went from 0% explainable (pure A_U
-    #     nuisance) to R^2 0.74-0.81 against that driver.
-    #   * duration: AUTOCLAVE_CYCLE_VARIABILITY 0.15 -> 0.07 and LOAD_FIXED_FRAC
-    #     0.30 -> 0.20, lifting R^2(volume -> cycle duration) from 0.60 to 0.93.
-    # NOT weather: WEATHER_ENERGY_COUPLING stays False, so the ef_* columns still
-    # carry no signal for this process.
-    # Hold energy is ~18 kW here against ~22 kW in 993 — nominal A_U is now the
-    # COLD-vessel case — so the hold rows are not level-comparable with 993/991.
-    # Same scope, split and seed as 993 so everything else is.
+    # Optuna ON (10 trials, not the default 50 — the 989 note prices 50 as a ~5x
+    # multiplier on the whole sklearn stage for marginal gains). It only touches the
+    # SKLEARN workers, so it costs on 'ml_external' and 'ml_only' and is a no-op for
+    # baseline / median / exemplar / both step variants, which have fixed models.
+    #
+    # 'seq2seq' / 'seq2seq_iom' stay OUT: the literature row is still the honest gap
+    # in the comparison, but 986 deadlocked the worker pool for 7h and the CUDA-hiding
+    # fix has never been validated. Run the seq2seq family in its own dedicated run
+    # first — a repeat must not take this table down with it.
+    #
+    # Three miners so notebooks 03 and 05 get their Alpha and Combined-best rows
+    # instead of the '--' they showed for the heuristic-only runs.
+    #
+    # RUNTIME: expect hours, not the ~25 min of 994 — seven approaches, three miners
+    # and a tuning search, against 994's three untuned approaches and one miner.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_997',
-        'processes_to_run':      ['process_1'],
+        'run_name':              'experiment_998',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3',
+                                  'process_4_1', 'process_4_2', 'process_5'],
+                                         # all six: process_1 is the schedule-coupled
+                                         # synthetic one, 2-5 are the real plant data —
+                                         # the argument has to hold on both
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic'],
+        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],
         'run_energy_modelling':  True,
-        'run_joint_duration_eval':   False,
+        'run_joint_duration_eval':   False,  # slow per-instance heatmaps — superseded by
+                                             # energy_distribution_results
         'run_schedule_profile_eval': True,   # notebooks 05 and 07 read
                                              # schedule_profile_eval_results/<proc>/predicted_curves.parquet
         'run_autoregressive_eval':   False,
         'save_predicted_curves': True,
         'train_ratio':           0.70,
         'split_type':            'temporal',
-        'random_seed':           42,
+        'random_seed':           42,     # bit-identical split to 993/994/997
         'curve_approaches': [
-            #'baseline',
-            #'ml_step_dtw',
+            'baseline',
+            'median_activity_sensor',
+            'ml_external',
+            'ml_only',
+            'ml_step_dtw',
             'ml_step_dtw_smooth',
+            'exemplar',
         ],
-        'curve_optimize_hyperparams': False,
-        'complete_curve_approaches': ['ml_step_dtw'],#, 'ml_step_dtw_smooth', 'baseline'],
-        'curve_median_floor':    False,
-        'save_curve_values':     True,
+        'curve_optimize_hyperparams': True,
+        'curve_n_optuna_trials': 10,
+        # Complete profiles for the method (both variants) plus the naive floor that
+        # notebook 05 reports as its Baseline row. ml_external is deliberately NOT
+        # here: the schedule-profile comparator PREFERS 'ml_external' whenever it is
+        # listed, which would quietly rebuild the Schedule-direct / Profile-generator
+        # rows and 07's "Best, mine" series on the incumbent instead of the method.
+        # Its curve-only rows are unaffected — every trained approach is scored there.
+        'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline'],
+        'curve_median_floor':    False,  # must stay OFF (see 989's note)
+        'save_curve_values':     True,   # keep y_true/y_pred for offline realism metrics
     },
+
+    # ── experiment_997 (superseded by 998) ────────────────────────────────────
+    # # ── experiment_996: canonical smooth run (global-warp reconstruction) ─────
+    # # Clean rerun after the 995 detour. 995 (DEAD END — do not cite) swapped the
+    # # smooth variant's global medoid warp for per-segment resampling +
+    # # interpolated gains; it RE-TERRACED the simulated heat declines (tread
+    # # pairs + ~1050 kW cliffs vs the warp's steady ~500 kW/min; near-flat-frac
+    # # 0.50 vs 0.35) because the leaf medoid is too coarse for any per-segment
+    # # replay once instances run longer than it. The warp also costs nothing on
+    # # levels (steam Wasserstein value median 73.3 warp vs 74.6 per-segment).
+    # # sim_extractor was reverted to the warp, so this run should reproduce
+    # # 994's outputs (same data/split/seed/code path).
+    # #
+    # # (994 context:) first run on the process_1 data regenerated
+    # # 2026-07-29 with the holding duty tied to the schedule. Two generator
+    # # changes measured there, both in simulation_process/:
+    # #   * hold level: sterilization_profile now takes a `hold_duty_factor`, and
+    # #     generate_process_1 derives it from how long that autoclave sat idle since
+    # #     its own previous cycle (1 - 0.35*exp(-idle_min/480)). A vessel that starts
+    # #     straight after the last batch is still hot and loses less. The gap is
+    # #     written to every event as object_attributes['idle_min'], so it is IN the
+    # #     feature frame — the holding level went from 0% explainable (pure A_U
+    # #     nuisance) to R^2 0.74-0.81 against that driver.
+    # #   * duration: AUTOCLAVE_CYCLE_VARIABILITY 0.15 -> 0.07 and LOAD_FIXED_FRAC
+    # #     0.30 -> 0.20, lifting R^2(volume -> cycle duration) from 0.60 to 0.93.
+    # # NOT weather: WEATHER_ENERGY_COUPLING stays False, so the ef_* columns still
+    # # carry no signal for this process.
+    # # Hold energy is ~18 kW here against ~22 kW in 993 — nominal A_U is now the
+    # # COLD-vessel case — so the hold rows are not level-comparable with 993/991.
+    # # Same scope, split and seed as 993 so everything else is.
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_997',
+    #     'processes_to_run':      ['process_1'],
+    #     'temporal_resolution':   '1min',
+    #     'run_process_modelling': True,
+    #     'mining_algorithms':     ['heuristic'],
+    #     'run_energy_modelling':  True,
+    #     'run_joint_duration_eval':   False,
+    #     'run_schedule_profile_eval': True,   # notebooks 05 and 07 read
+    #                                          # schedule_profile_eval_results/<proc>/predicted_curves.parquet
+    #     'run_autoregressive_eval':   False,
+    #     'save_predicted_curves': True,
+    #     'train_ratio':           0.70,
+    #     'split_type':            'temporal',
+    #     'random_seed':           42,
+    #     'curve_approaches': [
+    #         #'baseline',
+    #         #'ml_step_dtw',
+    #         'ml_step_dtw_smooth',
+    #     ],
+    #     'curve_optimize_hyperparams': False,
+    #     'complete_curve_approaches': ['ml_step_dtw'],#, 'ml_step_dtw_smooth', 'baseline'],
+    #     'curve_median_floor':    False,
+    #     'save_curve_values':     True,
+    # },
 
     # ── experiment_993 (superseded by 994 — same config, pre-schedule-coupling data)
     # # ── experiment_991: process_1-only check of the step-DTW fixes ────────────
