@@ -6888,6 +6888,17 @@ def predict_raw_curve_ml_cluster_dtw(raw_values, activity, attributes, pipeline,
 # (q99 sMAE 51.7 vs ml_external's 45.3; a wrong route lands on a model fitted to
 # a different profile). Here every instance flows through the same segment
 # models, so the worst failure is a mis-sized segment — local and bounded.
+#
+# 'ml_step_dtw_smooth' (gain_mode='smooth') is the SAME pipeline with one change
+# in reconstruction: the medoid fill is continuous across segment boundaries by
+# construction (consecutive segments read contiguous medoid samples), so the
+# only jump the step output has is the per-segment gain lv[m]/mu applied
+# piecewise-CONSTANT. The smooth variant evaluates those gains at segment
+# midpoints and interpolates them linearly across the curve instead, so a
+# breakpoint that lands inside a ramp (experiment_992's simulated steam
+# declines) no longer terraces it. Deliberately a separate approach name, not a
+# flag on ml_step_dtw: the step texture is part of what earned 984's realism
+# ratios, so the two must land side by side in every results table.
 
 STEP_DTW_MAX_SEGMENTS = 8
 
@@ -7026,6 +7037,7 @@ def build_and_train_pipeline_step_dtw(
     prev_act_energy_map=None,
     max_segments=STEP_DTW_MAX_SEGMENTS,
     segment_fill=None,
+    gain_mode=None,
     fallback_pipeline=None,
     **_ignored_hp_kwargs,
 ):
@@ -7034,6 +7046,13 @@ def build_and_train_pipeline_step_dtw(
     comment. `models` and the hyper-parameter kwargs are accepted and ignored,
     like the exemplar builders: the 2M models here are fixed (absolute-error
     gradient boosting), one per duration and one per level.
+
+    gain_mode : 'step' (default) applies each segment's level gain piecewise-
+    constant — sharp edges, the original ml_step_dtw; 'smooth' interpolates the
+    gains between segment midpoints, which removes the boundary jumps and is
+    published under the approach name 'ml_step_dtw_smooth'. Training, targets
+    and models are identical; only reconstruction differs, and the fallback
+    gate below scores whichever reconstruction this pipeline will actually use.
 
     fallback_pipeline : the leaf's already-trained ml_external pipeline, or
     None. When given, the assembled step pipeline is compared against it on
@@ -7116,13 +7135,16 @@ def build_and_train_pipeline_step_dtw(
                        if n_segments > 1 else [None] * n_segments)
     level_models = _fit_bank(levels, const_levels)
 
+    _gain = (gain_mode or 'step').strip().lower()
+    _tag = 'ml_step_dtw_smooth' if _gain == 'smooth' else 'ml_step_dtw'
+
     if verbose:
-        print(f"  [ml_step_dtw] {n} curves -> {n_segments} segment(s); "
+        print(f"  [{_tag}] {n} curves -> {n_segments} segment(s); "
               f"duration models kept {sum(m is not None for m in duration_models)}/{n_segments}, "
               f"level models kept {sum(m is not None for m in level_models)}/{n_segments}")
 
     pipeline = {
-        'approach':          'ml_step_dtw',
+        'approach':          _tag,
         'reference_curve':   _median_floor_reference(train_curves, fixed_length),
         'fixed_length':      fixed_length,
         'medoid_values':     np.asarray(train_curves[medoid_row]['original_values'],
@@ -7134,6 +7156,7 @@ def build_and_train_pipeline_step_dtw(
         'duration_models':   duration_models,
         'level_models':      level_models,
         'segment_fill':      (segment_fill or STEP_DTW_SEGMENT_FILL),
+        'gain_mode':         _gain,
         'feature_columns':   feature_columns,
         'exog_cols':         exog_cols,
         'prev_act_energy_map': prev_act_energy_map or {},
@@ -7180,7 +7203,7 @@ def build_and_train_pipeline_step_dtw(
                 pipeline['fallback_pipeline'] = fallback_pipeline
                 pipeline['model_name'] += ' -> ml_external fallback'
             if verbose:
-                print(f"  [ml_step_dtw] fallback gate: step val MAE={_step_mae:.4f} vs "
+                print(f"  [{_tag}] fallback gate: step val MAE={_step_mae:.4f} vs "
                       f"ml_external {_fb_mae:.4f} (ratio {STEP_DTW_FALLBACK_RATIO}, "
                       f"explained={seg_explained:.2f}) -> "
                       f"{'ML_EXTERNAL FALLBACK' if _fired else 'step model kept'}")
@@ -7191,7 +7214,7 @@ def build_and_train_pipeline_step_dtw(
         lambda rv, c: predict_raw_curve_step_dtw(
             rv, c['activity'], c['attributes'], pipeline,
             exog_values=c.get('exog_values', {})),
-        label=f' {variable} (ml_step_dtw)', verbose=verbose,
+        label=f' {variable} ({_tag})', verbose=verbose,
     )
     return pipeline
 
@@ -7259,6 +7282,51 @@ def predict_raw_curve_step_dtw(raw_values, activity, attributes, pipeline,
                                 [1.0]])
     Lm = len(med)
     fill = pipeline.get('segment_fill', 'medoid')
+
+    # gain_mode='smooth' (ml_step_dtw_smooth): two continuity repairs over the
+    # step fill, and BOTH are needed (experiment_993's simulated heat declines
+    # stayed terraced with the gain repair alone; a 995 attempt at per-segment
+    # resampling with smoothed gains re-terraced them — the medoid is too coarse
+    # for ANY per-segment replay when instances run longer than it):
+    #   1. the medoid is read through ONE piecewise-linear time warp (output
+    #      edge fracs -> medoid edge fracs) and interpolated continuously over
+    #      the whole curve. Per-segment resampling — the step fill — breaks
+    #      down at this data's granularity: a decline segment holds only 1-2
+    #      medoid samples, so stretching it renders a flat tread while the
+    #      medoid's real per-sample decline lands as a cliff at the boundary;
+    #   2. the per-segment level gains are evaluated at segment midpoints and
+    #      interpolated linearly (flat beyond the first/last midpoint —
+    #      np.interp's clamping) instead of applied piecewise-constant.
+    # Slope kinks at the warp knots remain on purpose: they are the predicted
+    # durations doing their job, not reconstruction artifacts. Real steps in
+    # the medoid survive (steep but continuous); only the fill's jumps go.
+    # Levels are safe: 994 (warp) vs 995 (per-segment) steam Wasserstein value
+    # medians were 73.3 vs 74.6 — the warp is not trading level accuracy.
+    if pipeline.get('gain_mode', 'step') == 'smooth':
+        if fill == 'medoid' and Lm >= 2:
+            xs = np.asarray(edges, dtype=float) / n
+            ys = med_edges
+            # Collapse zero-length output segments: their medoid chunk is
+            # dropped from the warp, same as the step fill's skip.
+            _keep = np.r_[xs[1:] != xs[:-1], True]
+            pos = np.interp((np.arange(n) + 0.5) / n, xs[_keep], ys[_keep])
+            base = np.interp(pos, np.linspace(0.0, 1.0, Lm), med)
+        else:
+            # Flat fill (or a degenerate medoid): base 1, so the interpolated
+            # gains below ARE the curve — a polyline through the step levels.
+            base = np.ones(n, dtype=float)
+        mids, gains = [], []
+        for m in range(n_segments):
+            a, b = int(edges[m]), int(edges[m + 1])
+            if b <= a:
+                continue
+            mu = float(np.mean(base[a:b]))
+            if abs(mu) > 1e-12:
+                mids.append((a + b - 1) / 2.0)
+                gains.append(lv[m] / mu)
+        if not mids:
+            return base
+        return base * np.interp(np.arange(n, dtype=float), mids, gains)
 
     y = np.empty(n, dtype=float)
     for m in range(n_segments):
@@ -9369,7 +9437,9 @@ def _dispatch_predict(raw_values, curve, pipeline):
     if approach == 'ml_cluster_dtw':
         return predict_raw_curve_ml_cluster_dtw(raw_values, act, attrs, pipeline,
                                                 exog_values=curve.get('exog_values', {}))
-    if approach == 'ml_step_dtw':
+    if approach in ('ml_step_dtw', 'ml_step_dtw_smooth'):
+        # Same predictor: the pipeline's stored gain_mode decides whether the
+        # per-segment gains are applied piecewise-constant or interpolated.
         return predict_raw_curve_step_dtw(raw_values, act, attrs, pipeline,
                                           exog_values=curve.get('exog_values', {}))
     if approach == 'seq2seq':
@@ -9479,7 +9549,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     # per-combo median under 'median_activity_sensor'.
     _SKLEARN_APPROACHES = {'median_activity_sensor', 'ml_dtw', 'ml_external', 'ml_only',
                            'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
-                           'ml_step_dtw',
+                           'ml_step_dtw', 'ml_step_dtw_smooth',
                            # train/eval-gap variants — see the block below
                            'ml_external_wcounts', 'ml_external_wmetric',
                            'ml_external_calib', 'ml_rawspace'}
@@ -9589,7 +9659,11 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                      # Same reasoning: identical curve set and features, so the
                      # gap to ml_external is attributable to the segment-target
                      # reparameterisation alone.
-                     'ml_step_dtw')
+                     'ml_step_dtw',
+                     # Identical training to ml_step_dtw; only the reconstruction
+                     # differs (interpolated gains), so the gap between the two
+                     # prices the smoothing alone.
+                     'ml_step_dtw_smooth')
     if any(v in _active for v in _GAP_VARIANTS):
         _pv, _ = split_curves_with_prev_activity(
             df_train, variable=sensor, activities=[activity], objects=[obj],
@@ -9608,12 +9682,14 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                         result[_v] = build_and_train_pipeline_ml_cluster_dtw(
                             [dict(c) for c in _pv], variable=sensor,
                             **_common, **_hp_kwargs)
-                    elif _v == 'ml_step_dtw':
+                    elif _v in ('ml_step_dtw', 'ml_step_dtw_smooth'):
                         # The leaf's ml_external (trained above when active) is
                         # handed in as the do-no-harm fallback; None when this
                         # run doesn't train ml_external, which disables the gate.
                         result[_v] = build_and_train_pipeline_step_dtw(
                             [dict(c) for c in _pv], variable=sensor,
+                            gain_mode=('smooth' if _v == 'ml_step_dtw_smooth'
+                                       else 'step'),
                             fallback_pipeline=result.get('ml_external'),
                             **_common, **_hp_kwargs)
                     elif _v == 'ml_rawspace':
@@ -10301,6 +10377,64 @@ def predict_curve_for_instance(activity, object_name, duration_minutes,
     raise last_exc
 
 
+def _inject_schedule_idle_min(simulated_df, case_col='case_id',
+                              activity_col='activity', object_col='object',
+                              resource_col='resource_id'):
+    """Recompute `idle_min` from the SIMULATED schedule and write it into each row's
+    object_attributes.
+
+    The generator stamps one idle_min per autoclave cycle / station visit — how long
+    that resource stood idle before it — and the holding duty keys off it, so the
+    level models are trained on it. A simulated log, though, inherits
+    object_attributes from the production plan, which carries only the case's FIRST
+    value: every simulated event of every case then arrives with the same number (the
+    batch-stagger gap), and the feature has no variance left to predict from.
+
+    Rebuilt here from the timestamps the simulation itself produced, exactly as
+    prev_act_name / prev_act_duration_min are: per resource, the gap between a visit's
+    start and the previous visit's end, held constant across that visit's events. A
+    visit starts when the case changes or the activity is a 'prepare' — the same two
+    boundaries the generator uses, since a rework restarts at 'prepare' within one case.
+
+    A run whose training data has no idle_min is unaffected: the extra key is dropped
+    when the feature frame is reindexed onto the training layout.
+    """
+    if simulated_df.empty or 'object_attributes' not in simulated_df.columns:
+        return simulated_df
+    # Which column names the RESOURCE. A simulated log carries the process-level
+    # object ('sterilization_process') in `object` and the actual machine in
+    # `resource_id`; a real log names the machine in `object` and has no
+    # resource_id. Grouping by the wrong one puts every case on one resource and
+    # every gap collapses to zero.
+    res_col = (resource_col
+               if resource_col in simulated_df.columns
+               and simulated_df[resource_col].nunique(dropna=True) > 1
+               else object_col)
+    if res_col not in simulated_df.columns:
+        return simulated_df
+    df = simulated_df.copy()
+    idle = np.zeros(len(df), dtype=float)
+    pos = {ix: k for k, ix in enumerate(df.index)}
+    origin = df['timestamp_start'].min()
+    for _, g in df.groupby(df[res_col], sort=False):
+        g = g.sort_values('timestamp_start')
+        prev_end, prev_case, gap = None, None, 0.0
+        for ix, r in g.iterrows():
+            if (prev_case is None or r[case_col] != prev_case
+                    or str(r[activity_col]).endswith('prepare')):
+                ref = prev_end if prev_end is not None else origin
+                gap = max(0.0, (r['timestamp_start'] - ref).total_seconds() / 60.0)
+            idle[pos[ix]] = gap
+            prev_end = (r['timestamp_end'] if prev_end is None
+                        else max(prev_end, r['timestamp_end']))
+            prev_case = r[case_col]
+    df['object_attributes'] = [
+        {**(a if isinstance(a, dict) else {}), 'idle_min': float(v)}
+        for a, v in zip(df['object_attributes'], idle)
+    ]
+    return df
+
+
 def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
                                    activity_exog_means=None,
                                    temporal_resolution_minutes=15.0,
@@ -10323,6 +10457,7 @@ def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
     simulated_df = (simulated_df
                     .sort_values([case_col, 'timestamp_start'])
                     .reset_index(drop=True))
+    simulated_df = _inject_schedule_idle_min(simulated_df, case_col, activity_col, object_col)
     _prev_names = simulated_df.groupby(case_col)[activity_col].shift(1)
     _durs_min = ((simulated_df['timestamp_end'] - simulated_df['timestamp_start'])
                  .dt.total_seconds() / 60.0)
@@ -10500,6 +10635,7 @@ def pool_simulated_curve_values(simulated_df, energy_pipelines, sensors,
     simulated_df = (simulated_df
                     .sort_values([case_col, 'timestamp_start'])
                     .reset_index(drop=True))
+    simulated_df = _inject_schedule_idle_min(simulated_df, case_col, activity_col, object_col)
     _prev_names = simulated_df.groupby(case_col)[activity_col].shift(1)
     _durs_min = ((simulated_df['timestamp_end'] - simulated_df['timestamp_start'])
                  .dt.total_seconds() / 60.0)
@@ -10863,6 +10999,9 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     # timestamp-resolved external factors need no extra input from the caller.
     if exog_lookup is None:
         exog_lookup = build_exog_lookup(real_expanded_df)
+
+    # idle_min rebuilt from this simulation's own schedule — see the helper.
+    simulated_df = _inject_schedule_idle_min(simulated_df, sim_case_col)
 
     real_ids_str = real_expanded_df[real_case_col].astype(str)
     sim_ids_str  = simulated_df[sim_case_col].astype(str)

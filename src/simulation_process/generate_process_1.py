@@ -324,7 +324,14 @@ def _distillation_curve(phase: str, n: int, rng: np.random.Generator,
 # the model's own fixed phase split (0.27 / 0.53 / 0.19) sets the durations
 # of the 'heat', 'hold' and 'cool' events for that cycle.
 AUTOCLAVE_CYCLE_BASE_MIN = {'standard': 60.0, 'cleaning': 32.0}
-AUTOCLAVE_CYCLE_VARIABILITY = 0.15
+# Per-cycle duration noise, as a fraction of the volume-implied cycle length. This
+# is the ONLY part of the duration no recorded attribute explains, so it caps how
+# far volume_L can go: at 0.15 a regression of duration on volume_L lands at
+# R^2 ~ 0.60-0.70 (residual sigma ~ 2.6 min on a 16 min heat phase), and the
+# simulation's own duration model then predicts the conditional mean and loses
+# that scatter entirely. Lowered so volume_L is the dominant driver; together
+# with LOAD_FIXED_FRAC below this puts R^2 ~ 0.93.
+AUTOCLAVE_CYCLE_VARIABILITY = 0.07
 
 # Load coupling: the autoclave is the longest station in the line, and it used
 # to be the ONLY one whose duration ignored volume_L. With a fixed steam supply
@@ -334,7 +341,11 @@ AUTOCLAVE_CYCLE_VARIABILITY = 0.15
 # charge. This factor also enters m_cp, the thermal mass being heated (together
 # with the charge factor below), which is what makes a big batch draw
 # proportionally more cooling water on the way down.
-AUTOCLAVE_LOAD_FIXED_FRAC = 0.30   # share of the cycle that does NOT scale with volume
+AUTOCLAVE_LOAD_FIXED_FRAC = 0.20   # share of the cycle that does NOT scale with volume
+                                   # (0.30 before: the smaller the fixed share, the wider
+                                   # the volume-driven span of the cycle length. Second-order
+                                   # next to CYCLE_VARIABILITY — 0.30 -> 0.20 is worth about
+                                   # +0.05 R^2, the noise cut above about +0.21.)
 
 
 def _load_factor(volume_L: float) -> float:
@@ -355,6 +366,35 @@ AUTOCLAVE_FLOW_FIXED_FRAC = 0.55   # share of the flow setting independent of th
 def _flow_factor(volume_L: float) -> float:
     """Steam / cooling-water flow multiplier for a charge of `volume_L`."""
     return AUTOCLAVE_FLOW_FIXED_FRAC + (1.0 - AUTOCLAVE_FLOW_FIXED_FRAC) * (volume_L / REFERENCE_VOLUME_L)
+
+# SCHEDULE coupling of the HOLDING phase. The holding duty is the vessel's heat
+# loss, A_U*(T_steri - T_amb), and until now nothing in the log explained the
+# batch-to-batch differences in it: the only thing that moved was the per-cycle
+# A_U draw, a physical constant no event attribute records, so every
+# attribute-conditioned model could do nothing but predict the leaf mean.
+#
+# It is now a function of WHEN the batch was scheduled on that autoclave: a vessel
+# that starts a cycle straight after the previous one is still hot and loses less
+# to the surroundings, one that has stood idle overnight starts cold and pays the
+# full loss. The gap comes out of the schedule alone — no weather, no new physics —
+# and it is written to the event's object_attributes as `idle_min`, so the feature
+# frame the curve models build actually contains it.
+#
+# Sized against the idle gaps this schedule produces (11% of cycles back-to-back
+# reworks, median gap ~7 h): WARM_FRAC 0.35 with TAU 480 min puts the duty factor
+# at p10..p90 = 0.65..0.98 with a 12.9% CV, against the ~7.5% CV the A_U/T_steri
+# draws contribute. Volume explains ~0.96 of the heat level; the schedule now
+# explains ~0.75 of the hold level, the rest staying genuine nuisance noise.
+AUTOCLAVE_HOLD_WARM_FRAC    = 0.35    # duty reduction for a vessel that is still fully warm
+AUTOCLAVE_HOLD_WARM_TAU_MIN = 480.0   # idle minutes for the residual heat to decay by 1/e
+# (no cold sentinel: a vessel with no previous cycle uses the visit-level idle gap,
+# which is measured from the start of the simulation and is already "cold".)
+
+
+def _hold_duty_factor(idle_min: float) -> float:
+    """Holding-duty multiplier for a vessel idle `idle_min` minutes before this cycle."""
+    return 1.0 - AUTOCLAVE_HOLD_WARM_FRAC * float(np.exp(-max(0.0, idle_min)
+                                                         / AUTOCLAVE_HOLD_WARM_TAU_MIN))
 
 # Physical parameters of `sterilization_profile` are also randomized per cycle
 # (not just its duration), but only as a small residual on top of the
@@ -389,7 +429,8 @@ AUTOCLAVE_PARAM_VARIABILITY = {
 
 
 def generate_autoclave_cycle(rng: np.random.Generator, recipe: str, T_amb_c: float,
-                             volume_L: float) -> pd.DataFrame:
+                             volume_L: float,
+                             idle_min: float = 10_000.0) -> pd.DataFrame:   # default: cold vessel
     """One heat/hold/cool profile (time, temp, type, Q) from the physical autoclave model."""
     load = _load_factor(volume_L)
     flow = _flow_factor(volume_L)
@@ -424,6 +465,7 @@ def generate_autoclave_cycle(rng: np.random.Generator, recipe: str, T_amb_c: flo
     return sterilization_profile(
         t_ges=t_ges_s,
         T_amb=T_amb_c + 273.15,
+        hold_duty_factor=_hold_duty_factor(idle_min),   # schedule -> holding duty
         m_dot_steam=params['m_dot_steam'],
         m_dot_cool=params['m_dot_cool'],
         A_U=params['A_U'],
@@ -517,6 +559,9 @@ def simulate(n_batches: int = N_BATCHES,
     events: list[dict] = []
     autoclave_profiles: dict[str, pd.DataFrame] = {}
     cycle_counter = 0
+    # When each autoclave last finished a cycle — the schedule quantity the holding
+    # duty keys off. Missing = never used yet, i.e. a cold vessel.
+    autoclave_last_end: dict[str, datetime] = {}
 
     for b in range(n_batches):
         case_id   = f'batch_{b+1:03d}'
@@ -555,6 +600,11 @@ def simulate(n_batches: int = N_BATCHES,
                 best_slot = int(np.argmin([t.timestamp() for t in res_times]))
             slot_free = res_times[best_slot]
             station_start = max(batch_ready, slot_free)
+            # Idle gap of the chosen resource before this visit. Defined for EVERY
+            # station, not just the autoclave: the attribute has to exist on every
+            # event or the parquet round-trip fills it with None on the others, and a
+            # NaN column reaches the regressors that cannot take one.
+            station_idle_min = max(0.0, (station_start - slot_free).total_seconds() / 60.0)
 
             # Resource name
             if n_res == 1:
@@ -574,17 +624,31 @@ def simulate(n_batches: int = N_BATCHES,
             idx = 0
             current_cycle_id = None
             current_profile = None
+            cycle_idle_min = station_idle_min
 
             while idx < len(events_to_process):
                 event_def = events_to_process[idx]
                 act_name = event_def['name']
+
+                if station == 'Autoclaving' and act_name == 'prepare':
+                    # How long this vessel stood idle before the cycle starts. Straight
+                    # out of the schedule: 0 when the next batch was queued behind this
+                    # one (or on a rework), hours when the autoclave waited for work.
+                    # A rework restarts at 'prepare' seconds after 'cool', so measure
+                    # from this vessel's own last cycle end rather than from the visit
+                    # start. No previous cycle -> the visit's gap, i.e. idle since the
+                    # simulation began, which is a cold vessel either way.
+                    _last_end = autoclave_last_end.get(resource_name)
+                    cycle_idle_min = (station_idle_min if _last_end is None else
+                                      max(0.0, (current_time - _last_end).total_seconds() / 60.0))
 
                 if station == 'Autoclaving' and act_name == 'heat':
                     # Start of a new sterilization cycle: draw a fresh physical profile.
                     cycle_counter += 1
                     current_cycle_id = f'ac_{cycle_counter}'
                     T_amb_c = physics_ambient_c(current_time)
-                    current_profile = generate_autoclave_cycle(rng, recipe, T_amb_c, volume_L)
+                    current_profile = generate_autoclave_cycle(rng, recipe, T_amb_c, volume_L,
+                                                               cycle_idle_min)
                     autoclave_profiles[current_cycle_id] = current_profile
 
                 if station == 'Autoclaving' and act_name in ('heat', 'hold', 'cool') and current_profile is not None:
@@ -603,6 +667,13 @@ def simulate(n_batches: int = N_BATCHES,
                 ts_start = current_time
                 ts_end   = current_time + timedelta(minutes=dur)
 
+                # Autoclave events also carry the vessel's idle gap, so the driver of
+                # the holding level is IN THE LOG rather than hidden in the physics.
+                _idle = (cycle_idle_min
+                         if station == 'Autoclaving' and act_name in ('prepare', 'heat', 'hold', 'cool')
+                         else station_idle_min)
+                ev_attrs = {**obj_attrs, 'idle_min': round(float(_idle), 1)}
+
                 events.append({
                     'case_id':               case_id,
                     'activity':              f'{resource_name}_{act_name}',
@@ -612,10 +683,14 @@ def simulate(n_batches: int = N_BATCHES,
                     'station':               station,
                     'object_type':           object_type,
                     'object':                resource_name,
-                    'object_attributes':     obj_attrs,
+                    'object_attributes':     ev_attrs,
                     'autoclave_cycle_id':    cycle_id,
                 })
                 current_time = ts_end + timedelta(seconds=1)
+
+                # Cycle finished: this vessel starts cooling down from now on.
+                if station == 'Autoclaving' and act_name == 'cool':
+                    autoclave_last_end[resource_name] = ts_end
                 
                 # Microscopic rework inside Autoclave: the charge failed the cycle
                 # and is sterilized again. A repeat ALWAYS restarts at 'prepare' —

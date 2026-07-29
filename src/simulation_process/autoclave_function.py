@@ -16,6 +16,11 @@ def sterilization_profile(t_ges = 6000,
     m_dot_cool = 14.00,
     cp_water = 4.18,
     A_U = 0.20797,
+    hold_duty_factor = 1.0,   # scales the HOLDING duty only (heat/cool untouched):
+                              # 1.0 = vessel started cold and pays the full A_U loss,
+                              # < 1.0 = still warm from the previous cycle. The caller
+                              # derives it from the schedule; see generate_process_1.
+
     fill_factor = 0.9,
     delta_T_storage = 30,
     visual=False):
@@ -103,7 +108,8 @@ def sterilization_profile(t_ges = 6000,
     Q_heating = m_dampf_gesamt * h_vap_kJkg / 3600
 
     # Holding phase
-    m_steam_holding = calculate_steam_demand_holding(A_U, T_steri, T_amb, t_holding, h_vap_kJkg)
+    m_steam_holding = calculate_steam_demand_holding(A_U, T_steri, T_amb, t_holding,
+                                                     h_vap_kJkg) * hold_duty_factor
     m_dampf_gesamt = m_dampf_gesamt + m_steam_holding
 
     # === Speicherberechnung ===
@@ -155,7 +161,7 @@ def sterilization_profile(t_ges = 6000,
 
     # ===================== Q HOLDING calculation =====================
     # Option A (physical, equal to `A_U*(T_steri-T_amb)`):
-    Q_holding_fill = A_U*(T_steri-T_amb)  # [kW], same as Q_loss (heat loss compensated by holding steam)
+    Q_holding_fill = hold_duty_factor * A_U*(T_steri-T_amb)  # [kW], same as Q_loss (heat loss compensated by holding steam)
     # Option B (based on used/averaged steam mass): can also use
     m_dot_holding = m_steam_holding / len(np.arange(int(t_heating)+1, int(t_heating)+int(t_holding)+1))
     Q_holding_avgsteam = m_dot_holding * h_vap_kJkg

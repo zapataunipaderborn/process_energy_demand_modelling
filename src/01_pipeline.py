@@ -186,52 +186,115 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── experiment_991: process_1-only check of the step-DTW fixes ────────────
-    # Re-runs ONLY the synthetic process after (a) the segment-fill
-    # interpolation fix in sim_extractor.predict_raw_curve_step_dtw (stretched
-    # segments no longer staircase when upsampled past the reference's
-    # resolution) and (b) — IF the generator task in
-    # simulation_process/opus_task_predictable_levels.md has been executed and
-    # data/gold/experiment_1/process_1 regenerated — volume-driven autoclave
-    # levels. Without (b) this run measures the smoothing fix alone.
-    # Lean scope: exactly what notebook 06's combined figure and the
-    # complete-profile metrics need — mining + simulation + curve eval +
-    # predicted curves. No joint-duration heatmaps, no schedule-profile stage,
-    # no seq2seq. Same data/split/seed as 988/989, so the process_1 rows drop
-    # straight into their comparison tables.
+    # ── experiment_995: DEAD END — do not cite; use 994 for the smooth rows ───
+    # Tried replacing the smooth variant's global medoid warp with per-segment
+    # resampling + interpolated gains ("crisper boundaries"). It RE-TERRACED the
+    # simulated heat declines (tread pairs + ~1050 kW cliffs vs 994's steady
+    # ~500 kW/min; near-flat-frac 0.50 vs 0.35) because the leaf medoid is too
+    # coarse for any per-segment replay once instances run longer than it. The
+    # warp also costs nothing on levels (steam Wasserstein value median 73.3
+    # warp vs 74.6 per-segment). sim_extractor was reverted to the 994 warp
+    # after this run; re-running this config now reproduces 994 exactly.
+    #
+    # (994 context:) first run on the process_1 data regenerated
+    # 2026-07-29 with the holding duty tied to the schedule. Two generator
+    # changes measured there, both in simulation_process/:
+    #   * hold level: sterilization_profile now takes a `hold_duty_factor`, and
+    #     generate_process_1 derives it from how long that autoclave sat idle since
+    #     its own previous cycle (1 - 0.35*exp(-idle_min/480)). A vessel that starts
+    #     straight after the last batch is still hot and loses less. The gap is
+    #     written to every event as object_attributes['idle_min'], so it is IN the
+    #     feature frame — the holding level went from 0% explainable (pure A_U
+    #     nuisance) to R^2 0.74-0.81 against that driver.
+    #   * duration: AUTOCLAVE_CYCLE_VARIABILITY 0.15 -> 0.07 and LOAD_FIXED_FRAC
+    #     0.30 -> 0.20, lifting R^2(volume -> cycle duration) from 0.60 to 0.93.
+    # NOT weather: WEATHER_ENERGY_COUPLING stays False, so the ef_* columns still
+    # carry no signal for this process.
+    # Hold energy is ~18 kW here against ~22 kW in 993 — nominal A_U is now the
+    # COLD-vessel case — so the hold rows are not level-comparable with 993/991.
+    # Same scope, split and seed as 993 so everything else is.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_991',   # regenerated process_1 data of 2026-07-29
+        'run_name':              'experiment_995',
         'processes_to_run':      ['process_1'],
         'temporal_resolution':   '1min',
-        'run_process_modelling': True,   # the (b) simulated panels need the nets + logs
-        'mining_algorithms':     ['heuristic'],   # single miner — fast check run
+        'run_process_modelling': True,
+        'mining_algorithms':     ['heuristic'],
         'run_energy_modelling':  True,
-        'run_joint_duration_eval':   False,  # slow per-instance heatmaps — not this run's job
-        'run_schedule_profile_eval': False,
+        'run_joint_duration_eval':   False,
+        'run_schedule_profile_eval': True,   # notebooks 05 and 07 read
+                                             # schedule_profile_eval_results/<proc>/predicted_curves.parquet
         'run_autoregressive_eval':   False,
-        'save_predicted_curves': True,   # gates the complete-curve eval notebook 06 reads
-                                         # (predicted_curves_ml_step_dtw.parquet +
-                                         # predicted_logs + complete-curve metrics)
+        'save_predicted_curves': True,
         'train_ratio':           0.70,
         'split_type':            'temporal',
-        'random_seed':           42,     # bit-identical split to 988/989
+        'random_seed':           42,
         'curve_approaches': [
-            'baseline',                 # kept: essentially free (one median curve per
-                                        # sensor, no ML) and required so the complete-curve
-                                        # 'Baseline' row exists (988 listed ml_step_dtw
-                                        # alone and that row came out '--')
-            'ml_step_dtw',              # the approach under test. NOTE: with ml_external
-                                        # absent, the do-no-harm fallback gate has nothing
-                                        # to route to and is inactive — every leaf keeps
-                                        # the pure step model, which is the point here
+            'baseline',
+            'ml_step_dtw',
+            'ml_step_dtw_smooth',
         ],
-        'curve_optimize_hyperparams': False,  # OFF for speed — no-op for both approaches
-                                              # anyway (fixed models)
-        'complete_curve_approaches': ['ml_step_dtw', 'baseline'],
-        'curve_median_floor':    False,  # must stay OFF (see 989's note)
-        'save_curve_values':     True,   # keep y_true/y_pred for offline realism metrics
+        'curve_optimize_hyperparams': False,
+        'complete_curve_approaches': ['ml_step_dtw', 'ml_step_dtw_smooth', 'baseline'],
+        'curve_median_floor':    False,
+        'save_curve_values':     True,
     },
+
+    # ── experiment_993 (superseded by 994 — same config, pre-schedule-coupling data)
+    # # ── experiment_991: process_1-only check of the step-DTW fixes ────────────
+    # # Re-runs ONLY the synthetic process after (a) the segment-fill
+    # # interpolation fix in sim_extractor.predict_raw_curve_step_dtw (stretched
+    # # segments no longer staircase when upsampled past the reference's
+    # # resolution) and (b) — IF the generator task in
+    # # simulation_process/opus_task_predictable_levels.md has been executed and
+    # # data/gold/experiment_1/process_1 regenerated — volume-driven autoclave
+    # # levels. Without (b) this run measures the smoothing fix alone.
+    # # Lean scope: exactly what notebook 06's combined figure and the
+    # # complete-profile metrics need — mining + simulation + curve eval +
+    # # predicted curves. No joint-duration heatmaps, no schedule-profile stage,
+    # # no seq2seq. Same data/split/seed as 988/989, so the process_1 rows drop
+    # # straight into their comparison tables.
+    # {
+    #     'data_experiment':       '1',
+    #     'run_name':              'experiment_993',   # 992 (regenerated process_1 data of
+    #                                                  # 2026-07-29) + ml_step_dtw_smooth
+    #                                                  # side-by-side comparison
+    #     'processes_to_run':      ['process_1'],
+    #     'temporal_resolution':   '1min',
+    #     'run_process_modelling': True,   # the (b) simulated panels need the nets + logs
+    #     'mining_algorithms':     ['heuristic'],   # single miner — fast check run
+    #     'run_energy_modelling':  True,
+    #     'run_joint_duration_eval':   False,  # slow per-instance heatmaps — not this run's job
+    #     'run_schedule_profile_eval': True,   # ON: notebooks 05 and 07 read
+    #                                          # schedule_profile_eval_results/<proc>/predicted_curves.parquet
+    #                                          # (05 takes its 'real' reference series from there too)
+    #     'run_autoregressive_eval':   False,
+    #     'save_predicted_curves': True,   # gates the complete-curve eval notebook 06 reads
+    #                                      # (predicted_curves_ml_step_dtw.parquet +
+    #                                      # predicted_logs + complete-curve metrics)
+    #     'train_ratio':           0.70,
+    #     'split_type':            'temporal',
+    #     'random_seed':           42,     # bit-identical split to 988/989
+    #     'curve_approaches': [
+    #         'baseline',                 # kept: essentially free (one median curve per
+    #                                     # sensor, no ML) and required so the complete-curve
+    #                                     # 'Baseline' row exists (988 listed ml_step_dtw
+    #                                     # alone and that row came out '--')
+    #         'ml_step_dtw',              # the approach under test. NOTE: with ml_external
+    #                                     # absent, the do-no-harm fallback gate has nothing
+    #                                     # to route to and is inactive — every leaf keeps
+    #                                     # the pure step model, which is the point here
+    #         'ml_step_dtw_smooth',       # same training, gains interpolated at
+    #                                     # reconstruction (no boundary jumps) — the
+    #                                     # staircase fix, run side by side so the smoothing
+    #                                     # can be judged (and dropped) in isolation
+    #     ],
+    #     'curve_optimize_hyperparams': False,  # OFF for speed — no-op for both approaches
+    #                                           # anyway (fixed models)
+    #     'complete_curve_approaches': ['ml_step_dtw', 'ml_step_dtw_smooth', 'baseline'],
+    #     'curve_median_floor':    False,  # must stay OFF (see 989's note)
+    #     'save_curve_values':     True,   # keep y_true/y_pred for offline realism metrics
+    # },
 
     # ── Reportable comparison: Step DTW vs incumbents vs literature ─────────
     # experiment_984 established ml_step_dtw (std/rough ratios 0.74/0.67 vs

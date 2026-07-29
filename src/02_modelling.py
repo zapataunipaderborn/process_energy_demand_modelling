@@ -849,6 +849,13 @@ def _pool_workers(n_tasks):
 #                        DURATIONS and LEVELS instead of per-position values.
 #                        Step edges are sharp by construction because averaging
 #                        happens in parameter space, not value space.
+#    'ml_step_dtw_smooth'  ml_step_dtw with the per-segment level gains
+#                        interpolated between segment midpoints at reconstruction
+#                        instead of applied piecewise-constant — same training,
+#                        targets and models, but no jumps at segment boundaries,
+#                        so a breakpoint inside a ramp no longer terraces it.
+#                        A separate approach (not a flag) so the two land side
+#                        by side in every results table.
 APPROACHES = [
     'baseline',
     'median_activity_sensor',
@@ -860,6 +867,7 @@ APPROACHES = [
     'exemplar_dtw',
     'ml_cluster_dtw',
     'ml_step_dtw',
+    'ml_step_dtw_smooth',
 
     # ── Train/eval-gap variants of 'ml_external' ─────────────────────────────
     # Every canonical approach fits a target in barycenter space (DTW-warped,
@@ -895,7 +903,7 @@ if _env_curve_approaches:
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
     _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
               'ml_only', 'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
-              'ml_step_dtw',
+              'ml_step_dtw', 'ml_step_dtw_smooth',
               'seq2seq', 'seq2seq_only', 'seq2seq_external', 'seq2seq_iom',
               'ml_external_wcounts', 'ml_external_wmetric', 'ml_external_calib',
               'ml_rawspace'}
@@ -4483,6 +4491,7 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_exemplar_dtw             = {}   # + DTW k-medoids + predicted time warp
     all_energy_pipelines_ml_cluster_dtw           = {}   # ml_external per shape cluster + predicted warp
     all_energy_pipelines_ml_step_dtw              = {}   # segment durations+levels via DTW correspondence
+    all_energy_pipelines_ml_step_dtw_smooth       = {}   # ml_step_dtw with interpolated (jump-free) level gains
     all_energy_pipelines_ml_external_wcounts      = {}   # DTW + ML + Ext. (count-weighted)
     all_energy_pipelines_ml_external_wmetric      = {}   # DTW + ML + Ext. (metric-weighted)
     all_energy_pipelines_ml_external_calib        = {}   # DTW + ML + Ext. (decode-calibrated)
@@ -4582,6 +4591,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_exemplar_dtw           = {}   # + DTW k-medoids + predicted warp
         _pipelines_ml_cluster_dtw         = {}   # ml_external per shape cluster + predicted warp
         _pipelines_ml_step_dtw            = {}   # segment durations+levels via DTW correspondence
+        _pipelines_ml_step_dtw_smooth     = {}   # ml_step_dtw with interpolated (jump-free) level gains
         _pipelines_ml_external_wcounts      = {}
         _pipelines_ml_external_wmetric      = {}
         _pipelines_ml_external_calib        = {}
@@ -4609,7 +4619,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         _sklearn_approaches = [a for a in APPROACHES
                                if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar',
                                         'exemplar_only','exemplar_dtw',
-                                        'ml_cluster_dtw','ml_step_dtw',
+                                        'ml_cluster_dtw','ml_step_dtw','ml_step_dtw_smooth',
                                         'ml_external_wcounts','ml_external_wmetric',
                                         'ml_external_calib','ml_rawspace'}]
         _seq2seq_approaches = [a for a in APPROACHES
@@ -4717,6 +4727,14 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['ml_step_dtw']['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw']),
                         'full_pipeline':   _r['ml_step_dtw'],
+                    }
+                if 'ml_step_dtw_smooth' in _r:
+                    # Same predictor as ml_step_dtw — the pipeline's stored
+                    # gain_mode='smooth' is what makes the reconstruction differ.
+                    _pipelines_ml_step_dtw_smooth.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_step_dtw_smooth']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw_smooth']),
+                        'full_pipeline':   _r['ml_step_dtw_smooth'],
                     }
                 if 'exemplar_only' in _r:
                     # Shares predict_raw_curve_exemplar with 'exemplar' — the two
@@ -4880,6 +4898,7 @@ if RUN_CURVE_ONLY_EVALUATION:
                              ('Exemplar + DTW (warped)', _pipelines_exemplar_dtw),
                              ('Cluster DTW + ML + Ext.', _pipelines_ml_cluster_dtw),
                              ('Step DTW + ML + Ext.',    _pipelines_ml_step_dtw),
+                             ('Step DTW smooth + ML + Ext.', _pipelines_ml_step_dtw_smooth),
                              ('DTW + Seq2Seq',           _pipelines_seq2seq),
                              ('Seq2Seq only (no DTW)',   _pipelines_seq2seq_only),
                              ('Seq2Seq IOM (DTW-selected)', _pipelines_seq2seq_iom),
@@ -4913,6 +4932,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_exemplar_dtw[_proc]            = _pipelines_exemplar_dtw
         all_energy_pipelines_ml_cluster_dtw[_proc]          = _pipelines_ml_cluster_dtw
         all_energy_pipelines_ml_step_dtw[_proc]             = _pipelines_ml_step_dtw
+        all_energy_pipelines_ml_step_dtw_smooth[_proc]      = _pipelines_ml_step_dtw_smooth
         all_energy_pipelines_ml_external_wcounts[_proc] = _pipelines_ml_external_wcounts
         all_energy_pipelines_ml_external_wmetric[_proc] = _pipelines_ml_external_wmetric
         all_energy_pipelines_ml_external_calib[_proc] = _pipelines_ml_external_calib
@@ -4974,7 +4994,7 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                 #   _exog_prev_approaches — trained on split_curves_with_prev_activity
                 #   _exog_plain_approaches — trained on plain split_curves + ef_*
                 _exog_prev_approaches  = ('ml_external', 'seq2seq_external', 'ml_cluster_dtw',
-                                          'ml_step_dtw')
+                                          'ml_step_dtw', 'ml_step_dtw_smooth')
                 _exog_plain_approaches = ('exemplar', 'exemplar_only', 'exemplar_dtw')
                 _exog_approaches = _exog_prev_approaches + _exog_plain_approaches
                 _exog_cols_eval = _fp.get('exog_cols', []) if _approach_eval in _exog_approaches else None
@@ -5447,6 +5467,7 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('Exemplar + DTW (warped)',         all_energy_pipelines_exemplar_dtw),
             ('Cluster DTW + ML + Ext.',         all_energy_pipelines_ml_cluster_dtw),
             ('Step DTW + ML + Ext.',            all_energy_pipelines_ml_step_dtw),
+            ('Step DTW smooth + ML + Ext.',     all_energy_pipelines_ml_step_dtw_smooth),
             ('DTW + ML + Ext. (count-weighted)', all_energy_pipelines_ml_external_wcounts),
             ('DTW + ML + Ext. (metric-weighted)', all_energy_pipelines_ml_external_wmetric),
             ('DTW + ML + Ext. (decode-calibrated)', all_energy_pipelines_ml_external_calib),
@@ -5783,6 +5804,8 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_ml_cluster_dtw' in dir() else {},
                     'Step DTW + ML + Ext.':             all_energy_pipelines_ml_step_dtw
                         if 'all_energy_pipelines_ml_step_dtw' in dir() else {},
+                    'Step DTW smooth + ML + Ext.':      all_energy_pipelines_ml_step_dtw_smooth
+                        if 'all_energy_pipelines_ml_step_dtw_smooth' in dir() else {},
                     'DTW + Seq2Seq':                      all_energy_pipelines_seq2seq
                         if 'all_energy_pipelines_seq2seq' in dir() else {},
                     'Seq2Seq only (no DTW)':              all_energy_pipelines_seq2seq_only
@@ -6489,6 +6512,7 @@ if _jdur_ready:
         ('Exemplar + DTW (warped)',       all_energy_pipelines_exemplar_dtw),
         ('Cluster DTW + ML + Ext.',       all_energy_pipelines_ml_cluster_dtw),
         ('Step DTW + ML + Ext.',          all_energy_pipelines_ml_step_dtw),
+        ('Step DTW smooth + ML + Ext.',   all_energy_pipelines_ml_step_dtw_smooth),
         ('ML + Ext. Factors', all_energy_pipelines_ml_external),
     ]:
         if not _jpips:
@@ -6668,6 +6692,7 @@ if _jdur_ready:
         ('Exemplar + DTW (warped)',         globals().get('all_energy_pipelines_exemplar_dtw', {})),
         ('Cluster DTW + ML + Ext.',         globals().get('all_energy_pipelines_ml_cluster_dtw', {})),
         ('Step DTW + ML + Ext.',            globals().get('all_energy_pipelines_ml_step_dtw', {})),
+        ('Step DTW smooth + ML + Ext.',     globals().get('all_energy_pipelines_ml_step_dtw_smooth', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
         ('Seq2Seq IOM (DTW-selected)',              globals().get('all_energy_pipelines_seq2seq_iom',    {})),
         ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
