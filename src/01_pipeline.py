@@ -231,7 +231,7 @@ EXPERIMENTS = [
                                          # the argument has to hold on both
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],
+        'mining_algorithms':     ['heuristic', 'alpha'],
         'run_energy_modelling':  True,
         'run_joint_duration_eval':   False,  # slow per-instance heatmaps — superseded by
                                              # energy_distribution_results
