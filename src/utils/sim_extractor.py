@@ -7113,35 +7113,98 @@ def build_and_train_pipeline_step_dtw(
     const_durations = durations.mean(axis=0)
     const_levels = np.median(levels, axis=0)
 
-    def _fit_bank(targets, const):
-        bank = []
-        for j in range(targets.shape[1]):
-            m_ = None
-            if feature_columns and len(tr_i) >= 8:
-                try:
-                    _m = HistGradientBoostingRegressor(loss='absolute_error',
-                                                       max_iter=200,
-                                                       random_state=random_state)
-                    _m.fit(X.values[tr_i], targets[tr_i, j])
-                    if float(np.mean(np.abs(_m.predict(X.values[vl_i]) - targets[vl_i, j]))) < \
-                       float(np.mean(np.abs(const[j] - targets[vl_i, j]))):
-                        m_ = _m
-                except Exception:
-                    m_ = None
-            bank.append(m_)
-        return bank
+    # A real held-out split is required to TUNE on: when val_size collapses
+    # (tr_i is vl_i, i.e. too few curves) the search would be selecting on its own
+    # training rows, so the historical fixed fit is used instead.
+    _tunable = bool(optimize_hyperparams) and not np.array_equal(tr_i, vl_i)
 
-    duration_models = (_fit_bank(durations, const_durations)
-                       if n_segments > 1 else [None] * n_segments)
-    level_models = _fit_bank(levels, const_levels)
+    # The candidate families, same dict the sklearn approaches compete. Passed in
+    # by the worker as `models` (already narrowed by PIPELINE_CURVE_MODELS); the
+    # historical single-family behaviour is the fallback for direct callers.
+    _families = dict(models) if models else {
+        'Hist Gradient Boosting': HistGradientBoostingRegressor}
+
+    def _fit_one(name, model_class, y):
+        """Fit one family to one segment target, tuned if there is a split to tune on."""
+        if _tunable:
+            if not verbose:
+                optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+            def objective(trial):
+                m = model_class(**_curve_model_trial_params(trial, name,
+                                                            random_state, n_jobs))
+                m.fit(X.values[tr_i], y[tr_i])
+                return -float(np.mean(np.abs(m.predict(X.values[vl_i]) - y[vl_i])))
+
+            study = optuna.create_study(
+                direction='maximize',
+                sampler=optuna.samplers.TPESampler(seed=random_state))
+            study.optimize(objective, n_trials=n_trials)
+            m = model_class(**_curve_model_finalise_params(name, study.best_params,
+                                                           random_state, n_jobs))
+        else:
+            # Untuned: bake the absolute-error loss in here too, or this branch
+            # silently trains on squared error while the metrics are L1.
+            _lk = _curve_model_loss_kwargs(name)
+            try:
+                m = model_class(random_state=random_state, **_lk)
+            except TypeError:
+                try:
+                    m = model_class(**_lk)
+                except TypeError:
+                    m = model_class()
+        m.fit(X.values[tr_i], y[tr_i])
+        return m
+
+    def _fit_segment_model(y):
+        """Best family for one segment target (a duration or a level), by held-out MAE.
+
+        Every family in `models` competes, exactly as they do for ml_external and
+        ml_only. Before this the step model was locked to a fixed 200-iteration
+        HGB while the incumbent picked its best of six AND tuned it, so any gap
+        between them confounded the segment reparameterisation with the model
+        choice. Returns (model, name, val_mae); (None, ...) if nothing fitted."""
+        best, best_name, best_mae = None, None, np.inf
+        for _name, _cls in _families.items():
+            try:
+                _m = _fit_one(_name, _cls, y)
+                _mae = float(np.mean(np.abs(_m.predict(X.values[vl_i]) - y[vl_i])))
+            except Exception:
+                continue
+            if _mae < best_mae:
+                best, best_name, best_mae = _m, _name, _mae
+        return best, best_name, best_mae
+
+    def _fit_bank(targets, const):
+        bank, names = [], []
+        for j in range(targets.shape[1]):
+            m_, nm_ = None, None
+            if feature_columns and len(tr_i) >= 8:
+                _m, _nm, _mae = _fit_segment_model(targets[:, j])
+                # Do-no-harm, unchanged: the winning family still has to beat the
+                # segment's own constant on the held-out curves to be kept at all.
+                if _m is not None and _mae < float(np.mean(np.abs(const[j] - targets[vl_i, j]))):
+                    m_, nm_ = _m, _nm
+            bank.append(m_)
+            names.append(nm_)
+        return bank, names
+
+    duration_models, duration_model_names = (
+        _fit_bank(durations, const_durations) if n_segments > 1
+        else ([None] * n_segments, [None] * n_segments))
+    level_models, level_model_names = _fit_bank(levels, const_levels)
 
     _gain = (gain_mode or 'step').strip().lower()
     _tag = 'ml_step_dtw_smooth' if _gain == 'smooth' else 'ml_step_dtw'
 
     if verbose:
+        _won = sorted({x for x in (duration_model_names + level_model_names) if x})
         print(f"  [{_tag}] {n} curves -> {n_segments} segment(s); "
+              f"{len(_families)} famil(y/ies)"
+              f"{f' x Optuna {n_trials} trials' if _tunable else ''} per segment; "
               f"duration models kept {sum(m is not None for m in duration_models)}/{n_segments}, "
-              f"level models kept {sum(m is not None for m in level_models)}/{n_segments}")
+              f"level models kept {sum(m is not None for m in level_models)}/{n_segments}"
+              + (f'; won: {", ".join(_won)}' if _won else ''))
 
     pipeline = {
         'approach':          _tag,
@@ -7160,7 +7223,11 @@ def build_and_train_pipeline_step_dtw(
         'feature_columns':   feature_columns,
         'exog_cols':         exog_cols,
         'prev_act_energy_map': prev_act_energy_map or {},
-        'model_name':        f'{n_segments} segments x GB(L1) durations+levels',
+        'model_name':        (f'{n_segments} segments x durations+levels'
+                              + (f' [{len(_families)} families'
+                                 + (f', tuned {n_trials}]' if _tunable else ']'))),
+        'duration_model_names': duration_model_names,
+        'level_model_names':    level_model_names,
         'segment_explained': seg_explained,
         'fallback_active':   False,
     }

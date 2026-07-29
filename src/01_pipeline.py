@@ -186,82 +186,95 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── experiment_998: the full comparison table, tuned ──────────────────────
-    # Everything that belongs in the reportable curve table, in ONE eval pass, on
-    # the schedule-coupled process_1 data (994/997 generation):
-    #   two naive floors      — 'baseline' (ONE median per sensor, pooled over
-    #                           activities) and 'median_activity_sensor' (the
-    #                           per-leaf median: sensor x activity x object)
-    #   the pointwise incumbent — 'ml_external', which is also the direct ablation
-    #                           of the method: same curves, same features, but a
-    #                           per-position target instead of segment structure,
-    #                           so the gap is attributable to the reparameterisation
-    #   the no-DTW ablation    — 'ml_only' (linear resample encode/decode, no DBA,
-    #                           no DTW anywhere): prices what DTW is worth on its own
-    #   the method             — 'ml_step_dtw' and 'ml_step_dtw_smooth', the same
-    #                           trained model with constant vs interpolated segment
-    #                           gains at reconstruction. 994 put them at sMAE
-    #                           0.941/0.925 and roughness 0.93x/0.74x, i.e. NOT a
-    #                           ranked pair — they are two points on the pointwise-
-    #                           vs-texture trade-off and both belong in the table
-    #   the realism reference  — 'exemplar' (a real curve replayed)
+    # ── experiment_999: the method alone, tuned, on all six processes ─────────
+    # FIRST of two queued runs. Only 'ml_step_dtw_smooth' is trained, so this one
+    # finishes on its own even if the second never gets its turn — the point is to
+    # have the method's numbers on all six processes by the morning.
     #
-    # Optuna ON (10 trials, not the default 50 — the 989 note prices 50 as a ~5x
-    # multiplier on the whole sklearn stage for marginal gains). It only touches the
-    # SKLEARN workers, so it costs on 'ml_external' and 'ml_only' and is a no-op for
-    # baseline / median / exemplar / both step variants, which have fixed models.
+    # Every curve model in this run is now on equal footing with the incumbents:
+    # build_and_train_pipeline_step_dtw used to fit ONE fixed 200-iteration
+    # HistGradientBoosting per segment and ignore both `models` and the Optuna
+    # flags. It now competes the same six families ml_external does and searches
+    # the same space, per segment, per bank. On a 40-curve synthetic leaf that
+    # matters more than expected: untuned it kept 0/6 level models (all fell back
+    # to the segment constant, MAE 212), tuned it keeps 6/6 (MAE 98), and the
+    # winning family varied across segments (Ridge / RF / XGBoost / Linear).
     #
-    # 'seq2seq' / 'seq2seq_iom' stay OUT: the literature row is still the honest gap
-    # in the comparison, but 986 deadlocked the worker pool for 7h and the CUDA-hiding
-    # fix has never been validated. Run the seq2seq family in its own dedicated run
-    # first — a repeat must not take this table down with it.
-    #
-    # Three miners so notebooks 03 and 05 get their Alpha and Combined-best rows
-    # instead of the '--' they showed for the heuristic-only runs.
-    #
-    # RUNTIME: expect hours, not the ~25 min of 994 — seven approaches, three miners
-    # and a tuning search, against 994's three untuned approaches and one miner.
+    # The do-no-harm gate is unchanged: a tuned winner still has to beat that
+    # segment's own constant on held-out curves to be kept at all.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_998',
+        'run_name':              'experiment_999',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
-                                         # all six: process_1 is the schedule-coupled
-                                         # synthetic one, 2-5 are the real plant data —
-                                         # the argument has to hold on both
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic', 'alpha'],
         'run_energy_modelling':  True,
-        'run_joint_duration_eval':   False,  # slow per-instance heatmaps — superseded by
-                                             # energy_distribution_results
-        'run_schedule_profile_eval': True,   # notebooks 05 and 07 read
-                                             # schedule_profile_eval_results/<proc>/predicted_curves.parquet
+        'run_joint_duration_eval':   False,
+        'run_schedule_profile_eval': True,
         'run_autoregressive_eval':   False,
         'save_predicted_curves': True,
         'train_ratio':           0.70,
         'split_type':            'temporal',
-        'random_seed':           42,     # bit-identical split to 993/994/997
+        'random_seed':           42,
+        'curve_approaches': [
+            'baseline',
+            'median_activity_sensor',
+            'ml_step_dtw_smooth',    # the method, and nothing else — NOTE this also
+                                     # disables the do-no-harm fallback gate, which has
+                                     # nothing to route to without ml_external
+        ],
+        'curve_optimize_hyperparams': True,
+        'curve_n_optuna_trials': 10,
+        # ONE approach assembled into complete case profiles: the stage is
+        # (process x mode x approach) inference over every simulated case.
+        'complete_curve_approaches': ['ml_step_dtw_smooth'],
+        'curve_median_floor':    False,
+        'save_curve_values':     True,
+    },
+
+    # ── experiment_1000: the full comparison table, same data and split ───────
+    # SECOND of the two. EXPERIMENTS runs top to bottom, so this starts by itself
+    # the moment 999 finishes — and if the machine runs out of night, 999's
+    # results are already on disk and complete.
+    # Adds everything 999 leaves out: the two naive floors, the pointwise
+    # incumbent (ml_external — also the direct ablation: same curves, same
+    # features, per-position target instead of segment structure), the no-DTW
+    # ablation (ml_only), and the realism reference (exemplar). All of them,
+    # including the step model, now compete six families with a 10-trial search,
+    # so no approach is handicapped by its model choice.
+    # Add 'ml_step_dtw' to the list to get the step-vs-smooth pair back.
+    {
+        'data_experiment':       '1',
+        'run_name':              'experiment_1000',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3',
+                                  'process_4_1', 'process_4_2', 'process_5'],
+        'temporal_resolution':   '1min',
+        'run_process_modelling': True,
+        'mining_algorithms':     ['heuristic', 'alpha'],
+        'run_energy_modelling':  True,
+        'run_joint_duration_eval':   False,
+        'run_schedule_profile_eval': True,
+        'run_autoregressive_eval':   False,
+        'save_predicted_curves': True,
+        'train_ratio':           0.70,
+        'split_type':            'temporal',
+        'random_seed':           42,     # identical split to 999, so the two tables
+                                         # are directly comparable row for row
         'curve_approaches': [
             'baseline',
             'median_activity_sensor',
             'ml_external',
             'ml_only',
-            'ml_step_dtw',
             'ml_step_dtw_smooth',
             'exemplar',
         ],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
-        # Complete profiles for the method (both variants) plus the naive floor that
-        # notebook 05 reports as its Baseline row. ml_external is deliberately NOT
-        # here: the schedule-profile comparator PREFERS 'ml_external' whenever it is
-        # listed, which would quietly rebuild the Schedule-direct / Profile-generator
-        # rows and 07's "Best, mine" series on the incumbent instead of the method.
-        # Its curve-only rows are unaffected — every trained approach is scored there.
-        'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline'],
-        'curve_median_floor':    False,  # must stay OFF (see 989's note)
-        'save_curve_values':     True,   # keep y_true/y_pred for offline realism metrics
+        'complete_curve_approaches': ['ml_step_dtw_smooth'],
+        'curve_median_floor':    False,
+        'save_curve_values':     True,
     },
 
     # ── experiment_997 (superseded by 998) ────────────────────────────────────
