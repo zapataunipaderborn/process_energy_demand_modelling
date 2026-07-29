@@ -186,15 +186,16 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── experiment_995: DEAD END — do not cite; use 994 for the smooth rows ───
-    # Tried replacing the smooth variant's global medoid warp with per-segment
-    # resampling + interpolated gains ("crisper boundaries"). It RE-TERRACED the
-    # simulated heat declines (tread pairs + ~1050 kW cliffs vs 994's steady
-    # ~500 kW/min; near-flat-frac 0.50 vs 0.35) because the leaf medoid is too
-    # coarse for any per-segment replay once instances run longer than it. The
-    # warp also costs nothing on levels (steam Wasserstein value median 73.3
-    # warp vs 74.6 per-segment). sim_extractor was reverted to the 994 warp
-    # after this run; re-running this config now reproduces 994 exactly.
+    # ── experiment_996: canonical smooth run (global-warp reconstruction) ─────
+    # Clean rerun after the 995 detour. 995 (DEAD END — do not cite) swapped the
+    # smooth variant's global medoid warp for per-segment resampling +
+    # interpolated gains; it RE-TERRACED the simulated heat declines (tread
+    # pairs + ~1050 kW cliffs vs the warp's steady ~500 kW/min; near-flat-frac
+    # 0.50 vs 0.35) because the leaf medoid is too coarse for any per-segment
+    # replay once instances run longer than it. The warp also costs nothing on
+    # levels (steam Wasserstein value median 73.3 warp vs 74.6 per-segment).
+    # sim_extractor was reverted to the warp, so this run should reproduce
+    # 994's outputs (same data/split/seed/code path).
     #
     # (994 context:) first run on the process_1 data regenerated
     # 2026-07-29 with the holding duty tied to the schedule. Two generator
@@ -215,7 +216,7 @@ EXPERIMENTS = [
     # Same scope, split and seed as 993 so everything else is.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_995',
+        'run_name':              'experiment_997',
         'processes_to_run':      ['process_1'],
         'temporal_resolution':   '1min',
         'run_process_modelling': True,
@@ -230,12 +231,12 @@ EXPERIMENTS = [
         'split_type':            'temporal',
         'random_seed':           42,
         'curve_approaches': [
-            'baseline',
-            'ml_step_dtw',
+            #'baseline',
+            #'ml_step_dtw',
             'ml_step_dtw_smooth',
         ],
         'curve_optimize_hyperparams': False,
-        'complete_curve_approaches': ['ml_step_dtw', 'ml_step_dtw_smooth', 'baseline'],
+        'complete_curve_approaches': ['ml_step_dtw'],#, 'ml_step_dtw_smooth', 'baseline'],
         'curve_median_floor':    False,
         'save_curve_values':     True,
     },
