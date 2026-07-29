@@ -20,6 +20,16 @@ downstream models are supposed to discover (see the VOLUME block below):
       volume explained only ~4% of total case duration and no case-duration
       model could beat a constant.
 
+  batch volume  -> autoclave energy levels.  The steam mass flow the operator
+      sets on the valve (`m_dot_steam`) and the cooling-water flow
+      (`m_dot_cool`) both scale with the charge, so the heat-phase steam
+      plateau (m_dot_steam * h_vap) and the cool-phase cooling-water peak are
+      predominantly determined by `volume_L`, with only a few percent of
+      residual noise on top. Previously both flows were drawn as pure +-18%
+      per-cycle noise with no recorded cause, so the plateau of every
+      `autoclaving_*_heat` instance varied for reasons no attribute-conditioned
+      model could learn — the level models could only predict a constant.
+
 The weather does NOT drive the energy demand of this process
 (WEATHER_ENERGY_COUPLING = False): the distillation duty and the autoclave
 losses are solved at a fixed ambient temperature (FIXED_AMBIENT_C, applied
@@ -321,8 +331,9 @@ AUTOCLAVE_CYCLE_VARIABILITY = 0.15
 # a larger charge simply takes longer to reach sterilization temperature, so the
 # cycle length is split into a load-independent part (vessel handling, valve
 # sequencing, the sterilization hold itself) and a part proportional to the
-# charge. The same factor scales m_cp, the thermal mass being heated, which is
-# what makes a big batch draw proportionally more cooling water on the way down.
+# charge. This factor also enters m_cp, the thermal mass being heated (together
+# with the charge factor below), which is what makes a big batch draw
+# proportionally more cooling water on the way down.
 AUTOCLAVE_LOAD_FIXED_FRAC = 0.30   # share of the cycle that does NOT scale with volume
 
 
@@ -330,10 +341,29 @@ def _load_factor(volume_L: float) -> float:
     """Duration/thermal-mass multiplier for a charge of `volume_L`."""
     return AUTOCLAVE_LOAD_FIXED_FRAC + (1.0 - AUTOCLAVE_LOAD_FIXED_FRAC) * (volume_L / REFERENCE_VOLUME_L)
 
+# Steam / cooling-water FLOW SETTING as a function of the charge: the operator
+# opens the steam valve further for a bigger batch, and the cooling circuit is
+# run proportionally harder on the way down. This is what makes the energy
+# LEVELS (heat-phase steam plateau = m_dot_steam * h_vap, cool-phase cooling
+# peak) predictable from a recorded attribute instead of being nuisance noise.
+# At VOLUME_RANGE_L = (200, 800) around REFERENCE_VOLUME_L = 500 the factor
+# spans ~0.73 .. ~1.27, i.e. roughly the same visual spread the old +-18%
+# per-cycle noise produced — but now caused by `volume_L`.
+AUTOCLAVE_FLOW_FIXED_FRAC = 0.55   # share of the flow setting independent of the charge
+
+
+def _flow_factor(volume_L: float) -> float:
+    """Steam / cooling-water flow multiplier for a charge of `volume_L`."""
+    return AUTOCLAVE_FLOW_FIXED_FRAC + (1.0 - AUTOCLAVE_FLOW_FIXED_FRAC) * (volume_L / REFERENCE_VOLUME_L)
+
 # Physical parameters of `sterilization_profile` are also randomized per cycle
-# (not just its duration) so batches produce visibly different curve shapes —
-# different steam/cooling flow levels, plateau heights, wall-loss rates, etc.
-# — instead of one shape merely stretched/compressed in time.
+# (not just its duration), but only as a small residual on top of the
+# attribute-driven levels above: the batch-to-batch differences in curve shape
+# must be EXPLAINED by something the event log records, otherwise no
+# attribute-conditioned level model can reproduce them. The per-cycle draws
+# below are therefore the unexplained remainder only — a few percent — while
+# the systematic spread comes from volume_L via `_flow_factor` / `_load_factor`
+# (and, for the holding phase, from the ambient temperature through A_U).
 AUTOCLAVE_PARAM_DEFAULTS = {
     'm_dot_steam': 1.94,
     'm_dot_cool':  14.00,
@@ -343,8 +373,9 @@ AUTOCLAVE_PARAM_DEFAULTS = {
     'm_cp':        63032.0,
 }
 AUTOCLAVE_PARAM_VARIABILITY = {
-    'm_dot_steam': 0.18,
-    'm_dot_cool':  0.18,
+    # Residual only — the systematic part of these two comes from _flow_factor.
+    'm_dot_steam': 0.04,
+    'm_dot_cool':  0.04,
     # A_U sets the holding-phase steam draw via Q = A_U*(T_steri - T_amb). At the
     # old +-18% this per-cycle nuisance spread was larger than the ~+-17% swing
     # the ambient temperature itself produces over the year, i.e. it masked the
@@ -353,7 +384,7 @@ AUTOCLAVE_PARAM_VARIABILITY = {
     'A_U':         0.06,
     'T_steri':     0.01,   # sterilization target: only a few K of spread
     'T_final':     0.02,
-    'm_cp':        0.12,
+    'm_cp':        0.05,
 }
 
 
@@ -361,15 +392,33 @@ def generate_autoclave_cycle(rng: np.random.Generator, recipe: str, T_amb_c: flo
                              volume_L: float) -> pd.DataFrame:
     """One heat/hold/cool profile (time, temp, type, Q) from the physical autoclave model."""
     load = _load_factor(volume_L)
+    flow = _flow_factor(volume_L)
     base_min = AUTOCLAVE_CYCLE_BASE_MIN[recipe] * load
-    t_ges_min = max(5.0, rng.normal(base_min, base_min * AUTOCLAVE_CYCLE_VARIABILITY))
+    # Truncated at +-3 sd. An untruncated normal occasionally returns a cycle far
+    # shorter than the charge allows (a -4.4 sd draw gave a 780 L batch a 28.6 min
+    # cycle against a 83.6 min nominal); since the cool-phase peak is the cooling
+    # energy divided by the cool-phase duration, such a draw produces a 4x power
+    # spike that is neither physical nor explainable from the batch attributes.
+    sd = base_min * AUTOCLAVE_CYCLE_VARIABILITY
+    t_ges_min = max(5.0, float(np.clip(rng.normal(base_min, sd),
+                                       base_min - 3.0 * sd, base_min + 3.0 * sd)))
     t_ges_s = int(round(t_ges_min * 60))
 
     params = {
         name: max(1e-4, rng.normal(default, default * AUTOCLAVE_PARAM_VARIABILITY[name]))
         for name, default in AUTOCLAVE_PARAM_DEFAULTS.items()
     }
-    params['m_cp'] *= load   # vessel + charge thermal mass
+    # Attribute-driven levels: the valve settings follow the charge size, so the
+    # heat plateau and the cooling peak are functions of volume_L plus the small
+    # residual already contained in the draws above.
+    params['m_dot_steam'] *= flow
+    params['m_dot_cool']  *= flow
+    # Vessel + charge thermal mass. `load` is the duration-side coupling; `flow` is
+    # the charge-size coupling of the levels. m_cp needs both: the cool-phase peak
+    # is the cooling energy (proportional to m_cp) spread over the cool-phase
+    # duration (also proportional to load), so a m_cp that only tracks `load`
+    # largely cancels itself out and the peak barely moves with the charge.
+    params['m_cp'] *= load * flow
     params['T_final'] = min(params['T_final'], params['T_steri'] - 20.0)  # stay physically valid
 
     return sterilization_profile(
@@ -568,13 +617,17 @@ def simulate(n_batches: int = N_BATCHES,
                 })
                 current_time = ts_end + timedelta(seconds=1)
                 
-                # Microscopic rework inside Autoclave
+                # Microscopic rework inside Autoclave: the charge failed the cycle
+                # and is sterilized again. A repeat ALWAYS restarts at 'prepare' —
+                # the vessel has been cooled down and depressurized by 'cool', so it
+                # has to be closed and brought back up before steam can be admitted.
+                # A 'cool' -> 'heat' transition is physically impossible and must not
+                # appear in the log; every cycle in the machine view is therefore a
+                # complete prepare -> heat -> hold -> cool sequence.
                 if station == 'Autoclaving' and act_name == 'cool':
                     if rng.random() < 0.15:  # 15% chance to rework
-                        if rng.random() < 0.5:  # 50% of reworks start from heat
-                            rework_events = [e for e in cfg['events'] if e['name'] in ('heat', 'hold', 'cool')]
-                        else:                   # 50% of reworks start from prepare
-                            rework_events = [e for e in cfg['events'] if e['name'] in ('prepare', 'heat', 'hold', 'cool')]
+                        rework_events = [e for e in cfg['events']
+                                         if e['name'] in ('prepare', 'heat', 'hold', 'cool')]
                         events_to_process = events_to_process[:idx+1] + rework_events + events_to_process[idx+1:]
 
                 # Rare maintenance stop after Destillation emptying (same pattern as the autoclave rework)

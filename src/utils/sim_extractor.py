@@ -7269,10 +7269,18 @@ def predict_raw_curve_step_dtw(raw_values, activity, attributes, pipeline,
             i0 = min(int(np.floor(med_edges[m] * Lm)), Lm - 1)
             i1 = min(max(int(np.ceil(med_edges[m + 1] * Lm)), i0 + 1), Lm)
             seg = med[i0:i1]
-            # Index selection, never interpolation — same rule as the exemplar
-            # family, so the medoid's within-segment texture survives.
-            seg = seg[np.clip(np.round(np.linspace(0, len(seg) - 1, b - a)).astype(int),
-                              0, len(seg) - 1)]
+            if b - a > len(seg):
+                # Upsampling: index selection would REPEAT samples, which turns
+                # the medoid's ramps into staircase treads (experiment_988's
+                # simulated heat declines). Interpolating within one real curve
+                # smooths nothing across instances, so it is safe here.
+                seg = np.interp(np.linspace(0.0, len(seg) - 1.0, b - a),
+                                np.arange(len(seg), dtype=float), seg)
+            else:
+                # Downsampling: index selection, same rule as the exemplar
+                # family, so the medoid's within-segment texture survives.
+                seg = seg[np.clip(np.round(np.linspace(0, len(seg) - 1, b - a)).astype(int),
+                                  0, len(seg) - 1)]
             mu = float(np.mean(seg))
             y[a:b] = seg * (lv[m] / mu) if abs(mu) > 1e-12 else lv[m]
         else:

@@ -37,33 +37,34 @@
 \caption{Energy profile extraction.}
 \label{algorithm:energy_model_extarction}
 \begin{algorithmic}[1]
-\Require Table $\mathcal{D}$ with case, activity, timestamps, attributes $\mathbf{x}^{\mathrm{attr}}$, external features $\mathbf{x}^{\mathrm{ef}}$ and energy values; regressors $\mathcal{R}$
+\Require Table $\mathcal{D}$ with case, activity, timestamps, attributes $\mathbf{x}^{\mathrm{attr}}$, external features $\mathbf{x}^{\mathrm{ef}}$ and energy values; regressors $\mathcal{R}$; maximum number of segments $M_{\max}$
 
 \State \textbf{(A) Extract activity-level energy profiles}
 \State For each pair of case $c$ and activity $a$ in $\mathcal{D}$, sort its rows by timestamp and extract their energy values as a raw curve $y_i$ of length $|y_i|$, with the process features $\mathbf{z}_i$ given by $\mathbf{x}^{\mathrm{attr}}$ and $\mathbf{x}^{\mathrm{ef}}$
 
-\State \textbf{(B) Build the reference curve}
-\State Set the number of latent positions $S$ to the median length of the raw curves of the activity, and resample every raw curve $y_i$ to that length
-\State Compute the reference curve $r$ from the resampled curves by DTW Barycenter Averaging, trimming the most deviating curves at each iteration so that unusually long or short instances do not dominate the average.
+\State \textbf{(B) Select the reference curve}
+\State Resample every raw curve $y_i$ to the median length $S$ of the raw curves of the activity and divide it by its mean value, obtaining its shape
+\State Set the reference curve $r$ to the DTW medoid: the raw curve whose shape has the smallest total DTW distance to the shapes of all other curves
 
-\State \textbf{(C) Align the curves}
+\State \textbf{(C) Segment the reference curve}
+\State For every number of segments $M \leq M_{\max}$, compute by dynamic programming the best piecewise-constant approximation of the shape of $r$, and keep the $M$ with the lowest BIC, yielding the interior breakpoints $b = (b_1 < \dots < b_{M-1})$ as fractions of the timeline
+
+\State \textbf{(D) Carry the segments onto every curve}
 \For{each raw curve $y_i$}
-    \State Align $y_i$ to $r$ by DTW and average the values matched to each reference position, obtaining the aligned curve $\tilde{y}_i$ of length $S$
-    \State If $y_i$ is much shorter than $r$, interpolate it linearly onto the $S$ positions instead, since its warping path would collapse into a step function
-\EndFor
-
-\State \textbf{(D) Build the training table}
-\For{each aligned curve $\tilde{y}_i$}
-    \For{each latent position $s = 1,\dots,S$}
-        \State Add to $\mathcal{E}$ one row with features $(\mathbf{z}_i,\, a,\, s,\, s/S,\, |y_i|)$ and target $\tilde{y}_i[s]$
-    \EndFor
+    \State Align the shape of $y_i$ to the shape of $r$ by DTW and map the breakpoints $b$ through the warping path onto the own timeline of $y_i$
+    \State Read off its targets: the duration fractions $\phi_{i,1},\dots,\phi_{i,M}$ of the segments, summing to one, and their levels $\lambda_{i,1},\dots,\lambda_{i,M}$, the mean raw energy value within each segment
+    \State Add to $\mathcal{E}$ one row with the features $(\mathbf{z}_i,\, a,\, |y_i|)$ and the $2M$ targets, summarising each external-factor series by its mean over the window of the activity
 \EndFor
 \State Encode the categorical variables and keep the numerical variables unchanged
 
-\State \textbf{(E) Train the curve model}
-\State Fit each $h \in \mathcal{R}$ on $\mathcal{E}$, optionally tuning its hyperparameters, and keep as $g$ the model with the lowest validation error
+\State \textbf{(E) Train the segment models}
+\For{each segment $m = 1,\dots,M$}
+    \State Fit on $\mathcal{E}$ one regressor $h \in \mathcal{R}$ for the duration $\phi_m$ and one for the level $\lambda_m$, under an absolute-error loss
+    \State Keep each regressor only if it beats its constant fallback — the training mean of $\phi_m$ and the training median of $\lambda_m$ — on held-out curves
+\EndFor
+\State Set the curve model $g$ to the resulting bank of $2M$ predictors, and route the activity to a per-position regression instead iff $g$ loses against it clearly on the held-out curves
 
-\State \Return the curve model $g$, the reference curve $r$ and the number of latent positions $S$, for each sensor, and activity
+\State \Return the curve model $g$, the reference curve $r$ and the breakpoints $b$, for each sensor, and activity
 \end{algorithmic}
 \end{algorithm}
 
@@ -71,7 +72,7 @@
 \caption{Simulation of the process and energy.}
 \label{alg:simulation}
 \begin{algorithmic}[1]
-\Require Stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, w)$ with the case-behaviour distributions $R_a$ and $W_a$, and case-duration model $\hat{f}_B$, from Algorithm~\ref{alg:pm_extraction_ml}; curve models $(g, r, S)$ from Algorithm~\ref{algorithm:energy_model_extarction}; production plan $P$ with the attributes $\mathbf{x}^{\mathrm{attr}}_c$ of every planned case and the external factors $\mathbf{x}^{\mathrm{ef}}$; exit discount $\alpha < 1$; step limit $k_{\max}$
+\Require Stochastic Petri net $\mathcal{N} = (N, M_0, M_f, \mathcal{G}, w)$ with the case-behaviour distributions $R_a$ and $W_a$, and case-duration model $\hat{f}_B$, from Algorithm~\ref{alg:pm_extraction_ml}; curve models $(g, r, b)$ from Algorithm~\ref{algorithm:energy_model_extarction}; production plan $P$ with the attributes $\mathbf{x}^{\mathrm{attr}}_c$ of every planned case and the external factors $\mathbf{x}^{\mathrm{ef}}$; exit discount $\alpha < 1$; step limit $k_{\max}$
 
 \State \textbf{(A) Initialise the case}
 \State Take the row of case $c$ from the production plan $P$ and assemble its feature vector $\mathbf{z}^\star$ from $\mathbf{x}^{\mathrm{attr}}_c$ and $\mathbf{x}^{\mathrm{ef}}$
@@ -95,7 +96,8 @@
 
 \State \textbf{(C) Predict and place the energy profiles}
 \For{each activity instance $(a, \Delta_a, d^\star) \in \mathcal{L}$ and each sensor}
-    \State Predict its energy profile $\hat{y}^\star$ on the canonical timeline with the model $g$ of that sensor and activity, from the features $\mathbf{z}^\star$, the position and the duration $d^\star$, and decode it onto a grid of length $d^\star$ by aligning that grid to the reference curve $r$ by DTW
+    \State Predict with the model $g$ of that sensor and activity the segment durations and levels of the instance, from the features $\mathbf{z}^\star$ and the duration $d^\star$
+    \State Reconstruct $\hat{y}^\star$ on a grid of length $d^\star$: place the segment boundaries at the normalised cumulative durations and fill each segment with the values of $r$, rescaled to its predicted level
     \State Insert $\hat{y}^\star$ into the simulated energy timeline $\hat{Y}$ over the interval $[\Delta_a,\, \Delta_a + d^\star]$
 \EndFor
 
