@@ -84,16 +84,13 @@ if os.environ.get('PYTHONHASHSEED') is None:
     print("[modelling] NOTE: PYTHONHASHSEED is unset. Runs launched through "
           "01_pipeline.py pin it; a direct `python 02_modelling.py` does not, so "
           "str-set iteration order may differ between runs.")
-from utils.simulation import ProcessSimulation, simulate_with_wip_ro
+from utils.simulation import ProcessSimulation
 from utils.sim_modeller import SimModeller
 
-from utils.sim_extractor import extract_energy_modifiers, extract_energy_direct_models, extract_energy_direct_models_global
 from utils.sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from utils.sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from utils.sim_extractor import compare_complete_case_curves, build_exog_lookup
 from utils.sim_extractor import build_sensor_activity_object_combos
-from utils.sim_extractor import predict_raw_curve_exemplar, predict_raw_curve_exemplar_dtw
-from utils.sim_extractor import predict_raw_curve_ml_cluster_dtw
 from utils.sim_extractor import predict_raw_curve_step_dtw
 from utils.sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
@@ -188,42 +185,6 @@ print(f"Processes to run: {processes_to_run}")
 
 process_datasets_to_model = process_datasets
 
-process_datasets_to_model_sensors = process_datasets_to_model.copy()
-process_datasets_to_model_sensors['process_1'] = process_datasets_to_model_sensors.get('process_1', {})
-# process_datasets_to_model_sensors['process_1']['objects_to_model'] = ['autoclaving_1']
-# process_datasets_to_model_sensors['process_1']['activities_to_model'] = ['heat', 'hold', 'cool']
-# process_datasets_to_model_sensors['process_1']['sensors_to_model'] = ['autoclave_steam_demand_kW_energy', 'autoclave_cooling_water_demand_kW_energy', 'destillation_steam_demand_kW_energy']
-
-process_datasets_to_model_sensors['process_2'] = process_datasets_to_model_sensors.get('process_2', {})
-# process_2 = production line l01
-# process_datasets_to_model_sensors['process_2']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_2']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
-
-process_datasets_to_model_sensors['process_3'] = process_datasets_to_model_sensors.get('process_3', {})
-# process_3 = production line l02 (split from original process_2)
-# process_datasets_to_model_sensors['process_3']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_3']['sensors_to_model'] = ['pro_volstrom_l/h_energy']
-
-process_datasets_to_model_sensors['process_4_1'] = process_datasets_to_model_sensors.get('process_4_1', {})
-# process_4_1 = spray tower (formerly process_3), regime before June 2025
-# process_datasets_to_model_sensors['process_4_1']['objects_to_model'] = ['tower_1']
-# process_datasets_to_model_sensors['process_4_1']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_4_1']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
-
-process_datasets_to_model_sensors['process_4_2'] = process_datasets_to_model_sensors.get('process_4_2', {})
-# process_4_2 = spray tower (formerly process_3), regime from June 2025 onward
-# process_datasets_to_model_sensors['process_4_2']['objects_to_model'] = ['tower_1']
-# process_datasets_to_model_sensors['process_4_2']['activities_to_model'] = ['Produktion']
-# process_datasets_to_model_sensors['process_4_2']['sensors_to_model'] = ['(8)_abluft_mas_kg/h_energy']
-
-process_datasets_to_model_sensors['process_5'] = process_datasets_to_model_sensors.get('process_5', {})
-# process_5 = Erhitzer (formerly process_4)
-# process_datasets_to_model_sensors['process_5']['objects_to_model'] = ['Erhitzer']
-# process_datasets_to_model_sensors['process_5']['activities_to_model'] = ['Step-032 = Umlauf', 'Step-030 = Produktion']
-# process_datasets_to_model_sensors['process_5']['sensors_to_model'] = ['temp_nach_WR2_(WT2)_5s_energy']
-
-print(process_datasets_to_model_sensors)
-# display(process_datasets_to_model_sensors['process_3']['expanded'])
 
 # Filter the original dictionary
 process_datasets_to_model = {
@@ -253,8 +214,6 @@ process_datasets_to_model_sensors = process_datasets_to_model.copy()
 #   → MINING_ALGORITHM:  only affects 'statistical' and the ml* modes.
 #                        energy-aware modes ignore it — they auto-pick the
 #                        best miner from the petri_net_* results.
-#   → SIMULATION_MODE:   only affects ml* modes ('ml' or 'ml_duration_only').
-#                        statistical and petri_net_* modes do not use it.
 #
 #   Energy-aware auto-selection (per activity, per modifier type):
 #     Duration  : ML kept only if val R² > 0  (> statistical baseline of predicting mean)
@@ -327,7 +286,7 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     scale predicts the arithmetic MEAN, which is what budget mode needs
     (count = budget / duration); the log1p target this used to offer predicted the
     geometric mean (~median) instead, under-filling the budget on right-skewed
-    activities (process_5 "Produktion": real mean 29 vs median 8) and making
+    activities (process_5's main activity: real mean 29 vs median 8) and making
     budget_ml_plus over-generate events 1.5-2.7x. It also amplified bad
     extrapolation exponentially. Removed 2026-07-24.
     """
@@ -541,24 +500,6 @@ MODES_TO_COMPARE = [
     # 'petri_net_combined_ml_plus_global',
     # 'petri_net_combined_ml_plus_per_act',
     # 'petri_net_median_duration',
-    # # ── energy-aware Petri-net variants ──────────────────────────────
-    # # Modifier approach: ML corrects a statistical base (ML only if it beats baseline)
-    # 'petri_net_energy_duration_aware',    # best duration (ML or stat) per activity; base PN transitions
-    # 'petri_net_energy_transition_aware',  # best transitions (ML or stat) per activity; base PN durations
-    # 'petri_net_energy_aware',             # best duration + best transition independently per activity
-    # # Direct approach: ML IS the prediction (energy_state → duration or next_activity directly)
-    # 'petri_net_energy_direct_duration_only',    # ML predicts duration directly; base PN transitions
-    # 'petri_net_energy_direct_transition_only',  # ML predicts next activity directly; stat durations
-    # 'petri_net_energy_direct',                  # ML predicts both directly per activity
-    # 'petri_net_energy_dist',                    # ML predicts log-mean; sample from LogNormal(predicted_μ, residual_σ)
-    # 'petri_net_direct_test',                    # ML shifts mean; shape sampled from fitted per-activity distribution
-    # # Quantile-blend: ML predicts quantile of fitted dist; entropy-weighted transition blend
-    # 'petri_net_quantile_blend',
-    # # Blend-duration: alpha-blend duration only; pure PN transitions
-    # 'petri_net_blend_duration',
-    # # Test-2: direct log-residual + temporal (hour/dow sin/cos) + shape-preserving + entropy blend
-    # 'petri_net_test_2',
-    #'petri_net_energy_direct_global',           # ONE global model across all activities (curr_act as feature)
     #'petri_net_statistical',
     #'petri_net_statistical_memory',
     #'ml_duration_only',
@@ -567,67 +508,6 @@ MODES_TO_COMPARE = [
     #'ml_global_model',
 ]
 
-# Keep requested modes, but drop Petri-net variants that are not enabled.
-_ENERGY_AWARE_MODES = {
-    # Modifier approach: ML corrects a statistical base duration/PN weights
-    'petri_net_energy_aware',
-    'petri_net_energy_duration_aware',
-    'petri_net_energy_transition_aware',
-    # Direct approach: ML is the full prediction (no statistical base)
-    'petri_net_energy_direct',
-    'petri_net_energy_direct_duration_only',
-    'petri_net_energy_direct_transition_only',
-    'petri_net_energy_direct_global',
-    'petri_net_energy_dist',
-    'petri_net_direct_test',
-    # Quantile-blend: ML predicts quantile of fitted dist + entropy-weighted transition blend
-    'petri_net_quantile_blend',
-    # Blend-duration: alpha-blend duration only; pure PN transitions
-    'petri_net_blend_duration',
-    # Test-2: temporal features + shape-preserving + entropy blend
-    'petri_net_test_2',
-}
-_ENERGY_DIRECT_MODES = {
-    'petri_net_energy_direct',
-    'petri_net_energy_direct_duration_only',
-    'petri_net_energy_direct_transition_only',
-    'petri_net_energy_direct_global',
-    'petri_net_energy_dist',
-    'petri_net_direct_test',
-}
-_ENERGY_QUANTILE_MODES = {
-    'petri_net_quantile_blend',
-}
-_ENERGY_BLEND_DUR_MODES = {
-    'petri_net_blend_duration',
-}
-_ENERGY_TEST2_MODES = {
-    'petri_net_test_2',
-}
-
-# ── Duration modifier models ───────────────────────────────────────────────
-# List of sklearn-compatible regressor types to compete per activity
-ENERGY_DURATION_MODELS    = ['xgboost', 'linear', 'lasso', 'mlp', 'statistical']
-
-# ── Transition modifier models ─────────────────────────────────────────────
-# List of classifier types to compete per activity
-ENERGY_TRANSITION_MODELS  = ['logistic', 'random_forest', 'gradient_boosting']
-
-ENERGY_DURATION_SCALE_CLIP = (0.7, 1.3)   # max ±30% shift per activity
-ENERGY_LOGIT_BIAS_CLIP     = (-1.0, 1.0)  # max ~2.7× odds-ratio shift per competing activity
-ENERGY_MIN_SAMPLES         = 3           # skip ML (use statistical) if n_samples < this
-
-# Will be populated per process after energy modelling:
-energy_modifiers_by_process = {}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIMULATION MODE TOGGLE
-#   'statistical'      – sample durations/transitions from best-fit distributions
-#   'ml'               – use ML models (falls back to statistical when needed)
-#   'ml_duration_only' – use ML only for the duration median; std and
-#                        transition probabilities still come from data extraction
-# ─────────────────────────────────────────────────────────────────────────────
-SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PROCESS MINING ALGORITHM
@@ -637,10 +517,7 @@ SIMULATION_MODE = 'ml_duration_only'   # ← change to 'ml' or 'ml_duration_only
 #   'ilp'        – pm4py ILP Miner → precise/sound, can be strict
 #   'manual'     – original manual extraction (no process mining)
 # ─────────────────────────────────────────────────────────────────────────────
-#MINING_ALGORITHM = 'inductive'   # ← change to 'manual' for old behavior
 MINING_ALGORITHM = os.environ.get('PIPELINE_DEFAULT_MINING_ALGORITHM', 'heuristic')
-#MINING_ALGORITHM = 'alpha'
-#MINING_ALGORITHM = 'ilp'
 
 # Petri-net miner variants to compare when mode names include the algorithm.
 # Override via PIPELINE_MINING_ALGORITHMS (comma-separated, e.g. "heuristic,inductive").
@@ -669,14 +546,13 @@ MINING_SEARCH_SPACE = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ML MODEL CONFIGURATION (only used when SIMULATION_MODE is 'ml' or 'ml_duration_only')
+# ML MODEL CONFIGURATION (SimModeller duration models for the ml* simulation modes)
 #   model_types: list of models to train — best is selected per activity key
 #                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
 #   optimize_hyperparams: True  → Optuna hyper-parameter search
 #                         False → use default model parameters
 #   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
 # ─────────────────────────────────────────────────────────────────────────────
-ML_MODEL_TYPES          = ['xgboost', 'linear', 'lasso', 'mlp']  # ← train all, pick best
 ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
 ML_OPTIMIZE_HYPERPARAMS = True    # ← set True to enable Optuna tuning
 ML_OPTUNA_TRIALS        = 20
@@ -828,20 +704,6 @@ def _pool_workers(n_tasks):
 #                        The faithful port of the competing paper -- see the
 #                        SEQ2SEQ IOM section in sim_extractor for the deviations.
 #    'ml_only'                 ML (GBM/RF), linear resample encode+decode (no DTW)
-#    'exemplar'          Real training curve (DTW medoid of a shape cluster),
-#                        chosen by a classifier over attributes + ef_* external
-#                        factors and scaled by an L1 level model. The only
-#                        approach that never averages, so the only one whose
-#                        output keeps realistic texture (ramps, duty cycling).
-#    'exemplar_only'     the no-DTW ablation of 'exemplar': the cluster medoid is
-#                        picked by mean absolute difference instead of DTW
-#                        distance. Everything else is identical, so the gap to
-#                        'exemplar' is attributable to DTW alone.
-#    'ml_cluster_dtw'    ml_external fitted PER DTW shape cluster and decoded
-#                        through a warp predicted from the attributes instead of
-#                        a uniform resample. Keeps exemplar_dtw's clustering and
-#                        learned warp but predicts every value with a regression,
-#                        so the curve is novel rather than a replayed one.
 #    'ml_step_dtw'       the leaf's STEP STRUCTURE as the regression target: the
 #                        DTW medoid is change-point segmented once, the
 #                        breakpoints are carried onto every training curve via
@@ -862,29 +724,17 @@ APPROACHES = [
     'ml_dtw',
     'ml_external',
     'ml_only',
-    'exemplar',
-    'exemplar_only',
-    'exemplar_dtw',
-    'ml_cluster_dtw',
     'ml_step_dtw',
     'ml_step_dtw_smooth',
 
     # ── Train/eval-gap variants of 'ml_external' ─────────────────────────────
-    # Every canonical approach fits a target in barycenter space (DTW-warped,
-    # position-averaged) but is SCORED pointwise on the real curve after a decode
-    # the model never saw. These four attack that gap, one change each, so the
+    # Fit in barycenter space like ml_external, but with per-row weights, so the
     # difference against 'ml_external' is attributable:
     #   ml_external_wcounts  row weight = raw samples folded into that canonical
     #                        position (they are not equally informative)
     #   ml_external_wmetric  ... additionally / curve sigma, matching sMAE
-    #   ml_external_calib    raw-space (gain, offset) fitted after the decode,
-    #                        correcting the encode's flattening of peaks
-    #   ml_rawspace          no encode/decode at all: train per raw sample, with
-    #                        DTW/DBA demoted from target transform to feature
     'ml_external_wcounts',
     'ml_external_wmetric',
-    'ml_external_calib',
-    'ml_rawspace',
 
     'seq2seq',
     'seq2seq_only',
@@ -902,11 +752,9 @@ if _env_curve_approaches:
     # Full universe of valid approach names (not just the currently-uncommented
     # defaults above) — mirrors the sklearn/seq2seq dispatch sets below.
     _known = {'baseline', 'median_activity_sensor', 'ml_dtw', 'ml_external',
-              'ml_only', 'exemplar', 'exemplar_only', 'exemplar_dtw', 'ml_cluster_dtw',
-              'ml_step_dtw', 'ml_step_dtw_smooth',
+              'ml_only', 'ml_step_dtw', 'ml_step_dtw_smooth',
               'seq2seq', 'seq2seq_only', 'seq2seq_external', 'seq2seq_iom',
-              'ml_external_wcounts', 'ml_external_wmetric', 'ml_external_calib',
-              'ml_rawspace'}
+              'ml_external_wcounts', 'ml_external_wmetric'}
     _unknown = [a for a in _requested if a not in _known]
     if _unknown:
         print(f"[modelling] WARNING: PIPELINE_CURVE_APPROACHES has names not in "
@@ -1512,8 +1360,6 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 process_test_cols = []
 energy_test_cols = []
 enabled_test_metrics = set()
-lower_is_better = set()
-higher_is_better = set()
 
 # Metrics where HIGHER is better (prefixes like train_ or test_ are stripped before checking)
 METRICS_HIGHER_IS_BETTER = {
@@ -1995,7 +1841,7 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     report("\n1. BASIC PROCESS METRICS")
     report("-" * 40)
     
-    # Event counts. Ratio is sim/real (matches modelling_utils and the
+    # Event counts. Ratio is sim/real (matches the
     # EvtRatio column convention): 1.0 = perfect match, >1 = simulation
     # OVER-counts events, <1 = simulation under-counts. NB: was real/sim here
     # (a reciprocal inconsistency, fixed 2026-07-21) — that both inverted the
@@ -2511,70 +2357,6 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     return results
 
 
-def plot_simulation_comparison(simulated_df, real_df, case_col='case_id', 
-                             activity_col='activity', start_col='timestamp_start', 
-                             end_col='timestamp_end'):
-    """Create detailed comparison plots"""
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('Simulation vs Real Data Comparison', fontsize=16, fontweight='bold')
-    
-    # 1. Activity frequencies
-    sim_freq = simulated_df[activity_col].value_counts()
-    real_freq = real_df[activity_col].value_counts()
-    
-    all_activities = list(set(sim_freq.index) | set(real_freq.index))
-    sim_aligned = [sim_freq.get(act, 0) for act in all_activities]
-    real_aligned = [real_freq.get(act, 0) for act in all_activities]
-    
-    x = np.arange(len(all_activities))
-    axes[0,0].bar(x - 0.2, real_aligned, 0.4, label='Real', alpha=0.7, color='skyblue')
-    axes[0,0].bar(x + 0.2, sim_aligned, 0.4, label='Simulated', alpha=0.7, color='orange')
-    axes[0,0].set_title('Activity Frequencies')
-    axes[0,0].set_xlabel('Activities')
-    axes[0,0].set_ylabel('Count')
-    axes[0,0].legend()
-    axes[0,0].tick_params(axis='x', rotation=45)
-    
-    # 2. Duration distributions
-    sim_durations = (simulated_df[end_col] - simulated_df[start_col]).dt.total_seconds() / 60
-    real_durations = (real_df[end_col] - real_df[start_col]).dt.total_seconds() / 60
-    
-    axes[0,1].hist(real_durations, alpha=0.7, label='Real', bins=30, density=True, color='skyblue')
-    axes[0,1].hist(sim_durations, alpha=0.7, label='Simulated', bins=30, density=True, color='orange')
-    axes[0,1].set_title('Activity Duration Distributions')
-    axes[0,1].set_xlabel('Duration (minutes)')
-    axes[0,1].set_ylabel('Density')
-    axes[0,1].legend()
-    
-    # 3. Events per case
-    sim_events_per_case = simulated_df.groupby(case_col).size()
-    real_events_per_case = real_df.groupby(case_col).size()
-    
-    axes[1,0].hist(real_events_per_case, alpha=0.7, label='Real', bins=20, density=True, color='skyblue')
-    axes[1,0].hist(sim_events_per_case, alpha=0.7, label='Simulated', bins=20, density=True, color='orange')
-    axes[1,0].set_title('Events per Case Distribution')
-    axes[1,0].set_xlabel('Events per Case')
-    axes[1,0].set_ylabel('Density')
-    axes[1,0].legend()
-    
-    # 4. Cumulative case duration
-    sim_case_durations = simulated_df.groupby(case_col).apply(
-        lambda x: (x[end_col].max() - x[start_col].min()).total_seconds() / 3600
-    )
-    real_case_durations = real_df.groupby(case_col).apply(
-        lambda x: (x[end_col].max() - x[start_col].min()).total_seconds() / 3600
-    )
-    
-    axes[1,1].hist(real_case_durations, alpha=0.7, label='Real', bins=20, density=True, color='skyblue')
-    axes[1,1].hist(sim_case_durations, alpha=0.7, label='Simulated', bins=20, density=True, color='orange')
-    axes[1,1].set_title('Case Duration Distribution')
-    axes[1,1].set_xlabel('Case Duration (hours)')
-    axes[1,1].set_ylabel('Density')
-    axes[1,1].legend()
-    
-    plt.tight_layout()
-    pass
 
 
 def visualize_heuristic_nets(df_compare, simulated_log):
@@ -2812,13 +2594,9 @@ all_energy_pipelines = {}
 
 _filtered_modes = []
 for _mode_name in MODES_TO_COMPARE:
-    if _mode_name in _ENERGY_AWARE_MODES:
-        _filtered_modes.append(_mode_name)   # always kept; validated at runtime
-        continue
     if _mode_name.startswith('petri_net_'):
         _mode_alg = _mode_name.replace('petri_net_', '', 1).strip().lower()
-        if (_mode_alg in ('combined', 'median_duration', 'wip_aware',
-                          'wip_branching_aware', 'budget') or
+        if (_mode_alg in ('combined', 'median_duration', 'budget') or
                 _mode_alg.endswith('_ml_plus_global') or
                 _mode_alg.endswith('_ml_plus_per_act')):
             _filtered_modes.append(_mode_name)
@@ -2992,9 +2770,6 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
 
-        if 'petri_net_wip_branching_aware' in MODES_TO_COMPARE:
-            ml_models.train_wip_transitions(raw_df, activity_stats_df)
-
     # ── Train the case-duration predictor for petri_net_budget mode ───────
     # One per-case total-duration regressor (schedule-only attributes -> total
     # minutes), the same predictor the "duration-corrected" post-processing
@@ -3047,11 +2822,6 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             # Derived after all base modes are evaluated.
             continue
 
-        if sim_mode in _ENERGY_AWARE_MODES:
-            # Energy-aware modes run in their own dedicated block below,
-            # after the best base PN has been selected.
-            continue
-
         print("\n" + "─"*80)
         print(f"  ▶ SIMULATION MODE: {sim_mode.upper()}")
         print("─"*80)
@@ -3060,13 +2830,7 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         simulation_mode = sim_mode
         mode_activity_stats_df = activity_stats_df
 
-        if sim_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
-            # Not parametrized by mining algorithm — uses the default
-            # MINING_ALGORITHM's Petri net + the shared ml_models (trained
-            # with 'wip'/'ro' features and waiting-time models; branching_aware
-            # additionally uses ml_models.transition_wip_models, if trained).
-            mode_algorithm = MINING_ALGORITHM
-        elif sim_mode == 'petri_net_budget':
+        if sim_mode == 'petri_net_budget':
             # Base PN token game on MINING_ALGORITHM's net, plus a per-case
             # duration budget spent inside the generator (case_duration_pipeline
             # passed to ProcessSimulation below). simulation_mode stays
@@ -3084,22 +2848,15 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             mode_activity_stats_df = extraction_by_algorithm[mode_algorithm]['activity_stats_df']
 
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net', 'petri_net_budget') else None
-        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_budget', 'petri_net_statistical', 'petri_net_statistical_memory', 'petri_net_wip_aware', 'petri_net_wip_branching_aware') else None
+        mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_budget', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
-        if simulation_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
-            simulated_log_train, _ = simulate_with_wip_ro(
-                mode_activity_stats_df, production_plan, mode_ml,
-                reference_mode='petri_net', process_models=mode_pm,
-                final_mode=simulation_mode,
-            )
-        else:
-            simulated_log_train = ProcessSimulation(
-                mode_activity_stats_df, production_plan,
-                mode=simulation_mode, ml_models=mode_ml,
-                process_models=mode_pm,
-                case_duration_pipeline=(_case_duration_pipeline
-                                        if simulation_mode == 'petri_net_budget' else None),
-            ).run()
+        simulated_log_train = ProcessSimulation(
+            mode_activity_stats_df, production_plan,
+            mode=simulation_mode, ml_models=mode_ml,
+            process_models=mode_pm,
+            case_duration_pipeline=(_case_duration_pipeline
+                                    if simulation_mode == 'petri_net_budget' else None),
+        ).run()
 
         print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
 
@@ -3115,7 +2872,6 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                                           per_case_tag=(process, sim_mode, split_label))
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
-        #plot_simulation_comparison(simulated_log_train, df_train)
         df_compare_train = df_train.dropna(subset=['case_id'])
         try:
             visualize_heuristic_nets(df_compare_train, simulated_log_train)
@@ -3143,24 +2899,15 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         df_test = test_datasets[process]['event_log'] if test_datasets else None
         if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
             production_plan_test = test_datasets[process]['production_plan']
-            if simulation_mode in ('petri_net_wip_aware', 'petri_net_wip_branching_aware'):
-                # Fresh reference pass + load profile from the test period's
-                # own production plan (not reused from train).
-                simulated_log_test, _ = simulate_with_wip_ro(
-                    mode_activity_stats_df, production_plan_test, mode_ml,
-                    reference_mode='petri_net', process_models=mode_pm,
-                    final_mode=simulation_mode,
-                )
-            else:
-                simulated_log_test = ProcessSimulation(
-                    mode_activity_stats_df,
-                    production_plan_test,
-                    mode=simulation_mode,
-                    ml_models=mode_ml,
-                    process_models=mode_pm,
-                    case_duration_pipeline=(_case_duration_pipeline
-                                            if simulation_mode == 'petri_net_budget' else None),
-                ).run()
+            simulated_log_test = ProcessSimulation(
+                mode_activity_stats_df,
+                production_plan_test,
+                mode=simulation_mode,
+                ml_models=mode_ml,
+                process_models=mode_pm,
+                case_duration_pipeline=(_case_duration_pipeline
+                                        if simulation_mode == 'petri_net_budget' else None),
+            ).run()
 
             print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
 
@@ -3191,7 +2938,6 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                                               per_case_tag=(process, sim_mode, 'TEST'))
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
-            #plot_simulation_comparison(simulated_log_test, df_test)
             df_compare_test = df_test.dropna(subset=['case_id'])
             try:
                 visualize_heuristic_nets(df_compare_test, simulated_log_test)
@@ -3583,113 +3329,6 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 process_mode_results.append(flattened_amlp)
                 evaluation_results_list.append(flattened_amlp)
 
-    # ── WIP/RO-aware combined with ML+ duration (global / per-activity) ──────
-    # Reuses the ML+ tuples trained just above (_mlp_glb_tpl/_mlp_pa_tpls) for
-    # duration, plus the shared ml_models (SimModeller) for waiting time, plus
-    # the default MINING_ALGORITHM's Petri net (like plain petri_net_wip_aware).
-    _wip_mlp_modes_requested = [
-        m for m in MODES_TO_COMPARE
-        if m in ('petri_net_wip_aware_ml_plus_global', 'petri_net_wip_aware_ml_plus_per_act')
-    ]
-    if _wip_mlp_modes_requested:
-        _wip_mlp_pm    = extraction_by_algorithm[MINING_ALGORITHM]['process_models']
-        _wip_mlp_stats = extraction_by_algorithm[MINING_ALGORITHM]['activity_stats_df']
-
-        for _wip_mlp_mode in _wip_mlp_modes_requested:
-            _use_global = _wip_mlp_mode.endswith('_ml_plus_global')
-            _g_arg  = _mlp_glb_tpl if _use_global else None
-            _pa_arg = None if _use_global else _mlp_pa_tpls
-
-            print("\n" + "─"*80)
-            print(f"  ▶ SIMULATION MODE: {_wip_mlp_mode.upper()}")
-            print("─"*80)
-
-            sim_wipmlp_train, _ = simulate_with_wip_ro(
-                _wip_mlp_stats, production_plan, ml_models,
-                reference_mode='petri_net', process_models=_wip_mlp_pm,
-                final_mode=_wip_mlp_mode,
-                mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
-                mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
-                mlp_ef_windows=_mlp_ef_windows,
-                mlp_global_mean=_mlp_glb_mean,
-            )
-            print(f"\n  Simulated log TRAIN ({_wip_mlp_mode}): {len(sim_wipmlp_train)} events")
-
-            eval_wipmlp_train = comprehensive_simulation_evaluation(
-                sim_wipmlp_train, df_train, process_models=_wip_mlp_pm,
-                per_case_tag=(process, _wip_mlp_mode, split_label)
-            )
-            flattened_wipmlp = {
-                'process':          process,
-                'mode':             _wip_mlp_mode,
-                'simulation_mode':  _wip_mlp_mode,
-                'mining_algorithm': MINING_ALGORITHM,
-                'split':            split_label,
-            }
-            for _cat, _mets in eval_wipmlp_train.items():
-                if isinstance(_mets, dict):
-                    for _mn, _mv in _mets.items():
-                        flattened_wipmlp[f"train_{_cat}_{_mn}"] = _mv
-                else:
-                    flattened_wipmlp[f"train_{_cat}"] = _mets
-
-            _df_test_wipmlp = test_datasets[process]['event_log'] if test_datasets else None
-            if TEMPORAL_SPLIT and _df_test_wipmlp is not None and len(_df_test_wipmlp) > 0:
-                _pp_test_wipmlp = test_datasets[process]['production_plan']
-                sim_wipmlp_test, _ = simulate_with_wip_ro(
-                    _wip_mlp_stats, _pp_test_wipmlp, ml_models,
-                    reference_mode='petri_net', process_models=_wip_mlp_pm,
-                    final_mode=_wip_mlp_mode,
-                    mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
-                    mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
-                    mlp_ef_windows=_mlp_ef_windows,
-                    mlp_global_mean=_mlp_glb_mean,
-                )
-                print(f"\n  Simulated log TEST  ({_wip_mlp_mode}): {len(sim_wipmlp_test)} events")
-
-                if EXPORT_RESULTS:
-                    _safe_process = str(process).replace(' ', '_').replace('/', '_')
-                    _safe_mode    = str(_wip_mlp_mode).replace(' ', '_').replace('/', '_')
-                    _pred_df = sim_wipmlp_test.drop(
-                        columns=[c for c in sim_wipmlp_test.columns
-                                 if c == 'simulated_energy_curves'],
-                        errors='ignore',
-                    )
-                    _pred_path = os.path.join(
-                        _predicted_logs_dir, f'{_safe_process}_{_safe_mode}.parquet'
-                    )
-                    _pred_df.to_parquet(_pred_path, index=False)
-                    print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
-
-                eval_wipmlp_test = comprehensive_simulation_evaluation(
-                    sim_wipmlp_test, _df_test_wipmlp, process_models=_wip_mlp_pm,
-                    per_case_tag=(process, _wip_mlp_mode, 'TEST')
-                )
-                for _cat, _mets in eval_wipmlp_test.items():
-                    if isinstance(_mets, dict):
-                        for _mn, _mv in _mets.items():
-                            flattened_wipmlp[f"test_{_cat}_{_mn}"] = _mv
-                    else:
-                        flattened_wipmlp[f"test_{_cat}"] = _mets
-
-                _combined_sim_store.append({
-                    'process':     process,
-                    'mode':        _wip_mlp_mode,
-                    'sim_df':      sim_wipmlp_test,
-                    'exp_df':      test_datasets[process].get('expanded'),
-                    'sensors':     [],
-                    'act_metrics': {},
-                })
-
-                _energy_distribution_pending.append((
-                    process, _wip_mlp_mode, sim_wipmlp_test,
-                    test_datasets[process].get('expanded'),
-                    dict(flattened_wipmlp),
-                ))
-
-            process_mode_results.append(flattened_wipmlp)
-            evaluation_results_list.append(flattened_wipmlp)
-
     # ── Budget + ML+ duration variants ───────────────────────────────────────
     # petri_net_budget (each case generated to its predicted total-duration
     # budget) combined with ML+ per-activity / global duration prediction — for
@@ -3803,522 +3442,6 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             process_mode_results.append(flattened_budmlp)
             evaluation_results_list.append(flattened_budmlp)
 
-    # ── Energy-aware Petri-net modes ─────────────────────────────────────────
-    # These run AFTER all base modes (including petri_net_combined) so the
-    # best base PN can be identified from the already-computed train scores.
-    _energy_modes_requested = [
-        m for m in MODES_TO_COMPARE if m in _ENERGY_AWARE_MODES
-    ]
-    all_energy_pipelines = {}  # Global store for evaluation
-    VERBOSE_EVAL = False        # Set to True for detailed logs
-
-    if _energy_modes_requested:
-        # Identify best non-energy Petri-net mode by TRAIN overall score
-        _base_candidate_modes = {
-            'petri_net_alpha', 'petri_net_heuristic', 'petri_net_inductive',
-        }
-        _base_candidates = [
-            row for row in process_mode_results
-            if row.get('mode') in _base_candidate_modes
-        ]
-        if not _base_candidates:
-            print(
-                "⚠️  No base Petri-net modes evaluated — cannot run energy-aware modes. "
-                "Add at least one of petri_net_alpha / petri_net_heuristic / "
-                "petri_net_inductive to MODES_TO_COMPARE."
-            )
-        else:
-            _best_base_row = min(
-                _base_candidates,
-                key=_combined_selection_score,
-            )
-            _best_base_alg = _best_base_row.get('mining_algorithm')
-            _best_base_pm  = extraction_by_algorithm[_best_base_alg]['process_models']
-            _best_base_stats = extraction_by_algorithm[_best_base_alg]['activity_stats_df']
-
-            print("\n" + "="*80)
-            print(f"ENERGY-AWARE MODES: using '{_best_base_row['mode']}' as base PN "
-                  f"(train_overall_error={_best_base_row.get('train_overall_error'):.4f})")
-            print("="*80)
-
-            # ── Extract energy modifiers once per process ─────────────────
-            _df_expanded_train = train_datasets[process].get('expanded')
-            if _df_expanded_train is None or _df_expanded_train.empty:
-                print("⚠️  No expanded training df available — skipping energy modifiers.")
-            else:
-                # Detect external-factor columns (ef_*) from expanded training df
-                _ef_ep_cols = [
-                    c for c in _df_expanded_train.columns
-                    if c.startswith('ef_')
-                    and _df_expanded_train[c].dtype in ('float64', 'float32', 'int64', 'int32')
-                ]
-                if _ef_ep_cols:
-                    print(f"  ℹ️  Energy models will use {len(_ef_ep_cols)} external factor(s): {_ef_ep_cols}")
-                # Auto-detect sensor columns: any *_energy column that is not a log column.
-                # If process_datasets_to_model_sensors is defined and has sensors_to_model,
-                # use that curated list instead (it is defined later in the energy-modelling section).
-                _sensors_from_config = (
-                    process_datasets_to_model_sensors  # noqa: F821
-                    .get(process, {})
-                    .get('sensors_to_model', [])
-                ) if 'process_datasets_to_model_sensors' in dir() else []
-
-                if _sensors_from_config:
-                    _sensors = _sensors_from_config
-                else:
-                    # Fall back: all *_to_model columns that are numeric
-                    _sensors = [
-                        c for c in _df_expanded_train.columns
-                        if c.endswith('_to_model')
-                        and _df_expanded_train[c].dtype in ('float64', 'float32', 'int64', 'int32')
-                    ]
-                    if _sensors:
-                        print(f"  ℹ️  Auto-detected {len(_sensors)} sensor column(s): {_sensors}")
-
-                if not _sensors:
-                    print("⚠️  No sensors found for this process — skipping energy modifiers.")
-                    _activity_exog_means = {}
-                else:
-                    # Initialise ALL model dicts before try so they're defined even if an
-                    # exception occurs mid-block (each set gets overwritten on success).
-                    _energy_dur_mods           = {}
-                    _energy_tr_mods            = {}
-                    _energy_state_cols         = []
-                    _energy_direct_dur_mods    = {}
-                    _energy_direct_tr_mods     = {}
-                    _direct_energy_state_cols  = []
-                    _quantile_dur_mods         = {}
-                    _quantile_tr_mods          = {}
-                    _quantile_energy_state_cols = []
-                    _test2_dur_mods            = {}
-                    _test2_tr_mods             = {}
-                    _test2_energy_state_cols   = []
-                    _global_dur_mods           = {}
-                    _global_tr_mods            = {}
-                    _global_energy_state_cols  = []
-                    try:
-                        _energy_dur_mods, _energy_tr_mods, _energy_state_cols, _model_choices_report = \
-                            extract_energy_modifiers(
-                                df_expanded=_df_expanded_train,
-                                sensors=_sensors,
-                                duration_models=ENERGY_DURATION_MODELS,
-                                transition_models=ENERGY_TRANSITION_MODELS,
-                                min_samples=ENERGY_MIN_SAMPLES,
-                                ef_cols=_ef_ep_cols,
-                            )
-                        energy_modifiers_by_process[process] = {
-                            'duration':    _energy_dur_mods,
-                            'transition':  _energy_tr_mods,
-                            'columns':     _energy_state_cols,
-                            'report':      _model_choices_report
-                        }
-
-                        # Print Model Choices Tracking Report
-                        if _model_choices_report:
-                            report("\n" + "="*80)
-                            report(f"ENERGY MODIFIER APPROACH TRACKING | Process: {process}")
-                            report("="*80)
-                            _choices_df = pd.DataFrame.from_dict(_model_choices_report, orient='index').reset_index()
-                            _choices_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
-                            _choices_df.insert(0, 'Dataset/Process', process)
-                            report(_choices_df.to_string(index=False))
-                            display(_choices_df)
-
-                        # Flatten activity_config to {activity_str: stats} — shared by direct + test2
-                        _act_dur_config = {}
-                        for (_act, _obj, _otype, _higher), _stats in _best_base_stats.items():
-                            _ak = str(_act)
-                            if _ak not in _act_dur_config:
-                                _act_dur_config[_ak] = _stats
-
-                        # ── Train direct ML models (if any direct modes requested) ──
-                        _direct_modes_requested = [
-                            m for m in _energy_modes_requested if m in _ENERGY_DIRECT_MODES
-                        ]
-                        if _direct_modes_requested:
-                            _energy_direct_dur_mods, _energy_direct_tr_mods, _direct_energy_state_cols, _direct_report = \
-                                extract_energy_direct_models(
-                                    df_expanded=_df_expanded_train,
-                                    sensors=_sensors,
-                                    duration_models=ENERGY_DURATION_MODELS,
-                                    transition_models=ENERGY_TRANSITION_MODELS,
-                                    min_samples=ENERGY_MIN_SAMPLES,
-                                    ef_cols=_ef_ep_cols,
-                                    activity_config=_act_dur_config,
-                                )
-                            if _direct_report:
-                                report("\n" + "="*80)
-                                report(f"ENERGY DIRECT MODEL APPROACH TRACKING | Process: {process}")
-                                report("="*80)
-                                _direct_df = pd.DataFrame.from_dict(_direct_report, orient='index').reset_index()
-                                _direct_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
-                                _direct_df.insert(0, 'Dataset/Process', process)
-                                report(_direct_df.to_string(index=False))
-                                display(_direct_df)
-
-                        # ── Train quantile-blend models ────────────────────────────────
-                        _quantile_dur_mods, _quantile_tr_mods, _quantile_energy_state_cols = {}, {}, []
-                        _quantile_modes_requested = [
-                            m for m in _energy_modes_requested
-                            if m in _ENERGY_QUANTILE_MODES | _ENERGY_BLEND_DUR_MODES
-                        ]
-                        if _quantile_modes_requested:
-                            from utils.sim_extractor import extract_energy_quantile_models
-                            _quantile_dur_mods, _quantile_tr_mods, _quantile_energy_state_cols, _quantile_report = \
-                                extract_energy_quantile_models(
-                                    df_expanded=_df_expanded_train,
-                                    sensors=_sensors,
-                                    stats_df=_best_base_stats,
-                                    duration_models=ENERGY_DURATION_MODELS,
-                                    transition_models=ENERGY_TRANSITION_MODELS,
-                                    min_samples=ENERGY_MIN_SAMPLES,
-                                    ef_cols=_ef_ep_cols,
-                                    activity_col='activity_log',
-                                    activity_config=_act_dur_config,
-                                )
-                            if _quantile_report:
-                                report("\n" + "="*80)
-                                report(f"QUANTILE-BLEND MODEL TRACKING | Process: {process}")
-                                report("="*80)
-                                _q_df = pd.DataFrame.from_dict(_quantile_report, orient='index').reset_index()
-                                _q_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
-                                _q_df.insert(0, 'Dataset/Process', process)
-                                report(_q_df.to_string(index=False))
-                                display(_q_df)
-
-                        # ── Train test-2 models (direct + temporal features) ──────────────
-                        _test2_dur_mods, _test2_tr_mods, _test2_energy_state_cols = {}, {}, []
-                        _test2_modes_requested = [
-                            m for m in _energy_modes_requested if m in _ENERGY_TEST2_MODES
-                        ]
-                        if _test2_modes_requested:
-                            from utils.sim_extractor import extract_energy_test2_models
-                            _test2_dur_mods, _test2_tr_mods, _test2_energy_state_cols, _test2_report = \
-                                extract_energy_test2_models(
-                                    df_expanded=_df_expanded_train,
-                                    sensors=_sensors,
-                                    duration_models=ENERGY_DURATION_MODELS,
-                                    transition_models=ENERGY_TRANSITION_MODELS,
-                                    min_samples=ENERGY_MIN_SAMPLES,
-                                    ef_cols=_ef_ep_cols,
-                                    activity_config=_act_dur_config,
-                                )
-                            if _test2_report:
-                                report("\n" + "="*80)
-                                report(f"TEST-2 MODEL TRACKING | Process: {process}")
-                                report("="*80)
-                                _t2_df = pd.DataFrame.from_dict(_test2_report, orient='index').reset_index()
-                                _t2_df.rename(columns={'index': 'Subprocess (Activity)'}, inplace=True)
-                                _t2_df.insert(0, 'Dataset/Process', process)
-                                report(_t2_df.to_string(index=False))
-                                display(_t2_df)
-
-                        # ── Train global direct model (one model, all activities pooled) ──
-                        _global_dur_mods, _global_tr_mods, _global_energy_state_cols = {}, {}, []
-                        _global_modes_requested = [
-                            m for m in _energy_modes_requested if m == 'petri_net_energy_direct_global'
-                        ]
-                        if _global_modes_requested:
-                            _global_dur_mods, _global_tr_mods, _global_energy_state_cols, _global_report = \
-                                extract_energy_direct_models_global(
-                                    df_expanded=_df_expanded_train,
-                                    sensors=_sensors,
-                                    duration_models=ENERGY_DURATION_MODELS,
-                                    transition_models=ENERGY_TRANSITION_MODELS,
-                                    min_samples=ENERGY_MIN_SAMPLES,
-                                    ef_cols=_ef_ep_cols,
-                                )
-                            report(f"\nGlobal model: Duration={_global_report.get('Duration','n/a')}  "
-                                   f"Transition={_global_report.get('Transition','n/a')}")
-
-                        # ── Train Dynamic ML Curve Predictors ──────────────────
-                        # One pipeline per (sensor, activity, object) so each barycenter
-                        # and model is fit on a homogeneous set of curves.
-                        # Only run this if we actually want to evaluate on Test results
-                        # as this DTW-based training is the slowest part of the pipeline.
-                        if RUN_TEST_EVALUATION:
-                            from utils.sim_extractor import (predict_raw_curve, predict_raw_curve_exog,
-                                                       _train_energy_pipeline_worker)
-                            import concurrent.futures, os
-
-                            _energy_pipelines = {}
-
-                            _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
-                            _activities_list = _config.get('activities_to_model', _df_expanded_train['activity_log'].dropna().unique().tolist())
-                            _objects_list    = _config.get('objects_to_model',    _df_expanded_train['object_log'].dropna().unique().tolist())
-
-                            def _make_predict_fn(ep_bound):
-                                _ep_exog = ep_bound.get('exog_cols', [])
-                                if _ep_exog:
-                                    return (lambda ep: lambda raw_values, activity, object_attributes, exog=None:
-                                        predict_raw_curve_exog(raw_values, activity, object_attributes,
-                                                               pipeline=ep, exog_values=exog or {})
-                                    )(ep_bound)
-                                return (lambda ep: lambda raw_values, activity, object_attributes, exog=None:
-                                    predict_raw_curve(raw_values, activity, object_attributes, pipeline=ep)
-                                )(ep_bound)
-
-                            # Pre-compute per-activity exog stats from training data.
-                            # Raw key (ef_col) retained for curve-prediction pipelines that
-                            # still use exog_cols with raw names.  Expanded keys (_mean/_end/_std)
-                            # are required by energy_state_columns after the ef_* expansion.
-                            _activity_exog_means = {}
-                            if _ef_ep_cols and 'activity_log' in _df_expanded_train.columns:
-                                for _act in _activities_list:
-                                    _act_rows = _df_expanded_train[_df_expanded_train['activity_log'] == _act]
-                                    if len(_act_rows) > 0:
-                                        _ef_entry = {}
-                                        for col in _ef_ep_cols:
-                                            if col not in _act_rows.columns or _act_rows[col].isna().all():
-                                                continue
-                                            _vals = _act_rows[col].dropna()
-                                            _mean = float(_vals.mean())
-                                            _std  = float(_vals.std()) if len(_vals) > 1 else 0.0
-                                            _ef_entry[col]              = _mean  # raw key for curve pipelines
-                                            _ef_entry[f'{col}_mean']    = _mean
-                                            _ef_entry[f'{col}_end']     = _mean  # best proxy at sim time
-                                            _ef_entry[f'{col}_std']     = _std
-                                        _activity_exog_means[_act] = _ef_entry
-
-                            # Restrict per-sensor to the objects/activities where that sensor
-                            # actually carries signal (see build_sensor_activity_object_combos).
-                            _combos = build_sensor_activity_object_combos(
-                                _df_expanded_train, _sensors, _activities_list, _objects_list
-                            )
-                            _n_workers = _pool_workers(len(_combos))
-                            print(f"\n  ℹ️ Training {len(_combos)} pipelines across {_n_workers} workers"
-                                  f" ({'with' if _ef_ep_cols else 'without'} external factors)...")
-                            print(f"     sensors={_sensors}")
-                            print(f"     activities={_activities_list}")
-                            print(f"     objects={_objects_list}")
-
-                            # ProcessPoolExecutor works from Jupyter notebooks; joblib/loky does not
-                            # reliably spawn from an interactive kernel on Linux.
-                            _results = []
-                            with concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers) as _ctx:
-                                _futures = {
-                                    _ctx.submit(_train_energy_pipeline_worker, s, a, o,
-                                                _df_expanded_train, 1, _ef_ep_cols): (s, a, o)
-                                    for s, a, o in _combos
-                                }
-                                for _fut in concurrent.futures.as_completed(_futures):
-                                    try:
-                                        _results.append(_fut.result())
-                                    except Exception as _e:
-                                        s, a, o = _futures[_fut]
-                                        print(f"    ⚠️  Worker failed {s}|{a}|{o}: {_e}")
-
-                            for _sensor, _activity, _object, _ep_pipeline in _results:
-                                if _ep_pipeline is None:
-                                    print(f"    ⚠️  Skipped {_sensor} | {_activity} | {_object} (too few curves).")
-                                    continue
-                                _energy_pipelines.setdefault(_sensor, {}).setdefault(_activity, {})[_object] = {
-                                    'reference_curve': _ep_pipeline['reference_curve'],
-                                    'predict_fn':      _make_predict_fn(_ep_pipeline),
-                                    'exog_cols':       _ep_pipeline.get('exog_cols', []),
-                                    'full_pipeline':   _ep_pipeline,
-                                }
-
-                            all_energy_pipelines[process] = _energy_pipelines
-                        else:
-                            _energy_pipelines = {}
-                            _activity_exog_means = {}
-
-                    except Exception as _exc:
-                        print(f"⚠️  extract_energy_modifiers or ML curve modeling failed: {_exc}")
-                        _energy_dur_mods, _energy_tr_mods, _energy_state_cols = {}, {}, []
-                        _energy_pipelines = {}
-                        _activity_exog_means = {}
-                        _config = process_datasets_to_model_sensors.get(process, {}) if 'process_datasets_to_model_sensors' in dir() else {}
-                        _activities_list = _config.get(
-                            'activities_to_model',
-                            _df_expanded_train['activity_log'].dropna().unique().tolist()
-                            if _df_expanded_train is not None and 'activity_log' in _df_expanded_train.columns
-                            else []
-                        )
-
-                # ── Simulate energy-aware modes ───────────────────────────
-                for _energy_mode in _energy_modes_requested:
-                    print("\n" + "─"*80)
-                    print(f"  ▶ SIMULATION MODE: {_energy_mode.upper()}")
-                    print("─"*80)
-
-                    def _build_activity_exog_means(df_expanded, activities, ef_cols):
-                        """Compute per-activity ef_* stats from any expanded dataframe."""
-                        means = {}
-                        if not ef_cols or 'activity_log' not in df_expanded.columns:
-                            return means
-                        for act in activities:
-                            act_rows = df_expanded[df_expanded['activity_log'] == act]
-                            if len(act_rows) == 0:
-                                continue
-                            entry = {}
-                            for col in ef_cols:
-                                if col not in act_rows.columns or act_rows[col].isna().all():
-                                    continue
-                                vals = act_rows[col].dropna()
-                                mean = float(vals.mean())
-                                std  = float(vals.std()) if len(vals) > 1 else 0.0
-                                entry[col]           = mean   # raw key for curve pipelines
-                                entry[f'{col}_mean'] = mean
-                                entry[f'{col}_end']  = mean   # best proxy at sim time
-                                entry[f'{col}_std']  = std
-                            means[act] = entry
-                        return means
-
-                    def _run_energy_sim(plan, stats_df, pm, exog_means=None):
-                        # Route each mode to its own trained model set
-                        _is_global    = _energy_mode == 'petri_net_energy_direct_global'
-                        _is_direct    = _energy_mode in _ENERGY_DIRECT_MODES
-                        _is_quantile  = _energy_mode in _ENERGY_QUANTILE_MODES
-                        _is_blend_dur = _energy_mode in _ENERGY_BLEND_DUR_MODES
-                        _is_test2     = _energy_mode in _ENERGY_TEST2_MODES
-                        if _is_global:
-                            _dur_mods   = _global_dur_mods
-                            _tr_mods    = _global_tr_mods
-                            _state_cols = _global_energy_state_cols
-                        elif _is_test2:
-                            _dur_mods   = _test2_dur_mods
-                            _tr_mods    = _test2_tr_mods
-                            _state_cols = _test2_energy_state_cols
-                        elif _is_blend_dur:
-                            _dur_mods   = _quantile_dur_mods
-                            _tr_mods    = {}   # pure PN transitions — no ML
-                            _state_cols = _quantile_energy_state_cols
-                        elif _is_quantile:
-                            _dur_mods   = _quantile_dur_mods
-                            _tr_mods    = _quantile_tr_mods
-                            _state_cols = _quantile_energy_state_cols
-                        elif _is_direct:
-                            _dur_mods   = _energy_direct_dur_mods
-                            _tr_mods    = _energy_direct_tr_mods
-                            _state_cols = _direct_energy_state_cols
-                        else:
-                            _dur_mods   = _energy_dur_mods
-                            _tr_mods    = _energy_tr_mods
-                            _state_cols = _energy_state_cols
-                        return ProcessSimulation(
-                            stats_df, plan,
-                            mode=_energy_mode,
-                            base_simulation_mode=SIMULATION_MODE,
-                            ml_models=ml_models,
-                            process_models=pm,
-                            energy_duration_modifiers=_dur_mods,
-                            energy_transition_modifiers=_tr_mods,
-                            energy_state_columns=_state_cols,
-                            energy_pipelines=_energy_pipelines,
-                            activity_exog_means=exog_means if exog_means is not None else _activity_exog_means,
-                            duration_scale_clip=ENERGY_DURATION_SCALE_CLIP,
-                            logit_bias_clip=ENERGY_LOGIT_BIAS_CLIP,
-                            temporal_resolution_minutes=TEMPORAL_RESOLUTION_MINUTES,
-                            verbose=VERBOSE_EVAL,
-                        ).run()
-
-                    _energy_sim_train = _run_energy_sim(
-                        production_plan, _best_base_stats, _best_base_pm
-                    )
-                    if VERBOSE_EVAL:
-                        print(f"\n  Simulated log TRAIN ({_energy_mode}): "
-                              f"{len(_energy_sim_train)} events")
-
-                    # Use _df_expanded_train for energy comparison in comprehensive_simulation_evaluation
-                    _eval_train = comprehensive_simulation_evaluation(
-                        _energy_sim_train, df_train, real_expanded_df=_df_expanded_train,
-                        process_models=_best_base_pm,
-                        per_case_tag=(process, _energy_mode, split_label))
-
-                    _energy_flattened = {
-                        'process':           process,
-                        'mode':              _energy_mode,
-                        'simulation_mode':   _energy_mode,
-                        'mining_algorithm':  _best_base_alg,
-                        'split':             split_label,
-                        'selected_mode':     _best_base_row['mode'],
-                    }
-                    for _cat, _met in _eval_train.items():
-                        if _cat == 'energy_metrics' and isinstance(_met, dict):
-                            # Special handling to flatten nested energy metrics
-                            for _sensor, _vals in _met.items():
-                                for _mn, _mv in _vals.items():
-                                    _energy_flattened[f"train_energy_{_sensor}_{_mn}"] = _mv
-                        elif isinstance(_met, dict):
-                            for _mn, _mv in _met.items():
-                                _energy_flattened[f"train_{_cat}_{_mn}"] = _mv
-                        else:
-                            _energy_flattened[f"train_{_cat}"] = _met
-
-                    # ── Test evaluation (Guarded for speed) ────────────────
-                    if RUN_TEST_EVALUATION:
-                        _df_test = test_datasets[process]['event_log'] if test_datasets else None
-                        if TEMPORAL_SPLIT and _df_test is not None and len(_df_test) > 0:
-                            _pp_test  = test_datasets[process]['production_plan']
-                            _exp_test = test_datasets[process]['expanded']
-                            # ef_* are real observable external factors — use actual test-set
-                            # values instead of training-time means so the model sees real
-                            # conditions, not a constant proxy.
-                            _exog_means_test = _build_activity_exog_means(
-                                _exp_test, _activities_list, _ef_ep_cols
-                            ) if _ef_ep_cols else _activity_exog_means
-                            _energy_sim_test = _run_energy_sim(
-                                _pp_test, _best_base_stats, _best_base_pm,
-                                exog_means=_exog_means_test,
-                            )
-                            if VERBOSE_EVAL:
-                                print(f"\n  Simulated log TEST  ({_energy_mode}): "
-                                      f"{len(_energy_sim_test)} events")
-
-                            _eval_test = comprehensive_simulation_evaluation(
-                                _energy_sim_test, _df_test, real_expanded_df=_exp_test,
-                                process_models=_best_base_pm,
-                                per_case_tag=(process, _energy_mode, 'TEST'))
-                            for _cat, _met in _eval_test.items():
-                                if _cat == 'energy_metrics' and isinstance(_met, dict):
-                                    for _sensor, _vals in _met.items():
-                                        for _mn, _mv in _vals.items():
-                                            _energy_flattened[f"test_energy_{_sensor}_{_mn}"] = _mv
-                                elif _cat == 'activity_energy_metrics':
-                                    pass  # kept in _eval_test for plotting; not flattened into wide df
-                                elif isinstance(_met, dict):
-                                    for _mn, _mv in _met.items():
-                                        _energy_flattened[f"test_{_cat}_{_mn}"] = _mv
-                                else:
-                                    _energy_flattened[f"test_{_cat}"] = _met
-
-                            # Store sim df for later curve plotting
-                            _combined_sim_store.append({
-                                'process':  process,
-                                'mode':     _energy_mode,
-                                'sim_df':   _energy_sim_test,
-                                'exp_df':   _exp_test,
-                                'sensors':  _sensors,
-                                'act_metrics': _eval_test.get('activity_energy_metrics', {}),
-                            })
-
-                    process_mode_results.append(_energy_flattened)
-                    evaluation_results_list.append(_energy_flattened)
-
-
-        # ── Intermediate Per-Process Training Heatmap ─────────────────────
-        if process_mode_results:
-            _proc_df = pd.DataFrame(process_mode_results)
-            
-            # Specifically filter for the CORE metrics the user wants to see
-            _train_cols = []
-            for _base in CORE_METRIC_BASES:
-                _full = f"train_{_base}"
-                if _full in _proc_df.columns:
-                    _train_cols.append(_full)
-            
-            # If no core metrics found, fall back to any training metric (fast fallback)
-            if not _train_cols:
-                _train_cols = [c for c in _proc_df.columns if c.startswith('train_') and not c.startswith('train_energy_')]
-            
-            display(Markdown(f"## 📊 Training Verification: {process.upper()}"))
-            display(Markdown(f"*Evaluation on training data — same metrics as test (0 = best)*"))
-            _hm_train_mean_path = os.path.join(_process_results_dir, f'process_train_heatmap_{process}_mean.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-            _hm_train_median_path = os.path.join(_process_results_dir, f'process_train_heatmap_{process}_median.png') if EXPORT_RESULTS and '_process_results_dir' in dir() else None
-            _plot_short_heatmap(_proc_df, f"Training Quality (Mean): {process}", save_path=_hm_train_mean_path, agg='mean', split='train')
-            _plot_short_heatmap(_proc_df, f"Training Quality (Median): {process}", save_path=_hm_train_median_path, agg='median', split='train')
 
 
 if RUN_PROCESS_MODELLING:
@@ -4469,7 +3592,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         predict_raw_curve_median,
         predict_raw_curve_exog,
         predict_raw_curve_exog_prev_activity,
-        predict_raw_curve_rawspace,
+        evaluate_pipeline_on_test,
         predict_raw_curve_ml_only,
         predict_raw_curve_seq2seq,
         predict_raw_curve_seq2seq_only,
@@ -4486,16 +3609,10 @@ if RUN_CURVE_ONLY_EVALUATION:
     all_energy_pipelines_seq2seq_external = {}  # DTW + Seq2Seq + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_seq2seq_iom          = {}   # Seq2Seq + IOM selection (Woerrlein & Strassburger)
     all_energy_pipelines_ml_only                  = {}   # ML, linear resample encode+decode
-    all_energy_pipelines_exemplar                 = {}   # real-curve exemplar + shape classifier
-    all_energy_pipelines_exemplar_only            = {}   # exemplar without DTW (Euclidean medoid)
-    all_energy_pipelines_exemplar_dtw             = {}   # + DTW k-medoids + predicted time warp
-    all_energy_pipelines_ml_cluster_dtw           = {}   # ml_external per shape cluster + predicted warp
     all_energy_pipelines_ml_step_dtw              = {}   # segment durations+levels via DTW correspondence
     all_energy_pipelines_ml_step_dtw_smooth       = {}   # ml_step_dtw with interpolated (jump-free) level gains
     all_energy_pipelines_ml_external_wcounts      = {}   # DTW + ML + Ext. (count-weighted)
     all_energy_pipelines_ml_external_wmetric      = {}   # DTW + ML + Ext. (metric-weighted)
-    all_energy_pipelines_ml_external_calib        = {}   # DTW + ML + Ext. (decode-calibrated)
-    all_energy_pipelines_ml_rawspace              = {}   # Raw-space ML + Ext. (no encode/decode)
 
     # Curve regressors are defined once in sim_extractor._make_curve_models and
     # used there by _train_curve_only_worker; imported here only so the run log
@@ -4586,16 +3703,10 @@ if RUN_CURVE_ONLY_EVALUATION:
         _pipelines_seq2seq_external    = {}
         _pipelines_seq2seq_iom              = {}
         _pipelines_ml_only                = {}
-        _pipelines_exemplar               = {}   # real-curve exemplar (no averaging)
-        _pipelines_exemplar_only          = {}   # exemplar without DTW (Euclidean medoid)
-        _pipelines_exemplar_dtw           = {}   # + DTW k-medoids + predicted warp
-        _pipelines_ml_cluster_dtw         = {}   # ml_external per shape cluster + predicted warp
         _pipelines_ml_step_dtw            = {}   # segment durations+levels via DTW correspondence
         _pipelines_ml_step_dtw_smooth     = {}   # ml_step_dtw with interpolated (jump-free) level gains
         _pipelines_ml_external_wcounts      = {}
         _pipelines_ml_external_wmetric      = {}
-        _pipelines_ml_external_calib        = {}
-        _pipelines_ml_rawspace              = {}
 
         # ── Parallel training for all sklearn-based approaches ───────────────
         # One worker per (sensor, activity, object) combo — each trains its own
@@ -4617,11 +3728,9 @@ if RUN_CURVE_ONLY_EVALUATION:
         # worker — it is built separately below. The worker trains the per-combo
         # median under 'median_activity_sensor'.
         _sklearn_approaches = [a for a in APPROACHES
-                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only','exemplar',
-                                        'exemplar_only','exemplar_dtw',
-                                        'ml_cluster_dtw','ml_step_dtw','ml_step_dtw_smooth',
-                                        'ml_external_wcounts','ml_external_wmetric',
-                                        'ml_external_calib','ml_rawspace'}]
+                               if a in {'median_activity_sensor','ml_dtw','ml_external','ml_only',
+                                        'ml_step_dtw','ml_step_dtw_smooth',
+                                        'ml_external_wcounts','ml_external_wmetric'}]
         _seq2seq_approaches = [a for a in APPROACHES
                                if a in {'seq2seq','seq2seq_only','seq2seq_external','seq2seq_iom'}]
 
@@ -4685,39 +3794,21 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_external']),
                         'full_pipeline':   _r['ml_external'],
                     }
-                # Train/eval-gap variants. The three exog ones share
-                # ml_external's predictor (they differ in the FIT, or carry a
-                # stored raw-space correction applied inside it); ml_rawspace has
-                # its own, because it never builds a canonical curve to decode.
+                # Train/eval-gap variants: share ml_external's predictor
+                # (they differ only in the FIT's row weights).
                 for _v, _dst in (('ml_external_wcounts', _pipelines_ml_external_wcounts),
-                                 ('ml_external_wmetric', _pipelines_ml_external_wmetric),
-                                 ('ml_external_calib',   _pipelines_ml_external_calib)):
+                                 ('ml_external_wmetric', _pipelines_ml_external_wmetric)):
                     if _v in _r:
                         _dst.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                             'reference_curve': _r[_v]['reference_curve'],
                             'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r[_v]),
                             'full_pipeline':   _r[_v],
                         }
-                if 'ml_rawspace' in _r:
-                    _pipelines_ml_rawspace.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['ml_rawspace']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_rawspace(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_rawspace']),
-                        'full_pipeline':   _r['ml_rawspace'],
-                    }
                 if 'ml_only' in _r:
                     _pipelines_ml_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': None,
                         'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep))(_r['ml_only']),
                         'full_pipeline':   _r['ml_only'],
-                    }
-                if 'ml_cluster_dtw' in _r:
-                    # exog-aware signature like ml_external: the cluster
-                    # classifier and the warp regressors both read ef_* window
-                    # means, so the values have to reach the predictor.
-                    _pipelines_ml_cluster_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['ml_cluster_dtw']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_ml_cluster_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_cluster_dtw']),
-                        'full_pipeline':   _r['ml_cluster_dtw'],
                     }
                 if 'ml_step_dtw' in _r:
                     # exog-aware signature like ml_external: the duration and
@@ -4735,29 +3826,6 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'reference_curve': _r['ml_step_dtw_smooth']['reference_curve'],
                         'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw_smooth']),
                         'full_pipeline':   _r['ml_step_dtw_smooth'],
-                    }
-                if 'exemplar_only' in _r:
-                    # Shares predict_raw_curve_exemplar with 'exemplar' — the two
-                    # differ only in how the stored medoid was chosen at training.
-                    _pipelines_exemplar_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['exemplar_only']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exemplar(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exemplar_only']),
-                        'full_pipeline':   _r['exemplar_only'],
-                    }
-                if 'exemplar_dtw' in _r:
-                    _pipelines_exemplar_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['exemplar_dtw']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exemplar_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exemplar_dtw']),
-                        'full_pipeline':   _r['exemplar_dtw'],
-                    }
-                if 'exemplar' in _r:
-                    # exog-aware signature (rv, act, attrs, exog=None), like
-                    # ml_external -- predict_curve_for_instance tries that form
-                    # before the 3-arg one, so the ef_* values reach the model.
-                    _pipelines_exemplar.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['exemplar']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exemplar(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['exemplar']),
-                        'full_pipeline':   _r['exemplar'],
                     }
 
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
@@ -4893,10 +3961,6 @@ if RUN_CURVE_ONLY_EVALUATION:
         for _lbl, _pipes in (('DTW + ML',                _pipelines_ml_dtw),
                              ('DTW + ML + Ext. Factors', _pipelines_ml_external),
                              ('ML only (no DTW)',        _pipelines_ml_only),
-                             ('Exemplar (real curve)',   _pipelines_exemplar),
-                             ('Exemplar (no DTW)', _pipelines_exemplar_only),
-                             ('Exemplar + DTW (warped)', _pipelines_exemplar_dtw),
-                             ('Cluster DTW + ML + Ext.', _pipelines_ml_cluster_dtw),
                              ('Step DTW + ML + Ext.',    _pipelines_ml_step_dtw),
                              ('Step DTW smooth + ML + Ext.', _pipelines_ml_step_dtw_smooth),
                              ('DTW + Seq2Seq',           _pipelines_seq2seq),
@@ -4927,16 +3991,10 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_seq2seq_external[_proc] = _pipelines_seq2seq_external
         all_energy_pipelines_seq2seq_iom[_proc]           = _pipelines_seq2seq_iom
         all_energy_pipelines_ml_only[_proc]                 = _pipelines_ml_only
-        all_energy_pipelines_exemplar[_proc]                = _pipelines_exemplar
-        all_energy_pipelines_exemplar_only[_proc]           = _pipelines_exemplar_only
-        all_energy_pipelines_exemplar_dtw[_proc]            = _pipelines_exemplar_dtw
-        all_energy_pipelines_ml_cluster_dtw[_proc]          = _pipelines_ml_cluster_dtw
         all_energy_pipelines_ml_step_dtw[_proc]             = _pipelines_ml_step_dtw
         all_energy_pipelines_ml_step_dtw_smooth[_proc]      = _pipelines_ml_step_dtw_smooth
         all_energy_pipelines_ml_external_wcounts[_proc] = _pipelines_ml_external_wcounts
         all_energy_pipelines_ml_external_wmetric[_proc] = _pipelines_ml_external_wmetric
-        all_energy_pipelines_ml_external_calib[_proc] = _pipelines_ml_external_calib
-        all_energy_pipelines_ml_rawspace[_proc] = _pipelines_ml_rawspace
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4993,9 +4051,9 @@ def _run_curve_eval(pipelines_dict, approach_label, split_label,
                 # evaluated without them.
                 #   _exog_prev_approaches — trained on split_curves_with_prev_activity
                 #   _exog_plain_approaches — trained on plain split_curves + ef_*
-                _exog_prev_approaches  = ('ml_external', 'seq2seq_external', 'ml_cluster_dtw',
+                _exog_prev_approaches  = ('ml_external', 'seq2seq_external',
                                           'ml_step_dtw', 'ml_step_dtw_smooth')
-                _exog_plain_approaches = ('exemplar', 'exemplar_only', 'exemplar_dtw')
+                _exog_plain_approaches = ()   # (was the exemplar family — retired)
                 _exog_approaches = _exog_prev_approaches + _exog_plain_approaches
                 _exog_cols_eval = _fp.get('exog_cols', []) if _approach_eval in _exog_approaches else None
                 if _approach_eval in _exog_prev_approaches:
@@ -5462,16 +4520,10 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             ('ML DTW',                    all_energy_pipelines_ml_dtw),
             ('ML + Ext. Factors',     all_energy_pipelines_ml_external),
             ('ML only (no DTW)',                all_energy_pipelines_ml_only),
-            ('Exemplar (real curve)',           all_energy_pipelines_exemplar),
-            ('Exemplar (no DTW)',     all_energy_pipelines_exemplar_only),
-            ('Exemplar + DTW (warped)',         all_energy_pipelines_exemplar_dtw),
-            ('Cluster DTW + ML + Ext.',         all_energy_pipelines_ml_cluster_dtw),
             ('Step DTW + ML + Ext.',            all_energy_pipelines_ml_step_dtw),
             ('Step DTW smooth + ML + Ext.',     all_energy_pipelines_ml_step_dtw_smooth),
             ('DTW + ML + Ext. (count-weighted)', all_energy_pipelines_ml_external_wcounts),
             ('DTW + ML + Ext. (metric-weighted)', all_energy_pipelines_ml_external_wmetric),
-            ('DTW + ML + Ext. (decode-calibrated)', all_energy_pipelines_ml_external_calib),
-            ('Raw-space ML + Ext. (no encode/decode)', all_energy_pipelines_ml_rawspace),
 
             ('DTW + Seq2Seq',                     all_energy_pipelines_seq2seq),
             ('Seq2Seq only (no DTW)',              all_energy_pipelines_seq2seq_only),
@@ -5742,42 +4794,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             except Exception as _e:
                 print(f"[WARN] Per-process sMAE heatmaps failed: {_e}")
 
-            # ── Delta-sMAE heatmaps: each approach vs ML DTW ─────────────────
-            try:
-                _base_pivot = _test_df[_test_df['Approach'] == 'ML DTW'].pivot_table(
-                    index=['Process', 'Sensor'], columns='Activity', values='sMAE', aggfunc='median'
-                )
-                for _delta_label, _delta_appr in [
-                    ('ML only',                'ML only (no DTW)'),
-                    ('ML DTW+Linear Decode',   'ML DTW + Linear Decode'),
-                    ('Seq2Seq only',            'Seq2Seq only (no DTW)'),
-                    ('Seq2Seq DTW+Lin Decode', 'Seq2Seq DTW + Linear Decode'),
-                    ('DTW + Seq2Seq',          'DTW + Seq2Seq'),
-                    ('ML + Ext. Factors', 'ML + Ext. Factors'),
-                ]:
-                    _new_pivot = _test_df[_test_df['Approach'] == _delta_appr].pivot_table(
-                        index=['Process', 'Sensor'], columns='Activity', values='sMAE', aggfunc='median'
-                    )
-                    if _base_pivot.empty or _new_pivot.empty:
-                        continue
-                    _delta = (_base_pivot - _new_pivot).reindex_like(_base_pivot)  # positive = improvement
-                    fig_d, ax_d = plt.subplots(figsize=(max(8, len(_base_pivot.columns) * 1.4),
-                                                         max(3, len(_base_pivot) * 1.2)))
-                    sns.heatmap(
-                        _delta, annot=True, fmt='.3f', cmap='RdYlGn',
-                        center=0, linewidths=0.5, ax=ax_d,
-                        cbar_kws={'label': f'ΔsMAE (Baseline − {_delta_label})'}
-                    )
-                    ax_d.set_title(
-                        f'ΔsMAE {_delta_label} vs Baseline — green = {_delta_label} better',
-                        fontsize=11, fontweight='bold'
-                    )
-                    ax_d.set_xticklabels(ax_d.get_xticklabels(), rotation=30, ha='right', fontsize=8)
-                    plt.tight_layout()
-                    plt.show()
-            except Exception as _e:
-                print(f"[WARN] Delta sMAE heatmaps failed: {_e}")
-
             # ── 5 BEST / 5 WORST curves per approach (TEST WAPE) ────────────────
             try:
                 display(Markdown("---"))
@@ -5794,14 +4810,6 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
                         if 'all_energy_pipelines_ml_external' in dir() else {},
                     'ML only (no DTW)':                 all_energy_pipelines_ml_only
                         if 'all_energy_pipelines_ml_only' in dir() else {},
-                    'Exemplar (real curve)':            all_energy_pipelines_exemplar
-                        if 'all_energy_pipelines_exemplar' in dir() else {},
-                    'Exemplar (no DTW)':      all_energy_pipelines_exemplar_only
-                        if 'all_energy_pipelines_exemplar_only' in dir() else {},
-                    'Exemplar + DTW (warped)':          all_energy_pipelines_exemplar_dtw
-                        if 'all_energy_pipelines_exemplar_dtw' in dir() else {},
-                    'Cluster DTW + ML + Ext.':          all_energy_pipelines_ml_cluster_dtw
-                        if 'all_energy_pipelines_ml_cluster_dtw' in dir() else {},
                     'Step DTW + ML + Ext.':             all_energy_pipelines_ml_step_dtw
                         if 'all_energy_pipelines_ml_step_dtw' in dir() else {},
                     'Step DTW smooth + ML + Ext.':      all_energy_pipelines_ml_step_dtw_smooth
@@ -5942,66 +4950,6 @@ elif RUN_CURVE_ONLY_EVALUATION:
     ))
 
 # %%
-# ── STANDALONE PROFILE EVALUATION (TRAIN & TEST) ──────────────────────────────
-import importlib, utils.sim_extractor as _se
-importlib.reload(_se)
-from utils.sim_extractor import evaluate_pipeline_on_test, split_curves
-profile_summary_records = []
-
-if 'process_datasets_to_model_sensors' in dir():
-    for process, config in process_datasets_to_model_sensors.items():
-        sensors_to_model = config.get('sensors_to_model', [])
-
-        for sensor in sensors_to_model:
-            if process not in all_energy_pipelines or sensor not in all_energy_pipelines[process]:
-                continue
-
-            # Iterate every (activity, object) sub-pipeline
-            for _activity, _obj_map in all_energy_pipelines[process][sensor].items():
-                for _object, _ep in _obj_map.items():
-                    pipeline = _ep['full_pipeline']
-
-                    for split_label, df_exp in [
-                        ('TRAIN', train_datasets[process].get('expanded')),
-                        ('TEST',  test_datasets[process].get('expanded') if RUN_TEST_EVALUATION else None),
-                    ]:
-                        if df_exp is None or df_exp.empty:
-                            continue
-                        _sc, _ = split_curves(df_exp, sensor, [_activity], [_object],
-                                              test_size=0.0, verbose=0)
-                        if not _sc:
-                            continue
-                        _mdf, _ = evaluate_pipeline_on_test(_sc, pipeline, max_plot_curves=0, verbose=0)
-                        if _mdf.empty:
-                            continue
-                        for _, _row in _mdf.iterrows():
-                            profile_summary_records.append({
-                                'Process':   process,
-                                'Sensor':    sensor,
-                                'Activity':  _activity,
-                                'Object':    _object,
-                                'Split':     split_label,
-                                'MAE':       _row['MAE'],
-                                'RMSE':      _row['RMSE'],
-                                'WAPE':      _row['WAPE (%)'],
-                                'sMAE':      _row.get('sMAE'),
-                                'sRMSE':     _row.get('sRMSE'),
-                            })
-
-if profile_summary_records:
-    profile_summary_df = pd.DataFrame(profile_summary_records)
-    report("\n" + "="*80)
-    report("DETAILED ENERGY PROFILE METRICS PER PROCESS / SENSOR / ACTIVITY")
-    report("="*80)
-    _psummary = (
-        profile_summary_df
-        .groupby(['Process', 'Sensor', 'Activity', 'Object', 'Split'])[['MAE', 'RMSE', 'WAPE', 'sMAE', 'sRMSE']]
-        .median()
-        .round(4)
-    )
-    report(_psummary.to_string())
-    display(_psummary)
-
 # ── SIMULATION CURVE VISUALS (SIMULATED VS REAL) ───────────────────────────
 report("\n" + "="*80)
 report("VISUAL COMPARISON: SIMULATED (TEST RUN) VS REAL DATA")
@@ -6120,108 +5068,6 @@ if _combined_sim_store:
             plt.show()
 else:
     report("  No combined simulation results available for curve plotting.")
-
-# ── FINAL CONSOLIDATED ENERGY PERFORMANCE REPORT ───────────────────────────
-report("\n" + "█"*80)
-report("█   FINAL ENERGY PERFORMANCE REPORT (SIMULATION QUALITY)             █")
-report("█"*80)
-
-energy_metrics_summary = []
-records = []
-if 'evaluation_results_df' in dir() and not evaluation_results_df.empty:
-    energy_cols = [c for c in evaluation_results_df.columns if c.startswith('test_energy_')]
-    for _, row in evaluation_results_df.iterrows():
-        proc = row['process']
-        mode = row['mode']
-        # Focus on the energy-aware modes for the detailed report
-        if mode not in _ENERGY_AWARE_MODES:
-            continue
-            
-        for c in energy_cols:
-            metric = c.split('_')[-1]
-            sensor = c.replace('test_energy_', '').replace(f'_{metric}', '')
-            val = row[c]
-            if pd.notna(val):
-                records.append({
-                    'Dataset': proc,
-                    'Sensor': sensor,
-                    'Metric': metric,
-                    'Value': val
-                })
-
-if records:
-    edf = pd.DataFrame(records)
-    # Pivot for clean display: Dataset and Sensor as index, Metric as columns
-    report_pivot = edf.pivot_table(index=['Dataset', 'Sensor'], columns='Metric', values='Value', aggfunc='median')
-    
-    # Ensure all requested metrics are in columns
-    final_cols = [c for c in ['MAE', 'RMSE', 'WAPE', 'R2'] if c in report_pivot.columns]
-    report_pivot = report_pivot[final_cols]
-    
-    report("\nDETAILED ENERGY PROFILE METRICS PER DATASET (TEST SET):")
-    report("-" * 80)
-    # Output to both log (via report/string) and notebook (via display)
-    # report() handles the log and the safe stdout
-    report(report_pivot.round(4).to_string())
-    # display() ensures the beautiful interactive table in the notebook
-    display(report_pivot.round(4))
-else:
-    report("\n⚠️  No energy simulation metrics found in the final results.")
-
-report("\n" + "█"*80 + "\n")
-
-# ── FEATURE IMPORTANCE SUMMARY ────────────────────────────────────────────────
-report("\n" + "="*80)
-report("ENERGY MODEL — FEATURE IMPORTANCE SUMMARY")
-report("="*80)
-report("(Only activities where an ML model beat the R²>0.05 threshold are shown)")
-
-_fi_records = []
-if 'energy_modifiers_by_process' in dir():
-    for _proc, _mods in energy_modifiers_by_process.items():
-        for _role, _mod_dict in [('Duration', _mods.get('duration', {})),
-                                  ('Transition', _mods.get('transition', {}))]:
-            for _act, _mdl in _mod_dict.items():
-                fi = getattr(_mdl, '_feature_importance', {})
-                if not fi:
-                    continue
-                # Top 3 features by importance
-                for rank, (feat, imp) in enumerate(
-                    sorted(fi.items(), key=lambda kv: -kv[1])[:3], start=1
-                ):
-                    _fi_records.append({
-                        'Process':   _proc,
-                        'Activity':  _act,
-                        'Role':      _role,
-                        'Rank':      rank,
-                        'Feature':   feat,
-                        'Importance': round(imp, 4),
-                    })
-
-if _fi_records:
-    _fi_df = pd.DataFrame(_fi_records)
-    _fi_pivot = _fi_df.pivot_table(
-        index=['Process', 'Activity', 'Role'],
-        columns='Rank',
-        values=['Feature', 'Importance'],
-        aggfunc='first',
-    )
-    # Flatten multi-level columns to e.g. "Feature_1", "Importance_1"
-    _fi_pivot.columns = [f'{col}_{rank}' for col, rank in _fi_pivot.columns]
-    _fi_pivot = _fi_pivot.reset_index()
-    # Reorder into readable triples: Feature_1, Imp_1, Feature_2, Imp_2 ...
-    _ordered = ['Process', 'Activity', 'Role']
-    for _r in [1, 2, 3]:
-        for _c in [f'Feature_{_r}', f'Importance_{_r}']:
-            if _c in _fi_pivot.columns:
-                _ordered.append(_c)
-    _fi_pivot = _fi_pivot[[c for c in _ordered if c in _fi_pivot.columns]]
-    report(_fi_pivot.to_string(index=False))
-    display(_fi_pivot)
-else:
-    report("  No ML models passed the R²>0.05 threshold — no feature importances to show.")
-
-report("\n" + "█"*80 + "\n")
 
 # ── POST-REPORT VISUALIZATIONS: GENERALIZATION GALLERY ───────────────────────
 # (Note: Placed at the very end to provide a final visual verification of curve fitting)
@@ -6507,10 +5353,6 @@ if _jdur_ready:
     for _jlabel, _jpips in [
         ('Baseline',                      all_energy_pipelines),
         ('Median per Activity & Sensor',  all_energy_pipelines_median_activity_sensor),
-        ('Exemplar (real curve)',         all_energy_pipelines_exemplar),
-        ('Exemplar (no DTW)',   all_energy_pipelines_exemplar_only),
-        ('Exemplar + DTW (warped)',       all_energy_pipelines_exemplar_dtw),
-        ('Cluster DTW + ML + Ext.',       all_energy_pipelines_ml_cluster_dtw),
         ('Step DTW + ML + Ext.',          all_energy_pipelines_ml_step_dtw),
         ('Step DTW smooth + ML + Ext.',   all_energy_pipelines_ml_step_dtw_smooth),
         ('ML + Ext. Factors', all_energy_pipelines_ml_external),
@@ -6687,10 +5529,6 @@ if _jdur_ready:
         ('Median per Activity & Sensor',            globals().get('all_energy_pipelines_median_activity_sensor', {})),
         ('ML DTW',                          globals().get('all_energy_pipelines_ml_dtw',   {})),
         ('ML + Ext. Factors',           globals().get('all_energy_pipelines_ml_external', {})),
-        ('Exemplar (real curve)',           globals().get('all_energy_pipelines_exemplar', {})),
-        ('Exemplar (no DTW)',     globals().get('all_energy_pipelines_exemplar_only', {})),
-        ('Exemplar + DTW (warped)',         globals().get('all_energy_pipelines_exemplar_dtw', {})),
-        ('Cluster DTW + ML + Ext.',         globals().get('all_energy_pipelines_ml_cluster_dtw', {})),
         ('Step DTW + ML + Ext.',            globals().get('all_energy_pipelines_ml_step_dtw', {})),
         ('Step DTW smooth + ML + Ext.',     globals().get('all_energy_pipelines_ml_step_dtw_smooth', {})),
         ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
@@ -6860,8 +5698,6 @@ else:
                 _mn, _mx = _vals.min(), _vals.max()
                 if _mn == _mx:
                     _agg_norm[_m] = 0.5
-                elif False:  # R2 removed
-                    _agg_norm[_m] = (_vals - _mn) / (_mx - _mn)
                 else:
                     _agg_norm[_m] = 1 - (_vals - _mn) / (_mx - _mn)
 
@@ -6930,15 +5766,6 @@ else:
             display(_as)
     else:
         print("No curve evaluation results found — skipping parquet export.")
-
-    # ── Profile summary ───────────────────────────────────────────────────────
-    _psdf = globals().get('profile_summary_df')
-    if _psdf is not None and not _psdf.empty:
-        _profile_path = os.path.join(_run_dir, 'profile_summary.parquet')
-        _psdf.to_parquet(_profile_path, index=False)
-        print(f"Saved profile  → {_profile_path}")
-    else:
-        print("No profile summary found — skipping profile parquet.")
 
     # ── Run metadata ─────────────────────────────────────────────────────────
     pd.DataFrame({
