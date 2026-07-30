@@ -163,6 +163,19 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    its held-out MAE < ratio x the floor's.
                                    None -> 1.0 (strictly better). 0.95 would
                                    demand a 5% improvement.
+  step_dtw_fallback_ratio  float|str|None
+                                   the ml_step_dtw* do-no-harm gate: a leaf is
+                                   routed to its ml_external pipeline iff the
+                                   step model's held-out MAE > ratio x
+                                   ml_external's. None -> 1.25 (sim_extractor
+                                   default). 'inf' DISABLES the gate — the
+                                   step/smooth model is kept on every leaf,
+                                   even where it clearly loses. Note the gate
+                                   is silently inert anyway when ml_external
+                                   is not in curve_approaches (nothing to
+                                   route to) — that, not retraining noise, is
+                                   why the smooth rows differed between
+                                   experiment_999 and experiment_1000.
   save_curve_values     bool|None  persist the full predicted / real curve on
                                    every scored curve in curve_eval_results.parquet,
                                    so any metric can be computed offline later
@@ -275,6 +288,10 @@ EXPERIMENTS = [
         'complete_curve_approaches': ['ml_step_dtw_smooth'],
         'curve_median_floor':    False,
         'save_curve_values':     True,
+        'step_dtw_fallback_ratio': 'inf',  # gate OFF: the smooth rows show the
+                                           # step model everywhere, no ml_external
+                                           # rescue on its weak leaves — matches
+                                           # 999's gateless conditions
     },
 
     # ── experiment_997 (superseded by 998) ────────────────────────────────────
@@ -757,6 +774,7 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     save_curve_values = exp.get('save_curve_values')
     curve_median_floor = exp.get('curve_median_floor')
     curve_median_floor_ratio = exp.get('curve_median_floor_ratio')
+    step_dtw_fallback_ratio = exp.get('step_dtw_fallback_ratio')
     train_ratio = exp.get('train_ratio')
     split_type = exp.get('split_type', 'temporal')
     random_seed = int(exp.get('random_seed', 42))
@@ -853,6 +871,10 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
         env['PIPELINE_CURVE_MEDIAN_FLOOR'] = 'true' if curve_median_floor else 'false'
     if curve_median_floor_ratio is not None:
         env['PIPELINE_CURVE_MEDIAN_FLOOR_RATIO'] = str(curve_median_floor_ratio)
+    if step_dtw_fallback_ratio is not None:
+        # 'inf' disables the step-DTW do-no-harm gate: no leaf is ever routed
+        # to ml_external, the step/smooth model is kept everywhere.
+        env['PIPELINE_STEP_DTW_FALLBACK_RATIO'] = str(step_dtw_fallback_ratio)
     if train_ratio is not None:
         env['PIPELINE_TRAIN_RATIO'] = str(train_ratio)
     env['PIPELINE_SPLIT_TYPE'] = split_type
