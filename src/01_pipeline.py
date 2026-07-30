@@ -230,7 +230,6 @@ EXPERIMENTS = [
             'ml_external',
             'ml_only',
             'ml_step_dtw_smooth',
-            'exemplar',
             'seq2seq_only',
         ],
         'curve_optimize_hyperparams': True,
