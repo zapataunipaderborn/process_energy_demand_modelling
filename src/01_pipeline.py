@@ -199,25 +199,62 @@ setting = True
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
-    # ── experiment_999: the method alone, tuned, on all six processes ─────────
-    # FIRST of two queued runs. Only 'ml_step_dtw_smooth' is trained, so this one
-    # finishes on its own even if the second never gets its turn — the point is to
-    # have the method's numbers on all six processes by the morning.
-    #
-    # Every curve model in this run is now on equal footing with the incumbents:
-    # build_and_train_pipeline_step_dtw used to fit ONE fixed 200-iteration
-    # HistGradientBoosting per segment and ignore both `models` and the Optuna
-    # flags. It now competes the same six families ml_external does and searches
-    # the same space, per segment, per bank. On a 40-curve synthetic leaf that
-    # matters more than expected: untuned it kept 0/6 level models (all fell back
-    # to the segment constant, MAE 212), tuned it keeps 6/6 (MAE 98), and the
-    # winning family varied across segments (Ridge / RF / XGBoost / Linear).
-    #
-    # The do-no-harm gate is unchanged: a tuned winner still has to beat that
-    # segment's own constant on held-out curves to be kept at all.
+    # ── experiment_1001: 1000's full comparison + seq2seq_only ────────────────
+    # FIRST of two queued runs. Identical to experiment_1000 (same data, split,
+    # seed, tuning: six model families x 10 Optuna trials, gate OFF) with
+    # 'seq2seq_only' added, so the neural baseline sits in the same tables as
+    # everything else. seq2seq trains on CPU here (CUDA_VISIBLE_DEVICES='' in
+    # the child env — the fork-deadlock fix), so expect this run to be MUCH
+    # longer than 1000; it is queued first so its table is complete before the
+    # iom run starts.
     {
         'data_experiment':       '1',
-        'run_name':              'experiment_999',
+        'run_name':              'experiment_1001',
+        'processes_to_run':      ['process_1', 'process_2', 'process_3',
+                                  'process_4_1', 'process_4_2', 'process_5'],
+        'temporal_resolution':   '1min',
+        'run_process_modelling': True,
+        'mining_algorithms':     ['heuristic', 'alpha'],
+        'run_energy_modelling':  True,
+        'run_joint_duration_eval':   False,
+        'run_schedule_profile_eval': True,
+        'run_autoregressive_eval':   False,
+        'save_predicted_curves': True,
+        'train_ratio':           0.70,
+        'split_type':            'temporal',
+        'random_seed':           42,     # identical split to 999/1000, so all
+                                         # tables are comparable row for row
+        'curve_approaches': [
+            'baseline',
+            'median_activity_sensor',
+            'ml_external',
+            'ml_only',
+            'ml_step_dtw_smooth',
+            'exemplar',
+            'seq2seq_only',
+        ],
+        'curve_optimize_hyperparams': True,
+        'curve_n_optuna_trials': 10,
+        # Complete-profile stage: smooth (~40 s per process_1 combo, per-instance
+        # model calls), baseline (~1 s, median resample), seq2seq_only (network
+        # forward passes per instance).
+        'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline',
+                                      'seq2seq_only'],
+        'curve_median_floor':    False,
+        'save_curve_values':     True,
+        'step_dtw_fallback_ratio': 'inf',  # gate OFF: the smooth rows show the
+                                           # step model everywhere, no ml_external
+                                           # rescue on its weak leaves
+    },
+
+    # ── experiment_1002: seq2seq_iom alone ────────────────────────────────────
+    # SECOND of the two: the competing paper's approach with its own selection
+    # rule (generate + score against a softDTW reference every 10 epochs), and
+    # nothing else. Same data/split/seed as 1001, so its rows drop straight into
+    # the same comparison.
+    {
+        'data_experiment':       '1',
+        'run_name':              'experiment_1002',
         'processes_to_run':      ['process_1', 'process_2', 'process_3',
                                   'process_4_1', 'process_4_2', 'process_5'],
         'temporal_resolution':   '1min',
@@ -232,67 +269,24 @@ EXPERIMENTS = [
         'split_type':            'temporal',
         'random_seed':           42,
         'curve_approaches': [
-            'baseline',
-            'median_activity_sensor',
-            'ml_step_dtw_smooth',    # the method, and nothing else — NOTE this also
-                                     # disables the do-no-harm fallback gate, which has
-                                     # nothing to route to without ml_external
+            'seq2seq_iom',
         ],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
-        # ONE approach assembled into complete case profiles: the stage is
-        # (process x mode x approach) inference over every simulated case.
-        'complete_curve_approaches': ['ml_step_dtw_smooth'],
+        'complete_curve_approaches': ['seq2seq_iom'],
         'curve_median_floor':    False,
         'save_curve_values':     True,
     },
 
-    # ── experiment_1000: the full comparison table, same data and split ───────
-    # SECOND of the two. EXPERIMENTS runs top to bottom, so this starts by itself
-    # the moment 999 finishes — and if the machine runs out of night, 999's
-    # results are already on disk and complete.
-    # Adds everything 999 leaves out: the two naive floors, the pointwise
-    # incumbent (ml_external — also the direct ablation: same curves, same
-    # features, per-position target instead of segment structure), the no-DTW
-    # ablation (ml_only), and the realism reference (exemplar). All of them,
-    # including the step model, now compete six families with a 10-trial search,
-    # so no approach is handicapped by its model choice.
-    # Add 'ml_step_dtw' to the list to get the step-vs-smooth pair back.
-    {
-        'data_experiment':       '1',
-        'run_name':              'experiment_1000',
-        'processes_to_run':      ['process_1', 'process_2', 'process_3',
-                                  'process_4_1', 'process_4_2', 'process_5'],
-        'temporal_resolution':   '1min',
-        'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha'],
-        'run_energy_modelling':  True,
-        'run_joint_duration_eval':   False,
-        'run_schedule_profile_eval': True,
-        'run_autoregressive_eval':   False,
-        'save_predicted_curves': True,
-        'train_ratio':           0.70,
-        'split_type':            'temporal',
-        'random_seed':           42,     # identical split to 999, so the two tables
-                                         # are directly comparable row for row
-        'curve_approaches': [
-            'baseline',
-            'median_activity_sensor',
-            'ml_external',
-            'ml_only',
-            'ml_step_dtw_smooth',
-            'exemplar',
-        ],
-        'curve_optimize_hyperparams': True,
-        'curve_n_optuna_trials': 10,
-        'complete_curve_approaches': ['ml_step_dtw_smooth'],
-        'curve_median_floor':    False,
-        'save_curve_values':     True,
-        'step_dtw_fallback_ratio': 'inf',  # gate OFF: the smooth rows show the
-                                           # step model everywhere, no ml_external
-                                           # rescue on its weak leaves — matches
-                                           # 999's gateless conditions
-    },
+    # ── experiment_999 + experiment_1000 (both ran 2026-07-29/30) ─────────────
+    # # 999: ml_step_dtw_smooth alone (tuned: six families x 10 trials) on all
+    # #      six processes; no ml_external, so the do-no-harm gate was inert.
+    # # 1000: the full comparison (baseline, median_activity_sensor, ml_external,
+    # #      ml_only, ml_step_dtw_smooth, exemplar), same split/seed as 999.
+    # #      NOTE the smooth rows differ between the two BECAUSE of the gate:
+    # #      with ml_external present it rescued ~39 weak leaves (sMAE mean
+    # #      4.47 vs 5.43, medians ~equal). Superseded by 1001's config, which
+    # #      pins the gate OFF ('step_dtw_fallback_ratio': 'inf').
 
     # ── experiment_997 (superseded by 998) ────────────────────────────────────
     # # ── experiment_996: canonical smooth run (global-warp reconstruction) ─────

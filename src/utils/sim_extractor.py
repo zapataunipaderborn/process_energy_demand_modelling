@@ -9513,6 +9513,8 @@ def _dispatch_predict(raw_values, curve, pipeline):
         return predict_raw_curve_seq2seq(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_only':
         return predict_raw_curve_seq2seq_only(raw_values, act, attrs, pipeline)
+    if approach == 'seq2seq_iom':
+        return predict_raw_curve_seq2seq_iom(raw_values, act, attrs, pipeline)
     if approach == 'seq2seq_external':
         return predict_raw_curve_seq2seq_external(raw_values, act, attrs, pipeline,
                                                        exog_values=curve.get('exog_values', {}))
