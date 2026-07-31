@@ -85,7 +85,6 @@ if os.environ.get('PYTHONHASHSEED') is None:
           "01_pipeline.py pin it; a direct `python 02_modelling.py` does not, so "
           "str-set iteration order may differ between runs.")
 from utils.simulation import ProcessSimulation
-from utils.sim_modeller import SimModeller
 
 from utils.sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
 from utils.sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
@@ -210,7 +209,6 @@ process_datasets_to_model_sensors = process_datasets_to_model.copy()
 #                                 (auto-selected by         ML if val score beats
 #                                 train score)              statistical baseline,
 #                                                           else statistical
-#   ml / ml_duration_only         MINING_ALGORITHM        ML models (ML_MODEL_TYPES)
 #
 #   → MINING_ALGORITHM:  only affects 'statistical' and the ml* modes.
 #                        energy-aware modes ignore it — they auto-pick the
@@ -545,18 +543,6 @@ MINING_SEARCH_SPACE = {
     ],
     'ilp_variant_coverages': [0.80, 0.90, 0.95, 1.0],
 }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ML MODEL CONFIGURATION (SimModeller duration models for the ml* simulation modes)
-#   model_types: list of models to train — best is selected per activity key
-#                Supported: 'xgboost', 'linear', 'lasso', 'mlp'
-#   optimize_hyperparams: True  → Optuna hyper-parameter search
-#                         False → use default model parameters
-#   n_optuna_trials: number of Optuna trials per model (ignored if optimize=False)
-# ─────────────────────────────────────────────────────────────────────────────
-ML_MODEL_TYPES          = ['xgboost', 'mean', 'median']
-ML_OPTIMIZE_HYPERPARAMS = True    # ← set True to enable Optuna tuning
-ML_OPTUNA_TRIALS        = 20
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CURVE MODELLING HYPERPARAMETER OPTIMIZATION
@@ -2986,23 +2972,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     print("="*50)
     print(activity_stats_df)
 
-    # ── Train ML models once (shared by ml-based modes) ───────────────────
+    # Legacy SimModeller ('ml'/'ml_duration_only' modes) removed — the
+    # evaluated ML+ modes carry their own duration models (mlp_* tuples).
     ml_models = None
-    if any(m != 'statistical' for m in MODES_TO_COMPARE):
-        print("\n" + "="*50)
-        print(f"TRAINING ML MODELS  (types={ML_MODEL_TYPES}, "
-              f"optuna={ML_OPTIMIZE_HYPERPARAMS})")
-        print("="*50)
-        ml_models = SimModeller(
-            model_types=ML_MODEL_TYPES,
-            optimize_hyperparams=ML_OPTIMIZE_HYPERPARAMS,
-            n_optuna_trials=ML_OPTUNA_TRIALS,
-            train_transitions=False,   # only duration for ml_duration_only
-        )
-        with _timed('duration_model_training', process=process,
-                    detail=f"SimModeller({'+'.join(ML_MODEL_TYPES)})", split='TRAIN'):
-            ml_models.train(raw_df, activity_stats_df)
-        print(ml_models.summary())
 
     # ── Train the case-duration predictor for petri_net_budget mode ───────
     # One per-case total-duration regressor (schedule-only attributes -> total
