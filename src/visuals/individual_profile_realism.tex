@@ -2,7 +2,7 @@
 \begin{table*}[H]
 \centering
 
-\begin{minipage}{8.5cm}
+\begin{minipage}{16cm}
 \centering
 
 \captionsetup{
@@ -18,21 +18,23 @@
 
 \begin{tabular}{p{6cm}|c|c|c|c|c|c}
 \toprule
-\textbf{Method} & \textbf{Sum} & \textbf{Max} & \textbf{Mean} & \textbf{Std} & \textbf{Roughness} & \textbf{Overall} \\
+Method & Sum & Max & Mean & Std & Roughness & Overall \\
 \midrule
-Step DTW smooth + ML + Ext. & 0.018 & \textbf{0.069} & 0.045 & \textbf{0.461} & \textbf{0.554} & \textbf{0.229} \\
-Median per activity and sensor & \textbf{0.016} & 0.072 & \textbf{0.043} & 0.552 & 0.662 & 0.269 \\
-Baseline & 0.018 & 0.074 & 0.051 & 0.613 & 0.724 & 0.296 \\
+Step DTW (ours) & 0.018 & \textbf{0.069} & 0.045 & \textbf{0.461} & \textbf{0.554} & \textbf{0.229} \\
+Activity median & \textbf{0.016} & 0.072 & \textbf{0.043} & 0.552 & 0.662 & 0.269 \\
+Step DTW w/o segments & 0.018 & 0.080 & 0.050 & 0.531 & 0.676 & 0.271 \\
+Step DTW w/o DTW & 0.018 & 0.089 & 0.054 & 0.592 & 0.702 & 0.291 \\
+Sensor median (baseline) & 0.018 & 0.074 & 0.051 & 0.613 & 0.724 & 0.296 \\
+Seq2Seq (aligned) & 0.021 & 0.091 & 0.062 & 0.726 & 0.820 & 0.344 \\
 \bottomrule
 \end{tabular}
 
 \vspace{0.5em}
 
-\parbox{12cm}{%
+\parbox{16cm}{%
 \footnotesize
-Curve realism for individual profile prediction, TEST set. Each column is the median over (process, activity, sensor) cells of the per-curve normalised error $|f(\mathrm{pred})-f(\mathrm{real})|\,/\,\overline{|f(\mathrm{real})|}$, where $f$ is the property named in the header, so \textbf{0 is perfect and lower is better}. Sum = total consumption, Max = peak demand, Mean = level (bias), Std = amplitude of the dynamics, Roughness = mean absolute step between samples; Overall is their plain average.
+Curve realism for individual profile prediction, TEST set. Each column is the median normalised absolute error of that curve property, so 0 is perfect and lower is better; Overall is their average.
 \textbf{Bold} marks the best value per column.
-Std and Roughness are complementary: a method can reach the right Std by adding high-frequency noise instead of reproducing real dynamics, and only Roughness separates those two. Pointwise error metrics are not reported: they cannot distinguish a usable load profile from a flat line through the middle of one.
 }
 
 \end{minipage}
