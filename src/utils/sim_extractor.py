@@ -6784,6 +6784,40 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     return _stamp_train_sensor_median(result, curves)
 
 
+# Keeps the trap's file object referenced for the life of the worker. If it were
+# garbage-collected the fd would close and faulthandler would write into a closed
+# descriptor, which is exactly when we need it to work.
+_STALL_TRAP_FILES = []
+
+
+def _pool_stall_trap_initializer(label='pool'):
+    """
+    ProcessPoolExecutor `initializer` that makes this worker dumpable on demand:
+    SIGUSR1 writes every thread's stack to
+    <PIPELINE_STALL_TRACE_DIR or $TMPDIR>/<label>_<pid>.trace.
+
+    Runs at worker startup, before any task argument is unpickled, so it also
+    covers a hang that happens while receiving the (large) df_train argument —
+    the seq2seq workers wedged at ~4s of CPU, which is about what unpickling that
+    frame costs, so the trap has to be armed before then to be worth anything.
+
+    Diagnostic only; it changes nothing about how the worker runs. It exists
+    because yama ptrace_scope=1 on this host blocks py-spy and gdb without root,
+    so a wedged worker cannot be inspected from outside.
+    """
+    import faulthandler, signal, tempfile, os as _os
+    try:
+        _dir = _os.environ.get('PIPELINE_STALL_TRACE_DIR') or tempfile.gettempdir()
+        _os.makedirs(_dir, exist_ok=True)
+        _f = open(_os.path.join(_dir, f'{label}_{_os.getpid()}.trace'), 'w')
+        _f.write(f'pid={_os.getpid()} ppid={_os.getppid()} label={label}\n')
+        _f.flush()
+        faulthandler.register(signal.SIGUSR1, file=_f, all_threads=True, chain=False)
+        _STALL_TRAP_FILES.append(_f)
+    except Exception:
+        pass   # a missing trap must never be the reason a run fails
+
+
 def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
                           hidden_size=128, num_layers=2, dropout=0.1,
                           epochs=80, batch_size=32, lr=1e-3,
@@ -8344,6 +8378,111 @@ def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_mi
     return t, _clip_physical(y_pred)
 
 
+# --- Schedule-direct with the STEP-DTW method (the process ablation) --------
+# train_schedule_profile_pipeline above answers "schedule-only vs. the full
+# pipeline" with a DIFFERENT curve method on each side (DBA+DTW+GBR here,
+# ml_step_dtw_smooth in the complete-curve eval), so its gap prices the process
+# model and the curve method together. The pair below holds the curve method
+# fixed: the same builder that produces 'ml_step_dtw_smooth' per (sensor,
+# activity, object) leaf is trained here on WHOLE-CASE curves with schedule-only
+# features, so the remaining gap against "Best, mine" is what the process model
+# itself contributes (per-activity leaves, activity duration + prev-activity
+# context, and a simulated rather than regressed span).
+#
+# The segment cap is its own constant: STEP_DTW_MAX_SEGMENTS = 8 is sized for a
+# single activity's curve, and a whole case is a longer, multi-phase curve that
+# would be forced to a coarser staircase under it. Nothing here picks a segment
+# COUNT — _stepdtw_segment_medoid chooses that by BIC and is separately capped
+# at L // min_seg with min_seg = max(2, L // 25), i.e. ~25 segments for any
+# curve of 50+ samples. Setting the cap to that same 25 makes the BIC penalty
+# and the minimum segment width the only things that bind, which is the point:
+# the data picks the resolution instead of a hard-coded 8. Raise it only if the
+# chosen counts are seen saturating at the cap (build with verbose=1 to log
+# "-> N segment(s)"); ml_step_dtw's own cap is deliberately untouched.
+SCHEDULE_STEP_DTW_MAX_SEGMENTS = int(_os_seed.environ.get(
+    'PIPELINE_SCHEDULE_STEP_DTW_MAX_SEGMENTS', '25'))
+
+# A predicted span that is wildly wrong must not turn into a multi-million-point
+# curve; lengths are clipped to this multiple of the median training length.
+_SCHEDULE_STEP_DTW_MAX_LENGTH_FACTOR = 4.0
+
+
+def _case_to_step_dtw_curve(case):
+    """One build_case_level_curves case as a curve dict the step-DTW builder
+    accepts. 'activity' and 'instance_id' are required by the builder's own
+    scoring hooks (_attach_median_floor, the fallback gate); there is only one
+    'activity' here by construction — the whole case."""
+    return {
+        'instance_id':     str(case['case_id']),
+        'case_id':         str(case['case_id']),
+        'activity':        '__case__',
+        'attributes':      dict(case.get('attributes') or {}),
+        'original_values': np.asarray(case['values'], dtype=float),
+        # ef_* factors are already reduced to per-case means inside
+        # 'attributes' by build_case_level_curves, so there is no per-position
+        # exogenous series left to hand over — the features stay case-level.
+        'exog_values':     {},
+    }
+
+
+def train_schedule_profile_pipeline_step_dtw(
+        train_cases, variable='case_profile', gain_mode='smooth',
+        max_segments=None, val_size=0.2, random_state=42, verbose=0):
+    """
+    Train the step-DTW curve method at CASE granularity on schedule-only
+    features — the like-for-like comparator described above.
+
+    Returns a pipeline dict for predict_schedule_profile_curve_step_dtw, or
+    None when there are too few cases to train on. The do-no-harm fallback gate
+    is off (fallback_pipeline=None): it can only route to an ml_external leaf
+    pipeline, which does not exist at case granularity.
+    """
+    if len(train_cases) < 4:
+        if verbose:
+            print(f"  [schedule-profile/step-dtw] skipped: only {len(train_cases)} cases (need >= 4)")
+        return None
+
+    curves = [_case_to_step_dtw_curve(c) for c in train_cases]
+    pipeline = build_and_train_pipeline_step_dtw(
+        curves, variable=variable,
+        gain_mode=gain_mode,
+        max_segments=(SCHEDULE_STEP_DTW_MAX_SEGMENTS if max_segments is None
+                      else int(max_segments)),
+        val_size=val_size, random_state=random_state, verbose=verbose,
+        fallback_pipeline=None, prev_act_energy_map=None,
+    )
+
+    # Sampling rate of the training curves, so a predicted span in MINUTES can
+    # be turned back into a curve length in SAMPLES — 'curve_length' is one of
+    # the model's own features, so it has to stay in the units it was fitted in.
+    _spm = [len(c['values']) / max(float(c['duration_minutes']), 1e-6) for c in train_cases]
+    _spm = float(np.median([s for s in _spm if np.isfinite(s) and s > 0] or [0.0]))
+    pipeline['samples_per_minute']  = _spm if _spm > 0 else None
+    pipeline['median_curve_length'] = int(np.median([len(c['values']) for c in train_cases]))
+    return pipeline
+
+
+def predict_schedule_profile_curve_step_dtw(attributes, pipeline, case_duration_minutes):
+    """
+    Predict a complete case profile with the step-DTW method from schedule-only
+    attributes, placed on `case_duration_minutes` (the case's own predicted
+    span, exactly like the other schedule-level baselines get).
+
+    Returns (t, v), same shape as predict_schedule_profile_curve.
+    """
+    _median_len = int(pipeline.get('median_curve_length') or pipeline.get('fixed_length') or 2)
+    spm = pipeline.get('samples_per_minute')
+    n = int(round(float(case_duration_minutes) * spm)) if spm else _median_len
+    n = int(np.clip(n, 2, max(2, int(_SCHEDULE_STEP_DTW_MAX_LENGTH_FACTOR * _median_len))))
+
+    attrs = dict(attributes or {})
+    attrs['_pred_curve_length'] = n
+    v = np.asarray(predict_raw_curve_step_dtw(np.zeros(n), '__case__', attrs, pipeline,
+                                              exog_values={}), dtype=float)
+    t = np.linspace(0, float(case_duration_minutes), len(v))
+    return t, _clip_physical(v)
+
+
 def train_case_duration_pipeline(train_cases, val_size=0.2, random_state=42,
                                  model_class=None, verbose=0):
     """
@@ -8590,7 +8729,8 @@ def sample_bootstrap_profile(generator, case_duration_minutes, rng=None):
 def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stochastic_generator,
                                              median_case_duration_minutes, random_state=42,
                                              save_curves=False, bootstrap_generator=None,
-                                             duration_pipeline=None):
+                                             duration_pipeline=None,
+                                             schedule_step_pipeline=None):
     """
     For each real test case (from build_case_level_curves), compare its real
     complete profile against (a) the schedule-only prediction and (b) one
@@ -8599,15 +8739,21 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
 
     Returns a DataFrame with one row per case_id:
     ['case_id', 'schedule_wasserstein_time', 'schedule_wasserstein_value',
+     'schedule_step_wasserstein_time', 'schedule_step_wasserstein_value',
      'stochastic_wasserstein_time', 'stochastic_wasserstein_value',
      'bootstrap_wasserstein_time', 'bootstrap_wasserstein_value'].
 
+    ``schedule_step_pipeline`` (from train_schedule_profile_pipeline_step_dtw)
+    is the same schedule-only prediction with the step-DTW curve method instead
+    of DBA+DTW+regression — the row that makes "does the process model help?"
+    a single-variable comparison against "Best, mine". Omitted when None.
+
     When save_curves=True, also returns a second, long-format DataFrame with
     one row per (case_id, series, timestep) — series in {'real', 'schedule',
-    'stochastic', 'bootstrap'} — columns ['case_id', 'series', 't_minutes',
-    'value'], so the exact curves behind the W1 numbers above can be reloaded
-    later for other metrics or plots. The caller adds a 'sensor' column since
-    this function is called once per sensor.
+    'schedule_step', 'stochastic', 'bootstrap'} — columns ['case_id', 'series',
+    't_minutes', 'value'], so the exact curves behind the W1 numbers above can
+    be reloaded later for other metrics or plots. The caller adds a 'sensor'
+    column since this function is called once per sensor.
 
     Span handling: when ``duration_pipeline`` is given, each predicted series
     (schedule-direct, stochastic, bootstrap) is placed on that case's OWN
@@ -8654,6 +8800,20 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
                 if save_curves:
                     curve_rows.extend({'case_id': c['case_id'], 'series': 'schedule', 't_minutes': float(t), 'value': float(v)}
                                       for t, v in zip(t_sched, v_sched))
+
+        if schedule_step_pipeline is not None:
+            try:
+                t_step, v_step = predict_schedule_profile_curve_step_dtw(
+                    c['attributes'], schedule_step_pipeline, case_span)
+            except Exception:
+                t_step, v_step = np.array([]), np.array([])
+            w_step = np.clip(v_step, 0, None)
+            if w_step.sum() > 0:
+                row['schedule_step_wasserstein_time']  = float(wasserstein_distance(t_real, t_step, u_weights=w_real, v_weights=w_step))
+                row['schedule_step_wasserstein_value'] = float(wasserstein_distance(v_real, v_step))
+                if save_curves:
+                    curve_rows.extend({'case_id': c['case_id'], 'series': 'schedule_step', 't_minutes': float(t), 'value': float(v)}
+                                      for t, v in zip(t_step, v_step))
 
         if stochastic_generator is not None:
             t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, case_span, rng=rng)

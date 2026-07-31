@@ -94,6 +94,7 @@ from utils.sim_extractor import build_sensor_activity_object_combos
 from utils.sim_extractor import predict_raw_curve_step_dtw
 from utils.sim_extractor import (
     build_case_level_curves, train_schedule_profile_pipeline,
+    train_schedule_profile_pipeline_step_dtw,
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
     compare_schedule_and_stochastic_profiles,
     train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
@@ -686,6 +687,155 @@ def _pool_workers(n_tasks):
         n = min(n, MAX_WORKERS)
     return max(1, n)
 
+
+# Seconds a worker pool may go with NO task completing before it is declared
+# deadlocked. The seq2seq pool has now wedged twice — experiment_986 (7h) and
+# experiment_2_20260730 (11.5h) — with the identical signature: every worker
+# alive, ~4s of CPU each, all threads parked in futex_wait, no output at all.
+#
+# The root cause is NOT known. The first attempt blamed CUDA fork-poisoning and
+# hid the GPUs from the child (01_pipeline.py); the hang came back with that env
+# confirmed in place, so that diagnosis was wrong. It has never reproduced
+# outside a full run. Until it can be caught in the act, this does not pretend to
+# fix it — it bounds the damage: no progress for this long means dump the workers'
+# stacks, kill the pool, and retry rather than wait forever.
+POOL_STALL_TIMEOUT = float(os.environ.get('PIPELINE_POOL_STALL_TIMEOUT', '1800'))
+
+
+def _kill_pool(pool):
+    """
+    Tear down a wedged pool. shutdown() alone is not enough: it joins the worker
+    processes, and workers stuck in futex_wait never exit, so the join is what
+    turned a deadlock into an 11-hour hang. SIGKILL first, then shut down.
+
+    Nothing in here may raise: it runs from a `finally` on the stall path, and an
+    exception escaping it would abandon a pool full of live workers — which is
+    precisely the state we are here to get out of.
+    """
+    try:
+        _procs = list((getattr(pool, '_processes', None) or {}).values())
+    except Exception:
+        _procs = []
+    for _p in _procs:
+        try:
+            _p.kill()
+        except Exception:
+            pass
+    for _p in _procs:
+        try:
+            _p.join(timeout=5)   # reap, so the interpreter does not linger on exit
+        except Exception:
+            pass
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+def _dump_worker_stacks(pool, label):
+    """
+    SIGUSR1 every live worker. Workers install a faulthandler trap
+    (utils.sim_extractor._pool_stall_trap_initializer) that writes all thread
+    stacks to PIPELINE_STALL_TRACE_DIR, so a wedged pool can be diagnosed after
+    the fact. This is the only route available: yama ptrace_scope=1 on this host
+    denies py-spy and gdb without root, so the process has to incriminate itself.
+    """
+    import signal as _signal
+    _dir = os.environ.get('PIPELINE_STALL_TRACE_DIR') or tempfile.gettempdir()
+    _pids = list(getattr(pool, '_processes', {}) or {})
+    for _pid in _pids:
+        try:
+            os.kill(_pid, _signal.SIGUSR1)
+        except OSError:
+            pass
+    _time.sleep(2)  # let the handlers finish writing before the SIGKILL below
+    print(f"  🔍 {label}: stack dumps for {len(_pids)} worker(s) written to {_dir} "
+          f"(pids: {', '.join(str(p) for p in _pids)})")
+
+
+def _run_pool_with_stall_watchdog(fn, tasks, n_workers, label,
+                                  stall_timeout=None, attempts=2):
+    """
+    Run `fn(*args)` over `tasks` in a process pool that cannot hang forever.
+
+    tasks     — list of (key, args_tuple); `key` only labels the task in messages
+    attempts  — how many times to try a fresh pool before giving up on forking
+
+    A pool that completes NOTHING for `stall_timeout` seconds is treated as
+    deadlocked: its workers are dumped and killed, and their tasks are retried in
+    a brand-new pool. Whatever still stalls after the last attempt is run inline
+    in this process — slow, but it terminates, and an in-process run cannot
+    inherit whatever fork-time state wedges the workers.
+
+    Returns a list of (key, result) for every task that produced one.
+    """
+    import concurrent.futures
+    stall_timeout = POOL_STALL_TIMEOUT if stall_timeout is None else stall_timeout
+    from utils.sim_extractor import _pool_stall_trap_initializer
+
+    remaining = list(tasks)
+    results = []
+    for _attempt in range(1, attempts + 1):
+        if not remaining:
+            break
+        if _attempt > 1:
+            print(f"  ↻ {label}: retrying {len(remaining)} task(s) in a fresh pool "
+                  f"(attempt {_attempt}/{attempts})...")
+        _stalled_keys = []
+        _pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=max(1, min(n_workers, len(remaining))),
+            initializer=_pool_stall_trap_initializer, initargs=(label,))
+        try:
+            _futs = {_pool.submit(fn, *_args): _key for _key, _args in remaining}
+            _pending = set(_futs)
+            while _pending:
+                _done, _pending = concurrent.futures.wait(
+                    _pending, timeout=stall_timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED)
+                if not _done:
+                    _stalled_keys = [_futs[_f] for _f in _pending]
+                    print(f"  ⛔ {label}: no task completed in {stall_timeout:.0f}s — "
+                          f"treating the pool as deadlocked with "
+                          f"{len(_stalled_keys)} task(s) outstanding.")
+                    _dump_worker_stacks(_pool, label)
+                    for _f in _pending:
+                        _f.cancel()
+                    break
+                for _f in _done:
+                    _key = _futs[_f]
+                    try:
+                        results.append((_key, _f.result()))
+                    except Exception as _e:
+                        print(f"  ⚠️  {label} worker failed [{_key}]: {_e}")
+        finally:
+            if _stalled_keys:
+                _kill_pool(_pool)
+            else:
+                _pool.shutdown(wait=True)
+        _stalled_set = set(map(str, _stalled_keys))
+        remaining = [(_k, _a) for _k, _a in remaining if str(_k) in _stalled_set]
+
+    if remaining:
+        print(f"  ↩︎ {label}: {len(remaining)} task(s) still stalled after "
+              f"{attempts} pool attempt(s) — running them in this process. "
+              f"This is slow, but it finishes.")
+        print(f"  ⚠️  {label}: this run is no longer bit-identical to a clean one. "
+              f"The workers re-seed and re-thread the process they run in, so "
+              f"running them inline perturbs this process's RNG stream. "
+              f"Re-run once the pool stall is fixed if you need reproducibility.")
+        import torch as _torch
+        _prev_threads = _torch.get_num_threads()
+        for _key, _args in remaining:
+            try:
+                results.append((_key, fn(*_args)))
+            except Exception as _e:
+                print(f"  ⚠️  {label} inline fallback failed [{_key}]: {_e}")
+        # The workers pin this process to 1 thread and leave it there; undo that
+        # so the rest of the stage does not silently run single-threaded.
+        _torch.set_num_threads(_prev_threads)
+        set_global_seeds(GLOBAL_RANDOM_SEED)
+    return results
+
 # ── Approaches to train — comment out any you want to skip ───────────────────
 #    'baseline'          "Baseline": ONE median curve per SENSOR, pooled over
 #                        all activities/objects (the coarser naive floor)
@@ -1073,6 +1223,11 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     vs. that same pipeline with its timeline rescaled to a dedicated
     case-duration prediction ("Best, duration-corrected").
 
+    A second schedule-only predictor ("schedule_step") runs the SAME step-DTW
+    curve method "Best, mine" uses, on whole-case curves — so its gap against
+    "Best, mine" isolates the process model rather than mixing it with the
+    change of curve method. See train_schedule_profile_pipeline_step_dtw.
+
     "Best, duration-corrected" exists because the process-simulation
     timeline has no mechanism forcing its total elapsed time to be
     realistic — local per-activity duration errors and resource/shift
@@ -1159,6 +1314,15 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         median_case_duration_minutes = float(np.median([c['duration_minutes'] for c in train_cases]))
 
         schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
+        # Same schedule-only inputs, but the step-DTW curve method — so the gap
+        # against "Best, mine" (also step-DTW) prices the process model alone.
+        try:
+            schedule_step_pipeline = train_schedule_profile_pipeline_step_dtw(
+                train_cases, variable=sensor, gain_mode='smooth', verbose=0)
+        except Exception as _exc:
+            print(f"  ⚠️ Schedule-direct (step-DTW) not trained for {process}/{sensor}: "
+                  f"{type(_exc).__name__}: {_exc} — that series will be missing.")
+            schedule_step_pipeline = None
         stochastic_gen    = fit_stochastic_profile_generator(train_cases)
         bootstrap_gen     = fit_bootstrap_profile_generator(train_cases)
         duration_pipeline = train_case_duration_pipeline(train_cases, verbose=0)
@@ -1176,6 +1340,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
             save_curves=SAVE_PREDICTED_CURVES,
             bootstrap_generator=bootstrap_gen,
             duration_pipeline=duration_pipeline,
+            schedule_step_pipeline=schedule_step_pipeline,
         )
         cmp_df, sensor_curve_df = _cmp_result if SAVE_PREDICTED_CURVES else (_cmp_result, None)
         if cmp_df.empty:
@@ -1284,7 +1449,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     if all_curve_rows:
         curves_out = pd.concat(all_curve_rows, ignore_index=True)
         curves_out.to_parquet(os.path.join(out_dir, 'predicted_curves.parquet'), index=False)
-        print(f"  💾 Predicted curves (real/schedule/stochastic/bootstrap/best/best_duration_corrected) saved → "
+        print(f"  💾 Predicted curves (real/schedule/schedule_step/stochastic/bootstrap/best/best_duration_corrected) saved → "
               f"schedule_profile_eval_results/{process}/predicted_curves.parquet")
 
         # ── Population-Level (unpaired) Distributional Evaluation ─────────
@@ -1303,7 +1468,8 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
         real_pooled = _pool_by_sensor(curves_out, 'real')
         population_rows = []
-        for _pop_method in ('schedule', 'stochastic', 'bootstrap', 'best', 'best_duration_corrected'):
+        for _pop_method in ('schedule', 'schedule_step', 'stochastic', 'bootstrap',
+                            'best', 'best_duration_corrected'):
             method_pooled = _pool_by_sensor(curves_out, _pop_method)
             mag_df = compare_pooled_value_distributions(real_pooled, method_pooled)
             shape_df = compare_population_shape(curves_out, method_series=_pop_method)
@@ -3835,26 +4001,27 @@ if RUN_CURVE_ONLY_EVALUATION:
             print(f"\n  Parallel seq2seq training: {len(_combos)} combos × "
                   f"{len(_seq2seq_approaches)} approaches across {_s2s_n_workers} workers...")
             _s2s_t0 = _time.perf_counter()
-            with concurrent.futures.ProcessPoolExecutor(max_workers=_s2s_n_workers) as _s2s_pool:
-                _s2s_futs = {
-                    _s2s_pool.submit(
-                        _train_seq2seq_worker,
-                        _s, _a, _o, _df_train_exp, _seq2seq_approaches, _ef_cols,
-                        SEQ2SEQ_HIDDEN_SIZE, SEQ2SEQ_NUM_LAYERS, SEQ2SEQ_DROPOUT,
-                        SEQ2SEQ_EPOCHS, SEQ2SEQ_BATCH_SIZE, SEQ2SEQ_LR,
-                        SEQ2SEQ_TEACHER_FORCING, SEQ2SEQ_PATIENCE,
-                    ): (_s, _a, _o, _time.perf_counter())
-                    for _s, _a, _o in _combos
-                }
-                _s2s_results = []
-                for _s2s_fut in concurrent.futures.as_completed(_s2s_futs):
-                    _s, _a, _o, _s_t0 = _s2s_futs[_s2s_fut]
-                    try:
-                        _res = _s2s_fut.result()
-                        _res['_elapsed'] = _time.perf_counter() - _s_t0
-                        _s2s_results.append(_res)
-                    except Exception as _s2s_e:
-                        print(f"  ⚠️  Seq2seq worker failed [{_s}|{_a}|{_o}]: {_s2s_e}")
+            # Watchdogged pool — see _run_pool_with_stall_watchdog. A plain
+            # ProcessPoolExecutor here deadlocked twice and blocked the whole run
+            # indefinitely; this bounds a stall to POOL_STALL_TIMEOUT and still
+            # produces every model, via a fresh pool or inline as a last resort.
+            _s2s_tasks = [
+                ((_s, _a, _o), (
+                    _s, _a, _o, _df_train_exp, _seq2seq_approaches, _ef_cols,
+                    SEQ2SEQ_HIDDEN_SIZE, SEQ2SEQ_NUM_LAYERS, SEQ2SEQ_DROPOUT,
+                    SEQ2SEQ_EPOCHS, SEQ2SEQ_BATCH_SIZE, SEQ2SEQ_LR,
+                    SEQ2SEQ_TEACHER_FORCING, SEQ2SEQ_PATIENCE,
+                ))
+                for _s, _a, _o in _combos
+            ]
+            _s2s_results = []
+            for _key, _res in _run_pool_with_stall_watchdog(
+                    _train_seq2seq_worker, _s2s_tasks, _s2s_n_workers, 'seq2seq'):
+                # '_elapsed' was per-task wall clock before; with retries and an
+                # inline fallback in play a per-task figure would be misleading,
+                # so report the stage total instead.
+                _res['_elapsed'] = _time.perf_counter() - _s2s_t0
+                _s2s_results.append(_res)
             print(f"  seq2seq training done in {_time.perf_counter() - _s2s_t0:.1f}s")
             # Same fixed key order as the sklearn pool above.
             _s2s_results.sort(key=lambda r: (str(r['sensor']), str(r['activity']), str(r['object'])))
