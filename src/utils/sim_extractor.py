@@ -6609,8 +6609,12 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
     (activity, object) of the sensor.
 
     Returns dict keyed by approach name, each value is the raw pipeline dict,
-    plus 'sensor'/'activity'/'object' keys for reassembly.
+    plus 'sensor'/'activity'/'object' keys for reassembly and '_timings', the
+    per-approach training seconds for this leaf (CPU time of this worker, so
+    they sum across leaves to far more than the pool's wall clock — 02_modelling
+    records both; see its RUNTIME PROFILING section).
     """
+    import time as _wtime
     # Reproducibility: seed from this combo's own key, not from whatever RNG
     # state this pool worker inherited. Same combo -> same models, regardless of
     # worker count or the order the pool scheduled tasks in.
@@ -6627,6 +6631,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                            'ml_external_wcounts', 'ml_external_wmetric'}
     _active = [a for a in approaches if a in _SKLEARN_APPROACHES]
 
+    _t_extract = _wtime.perf_counter()
     curves, _ = split_curves(
         df_train,
         variable=sensor,
@@ -6636,8 +6641,10 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
         verbose=0,
         exog_columns=ef_cols,
     )
+    _timings = {'_curve_extraction': _wtime.perf_counter() - _t_extract}
     if len(curves) < 5:
-        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
+        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True,
+                '_timings': _timings}
 
     models = _make_curve_models()
 
@@ -6661,22 +6668,27 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
         # "Median per Activity & Sensor": median training curve for THIS
         # (sensor, activity, object), no model. (The coarser 'baseline' —
         # one median per sensor — is built in 02_modelling.py, not here.)
+        _t_a = _wtime.perf_counter()
         _mas_pipe = build_and_train_pipeline_median(
             curves, variable=sensor, fixed_length=fixed_length, verbose=0,
         )
         _mas_pipe['approach'] = 'median_activity_sensor'
         result['median_activity_sensor'] = _mas_pipe
+        _timings['median_activity_sensor'] = _wtime.perf_counter() - _t_a
     if 'ml_dtw' in _active:
         # The former 'baseline': DBA barycenter + DTW alignment + regression.
+        _t_a = _wtime.perf_counter()
         result['ml_dtw'] = build_and_train_pipeline(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1,
             random_state=_seed, **_hp_kwargs,
         )
+        _timings['ml_dtw'] = _wtime.perf_counter() - _t_a
     if 'ml_external' in _active:
         # Previous-activity NAME + its TRAINING energy level (both event-log-keyed
         # facts) + ef_* external factors. No lagged meter readings — see
         # split_curves_with_prev_activity / build_prev_activity_energy_map.
+        _t_a = _wtime.perf_counter()
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
             variable=sensor,
@@ -6696,6 +6708,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                 prev_act_energy_map=prev_act_energy_map,
                 **_hp_kwargs,
             )
+            _timings['ml_external'] = _wtime.perf_counter() - _t_a
         elif 'ml_dtw' in result:
             # Fewer than 5 curves survive the stricter prev-activity-context
             # extraction (a separate, narrower filter than the len(curves)<5
@@ -6732,11 +6745,13 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                      # prices the smoothing alone.
                      'ml_step_dtw_smooth')
     if any(v in _active for v in _GAP_VARIANTS):
+        _t_a = _wtime.perf_counter()
         _pv, _ = split_curves_with_prev_activity(
             df_train, variable=sensor, activities=[activity], objects=[obj],
             test_size=0.0, verbose=0, exog_columns=ef_cols,
             include_prev_energy=False,
         )
+        _timings['_curve_extraction_prev_activity'] = _wtime.perf_counter() - _t_a
         _common = dict(fixed_length=fixed_length, val_size=val_size, models=models,
                        verbose=0, n_jobs=1, random_state=_seed,
                        prev_act_energy_map=prev_act_energy_map)
@@ -6744,6 +6759,7 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
             for _v in _GAP_VARIANTS:
                 if _v not in _active:
                     continue
+                _t_a = _wtime.perf_counter()
                 try:
                     if _v in ('ml_step_dtw', 'ml_step_dtw_smooth'):
                         # The leaf's ml_external (trained above when active) is
@@ -6768,6 +6784,8 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                     # the established approaches for this combo must still land.
                     print(f"  [WARN] {_v} failed for {sensor}|{activity}|{obj}: "
                           f"{type(_e).__name__}: {_e}")
+                finally:
+                    _timings[_v] = _wtime.perf_counter() - _t_a
         else:
             print(f"  [WARN] {'/'.join(v for v in _GAP_VARIANTS if v in _active)}: only "
                   f"{len(_pv)} curve(s) with previous-activity context for "
@@ -6776,12 +6794,18 @@ def _train_curve_only_worker(sensor, activity, obj, df_train, approaches, ef_col
                   f"would silently contaminate the comparison these variants exist for.")
 
     if 'ml_only' in _active:
+        _t_a = _wtime.perf_counter()
         result['ml_only'] = build_and_train_pipeline_ml_only(
             curves, variable=sensor, fixed_length=fixed_length,
             val_size=val_size, models=models, verbose=0, n_jobs=1,
             random_state=_seed, **_hp_kwargs,
         )
-    return _stamp_train_sensor_median(result, curves)
+        _timings['ml_only'] = _wtime.perf_counter() - _t_a
+    # Stamped BEFORE '_timings' is attached: _stamp_train_sensor_median writes
+    # into every dict value it finds, and the timings dict is not a pipeline.
+    result = _stamp_train_sensor_median(result, curves)
+    result['_timings'] = _timings
+    return result
 
 
 # Keeps the trap's file object referenced for the life of the worker. If it were
@@ -6854,11 +6878,13 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
     # torch's setting does not cover it.
     from threadpoolctl import threadpool_limits
     threadpool_limits(limits=1)
+    import time as _wtime
     _SEQ2SEQ = {'seq2seq', 'seq2seq_only', 'seq2seq_external', 'seq2seq_iom'}
     _active = [a for a in approaches if a in _SEQ2SEQ]
     if not _active:
         return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
 
+    _t_extract = _wtime.perf_counter()
     curves, _ = split_curves(
         df_train,
         variable=sensor,
@@ -6868,12 +6894,17 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
         verbose=0,
         exog_columns=ef_cols,
     )
+    # Per-approach training seconds for this leaf, same contract as
+    # _train_curve_only_worker's '_timings' (CPU time inside one pool worker).
+    _timings = {'_curve_extraction': _wtime.perf_counter() - _t_extract}
     if len(curves) < 5:
-        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True}
+        return {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': True,
+                '_timings': _timings}
 
     result = {'sensor': sensor, 'activity': activity, 'object': obj, 'skipped': False}
 
     if 'seq2seq' in _active:
+        _t_a = _wtime.perf_counter()
         result['seq2seq'] = build_and_train_pipeline_seq2seq(
             curves, variable=sensor, fixed_length=fixed_length, random_state=_s2s_seed,
             val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
@@ -6882,7 +6913,10 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             verbose=False,
         )
 
+        _timings['seq2seq'] = _wtime.perf_counter() - _t_a
+
     if 'seq2seq_only' in _active:
+        _t_a = _wtime.perf_counter()
         result['seq2seq_only'] = build_and_train_pipeline_seq2seq_only(
             curves, variable=sensor, fixed_length=fixed_length, random_state=_s2s_seed,
             val_size=val_size, hidden_size=hidden_size, num_layers=num_layers,
@@ -6891,7 +6925,10 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             verbose=False,
         )
 
+        _timings['seq2seq_only'] = _wtime.perf_counter() - _t_a
+
     if 'seq2seq_iom' in _active:
+        _t_a = _wtime.perf_counter()
         # No `patience`: IOM trains the full budget by design (see the section
         # header) -- early stopping is the rule it replaces, not one it inherits.
         result['seq2seq_iom'] = build_and_train_pipeline_seq2seq_iom(
@@ -6902,7 +6939,10 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             verbose=False,
         )
 
+        _timings['seq2seq_iom'] = _wtime.perf_counter() - _t_a
+
     if 'seq2seq_external' in _active:
+        _t_a = _wtime.perf_counter()
         # Same as ml_external: previous-activity NAME + ef_* only, no lagged energy.
         _prev_curves, _ = split_curves_with_prev_activity(
             df_train,
@@ -6935,8 +6975,12 @@ def _train_seq2seq_worker(sensor, activity, obj, df_train, approaches, ef_cols,
             print(f"  [WARN] seq2seq_external: only {len(_prev_curves)} curve(s) with "
                   f"previous-activity context for {sensor}|{activity}|{obj} (need >=5), and "
                   f"no plain seq2seq pipeline available either -- no prediction possible for this combo.")
+        _timings['seq2seq_external'] = _wtime.perf_counter() - _t_a
 
-    return _stamp_train_sensor_median(result, curves)
+    # Stamped BEFORE '_timings' is attached — see _train_curve_only_worker.
+    result = _stamp_train_sensor_median(result, curves)
+    result['_timings'] = _timings
+    return result
 
 
 # Persist the full y_true / y_pred arrays on every scored curve, so metrics

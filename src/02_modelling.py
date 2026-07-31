@@ -966,10 +966,74 @@ sys.stdout = StreamToLogger(logging.info)
 sys.stderr = StreamToLogger(logging.error)
 
 import time as _time
+import contextlib
 _pipeline_start = _time.perf_counter()
 
 logging.info(f"Run started — output folder: {_run_dir}")
 logging.info(f"Approaches: {APPROACHES}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RUNTIME PROFILING — every stage of the pipeline, written to runtime_*.csv
+# ══════════════════════════════════════════════════════════════════════════════
+# One row per timed unit of work: process mining, ML duration training, each
+# simulation run, each process evaluation, curve training (per approach, summed
+# over the leaves that trained it), every evaluation stage and the export.
+#
+# Wall clock, deliberately. The two curve-training pools run one worker process
+# per (sensor, activity, object), so the per-approach seconds collected inside
+# the workers are CPU-parallel: they sum to far more than the pool's own
+# wall-clock row ('curve_training_pool'). Both are recorded — the per-approach
+# numbers are what a "how expensive is this method?" table needs, the pool row
+# is what the run actually cost. `parallel_workers` says which is which.
+_RUNTIME_ROWS = []
+
+
+def _record_runtime(stage, seconds, process=None, detail=None, split=None,
+                    n_items=None, parallel_workers=None):
+    """Append one timing row. Never raises — a broken timer must not stop a run."""
+    try:
+        _RUNTIME_ROWS.append({
+            'stage':            str(stage),
+            'process':          None if process is None else str(process),
+            'detail':           None if detail is None else str(detail),
+            'split':            None if split is None else str(split),
+            'n_items':          None if n_items is None else int(n_items),
+            'parallel_workers': None if parallel_workers is None else int(parallel_workers),
+            'seconds':          float(seconds),
+        })
+    except Exception:
+        pass
+
+
+def _record_curve_training_timings(worker_results, process, pool_label):
+    """
+    Fold one training pool's per-leaf '_timings' dicts into one row per approach:
+    total seconds spent training it across the leaves, and how many leaves that
+    was. Summed CPU time across pool workers — see the note above.
+    """
+    _totals, _counts = {}, {}
+    for _res in worker_results or []:
+        for _appr, _sec in (_res.get('_timings') or {}).items():
+            _totals[_appr] = _totals.get(_appr, 0.0) + float(_sec)
+            _counts[_appr] = _counts.get(_appr, 0) + 1
+    for _appr in sorted(_totals):
+        _record_runtime('curve_training', _totals[_appr], process=process,
+                        detail=f'{pool_label}:{_appr}', split='TRAIN',
+                        n_items=_counts[_appr])
+
+
+@contextlib.contextmanager
+def _timed(stage, process=None, detail=None, split=None, n_items=None,
+           parallel_workers=None):
+    """Time a block and record it, including when the block raises."""
+    _t_start = _time.perf_counter()
+    try:
+        yield
+    finally:
+        _record_runtime(stage, _time.perf_counter() - _t_start, process=process,
+                        detail=detail, split=split, n_items=n_items,
+                        parallel_workers=parallel_workers)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2801,12 +2865,13 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     production_plan = train_datasets[process]['production_plan']
 
     # ── Extract process statistics for non-Petri modes (shared baseline) ─────
-    activity_stats_df, raw_df, process_models = extract_process(
-        df_train,
-        mining_algorithm=MINING_ALGORITHM,
-        optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
-        mining_search_space=MINING_SEARCH_SPACE,
-    )
+    with _timed('process_mining', process=process, detail=MINING_ALGORITHM, split='TRAIN'):
+        activity_stats_df, raw_df, process_models = extract_process(
+            df_train,
+            mining_algorithm=MINING_ALGORITHM,
+            optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
+            mining_search_space=MINING_SEARCH_SPACE,
+        )
 
     # ── Extract process models for each requested Petri-net algorithm ─────────
     petri_mode_algorithms = []
@@ -2830,12 +2895,13 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
     for mode_alg in petri_mode_algorithms:
         if mode_alg in extraction_by_algorithm:
             continue
-        pm_activity_stats_df, pm_raw_df, pm_process_models = extract_process(
-            df_train,
-            mining_algorithm=mode_alg,
-            optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
-            mining_search_space=MINING_SEARCH_SPACE,
-        )
+        with _timed('process_mining', process=process, detail=mode_alg, split='TRAIN'):
+            pm_activity_stats_df, pm_raw_df, pm_process_models = extract_process(
+                df_train,
+                mining_algorithm=mode_alg,
+                optimize_mining_hyperparams=OPTIMIZE_MINING_HYPERPARAMS,
+                mining_search_space=MINING_SEARCH_SPACE,
+            )
         extraction_by_algorithm[mode_alg] = {
             'activity_stats_df': pm_activity_stats_df,
             'raw_df': pm_raw_df,
@@ -2933,7 +2999,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             n_optuna_trials=ML_OPTUNA_TRIALS,
             train_transitions=False,   # only duration for ml_duration_only
         )
-        ml_models.train(raw_df, activity_stats_df)
+        with _timed('duration_model_training', process=process,
+                    detail=f"SimModeller({'+'.join(ML_MODEL_TYPES)})", split='TRAIN'):
+            ml_models.train(raw_df, activity_stats_df)
         print(ml_models.summary())
 
     # ── Train the case-duration predictor for petri_net_budget mode ───────
@@ -2968,9 +3036,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 try:
                     # Case duration/attributes are case-level (sensor-independent),
                     # so any one sensor's case list yields the same duration model.
-                    _bud_cases = build_case_level_curves(_bud_train_exp, _bud_sensors[0], ef_cols=_bud_ef_cols)
-                    _bud_cases = _retarget_cases_to_event_span(_bud_cases, df_train)
-                    _case_duration_pipeline = train_case_duration_pipeline(_bud_cases, verbose=0)
+                    with _timed('case_duration_training', process=process,
+                                detail='petri_net_budget', split='TRAIN'):
+                        _bud_cases = build_case_level_curves(_bud_train_exp, _bud_sensors[0], ef_cols=_bud_ef_cols)
+                        _bud_cases = _retarget_cases_to_event_span(_bud_cases, df_train)
+                        _case_duration_pipeline = train_case_duration_pipeline(_bud_cases, verbose=0)
                 except Exception as _bud_exc:
                     print(f"  ⚠️ petri_net_budget: case-duration pipeline training failed "
                           f"({_bud_exc}) — mode will run as plain petri_net for {process}.")
@@ -3016,13 +3086,14 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         mode_ml = ml_models if simulation_mode not in ('statistical', 'petri_net', 'petri_net_budget') else None
         mode_pm = extraction_by_algorithm.get(mode_algorithm, {}).get('process_models') if simulation_mode in ('petri_net', 'petri_net_budget', 'petri_net_statistical', 'petri_net_statistical_memory') else None
 
-        simulated_log_train = ProcessSimulation(
-            mode_activity_stats_df, production_plan,
-            mode=simulation_mode, ml_models=mode_ml,
-            process_models=mode_pm,
-            case_duration_pipeline=(_case_duration_pipeline
-                                    if simulation_mode == 'petri_net_budget' else None),
-        ).run()
+        with _timed('simulation', process=process, detail=sim_mode, split='TRAIN'):
+            simulated_log_train = ProcessSimulation(
+                mode_activity_stats_df, production_plan,
+                mode=simulation_mode, ml_models=mode_ml,
+                process_models=mode_pm,
+                case_duration_pipeline=(_case_duration_pipeline
+                                        if simulation_mode == 'petri_net_budget' else None),
+            ).run()
 
         print(f"\n  Simulated log TRAIN ({sim_mode}): {len(simulated_log_train)} events")
 
@@ -3033,9 +3104,10 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print(f"\n  🔍 EVALUATION ON {split_label}  [{sim_mode}]")
         print("  " + "="*76)
 
-        eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train,
-                                                          process_models=mode_pm,
-                                                          per_case_tag=(process, sim_mode, split_label))
+        with _timed('process_evaluation', process=process, detail=sim_mode, split=split_label):
+            eval_train = comprehensive_simulation_evaluation(simulated_log_train, df_train,
+                                                              process_models=mode_pm,
+                                                              per_case_tag=(process, sim_mode, split_label))
 
         print(f"\n  📊 COMPARISON PLOTS ({split_label})  [{sim_mode}]")
         df_compare_train = df_train.dropna(subset=['case_id'])
@@ -3065,15 +3137,16 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         df_test = test_datasets[process]['event_log'] if test_datasets else None
         if TEMPORAL_SPLIT and df_test is not None and len(df_test) > 0:
             production_plan_test = test_datasets[process]['production_plan']
-            simulated_log_test = ProcessSimulation(
-                mode_activity_stats_df,
-                production_plan_test,
-                mode=simulation_mode,
-                ml_models=mode_ml,
-                process_models=mode_pm,
-                case_duration_pipeline=(_case_duration_pipeline
-                                        if simulation_mode == 'petri_net_budget' else None),
-            ).run()
+            with _timed('simulation', process=process, detail=sim_mode, split='TEST'):
+                simulated_log_test = ProcessSimulation(
+                    mode_activity_stats_df,
+                    production_plan_test,
+                    mode=simulation_mode,
+                    ml_models=mode_ml,
+                    process_models=mode_pm,
+                    case_duration_pipeline=(_case_duration_pipeline
+                                            if simulation_mode == 'petri_net_budget' else None),
+                ).run()
 
             print(f"\n  Simulated log TEST  ({sim_mode}): {len(simulated_log_test)} events")
 
@@ -3099,9 +3172,10 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print(f"\n  🔍 EVALUATION ON TEST SET  [{sim_mode}]")
             print("  " + "="*76)
 
-            eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test,
-                                                              process_models=mode_pm,
-                                                              per_case_tag=(process, sim_mode, 'TEST'))
+            with _timed('process_evaluation', process=process, detail=sim_mode, split='TEST'):
+                eval_test = comprehensive_simulation_evaluation(simulated_log_test, df_test,
+                                                                  process_models=mode_pm,
+                                                                  per_case_tag=(process, sim_mode, 'TEST'))
 
             print(f"\n  📊 COMPARISON PLOTS (TEST)  [{sim_mode}]")
             df_compare_test = df_test.dropna(subset=['case_id'])
@@ -3198,8 +3272,9 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             _best_pm    = extraction_by_algorithm[_best_alg]['process_models']
             _best_stats = extraction_by_algorithm[_best_alg]['activity_stats_df']
 
-            _glb_tpl, _pa_tpls, _mlp_feat_cols, _act_means, _glb_mean, _mlp_ef_windows = \
-                _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'))
+            with _timed('duration_model_training', process=process, detail='ml_plus', split='TRAIN'):
+                _glb_tpl, _pa_tpls, _mlp_feat_cols, _act_means, _glb_mean, _mlp_ef_windows = \
+                    _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'))
 
             print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
             print(f"  Global model: {_glb_tpl[2] if _glb_tpl else 'None'}")
@@ -3215,23 +3290,25 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 print(f"  ▶ SIMULATION MODE: {_mlp_mode.upper()}")
                 print("─"*80)
 
-                sim_mlp_train = ProcessSimulation(
-                    _best_stats, production_plan,
-                    mode=_sim_mode,
-                    process_models=_best_pm,
-                    mlp_global_tuple=_g_arg,
-                    mlp_per_act_tuples=_pa_arg,
-                    mlp_feat_cols=_mlp_feat_cols,
-                    mlp_ef_windows=_mlp_ef_windows,
-                    mlp_activity_means=_act_means,
-                    mlp_global_mean=_glb_mean,
-                ).run()
+                with _timed('simulation', process=process, detail=_mlp_mode, split='TRAIN'):
+                    sim_mlp_train = ProcessSimulation(
+                        _best_stats, production_plan,
+                        mode=_sim_mode,
+                        process_models=_best_pm,
+                        mlp_global_tuple=_g_arg,
+                        mlp_per_act_tuples=_pa_arg,
+                        mlp_feat_cols=_mlp_feat_cols,
+                        mlp_ef_windows=_mlp_ef_windows,
+                        mlp_activity_means=_act_means,
+                        mlp_global_mean=_glb_mean,
+                    ).run()
                 print(f"\n  Simulated log TRAIN ({_mlp_mode}): {len(sim_mlp_train)} events")
 
-                eval_mlp_train = comprehensive_simulation_evaluation(
-                    sim_mlp_train, df_train, process_models=_best_pm,
-                    per_case_tag=(process, _mlp_mode, split_label)
-                )
+                with _timed('process_evaluation', process=process, detail=_mlp_mode, split=split_label):
+                    eval_mlp_train = comprehensive_simulation_evaluation(
+                        sim_mlp_train, df_train, process_models=_best_pm,
+                        per_case_tag=(process, _mlp_mode, split_label)
+                    )
 
                 flattened_mlp = {
                     'process':          process,
@@ -3251,17 +3328,18 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 _df_test_mlp = test_datasets[process]['event_log'] if test_datasets else None
                 if TEMPORAL_SPLIT and _df_test_mlp is not None and len(_df_test_mlp) > 0:
                     _pp_test_mlp = test_datasets[process]['production_plan']
-                    sim_mlp_test = ProcessSimulation(
-                        _best_stats, _pp_test_mlp,
-                        mode=_sim_mode,
-                        process_models=_best_pm,
-                        mlp_global_tuple=_g_arg,
-                        mlp_per_act_tuples=_pa_arg,
-                        mlp_feat_cols=_mlp_feat_cols,
-                        mlp_ef_windows=_mlp_ef_windows,
-                        mlp_activity_means=_act_means,
-                        mlp_global_mean=_glb_mean,
-                    ).run()
+                    with _timed('simulation', process=process, detail=_mlp_mode, split='TEST'):
+                        sim_mlp_test = ProcessSimulation(
+                            _best_stats, _pp_test_mlp,
+                            mode=_sim_mode,
+                            process_models=_best_pm,
+                            mlp_global_tuple=_g_arg,
+                            mlp_per_act_tuples=_pa_arg,
+                            mlp_feat_cols=_mlp_feat_cols,
+                            mlp_ef_windows=_mlp_ef_windows,
+                            mlp_activity_means=_act_means,
+                            mlp_global_mean=_glb_mean,
+                        ).run()
                     print(f"\n  Simulated log TEST  ({_mlp_mode}): {len(sim_mlp_test)} events")
 
                     if EXPORT_RESULTS:
@@ -3278,10 +3356,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         _pred_df.to_parquet(_pred_path, index=False)
                         print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
-                    eval_mlp_test = comprehensive_simulation_evaluation(
-                        sim_mlp_test, _df_test_mlp, process_models=_best_pm,
-                        per_case_tag=(process, _mlp_mode, 'TEST')
-                    )
+                    with _timed('process_evaluation', process=process, detail=_mlp_mode, split='TEST'):
+                        eval_mlp_test = comprehensive_simulation_evaluation(
+                            sim_mlp_test, _df_test_mlp, process_models=_best_pm,
+                            per_case_tag=(process, _mlp_mode, 'TEST')
+                        )
                     for _cat, _mets in eval_mlp_test.items():
                         if isinstance(_mets, dict):
                             for _mn, _mv in _mets.items():
@@ -3310,17 +3389,20 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             _med_pm    = extraction_by_algorithm[_med_alg]['process_models']
             _med_stats = extraction_by_algorithm[_med_alg]['activity_stats_df']
 
-            sim_med_train = ProcessSimulation(
-                _med_stats, production_plan,
-                mode='petri_net_median_duration',
-                process_models=_med_pm,
-            ).run()
+            with _timed('simulation', process=process, detail='petri_net_median_duration', split='TRAIN'):
+                sim_med_train = ProcessSimulation(
+                    _med_stats, production_plan,
+                    mode='petri_net_median_duration',
+                    process_models=_med_pm,
+                ).run()
             print(f"\n  Simulated log TRAIN (petri_net_median_duration): {len(sim_med_train)} events")
 
-            eval_med_train = comprehensive_simulation_evaluation(
-                sim_med_train, df_train, process_models=_med_pm,
-                per_case_tag=(process, 'petri_net_median_duration', split_label)
-            )
+            with _timed('process_evaluation', process=process,
+                        detail='petri_net_median_duration', split=split_label):
+                eval_med_train = comprehensive_simulation_evaluation(
+                    sim_med_train, df_train, process_models=_med_pm,
+                    per_case_tag=(process, 'petri_net_median_duration', split_label)
+                )
 
             flattened_med = {
                 'process':           process,
@@ -3339,17 +3421,20 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             _df_test_med = test_datasets[process]['event_log'] if test_datasets else None
             if TEMPORAL_SPLIT and _df_test_med is not None and len(_df_test_med) > 0:
                 _pp_test_med = test_datasets[process]['production_plan']
-                sim_med_test = ProcessSimulation(
-                    _med_stats, _pp_test_med,
-                    mode='petri_net_median_duration',
-                    process_models=_med_pm,
-                ).run()
+                with _timed('simulation', process=process, detail='petri_net_median_duration', split='TEST'):
+                    sim_med_test = ProcessSimulation(
+                        _med_stats, _pp_test_med,
+                        mode='petri_net_median_duration',
+                        process_models=_med_pm,
+                    ).run()
                 print(f"\n  Simulated log TEST  (petri_net_median_duration): {len(sim_med_test)} events")
 
-                eval_med_test = comprehensive_simulation_evaluation(
-                    sim_med_test, _df_test_med, process_models=_med_pm,
-                    per_case_tag=(process, 'petri_net_median_duration', 'TEST')
-                )
+                with _timed('process_evaluation', process=process,
+                            detail='petri_net_median_duration', split='TEST'):
+                    eval_med_test = comprehensive_simulation_evaluation(
+                        sim_med_test, _df_test_med, process_models=_med_pm,
+                        per_case_tag=(process, 'petri_net_median_duration', 'TEST')
+                    )
                 for _cat, _mets in eval_med_test.items():
                     if isinstance(_mets, dict):
                         for _mn, _mv in _mets.items():
@@ -3403,23 +3488,25 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 print(f"  ▶ SIMULATION MODE: {_algo_mode.upper()}")
                 print("─"*80)
 
-                sim_amlp_train = ProcessSimulation(
-                    _algo_stats, production_plan,
-                    mode=_sim_mode,
-                    process_models=_algo_pm,
-                    mlp_global_tuple=_g_arg,
-                    mlp_per_act_tuples=_pa_arg,
-                    mlp_feat_cols=_mlp_feat_cols,
-                    mlp_ef_windows=_mlp_ef_windows,
-                    mlp_activity_means=_mlp_act_means,
-                    mlp_global_mean=_mlp_glb_mean,
-                ).run()
+                with _timed('simulation', process=process, detail=_algo_mode, split='TRAIN'):
+                    sim_amlp_train = ProcessSimulation(
+                        _algo_stats, production_plan,
+                        mode=_sim_mode,
+                        process_models=_algo_pm,
+                        mlp_global_tuple=_g_arg,
+                        mlp_per_act_tuples=_pa_arg,
+                        mlp_feat_cols=_mlp_feat_cols,
+                        mlp_ef_windows=_mlp_ef_windows,
+                        mlp_activity_means=_mlp_act_means,
+                        mlp_global_mean=_mlp_glb_mean,
+                    ).run()
                 print(f"\n  Simulated log TRAIN ({_algo_mode}): {len(sim_amlp_train)} events")
 
-                eval_amlp_train = comprehensive_simulation_evaluation(
-                    sim_amlp_train, df_train, process_models=_algo_pm,
-                    per_case_tag=(process, _algo_mode, split_label)
-                )
+                with _timed('process_evaluation', process=process, detail=_algo_mode, split=split_label):
+                    eval_amlp_train = comprehensive_simulation_evaluation(
+                        sim_amlp_train, df_train, process_models=_algo_pm,
+                        per_case_tag=(process, _algo_mode, split_label)
+                    )
 
                 flattened_amlp = {
                     'process':          process,
@@ -3439,17 +3526,18 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                 _df_test_amlp = test_datasets[process]['event_log'] if test_datasets else None
                 if TEMPORAL_SPLIT and _df_test_amlp is not None and len(_df_test_amlp) > 0:
                     _pp_test_amlp = test_datasets[process]['production_plan']
-                    sim_amlp_test = ProcessSimulation(
-                        _algo_stats, _pp_test_amlp,
-                        mode=_sim_mode,
-                        process_models=_algo_pm,
-                        mlp_global_tuple=_g_arg,
-                        mlp_per_act_tuples=_pa_arg,
-                        mlp_feat_cols=_mlp_feat_cols,
-                        mlp_ef_windows=_mlp_ef_windows,
-                        mlp_activity_means=_mlp_act_means,
-                        mlp_global_mean=_mlp_glb_mean,
-                    ).run()
+                    with _timed('simulation', process=process, detail=_algo_mode, split='TEST'):
+                        sim_amlp_test = ProcessSimulation(
+                            _algo_stats, _pp_test_amlp,
+                            mode=_sim_mode,
+                            process_models=_algo_pm,
+                            mlp_global_tuple=_g_arg,
+                            mlp_per_act_tuples=_pa_arg,
+                            mlp_feat_cols=_mlp_feat_cols,
+                            mlp_ef_windows=_mlp_ef_windows,
+                            mlp_activity_means=_mlp_act_means,
+                            mlp_global_mean=_mlp_glb_mean,
+                        ).run()
                     print(f"\n  Simulated log TEST  ({_algo_mode}): {len(sim_amlp_test)} events")
 
                     if EXPORT_RESULTS:
@@ -3466,10 +3554,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                         _pred_df.to_parquet(_pred_path, index=False)
                         print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
-                    eval_amlp_test = comprehensive_simulation_evaluation(
-                        sim_amlp_test, _df_test_amlp, process_models=_algo_pm,
-                        per_case_tag=(process, _algo_mode, 'TEST')
-                    )
+                    with _timed('process_evaluation', process=process, detail=_algo_mode, split='TEST'):
+                        eval_amlp_test = comprehensive_simulation_evaluation(
+                            sim_amlp_test, _df_test_amlp, process_models=_algo_pm,
+                            per_case_tag=(process, _algo_mode, 'TEST')
+                        )
                     for _cat, _mets in eval_amlp_test.items():
                         if isinstance(_mets, dict):
                             for _mn, _mv in _mets.items():
@@ -3520,22 +3609,24 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             print(f"  ▶ SIMULATION MODE: {_bud_mode.upper()}")
             print("─"*80)
 
-            sim_budmlp_train = ProcessSimulation(
-                _bud_mlp_stats, production_plan,
-                mode=_bud_mode,
-                process_models=_bud_mlp_pm,
-                case_duration_pipeline=_case_duration_pipeline,
-                mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
-                mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
-                mlp_ef_windows=_mlp_ef_windows,
-                mlp_global_mean=_mlp_glb_mean,
-            ).run()
+            with _timed('simulation', process=process, detail=_bud_mode, split='TRAIN'):
+                sim_budmlp_train = ProcessSimulation(
+                    _bud_mlp_stats, production_plan,
+                    mode=_bud_mode,
+                    process_models=_bud_mlp_pm,
+                    case_duration_pipeline=_case_duration_pipeline,
+                    mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
+                    mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                    mlp_ef_windows=_mlp_ef_windows,
+                    mlp_global_mean=_mlp_glb_mean,
+                ).run()
             print(f"\n  Simulated log TRAIN ({_bud_mode}): {len(sim_budmlp_train)} events")
 
-            eval_budmlp_train = comprehensive_simulation_evaluation(
-                sim_budmlp_train, df_train, process_models=_bud_mlp_pm,
-                per_case_tag=(process, _bud_mode, split_label)
-            )
+            with _timed('process_evaluation', process=process, detail=_bud_mode, split=split_label):
+                eval_budmlp_train = comprehensive_simulation_evaluation(
+                    sim_budmlp_train, df_train, process_models=_bud_mlp_pm,
+                    per_case_tag=(process, _bud_mode, split_label)
+                )
             flattened_budmlp = {
                 'process':          process,
                 'mode':             _bud_mode,
@@ -3553,16 +3644,17 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
             _df_test_budmlp = test_datasets[process]['event_log'] if test_datasets else None
             if TEMPORAL_SPLIT and _df_test_budmlp is not None and len(_df_test_budmlp) > 0:
                 _pp_test_budmlp = test_datasets[process]['production_plan']
-                sim_budmlp_test = ProcessSimulation(
-                    _bud_mlp_stats, _pp_test_budmlp,
-                    mode=_bud_mode,
-                    process_models=_bud_mlp_pm,
-                    case_duration_pipeline=_case_duration_pipeline,
-                    mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
-                    mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
-                    mlp_ef_windows=_mlp_ef_windows,
-                    mlp_global_mean=_mlp_glb_mean,
-                ).run()
+                with _timed('simulation', process=process, detail=_bud_mode, split='TEST'):
+                    sim_budmlp_test = ProcessSimulation(
+                        _bud_mlp_stats, _pp_test_budmlp,
+                        mode=_bud_mode,
+                        process_models=_bud_mlp_pm,
+                        case_duration_pipeline=_case_duration_pipeline,
+                        mlp_global_tuple=_g_arg, mlp_per_act_tuples=_pa_arg,
+                        mlp_feat_cols=_mlp_feat_cols, mlp_activity_means=_mlp_act_means,
+                        mlp_ef_windows=_mlp_ef_windows,
+                        mlp_global_mean=_mlp_glb_mean,
+                    ).run()
                 print(f"\n  Simulated log TEST  ({_bud_mode}): {len(sim_budmlp_test)} events")
 
                 if EXPORT_RESULTS:
@@ -3579,10 +3671,11 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                     _pred_df.to_parquet(_pred_path, index=False)
                     print(f"  Saved predicted log → predicted_logs/{_safe_process}_{_safe_mode}.parquet")
 
-                eval_budmlp_test = comprehensive_simulation_evaluation(
-                    sim_budmlp_test, _df_test_budmlp, process_models=_bud_mlp_pm,
-                    per_case_tag=(process, _bud_mode, 'TEST')
-                )
+                with _timed('process_evaluation', process=process, detail=_bud_mode, split='TEST'):
+                    eval_budmlp_test = comprehensive_simulation_evaluation(
+                        sim_budmlp_test, _df_test_budmlp, process_models=_bud_mlp_pm,
+                        per_case_tag=(process, _bud_mode, 'TEST')
+                    )
                 for _cat, _mets in eval_budmlp_test.items():
                     if isinstance(_mets, dict):
                         for _mn, _mv in _mets.items():
@@ -3925,7 +4018,12 @@ if RUN_CURVE_ONLY_EVALUATION:
                     except Exception as _we:
                         _ws, _wa, _wo = _futs[_fut]
                         print(f"  ⚠️  Worker failed {_ws}|{_wa}|{_wo}: {_we}")
-            print(f"  sklearn training done in {_time.perf_counter() - _sklearn_t0:.1f}s")
+            _sklearn_elapsed = _time.perf_counter() - _sklearn_t0
+            print(f"  sklearn training done in {_sklearn_elapsed:.1f}s")
+            _record_runtime('curve_training_pool', _sklearn_elapsed, process=_proc,
+                            detail='sklearn', split='TRAIN', n_items=len(_combos),
+                            parallel_workers=_n_workers)
+            _record_curve_training_timings(_worker_results, _proc, 'sklearn')
 
             # Reassemble in a fixed key order, not pool-completion order: each
             # worker's models are already seeded from its own key, so only the
@@ -4022,7 +4120,12 @@ if RUN_CURVE_ONLY_EVALUATION:
                 # so report the stage total instead.
                 _res['_elapsed'] = _time.perf_counter() - _s2s_t0
                 _s2s_results.append(_res)
-            print(f"  seq2seq training done in {_time.perf_counter() - _s2s_t0:.1f}s")
+            _s2s_elapsed = _time.perf_counter() - _s2s_t0
+            print(f"  seq2seq training done in {_s2s_elapsed:.1f}s")
+            _record_runtime('curve_training_pool', _s2s_elapsed, process=_proc,
+                            detail='seq2seq', split='TRAIN', n_items=len(_combos),
+                            parallel_workers=_s2s_n_workers)
+            _record_curve_training_timings(_s2s_results, _proc, 'seq2seq')
             # Same fixed key order as the sklearn pool above.
             _s2s_results.sort(key=lambda r: (str(r['sensor']), str(r['activity']), str(r['object'])))
 
@@ -4098,6 +4201,7 @@ if RUN_CURVE_ONLY_EVALUATION:
         # run in the per-(sensor,activity,object) worker because the per-sensor
         # pool spans activities/objects a single combo worker never sees together.
         if 'baseline' in APPROACHES:
+            _baseline_t0 = _time.perf_counter()
             _combos_by_sensor = {}
             for _cs, _ca, _co in _combos:
                 _combos_by_sensor.setdefault(_cs, []).append((_ca, _co))
@@ -4117,6 +4221,12 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'predict_fn':      lambda rv, act, attrs, ep=_ep_s: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
                         'full_pipeline':   _ep_s,
                     }
+            # Single-threaded, unlike the two pools above — directly comparable
+            # to their wall clock ('curve_training_pool'), not to the summed
+            # per-approach worker seconds.
+            _record_runtime('curve_training', _time.perf_counter() - _baseline_t0,
+                            process=_proc, detail='inline:baseline', split='TRAIN',
+                            n_items=len(_combos_by_sensor))
 
         # ── Median-floor report (see sim_extractor.CURVE_MEDIAN_FLOOR) ────────
         # Every learned leaf is kept only if it beat its own median curve on
@@ -4490,10 +4600,12 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     print("="*50)
     for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
         for _approach_p in _energy_approaches_available:
-            _save_energy_distribution_metrics(
-                _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
-                approach=_approach_p,
-            )
+            with _timed('energy_distribution_eval', process=_proc_p,
+                        detail=f'{_mode_p}:{_approach_p}', split='TEST'):
+                _save_energy_distribution_metrics(
+                    _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
+                    approach=_approach_p,
+                )
 
     # Complete-curve eval is pure inference (all pipelines are already trained
     # above), so — unlike the energy-distribution loop above, which is kept to
@@ -4559,10 +4671,12 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
     print("="*50)
     for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
         for _approach_p in _complete_curve_approaches_available:
-            _save_complete_curve_eval_metrics(
-                _proc_p, _mode_p, _sim_p, _exp_p, _complete_curve_eval_dir,
-                approach=_approach_p,
-            )
+            with _timed('complete_curve_eval', process=_proc_p,
+                        detail=f'{_mode_p}:{_approach_p}', split='TEST'):
+                _save_complete_curve_eval_metrics(
+                    _proc_p, _mode_p, _sim_p, _exp_p, _complete_curve_eval_dir,
+                    approach=_approach_p,
+                )
 
     # ── Schedule Profile Evaluation (opt-in — off by default) ─────────────
     # Runs once per process (not per mode): trains a schedule-only case-level
@@ -4624,15 +4738,18 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
             if _sched_comparator != 'ml_external':
                 print(f"  ℹ️ Schedule-profile 'Best, mine' comparator: "
                       f"'{_sched_comparator}' (ml_external not in the complete-curve eval).")
-            _save_schedule_profile_eval(
-                _proc_p, _train_exp_p, _test_exp_p, _sensors_p, _ef_cols_p,
-                _schedule_profile_eval_dir,
-                best_mode_safe=_best_mode_by_process.get(_proc_p),
-                complete_curve_dir=_complete_curve_eval_dir,
-                predicted_logs_dir=_predicted_logs_dir,
-                budget_mode_safe=_budget_mode_pin,
-                comparator_approach=_sched_comparator,
-            )
+            with _timed('schedule_profile_eval', process=_proc_p,
+                        detail=f'comparator:{_sched_comparator}', split='TEST',
+                        n_items=len(_sensors_p)):
+                _save_schedule_profile_eval(
+                    _proc_p, _train_exp_p, _test_exp_p, _sensors_p, _ef_cols_p,
+                    _schedule_profile_eval_dir,
+                    best_mode_safe=_best_mode_by_process.get(_proc_p),
+                    complete_curve_dir=_complete_curve_eval_dir,
+                    predicted_logs_dir=_predicted_logs_dir,
+                    budget_mode_safe=_budget_mode_pin,
+                    comparator_approach=_sched_comparator,
+                )
 
 
 if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_pipelines:
@@ -4700,37 +4817,40 @@ if RUN_CURVE_ONLY_EVALUATION and 'all_energy_pipelines' in dir() and all_energy_
             if not _pipelines:
                 continue
             display(Markdown(f"### {_approach_label}"))
-            _recs = _run_curve_eval(
-                _pipelines, _approach_label, _split_label,
-                _df_src, _activities_map, _objects_map,
-                save_dir=None,
-            )
+            with _timed('curve_only_eval', detail=_approach_label, split=_split_label):
+                _recs = _run_curve_eval(
+                    _pipelines, _approach_label, _split_label,
+                    _df_src, _activities_map, _objects_map,
+                    save_dir=None,
+                )
             _all_records.extend(_recs)
             _ckpt_curve_eval(_recs, _split_label, _approach_label)
 
         # ── Autoregressive rollout for ml_external ───────────────────
         if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_ml_external:
             display(Markdown("### DTW + Ext. Factors + Prev Act (autoreg)"))
-            _ar_recs = _run_curve_eval_autoregressive_prev_act(
-                all_energy_pipelines_ml_external,
-                'DTW + Ext. Factors + Prev Act (autoreg)',
-                _split_label,
-                _df_src, _activities_map, _objects_map,
-                save_dir=None,
-            )
+            with _timed('curve_only_eval', detail='ml_external (autoreg)', split=_split_label):
+                _ar_recs = _run_curve_eval_autoregressive_prev_act(
+                    all_energy_pipelines_ml_external,
+                    'DTW + Ext. Factors + Prev Act (autoreg)',
+                    _split_label,
+                    _df_src, _activities_map, _objects_map,
+                    save_dir=None,
+                )
             _all_records.extend(_ar_recs)
             _ckpt_curve_eval(_ar_recs, _split_label, 'ml_external_autoreg')
 
         # ── Autoregressive rollout for seq2seq_external ─────────────────
         if RUN_AUTOREGRESSIVE_EVAL and all_energy_pipelines_seq2seq_external:
             display(Markdown("### DTW + Seq2Seq + Ext. Factors + Prev Act (autoreg)"))
-            _ar_s2s_recs = _run_curve_eval_autoregressive_prev_act(
-                all_energy_pipelines_seq2seq_external,
-                'DTW + Seq2Seq + Ext. Factors + Prev Act (autoreg)',
-                _split_label,
-                _df_src, _activities_map, _objects_map,
-                save_dir=None,
-            )
+            with _timed('curve_only_eval', detail='seq2seq_external (autoreg)', split=_split_label):
+                _ar_s2s_recs = _run_curve_eval_autoregressive_prev_act(
+                    all_energy_pipelines_seq2seq_external,
+                    'DTW + Seq2Seq + Ext. Factors + Prev Act (autoreg)',
+                    _split_label,
+                    _df_src, _activities_map, _objects_map,
+                    save_dir=None,
+                )
             _all_records.extend(_ar_s2s_recs)
             _ckpt_curve_eval(_ar_s2s_recs, _split_label, 'seq2seq_external_autoreg')
 
@@ -5282,6 +5402,7 @@ _jdur_ready = (
 )
 
 if _jdur_ready:
+    _jdur_t0 = _time.perf_counter()
     display(Markdown("---"))
     display(Markdown("# Joint Duration + Profile Evaluation"))
     display(Markdown(
@@ -5612,6 +5733,9 @@ if _jdur_ready:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if _jdur_ready:
+    _record_runtime('joint_duration_eval', _time.perf_counter() - _jdur_t0,
+                    detail='matched pairs', split='TEST')
+    _jdur_mode_t0 = _time.perf_counter()
     display(Markdown("---"))
     display(Markdown("# Joint Duration + Profile Evaluation — Per Simulation Mode"))
     display(Markdown(
@@ -5794,6 +5918,9 @@ if _jdur_ready:
     elif not _jpm_all_records:
         print("[WARN per-mode joint] No records — check WARN/ERROR messages above.")
 
+    _record_runtime('joint_duration_eval', _time.perf_counter() - _jdur_mode_t0,
+                    detail='per simulation mode', split='TEST')
+
 # %%
 # ══════════════════════════════════════════════════════════════════════════════
 # RESULTS EXPORT — parquet table + HTML notebook snapshot
@@ -5802,6 +5929,18 @@ import subprocess
 
 if not EXPORT_RESULTS:
     print("EXPORT_RESULTS=False — skipping export.")
+    # The runtime table is written even here: it costs nothing, and a timing
+    # run is exactly the kind of run somebody does with the export off.
+    _record_runtime('pipeline_total', _time.perf_counter() - _pipeline_start,
+                    detail='wall clock, whole run')
+    if _RUNTIME_ROWS:
+        _rt_df = pd.DataFrame(_RUNTIME_ROWS)
+        _rt_df['minutes'] = _rt_df['seconds'] / 60.0
+        _rt_df['run_name'] = _run_name
+        _rt_df['run_timestamp'] = _run_ts
+        _rt_df.to_csv(os.path.join(_run_dir, 'runtime_profile.csv'), index=False)
+        print(f"Saved runtime  → {os.path.join(_run_dir, 'runtime_profile.csv')} "
+              f"({len(_rt_df)} timed stages)")
 else:
     # _run_dir is created at startup — just flush the log before saving anything
     _log_handler.flush()
@@ -5933,6 +6072,67 @@ else:
             display(_as)
     else:
         print("No curve evaluation results found — skipping parquet export.")
+
+    # ── Runtime profile ──────────────────────────────────────────────────────
+    # Every timed stage of this run (see the RUNTIME PROFILING section):
+    # runtime_profile.* is the raw rows, runtime_summary.csv the per-stage
+    # totals. Written before the HTML export so the table exists even if
+    # nbconvert fails.
+    _record_runtime('pipeline_total', _time.perf_counter() - _pipeline_start,
+                    detail='wall clock, whole run')
+    if _RUNTIME_ROWS:
+        _rt_df = pd.DataFrame(_RUNTIME_ROWS)
+        _rt_df['minutes'] = _rt_df['seconds'] / 60.0
+        _rt_df['run_name'] = _run_name
+        _rt_df['run_timestamp'] = _run_ts
+        _rt_df.to_parquet(os.path.join(_run_dir, 'runtime_profile.parquet'), index=False)
+        _rt_df.to_csv(os.path.join(_run_dir, 'runtime_profile.csv'), index=False)
+
+        # Per-stage totals. 'pipeline_total' is the wall clock of everything,
+        # so it is listed separately rather than summed with the stages it
+        # contains, and the parallel pools' summed worker seconds
+        # ('curve_training') legitimately exceed it.
+        _rt_summary = (
+            _rt_df[_rt_df['stage'] != 'pipeline_total']
+            .groupby('stage')
+            .agg(seconds=('seconds', 'sum'), minutes=('minutes', 'sum'),
+                 n_rows=('seconds', 'size'))
+            .sort_values('seconds', ascending=False)
+            .reset_index()
+        )
+        _rt_total = float(_rt_df.loc[_rt_df['stage'] == 'pipeline_total', 'seconds'].sum())
+        _rt_summary['pct_of_wall_clock'] = (
+            100.0 * _rt_summary['seconds'] / _rt_total if _rt_total > 0 else float('nan'))
+        _rt_summary.to_csv(os.path.join(_run_dir, 'runtime_summary.csv'), index=False)
+        print(f"Saved runtime  → {os.path.join(_run_dir, 'runtime_profile.parquet')} "
+              f"({len(_rt_df)} timed stages)")
+        display(Markdown("## Runtime by stage"))
+        display(_rt_summary.round(2))
+        report("\nRUNTIME BY STAGE (seconds)")
+        report(_rt_summary.round(2).to_string())
+
+        # Per-approach curve training, the "what does each method cost?" view.
+        _rt_methods = _rt_df[_rt_df['stage'] == 'curve_training']
+        if not _rt_methods.empty:
+            _rt_by_method = (
+                _rt_methods.assign(
+                    method=_rt_methods['detail'].astype(str).str.split(':').str[-1],
+                    # object dtype: n_items is None for stages that have no
+                    # natural item count, so sum() needs a numeric cast first.
+                    n_items=pd.to_numeric(_rt_methods['n_items'], errors='coerce'))
+                .groupby('method')
+                .agg(seconds=('seconds', 'sum'), leaves=('n_items', 'sum'))
+                .sort_values('seconds', ascending=False)
+            )
+            _rt_by_method['seconds_per_leaf'] = (
+                _rt_by_method['seconds'] / _rt_by_method['leaves'].replace(0, np.nan))
+            _rt_by_method.reset_index().to_csv(
+                os.path.join(_run_dir, 'runtime_by_method.csv'), index=False)
+            display(Markdown("## Curve training cost per method "
+                             "(summed across pool workers — not wall clock)"))
+            display(_rt_by_method.round(2))
+            report("\nCURVE TRAINING COST PER METHOD (summed worker seconds)")
+            report(_rt_by_method.round(2).to_string())
 
     # ── Run metadata ─────────────────────────────────────────────────────────
     pd.DataFrame({

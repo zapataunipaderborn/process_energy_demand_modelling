@@ -58,6 +58,7 @@ pip install -r requirements.txt
    - `process_results/` — process-model (Petri net) quality per mining algorithm and simulation mode,
    - `complete_curve_eval_results/` — complete case-profile evaluation per (process × simulation mode × approach),
    - `schedule_profile_eval_results/` — schedule-level load-profile comparison (best model vs. schedule-direct vs. stochastic generators),
+   - `runtime_profile.parquet`/`.csv`, `runtime_summary.csv`, `runtime_by_method.csv` — wall-clock cost of every stage (mining, duration models, each simulation, each evaluation) and the training cost of each curve method,
    - `pipeline_execution.log`, `info.json` — full run log and configuration record.
 
    The notebooks `src/03…08` reproduce the paper's tables and figures from such a run folder (set the experiment folder name at the top of each notebook).

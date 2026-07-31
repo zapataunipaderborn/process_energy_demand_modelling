@@ -217,8 +217,8 @@ EXPERIMENTS = [
         'save_predicted_curves': True,
         'train_ratio':           0.70,
         'split_type':            'temporal',
-        'random_seed':           42,     # identical split to 999/1000, so all
-                                         # tables are comparable row for row
+        'random_seed':           42,     
+                                         
         'curve_approaches': [
             'baseline',
             'median_activity_sensor',
@@ -226,6 +226,7 @@ EXPERIMENTS = [
             'ml_only',
             'ml_step_dtw_smooth',
             'seq2seq_external',
+            'seq2seq_iom',
         ],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
@@ -234,33 +235,6 @@ EXPERIMENTS = [
         'save_curve_values':     True,
         'step_dtw_fallback_ratio': 'inf',  
     },
-
-    {
-        'data_experiment':       '1',
-        'run_name':              'experiment_2',
-        'processes_to_run':      ['process_1', 'process_2', 'process_3',
-                                  'process_4_1', 'process_4_2', 'process_5'],
-        'temporal_resolution':   '1min',
-        'run_process_modelling': True,
-        'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],
-        'run_energy_modelling':  True,
-        'run_joint_duration_eval':   False,
-        'run_schedule_profile_eval': True,
-        'run_autoregressive_eval':   False,
-        'save_predicted_curves': True,
-        'train_ratio':           0.70,
-        'split_type':            'temporal',
-        'random_seed':           42,
-        'curve_approaches': [
-            'seq2seq_iom',
-        ],
-        'curve_optimize_hyperparams': True,
-        'curve_n_optuna_trials': 10,
-        'complete_curve_approaches': ['seq2seq_iom'],
-        'curve_median_floor':    False,
-        'save_curve_values':     True,
-    },
-
 
 ]
 
