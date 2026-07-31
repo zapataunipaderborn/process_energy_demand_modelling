@@ -1,0 +1,33 @@
+% Process discovery + timing — \input{} this file.
+\begin{table*}[t]
+\centering
+\caption{Process modelling and timing accuracy (test set results)}
+\label{tab:process_results}
+\vspace{-0.5em}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.3}
+\footnotesize
+\begin{tabular}{ll|c|c|c|c|c|c|c|c}
+\toprule
+Method & \makecell[l]{Time\\approach} & Fitness & Precision & \makecell{Generalization} & Simplicity & \makecell{Evt-Ratio\\Error} & \makecell{Dur-act\\WAPE (\%)} & \makecell{Case \\span\\WAPE (\%)} & \makecell{Case \\span MAE\\(min)} \\
+\midrule
+\multirow{3}{*}{\makecell[c]{Alpha \\ (Baseline)}} & baseline & 0.636 & 0.396 & 0.545 & 0.489 & 0.350 & 38.233 & 66.098 & 180.0 \\
+ & ml\_global & 0.636 & 0.396 & 0.545 & 0.489 & 0.350 & 27.375 & 57.220 & 180.7 \\
+ & ml\_local & 0.636 & 0.396 & 0.545 & 0.489 & 0.350 & 26.830 & 57.395 & 198.7 \\
+\cline{1-10}
+\multirow{3}{*}{\makecell[c]{Best \\ Petri Net}} & baseline & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & 43.875 & 74.272 & 198.7 \\
+ & ml\_global & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & 25.709 & 59.853 & 141.3 \\
+ & ml\_local & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & \textbf{21.139} & 59.252 & 174.0 \\
+\cline{1-10}
+\multirow{3}{*}{\makecell[c]{Best \\ Petri Net \\ + Budget}} & baseline & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.357 & 38.399 & 35.057 & 62.8 \\
+ & ml\_global & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.267 & 26.203 & \textbf{23.011} & 45.5 \\
+ & ml\_local & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & \textbf{0.250} & 22.630 & 23.165 & \textbf{43.3} \\
+\cline{1-10}
+\bottomrule
+\end{tabular}
+\vspace{0.5em}
+\noindent\raggedright\footnotesize
+
+Description: Process discovery methods are Alpha (naive miner baseline), Best Petri Net (best discovered Petri Net), Best Petri Net + Budget (best Petri Net + duration budgeting at simulation time), each crossed with the three activity-duration predictors (baseline is the median, ml\_local is a ML model per activity and ml\_global is a ML model for all activities). Fitness, Precision, Generalization and Simplicity are discovery quality (higher is better); Evt-Ratio Error is the relation between total simulated events/number of real events, lower is better; and the Dur-act are the difference of the individual activities durations vs the observed in test set and Span are the same but for the trace length (lower is better). \textbf{Bold} = best per column. Activity durations are reported as WAPE rather than MAE: MAE averages absolute minute errors over the activity types a case shares with its simulation, and that set differs per method, so a model that reproduces more short activities scores a lower MAE without being more accurate. Fitness, Precision, Generalization and Simplicity are model-level and are therefore reported as the median across processes; every timing column is pooled over all test cases, so each case is one unit of the median.
+
+\end{table*}

@@ -1,0 +1,42 @@
+% Aggregated realism table — \input{} this file.
+\begin{table*}[H]
+\centering
+
+\begin{minipage}{16cm}
+\centering
+
+\captionsetup{
+    justification=centering,
+    singlelinecheck=false,
+    format=plain
+}
+
+\caption{Curve realism for individual energy-profile prediction.}
+\label{tab:individual_profile_realism}
+
+\vspace{-0.5em}
+
+\begin{tabular}{p{6cm}|c|c|c|c|c|c}
+\toprule
+Method & Sum & Max & Mean & Std & Roughness & Overall \\
+\midrule
+Step DTW (ours) & 0.018 & \textbf{0.069} & 0.045 & \textbf{0.461} & \textbf{0.554} & \textbf{0.229} \\
+Activity median & \textbf{0.016} & 0.072 & \textbf{0.043} & 0.552 & 0.662 & 0.269 \\
+Step DTW w/o segments & 0.018 & 0.080 & 0.050 & 0.531 & 0.676 & 0.271 \\
+Step DTW w/o DTW & 0.018 & 0.089 & 0.054 & 0.592 & 0.702 & 0.291 \\
+Sensor median (baseline) & 0.018 & 0.074 & 0.051 & 0.613 & 0.724 & 0.296 \\
+Seq2Seq (aligned) & 0.021 & 0.091 & 0.062 & 0.726 & 0.820 & 0.344 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+
+\parbox{16cm}{%
+\footnotesize
+Curve realism for individual profile prediction, TEST set. Each column is the median normalised absolute error of that curve property, so 0 is perfect and lower is better; Overall is their average.
+\textbf{Bold} marks the best value per column.
+}
+
+\end{minipage}
+
+\end{table*}
