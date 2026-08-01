@@ -219,14 +219,26 @@ EXPERIMENTS = [
         'split_type':            'temporal',
         'random_seed':           42,     
                                          
+        # seq2seq first: they are the only approaches that have ever killed a run
+        # (numba/softDTW in a forked worker), and 02_modelling.py now trains the
+        # seq2seq pool BEFORE the sklearn pool, so a fork problem surfaces in the
+        # first minutes of process_1 instead of hours in. Order here is the
+        # reporting order; the pool order is what makes the failure early.
+        #
+        # NOTE the pair keeps its previous RELATIVE order (external before iom).
+        # A seq2seq worker seeds once per combo (stable_seed('seq2seq', s, a, o))
+        # and then trains its approaches in list order off that one stream, so
+        # swapping the two would silently change both models' numbers. Moving the
+        # pair ahead of the sklearn names does not: the two pools filter APPROACHES
+        # into disjoint lists, so only order WITHIN a group reaches the RNG.
         'curve_approaches': [
+            'seq2seq_external',
+            'seq2seq_iom',
             'baseline',
             'median_activity_sensor',
             'ml_external',
             'ml_only',
             'ml_step_dtw_smooth',
-            'seq2seq_external',
-            'seq2seq_iom',
         ],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
@@ -310,6 +322,20 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     # parent never initialises CUDA and there is nothing to inherit.
     env['CUDA_VISIBLE_DEVICES']           = ''
     env['PYTORCH_NVML_BASED_CUDA_CHECK']  = '1'
+    # numba must use its FORK-SAFE threading layer. This is the confirmed cause of
+    # the experiment_1_20260731 death: tslearn's softDTW (seq2seq_iom's reference
+    # curve) is @njit, and numba resolves its threading layer by priority
+    # tbb > omp > workqueue. TBB is not installed in htp_causal, so it picks 'omp'
+    # -- and numba's OpenMP layer (numba/np/ufunc/omppool.*.so) installs a
+    # pthread_atfork CHILD handler that prints
+    #   "Terminating: fork() called from a process already using GNU OpenMP..."
+    # and kills every process forked after numba has run in the parent. Once the
+    # seq2seq stall-watchdog fell back to running tasks INLINE (which executes
+    # softDTW in the parent), the next pool's 16 workers were all killed at fork.
+    # 'workqueue' is numba's fork-safe layer and carries no atfork handler.
+    # Verified: parent-runs-softDTW then forks 16 workers -> 0/16 under the default
+    # layer, 16/16 under workqueue, with identical numerics.
+    env['NUMBA_THREADING_LAYER']          = 'workqueue'
     # ── Reproducibility ──────────────────────────────────────────────────────
     # One master seed for the child run: 02_modelling.py seeds python/numpy/torch
     # from it and derives every per-combo training seed from it.
