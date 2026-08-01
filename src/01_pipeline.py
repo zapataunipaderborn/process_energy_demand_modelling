@@ -240,6 +240,19 @@ EXPERIMENTS = [
             'ml_only',
             'ml_step_dtw_smooth',
         ],
+        # LSTM only — the transformer cell is the O(T^2) one and it is what made
+        # experiment_1_20260801 look hung. Both cells used to be trained per combo
+        # with the lower val_loss kept; on this data's long activities that cost:
+        #   T=1000  lstm 15.4 min   transformer  47.3 min
+        #   T=2000  lstm 24.6 min   transformer 175.3 min   (per combo, per approach,
+        #                                                    at the worker's 1 thread)
+        # Attention is quadratic in sequence length, the LSTM is ~linear, and the
+        # long-activity combos in process_4_1 run to thousands of 1-min steps.
+        # Dropping the cell removes the quadratic term AND the second training run
+        # per combo — roughly 8x on the affected process. Set to
+        # ['lstm', 'transformer'] to restore the comparison (and expect the long
+        # combos to take hours).
+        'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
         'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline'],

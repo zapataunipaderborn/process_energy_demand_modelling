@@ -720,6 +720,13 @@ def _pool_workers(n_tasks):
 # stacks, kill the pool, and retry rather than wait forever.
 POOL_STALL_TIMEOUT = float(os.environ.get('PIPELINE_POOL_STALL_TIMEOUT', '1800'))
 
+# How often a running pool reports progress. Without this a pool that is working
+# normally is indistinguishable from a dead one for however long its slowest task
+# takes — experiment_1_20260801 spent 80 silent minutes in the inline fallback and
+# looked hung. Every heartbeat also samples worker CPU, which is what the stall
+# rule keys off (see _pool_worker_cpu_seconds).
+POOL_HEARTBEAT_SECONDS = float(os.environ.get('PIPELINE_POOL_HEARTBEAT', '300'))
+
 
 def _kill_pool(pool):
     """
@@ -749,6 +756,29 @@ def _kill_pool(pool):
         pool.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
+
+
+def _pool_worker_cpu_seconds(pool):
+    """
+    Total CPU seconds burnt so far by this pool's workers (utime+stime, /proc).
+
+    This is what tells a DEADLOCK apart from work that is merely SLOW, and the
+    two look identical from the outside: neither completes a task. A wedged
+    worker burns no CPU (experiment_986: ~4s each, then parked in futex_wait); a
+    worker training a transformer burns a full core. Counting completed tasks
+    cannot distinguish them — see _run_pool_with_stall_watchdog.
+    """
+    _total = 0.0
+    _hz = os.sysconf('SC_CLK_TCK')
+    for _pid in list(getattr(pool, '_processes', {}) or {}):
+        try:
+            with open(f'/proc/{_pid}/stat', 'rb') as _fh:
+                # Split on the last ')' — comm may itself contain spaces/parens.
+                _f = _fh.read().rsplit(b')', 1)[-1].split()
+            _total += (int(_f[11]) + int(_f[12])) / _hz   # utime + stime
+        except (OSError, IndexError, ValueError):
+            pass
+    return _total
 
 
 def _dump_worker_stacks(pool, label):
@@ -832,15 +862,47 @@ def _run_pool_with_stall_watchdog(fn, tasks, n_workers, label,
                               f"first affected task [{_key}]: {_bpe}")
                     _broken_keys.append(_key)
             _pending = set(_futs)
+            _n_total = len(_pending)
+            _t_pool = _time.perf_counter()
+            _cpu_prev = _pool_worker_cpu_seconds(_pool)
+            _idle_for = 0.0            # seconds of NO task completion AND no CPU burnt
+            _since_beat = 0.0
             while _pending:
+                _tick = min(stall_timeout, POOL_HEARTBEAT_SECONDS)
                 _done, _pending = concurrent.futures.wait(
-                    _pending, timeout=stall_timeout,
+                    _pending, timeout=_tick,
                     return_when=concurrent.futures.FIRST_COMPLETED)
-                if not _done:
+                # CPU burnt by the workers during this tick, in "cores busy" terms.
+                _cpu_now = _pool_worker_cpu_seconds(_pool)
+                _cores = max(0.0, _cpu_now - _cpu_prev) / max(_tick, 1e-9)
+                _cpu_prev = _cpu_now
+                _since_beat += _tick
+
+                if _done or _cores > 0.05:
+                    # Either a task finished, or the workers are computing. The
+                    # tail of a pool legitimately completes nothing for a long
+                    # time — 30 seq2seq_iom combos on long curves ran >30min each
+                    # at a full core, and the old "nothing completed in 1800s"
+                    # rule killed two pools of healthy work before falling back to
+                    # the slowest mode there is (sequential, in this process).
+                    _idle_for = 0.0
+                else:
+                    _idle_for += _tick
+
+                if _pending and _since_beat >= POOL_HEARTBEAT_SECONDS:
+                    _since_beat = 0.0
+                    print(f"  ⏳ {label}: {_n_total - len(_pending)}/{_n_total} done, "
+                          f"{len(_pending)} running on {_cores:.1f} core(s), "
+                          f"{(_time.perf_counter() - _t_pool)/60:.0f} min elapsed"
+                          f"{'' if _idle_for == 0 else f' — NO cpu for {_idle_for:.0f}s'}")
+
+                if _idle_for >= stall_timeout:
                     _stalled_keys = [_futs[_f] for _f in _pending]
-                    print(f"  ⛔ {label}: no task completed in {stall_timeout:.0f}s — "
-                          f"treating the pool as deadlocked with "
-                          f"{len(_stalled_keys)} task(s) outstanding.")
+                    print(f"  ⛔ {label}: {len(_stalled_keys)} task(s) outstanding and the "
+                          f"workers burnt NO cpu for {stall_timeout:.0f}s — that is a real "
+                          f"deadlock, not slow work. Stalled: "
+                          f"{', '.join(str(k) for k in _stalled_keys[:4])}"
+                          f"{' ...' if len(_stalled_keys) > 4 else ''}")
                     _dump_worker_stacks(_pool, label)
                     for _f in _pending:
                         _f.cancel()
