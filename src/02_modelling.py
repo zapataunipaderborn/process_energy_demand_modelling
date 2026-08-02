@@ -9,6 +9,18 @@ import os
 # Disable ALL progress bars (tqdm) to silence pm4py replay noise
 os.environ["TQDM_DISABLE"] = "1"
 
+# numba must use its FORK-SAFE threading layer, and this has to be set BEFORE
+# numba is imported (pm4py/tslearn pull it in below). numba resolves the layer by
+# priority tbb > omp > workqueue; TBB is not installed in htp_causal, so the
+# default is 'omp' -- whose atfork child handler KILLS every process forked after
+# numba has run in this one ("Terminating: fork() called from a process already
+# using GNU OpenMP"). That is what killed experiment_1_20260731: the seq2seq
+# watchdog's inline fallback ran tslearn softDTW in the parent, and the next
+# pool's 16 workers all died at fork. 01_pipeline.py exports this for the
+# modelling child; setdefault here keeps a direct `python 02_modelling.py` and
+# the debug notebook equally safe without overriding a deliberate choice.
+os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
+
 import logging
 import sys
 import numpy as np
@@ -665,6 +677,27 @@ if MAX_WORKERS is not None:
           f"(PIPELINE_MAX_WORKERS); machine has {os.cpu_count()} core(s).")
 
 
+def _report_numba_fork_safety():
+    """
+    Print, at startup, which numba threading layer this run will fork with.
+
+    Config only — this deliberately does NOT execute a numba kernel, because
+    doing so is precisely what arms the unsafe layer's atfork handler. 'workqueue'
+    is fork-safe; 'omp' kills every child at fork; 'tbb' is not fork-safe either.
+    A run that prints anything other than a fork-safe layer here WILL lose its
+    worker pools — stop it and fix the environment rather than wait for it.
+    """
+    _layer = os.environ.get('NUMBA_THREADING_LAYER', '(unset)')
+    _safe  = _layer in ('workqueue', 'forksafe')
+    print(f"[modelling] numba threading layer: {_layer} "
+          f"({'fork-safe' if _safe else '⚠️  NOT FORK-SAFE — worker pools will die at fork'})",
+          flush=True)
+    return _safe
+
+
+_report_numba_fork_safety()
+
+
 def _pool_workers(n_tasks):
     """Worker count for a pool over `n_tasks`: one per core, capped by
     PIPELINE_MAX_WORKERS when set, and never more than there is work for."""
@@ -686,6 +719,13 @@ def _pool_workers(n_tasks):
 # fix it — it bounds the damage: no progress for this long means dump the workers'
 # stacks, kill the pool, and retry rather than wait forever.
 POOL_STALL_TIMEOUT = float(os.environ.get('PIPELINE_POOL_STALL_TIMEOUT', '1800'))
+
+# How often a running pool reports progress. Without this a pool that is working
+# normally is indistinguishable from a dead one for however long its slowest task
+# takes — experiment_1_20260801 spent 80 silent minutes in the inline fallback and
+# looked hung. Every heartbeat also samples worker CPU, which is what the stall
+# rule keys off (see _pool_worker_cpu_seconds).
+POOL_HEARTBEAT_SECONDS = float(os.environ.get('PIPELINE_POOL_HEARTBEAT', '300'))
 
 
 def _kill_pool(pool):
@@ -716,6 +756,29 @@ def _kill_pool(pool):
         pool.shutdown(wait=False, cancel_futures=True)
     except Exception:
         pass
+
+
+def _pool_worker_cpu_seconds(pool):
+    """
+    Total CPU seconds burnt so far by this pool's workers (utime+stime, /proc).
+
+    This is what tells a DEADLOCK apart from work that is merely SLOW, and the
+    two look identical from the outside: neither completes a task. A wedged
+    worker burns no CPU (experiment_986: ~4s each, then parked in futex_wait); a
+    worker training a transformer burns a full core. Counting completed tasks
+    cannot distinguish them — see _run_pool_with_stall_watchdog.
+    """
+    _total = 0.0
+    _hz = os.sysconf('SC_CLK_TCK')
+    for _pid in list(getattr(pool, '_processes', {}) or {}):
+        try:
+            with open(f'/proc/{_pid}/stat', 'rb') as _fh:
+                # Split on the last ')' — comm may itself contain spaces/parens.
+                _f = _fh.read().rsplit(b')', 1)[-1].split()
+            _total += (int(_f[11]) + int(_f[12])) / _hz   # utime + stime
+        except (OSError, IndexError, ValueError):
+            pass
+    return _total
 
 
 def _dump_worker_stacks(pool, label):
@@ -753,9 +816,20 @@ def _run_pool_with_stall_watchdog(fn, tasks, n_workers, label,
     in this process — slow, but it terminates, and an in-process run cannot
     inherit whatever fork-time state wedges the workers.
 
+    A pool whose workers DIE (BrokenProcessPool) is treated the same way. That is
+    the other half of the same problem and it cost experiment_1_20260731 the whole
+    run: numba's OpenMP layer kills every child forked after numba has run in the
+    parent, so all 60 tasks failed in 1.7s. Those are not "stalls", so the old code
+    retried nothing, returned nothing, and then hung forever in shutdown(wait=True)
+    — the executor's queue-feeder threads were blocked in pipe_write against a call
+    queue whose readers were all dead, and shutdown() joins them. Hence: a broken
+    pool is retried like a stalled one, and is torn down with _kill_pool (which
+    never joins) rather than shutdown(wait=True).
+
     Returns a list of (key, result) for every task that produced one.
     """
     import concurrent.futures
+    from concurrent.futures.process import BrokenProcessPool
     stall_timeout = POOL_STALL_TIMEOUT if stall_timeout is None else stall_timeout
     from utils.sim_extractor import _pool_stall_trap_initializer
 
@@ -768,21 +842,67 @@ def _run_pool_with_stall_watchdog(fn, tasks, n_workers, label,
             print(f"  ↻ {label}: retrying {len(remaining)} task(s) in a fresh pool "
                   f"(attempt {_attempt}/{attempts})...")
         _stalled_keys = []
+        _broken_keys = []
         _pool = concurrent.futures.ProcessPoolExecutor(
             max_workers=max(1, min(n_workers, len(remaining))),
             initializer=_pool_stall_trap_initializer, initargs=(label,))
         try:
-            _futs = {_pool.submit(fn, *_args): _key for _key, _args in remaining}
+            # Submit one at a time, not as a comprehension: once a worker dies the
+            # executor marks itself broken and every LATER submit() raises too. In a
+            # comprehension that exception escapes mid-build, skipping straight to
+            # the finally below with no keys recorded — i.e. the tasks are silently
+            # dropped and the pool is shut down with the joining path.
+            _futs = {}
+            for _key, _args in remaining:
+                try:
+                    _futs[_pool.submit(fn, *_args)] = _key
+                except BrokenProcessPool as _bpe:
+                    if not _broken_keys:
+                        print(f"  💥 {label}: pool broke while submitting — "
+                              f"first affected task [{_key}]: {_bpe}")
+                    _broken_keys.append(_key)
             _pending = set(_futs)
+            _n_total = len(_pending)
+            _t_pool = _time.perf_counter()
+            _cpu_prev = _pool_worker_cpu_seconds(_pool)
+            _idle_for = 0.0            # seconds of NO task completion AND no CPU burnt
+            _since_beat = 0.0
             while _pending:
+                _tick = min(stall_timeout, POOL_HEARTBEAT_SECONDS)
                 _done, _pending = concurrent.futures.wait(
-                    _pending, timeout=stall_timeout,
+                    _pending, timeout=_tick,
                     return_when=concurrent.futures.FIRST_COMPLETED)
-                if not _done:
+                # CPU burnt by the workers during this tick, in "cores busy" terms.
+                _cpu_now = _pool_worker_cpu_seconds(_pool)
+                _cores = max(0.0, _cpu_now - _cpu_prev) / max(_tick, 1e-9)
+                _cpu_prev = _cpu_now
+                _since_beat += _tick
+
+                if _done or _cores > 0.05:
+                    # Either a task finished, or the workers are computing. The
+                    # tail of a pool legitimately completes nothing for a long
+                    # time — 30 seq2seq_iom combos on long curves ran >30min each
+                    # at a full core, and the old "nothing completed in 1800s"
+                    # rule killed two pools of healthy work before falling back to
+                    # the slowest mode there is (sequential, in this process).
+                    _idle_for = 0.0
+                else:
+                    _idle_for += _tick
+
+                if _pending and _since_beat >= POOL_HEARTBEAT_SECONDS:
+                    _since_beat = 0.0
+                    print(f"  ⏳ {label}: {_n_total - len(_pending)}/{_n_total} done, "
+                          f"{len(_pending)} running on {_cores:.1f} core(s), "
+                          f"{(_time.perf_counter() - _t_pool)/60:.0f} min elapsed"
+                          f"{'' if _idle_for == 0 else f' — NO cpu for {_idle_for:.0f}s'}")
+
+                if _idle_for >= stall_timeout:
                     _stalled_keys = [_futs[_f] for _f in _pending]
-                    print(f"  ⛔ {label}: no task completed in {stall_timeout:.0f}s — "
-                          f"treating the pool as deadlocked with "
-                          f"{len(_stalled_keys)} task(s) outstanding.")
+                    print(f"  ⛔ {label}: {len(_stalled_keys)} task(s) outstanding and the "
+                          f"workers burnt NO cpu for {stall_timeout:.0f}s — that is a real "
+                          f"deadlock, not slow work. Stalled: "
+                          f"{', '.join(str(k) for k in _stalled_keys[:4])}"
+                          f"{' ...' if len(_stalled_keys) > 4 else ''}")
                     _dump_worker_stacks(_pool, label)
                     for _f in _pending:
                         _f.cancel()
@@ -791,18 +911,34 @@ def _run_pool_with_stall_watchdog(fn, tasks, n_workers, label,
                     _key = _futs[_f]
                     try:
                         results.append((_key, _f.result()))
+                    except BrokenProcessPool as _bpe:
+                        # The pool is dead, not this task: every other future will
+                        # raise the same thing. Log the first in full, then count —
+                        # 60 identical tracebacks buried the cause last time.
+                        if not _broken_keys:
+                            print(f"  💥 {label}: worker process died — the pool is "
+                                  f"broken, not the task [{_key}]: {_bpe}")
+                        _broken_keys.append(_key)
                     except Exception as _e:
                         print(f"  ⚠️  {label} worker failed [{_key}]: {_e}")
         finally:
-            if _stalled_keys:
+            # Never shutdown(wait=True) a pool that lost workers: that join is what
+            # turned both the deadlock and the fork-abort into multi-hour hangs.
+            # `_pool._broken` is the belt-and-braces case — an unexpected exception
+            # escaping the try must not reach the joining path either.
+            if _stalled_keys or _broken_keys or getattr(_pool, '_broken', None):
                 _kill_pool(_pool)
             else:
                 _pool.shutdown(wait=True)
-        _stalled_set = set(map(str, _stalled_keys))
-        remaining = [(_k, _a) for _k, _a in remaining if str(_k) in _stalled_set]
+        if _broken_keys:
+            print(f"  💥 {label}: {len(_broken_keys)} task(s) lost to a broken pool "
+                  f"(check the run's stderr/nohup.out — a child killed at fork "
+                  f"reports there, not in this log).")
+        _retry_set = set(map(str, _stalled_keys)) | set(map(str, _broken_keys))
+        remaining = [(_k, _a) for _k, _a in remaining if str(_k) in _retry_set]
 
     if remaining:
-        print(f"  ↩︎ {label}: {len(remaining)} task(s) still stalled after "
+        print(f"  ↩︎ {label}: {len(remaining)} task(s) still stalled/broken after "
               f"{attempts} pool attempt(s) — running them in this process. "
               f"This is slow, but it finishes.")
         print(f"  ⚠️  {label}: this run is no longer bit-identical to a clean one. "
@@ -957,6 +1093,11 @@ _pipeline_start = _time.perf_counter()
 
 logging.info(f"Run started — output folder: {_run_dir}")
 logging.info(f"Approaches: {APPROACHES}")
+# Re-emit the fork-safety line now that the log exists. The first call happens at
+# import time, before this redirection, so it lands in the caller's stdout (and
+# with block buffering may not surface until exit) — useless for diagnosing a run
+# from its own log, which is the first place anyone looks.
+_report_numba_fork_safety()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3971,100 +4112,12 @@ if RUN_CURVE_ONLY_EVALUATION:
         _combos    = build_sensor_activity_object_combos(_df_train_exp, _sensors, _activities, _objects)
         _n_workers = _pool_workers(len(_combos))
 
-        if _sklearn_approaches and _combos:
-            print(f"\n  Parallel sklearn training: {len(_combos)} combos × {len(_sklearn_approaches)} approaches "
-                  f"across {_n_workers} workers...")
-            _sklearn_t0 = _time.perf_counter()
-            with concurrent.futures.ProcessPoolExecutor(max_workers=_n_workers) as _pool:
-                _futs = {
-                    _pool.submit(_train_curve_only_worker,
-                                 s, a, o, _df_train_exp, _sklearn_approaches, _ef_cols,
-                                 None, 0.2, CURVE_OPTIMIZE_HYPERPARAMS, CURVE_N_OPTUNA_TRIALS,
-                                 _prev_act_energy_maps.get(s)): (s, a, o)
-                    for s, a, o in _combos
-                }
-                _worker_results = []
-                for _fut in concurrent.futures.as_completed(_futs):
-                    try:
-                        _worker_results.append(_fut.result())
-                    except Exception as _we:
-                        _ws, _wa, _wo = _futs[_fut]
-                        print(f"  ⚠️  Worker failed {_ws}|{_wa}|{_wo}: {_we}")
-            _sklearn_elapsed = _time.perf_counter() - _sklearn_t0
-            print(f"  sklearn training done in {_sklearn_elapsed:.1f}s")
-            _record_runtime('curve_training_pool', _sklearn_elapsed, process=_proc,
-                            detail='sklearn', split='TRAIN', n_items=len(_combos),
-                            parallel_workers=_n_workers)
-            _record_curve_training_timings(_worker_results, _proc, 'sklearn')
-
-            # Reassemble in a fixed key order, not pool-completion order: each
-            # worker's models are already seeded from its own key, so only the
-            # dict INSERTION order was still schedule-dependent — and that
-            # leaks into the row order of every saved results table.
-            _worker_results.sort(key=lambda r: (str(r['sensor']), str(r['activity']), str(r['object'])))
-
-            # Reassemble into per-sensor dicts keyed [sensor][activity][object]
-            for _r in _worker_results:
-                _s, _a, _o = _r['sensor'], _r['activity'], _r['object']
-                if _r.get('skipped'):
-                    print(f"  ⚠️  Skipped {_s}|{_a}|{_o} (too few curves).")
-                    continue
-                if 'median_activity_sensor' in _r:
-                    # "Median per Activity & Sensor": median curve for this
-                    # (sensor, activity, object), no model.
-                    _pipelines_median_activity_sensor.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['median_activity_sensor']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['median_activity_sensor']: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
-                        'full_pipeline':   _r['median_activity_sensor'],
-                    }
-                if 'ml_dtw' in _r:
-                    # The former 'baseline': DBA barycenter + DTW alignment + regression.
-                    _pipelines_ml_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['ml_dtw']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['ml_dtw']: predict_raw_curve(rv, act, attrs, pipeline=ep),
-                        'full_pipeline':   _r['ml_dtw'],
-                    }
-                if 'ml_external' in _r:
-                    _pipelines_ml_external.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['ml_external']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_external']),
-                        'full_pipeline':   _r['ml_external'],
-                    }
-                # Train/eval-gap variants: share ml_external's predictor
-                # (they differ only in the FIT's row weights).
-                for _v, _dst in (('ml_external_wcounts', _pipelines_ml_external_wcounts),
-                                 ('ml_external_wmetric', _pipelines_ml_external_wmetric)):
-                    if _v in _r:
-                        _dst.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                            'reference_curve': _r[_v]['reference_curve'],
-                            'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r[_v]),
-                            'full_pipeline':   _r[_v],
-                        }
-                if 'ml_only' in _r:
-                    _pipelines_ml_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': None,
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep))(_r['ml_only']),
-                        'full_pipeline':   _r['ml_only'],
-                    }
-                if 'ml_step_dtw' in _r:
-                    # exog-aware signature like ml_external: the duration and
-                    # level models read ef_* window means, so the values have to
-                    # reach the predictor.
-                    _pipelines_ml_step_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['ml_step_dtw']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw']),
-                        'full_pipeline':   _r['ml_step_dtw'],
-                    }
-                if 'ml_step_dtw_smooth' in _r:
-                    # Same predictor as ml_step_dtw — the pipeline's stored
-                    # gain_mode='smooth' is what makes the reconstruction differ.
-                    _pipelines_ml_step_dtw_smooth.setdefault(_s, {}).setdefault(_a, {})[_o] = {
-                        'reference_curve': _r['ml_step_dtw_smooth']['reference_curve'],
-                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw_smooth']),
-                        'full_pipeline':   _r['ml_step_dtw_smooth'],
-                    }
-
         # ── Seq2seq approaches — one worker per (sensor, activity, object) combo ──
+        # Trained FIRST, before the sklearn pool. These are the only approaches
+        # that have ever wedged or died in the pool (numba/softDTW in a forked
+        # child), so they run while the log is short and a failure is visible in
+        # the first minutes of the process — not after the sklearn pool has burnt
+        # 7-11 minutes per process and buried the cause under 5k lines of output.
         if _seq2seq_approaches and _combos:
             from utils.sim_extractor import _train_seq2seq_worker
             _s2s_n_workers = _pool_workers(len(_combos))
@@ -4151,6 +4204,100 @@ if RUN_CURVE_ONLY_EVALUATION:
                         'full_pipeline':   _ep,
                     }
                     print(f"  [{_s}|{_a}|{_o}] seq2seq_external  val_loss={_ep['val_loss']:.5f}  cell={_ep.get('cell_type', 'lstm')}  ({_s_elapsed:.1f}s)")
+
+        if _sklearn_approaches and _combos:
+            print(f"\n  Parallel sklearn training: {len(_combos)} combos × {len(_sklearn_approaches)} approaches "
+                  f"across {_n_workers} workers...")
+            _sklearn_t0 = _time.perf_counter()
+            # Same watchdogged pool as seq2seq below. This one has never wedged,
+            # but it forks from the same parent, so a bare ProcessPoolExecutor
+            # here carries the identical failure mode: a dead or stuck worker
+            # would hang the run with no bound and no fallback.
+            _sk_tasks = [
+                ((s, a, o), (
+                    s, a, o, _df_train_exp, _sklearn_approaches, _ef_cols,
+                    None, 0.2, CURVE_OPTIMIZE_HYPERPARAMS, CURVE_N_OPTUNA_TRIALS,
+                    _prev_act_energy_maps.get(s),
+                ))
+                for s, a, o in _combos
+            ]
+            _worker_results = [
+                _res for _key, _res in _run_pool_with_stall_watchdog(
+                    _train_curve_only_worker, _sk_tasks, _n_workers, 'sklearn')
+            ]
+            _sklearn_elapsed = _time.perf_counter() - _sklearn_t0
+            print(f"  sklearn training done in {_sklearn_elapsed:.1f}s")
+            _record_runtime('curve_training_pool', _sklearn_elapsed, process=_proc,
+                            detail='sklearn', split='TRAIN', n_items=len(_combos),
+                            parallel_workers=_n_workers)
+            _record_curve_training_timings(_worker_results, _proc, 'sklearn')
+
+            # Reassemble in a fixed key order, not pool-completion order: each
+            # worker's models are already seeded from its own key, so only the
+            # dict INSERTION order was still schedule-dependent — and that
+            # leaks into the row order of every saved results table.
+            _worker_results.sort(key=lambda r: (str(r['sensor']), str(r['activity']), str(r['object'])))
+
+            # Reassemble into per-sensor dicts keyed [sensor][activity][object]
+            for _r in _worker_results:
+                _s, _a, _o = _r['sensor'], _r['activity'], _r['object']
+                if _r.get('skipped'):
+                    print(f"  ⚠️  Skipped {_s}|{_a}|{_o} (too few curves).")
+                    continue
+                if 'median_activity_sensor' in _r:
+                    # "Median per Activity & Sensor": median curve for this
+                    # (sensor, activity, object), no model.
+                    _pipelines_median_activity_sensor.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['median_activity_sensor']['reference_curve'],
+                        'predict_fn':      lambda rv, act, attrs, ep=_r['median_activity_sensor']: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
+                        'full_pipeline':   _r['median_activity_sensor'],
+                    }
+                if 'ml_dtw' in _r:
+                    # The former 'baseline': DBA barycenter + DTW alignment + regression.
+                    _pipelines_ml_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_dtw']['reference_curve'],
+                        'predict_fn':      lambda rv, act, attrs, ep=_r['ml_dtw']: predict_raw_curve(rv, act, attrs, pipeline=ep),
+                        'full_pipeline':   _r['ml_dtw'],
+                    }
+                if 'ml_external' in _r:
+                    _pipelines_ml_external.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_external']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_external']),
+                        'full_pipeline':   _r['ml_external'],
+                    }
+                # Train/eval-gap variants: share ml_external's predictor
+                # (they differ only in the FIT's row weights).
+                for _v, _dst in (('ml_external_wcounts', _pipelines_ml_external_wcounts),
+                                 ('ml_external_wmetric', _pipelines_ml_external_wmetric)):
+                    if _v in _r:
+                        _dst.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                            'reference_curve': _r[_v]['reference_curve'],
+                            'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r[_v]),
+                            'full_pipeline':   _r[_v],
+                        }
+                if 'ml_only' in _r:
+                    _pipelines_ml_only.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': None,
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep))(_r['ml_only']),
+                        'full_pipeline':   _r['ml_only'],
+                    }
+                if 'ml_step_dtw' in _r:
+                    # exog-aware signature like ml_external: the duration and
+                    # level models read ef_* window means, so the values have to
+                    # reach the predictor.
+                    _pipelines_ml_step_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_step_dtw']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw']),
+                        'full_pipeline':   _r['ml_step_dtw'],
+                    }
+                if 'ml_step_dtw_smooth' in _r:
+                    # Same predictor as ml_step_dtw — the pipeline's stored
+                    # gain_mode='smooth' is what makes the reconstruction differ.
+                    _pipelines_ml_step_dtw_smooth.setdefault(_s, {}).setdefault(_a, {})[_o] = {
+                        'reference_curve': _r['ml_step_dtw_smooth']['reference_curve'],
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}))(_r['ml_step_dtw_smooth']),
+                        'full_pipeline':   _r['ml_step_dtw_smooth'],
+                    }
 
         # NOTE: the old inline "mean baseline" block (flat constant = training
         # mean at every timestep, approach='mean_baseline') has been retired.
