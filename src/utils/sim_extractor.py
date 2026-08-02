@@ -4541,9 +4541,19 @@ def build_and_train_pipeline_step_dtw(
 ):
     """
     Segment-parameter regression via DTW correspondence — see the section
-    comment. `models` and the hyper-parameter kwargs are accepted and ignored,
-    like the exemplar builders: the 2M models here are fixed (absolute-error
-    gradient boosting), one per duration and one per level.
+    comment. There are 2M models, one per segment duration and one per segment
+    level.
+
+    `models` and `optimize_hyperparams` / `n_trials` ARE used here, unlike the
+    exemplar builders: `models` is the candidate family dict the sklearn
+    approaches compete over, and optimize_hyperparams runs the same Optuna
+    search per segment. It fires only when a real held-out split exists
+    (`_tunable` below) — with too few curves the search would select on its own
+    training rows, so the fixed fit is used instead. Both arrive from
+    CURVE_OPTIMIZE_HYPERPARAMS / CURVE_N_OPTUNA_TRIALS via
+    _train_curve_only_worker, and from the same constants via
+    train_schedule_profile_pipeline_step_dtw, so the leaf pipelines and the
+    schedule-direct comparator are tuned alike.
 
     gain_mode : 'step' (default) applies each segment's level gain piecewise-
     constant — sharp edges, the original ml_step_dtw; 'smooth' interpolates the
@@ -7988,11 +7998,56 @@ def _extract_real_case_curves_all_sensors(real_case_df, sensors,
     return result
 
 
+# A leaf pipeline exists only for (sensor, activity, object) combinations with
+# enough training curves (>=5). When one is missing, the case assembler used to
+# emit NOTHING for that activity's interval, so the assembled case curve had a
+# literal hole: no samples at all while an activity was running. Measured on
+# experiment_1's budget mode, 81.5% of (case, sensor) curves had at least one
+# such hole and process_4_1 lost a median 28.1% of every case span -- always to a
+# running activity, never to idle time. That silently depressed every
+# complete-profile metric (a plain sum over samples loses the missing minutes
+# outright) and it did so ONLY for the process-model rows, since the
+# schedule-direct rows predict one whole-case curve and can never have a hole.
+# Filling the gap makes the comparison whole-case on both sides.
+#
+# Set PIPELINE_COMPLETE_CURVE_FILL_MISSING=false to restore the old skip.
+COMPLETE_CURVE_FILL_MISSING = _os_seed.environ.get(
+    'PIPELINE_COMPLETE_CURVE_FILL_MISSING', 'true').lower() == 'true'
+
+
+def _build_gap_fill_curves(energy_pipelines, sensors):
+    """
+    One fallback curve per sensor: the pointwise median of that sensor's trained
+    leaf `reference_curve`s, resampled to their median length. Same idea as the
+    'baseline' row's per-sensor median curve, but taken from the pipelines being
+    evaluated, so no extra training pass and no access to the test split.
+
+    Returns {sensor: np.ndarray}; a sensor with no usable reference curve is
+    absent from the dict and its gaps stay unfilled.
+    """
+    out = {}
+    for sensor in sensors:
+        refs = []
+        for _act_map in (energy_pipelines.get(sensor) or {}).values():
+            for _ep in (_act_map or {}).values():
+                _rc = (_ep or {}).get('reference_curve')
+                if _rc is not None and len(_rc) >= 2:
+                    refs.append(np.asarray(_rc, dtype=float))
+        if not refs:
+            continue
+        L = max(2, int(np.median([len(r) for r in refs])))
+        stack = np.array([np.interp(np.linspace(0, 1, L), np.linspace(0, 1, len(r)), r)
+                          for r in refs])
+        out[sensor] = _clip_physical(np.median(stack, axis=0))
+    return out
+
+
 def _predict_case_curves_all_sensors(sim_case_df, energy_pipelines, sensors,
                                      activity_exog_means=None,
                                      temporal_resolution_minutes=15.0,
                                      activity_col='activity', object_col='object',
-                                     exog_lookup=None):
+                                     exog_lookup=None,
+                                     gap_fill_curves=None, fill_stats=None):
     """
     Predict every sensor's (relative_time_minutes, value) curve for one
     simulated case (already filtered to that case_id) in a single pass over
@@ -8009,6 +8064,13 @@ def _predict_case_curves_all_sensors(sim_case_df, energy_pipelines, sensors,
 
     Returns {sensor: (times, values)}, only for sensors with at least one
     usable predicted curve for this case.
+
+    `gap_fill_curves` (from _build_gap_fill_curves) covers activities with no
+    trained leaf, so the assembled case curve spans the whole case instead of
+    carrying a hole — see COMPLETE_CURVE_FILL_MISSING for why that matters.
+    `fill_stats` is an optional dict the caller passes in to collect what was
+    filled; a fill is a real gap in the model's coverage, so it is counted and
+    reported rather than left to look like a successful prediction.
     """
     sim_case_df = sim_case_df.sort_values('timestamp_start')
     case_start = sim_case_df['timestamp_start'].iloc[0]
@@ -8043,7 +8105,21 @@ def _predict_case_curves_all_sensors(sim_case_df, energy_pipelines, sensors,
                 exog_lookup=exog_lookup, ts_start=ts_start, ts_end=ts_end,
             )
             if curve is None or len(curve) == 0:
-                continue
+                # No trained leaf for this (sensor, activity, object). Fill with
+                # the sensor's fallback curve on this activity's own grid rather
+                # than emitting nothing — see COMPLETE_CURVE_FILL_MISSING.
+                _fb = (gap_fill_curves or {}).get(sensor)
+                if _fb is None or not COMPLETE_CURVE_FILL_MISSING:
+                    continue
+                _n_ts = max(2, round(duration_minutes / max(temporal_resolution_minutes, 1e-9)))
+                curve = np.interp(np.linspace(0, 1, _n_ts),
+                                  np.linspace(0, 1, len(_fb)), _fb)
+                if fill_stats is not None:
+                    fill_stats['filled'] = fill_stats.get('filled', 0) + 1
+                    fill_stats['minutes'] = fill_stats.get('minutes', 0.0) + float(duration_minutes)
+                    fill_stats.setdefault('activities', {})
+                    fill_stats['activities'][str(activity)] = (
+                        fill_stats['activities'].get(str(activity), 0.0) + float(duration_minutes))
             n = len(curve)
             t = np.linspace(t_start, t_end, n) if n > 1 else np.array([t_start])
             times_acc[sensor].append(t)
@@ -8125,6 +8201,11 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     real_groups = real_expanded_df[real_valid].groupby(real_ids_str[real_valid])
     sim_groups  = simulated_df[sim_valid].groupby(sim_ids_str[sim_valid])
 
+    # Per-sensor fallback curves for activities with no trained leaf, built once
+    # for the whole comparison — see COMPLETE_CURVE_FILL_MISSING.
+    _gap_fill = _build_gap_fill_curves(energy_pipelines, sensors) if COMPLETE_CURVE_FILL_MISSING else {}
+    _fill_stats = {}
+
     rows = []
     curve_rows = [] if save_curves else None
     for cid in shared_cases:
@@ -8143,6 +8224,7 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
             sim_g, energy_pipelines, list(real_curves.keys()),
             activity_exog_means, temporal_resolution_minutes,
             exog_lookup=exog_lookup,
+            gap_fill_curves=_gap_fill, fill_stats=_fill_stats,
         )
 
         for sensor, (t_real, v_real) in real_curves.items():
@@ -8177,6 +8259,20 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
                     'case_id': cid, 'sensor': sensor, 'series': 'predicted',
                     't_minutes': float(t), 'value': float(v),
                 } for t, v in zip(t_sim, v_sim))
+
+    # Never silent: a filled interval is a gap in the model's coverage, and the
+    # whole reason this exists is that the previous behaviour (drop the interval)
+    # was invisible in the outputs and quietly biased every metric.
+    if _fill_stats.get('filled'):
+        _acts = sorted(_fill_stats.get('activities', {}).items(), key=lambda kv: -kv[1])
+        print(f"  ℹ️ complete-curve: filled {_fill_stats['filled']:,} (activity, sensor) "
+              f"intervals with no trained leaf, {_fill_stats['minutes']:,.0f} activity-minutes "
+              f"total, using the per-sensor fallback curve. Top: "
+              + ', '.join(f'{a} ({m:,.0f} min)' for a, m in _acts[:3]))
+    _no_fb = [s for s in sensors if s not in _gap_fill]
+    if COMPLETE_CURVE_FILL_MISSING and _no_fb:
+        print(f"  ⚠️ complete-curve: no fallback curve for {len(_no_fb)} sensor(s) "
+              f"(no trained leaf at all) — their gaps are still dropped: {_no_fb[:3]}")
 
     if save_curves:
         return pd.DataFrame(rows), pd.DataFrame(curve_rows)
@@ -8367,12 +8463,19 @@ def train_schedule_profile_pipeline(train_cases, fixed_length=None, val_size=0.2
     }
 
 
-def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_minutes):
+def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_minutes,
+                                   n_samples=None):
     """
     Predict a complete case profile from schedule-only attributes. Output time
     axis is fixed at median_case_duration_minutes for every case — the only
     length assumption available without simulating the process, not the
     (unknown, at prediction time) true case duration.
+
+    `n_samples` resamples the finished curve onto that many points -- see
+    SCHEDULE_DIRECT_LENGTH_SOURCE. The model is still evaluated at its own
+    `fixed_length` positions and interpolated afterwards, deliberately: the
+    regression is fitted on position_idx / relative_pos, so predicting directly
+    at foreign positions would extrapolate features rather than resample a curve.
 
     Returns (t, v), same shape as the other build_*_case_curve functions.
     """
@@ -8416,7 +8519,12 @@ def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_mi
     X = X.fillna(0)
 
     y_pred = model.predict(X)
-    t = np.linspace(0, median_case_duration_minutes, fixed_length)
+    if n_samples is not None and int(n_samples) >= 2 and int(n_samples) != fixed_length:
+        _n = int(n_samples)
+        y_pred = np.interp(np.linspace(0, 1, _n), np.linspace(0, 1, fixed_length), y_pred)
+        t = np.linspace(0, median_case_duration_minutes, _n)
+    else:
+        t = np.linspace(0, median_case_duration_minutes, fixed_length)
     # Same non-negativity constraint as the process-simulation curves
     # (see _clip_physical) -- applied to every predictor, not just one.
     return t, _clip_physical(y_pred)
@@ -8433,18 +8541,25 @@ def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_mi
 # itself contributes (per-activity leaves, activity duration + prev-activity
 # context, and a simulated rather than regressed span).
 #
-# The segment cap is its own constant: STEP_DTW_MAX_SEGMENTS = 8 is sized for a
-# single activity's curve, and a whole case is a longer, multi-phase curve that
-# would be forced to a coarser staircase under it. Nothing here picks a segment
-# COUNT — _stepdtw_segment_medoid chooses that by BIC and is separately capped
-# at L // min_seg with min_seg = max(2, L // 25), i.e. ~25 segments for any
-# curve of 50+ samples. Setting the cap to that same 25 makes the BIC penalty
-# and the minimum segment width the only things that bind, which is the point:
-# the data picks the resolution instead of a hard-coded 8. Raise it only if the
-# chosen counts are seen saturating at the cap (build with verbose=1 to log
-# "-> N segment(s)"); ml_step_dtw's own cap is deliberately untouched.
+# The segment cap is TIED to ml_step_dtw's own STEP_DTW_MAX_SEGMENTS, because
+# "the same curve method" has to include its capacity. An earlier value of 25
+# was chosen on the argument that a whole case is longer and multi-phase, so it
+# should be allowed a finer staircase than a single activity's curve — but that
+# also makes segment count a second thing varying between this row and the
+# Petri-net rows, and segment count is exactly what sets how well the spread and
+# jaggedness of a curve can be reproduced (the Std and Roughness columns, where
+# this row's margin is largest). With the caps equal, the remaining gap is the
+# process model alone, which is the only claim this comparator is here to make.
+#
+# Nothing here picks a segment COUNT — _stepdtw_segment_medoid chooses that by
+# BIC, separately capped at L // min_seg with min_seg = max(2, L // 25), i.e.
+# ~25 for any curve of 50+ samples. So this cap BINDS on whole-case curves in a
+# way it barely does per activity: if the logged counts (verbose=1 logs
+# "-> N segment(s)") sit at the cap for most cases, the honest report is the
+# matched-capacity number here plus an uncapped variant named as its own row,
+# not a silent raise back to 25.
 SCHEDULE_STEP_DTW_MAX_SEGMENTS = int(_os_seed.environ.get(
-    'PIPELINE_SCHEDULE_STEP_DTW_MAX_SEGMENTS', '25'))
+    'PIPELINE_SCHEDULE_STEP_DTW_MAX_SEGMENTS', str(STEP_DTW_MAX_SEGMENTS)))
 
 # A predicted span that is wildly wrong must not turn into a multi-million-point
 # curve; lengths are clipped to this multiple of the median training length.
@@ -8471,7 +8586,8 @@ def _case_to_step_dtw_curve(case):
 
 def train_schedule_profile_pipeline_step_dtw(
         train_cases, variable='case_profile', gain_mode='smooth',
-        max_segments=None, val_size=0.2, random_state=42, verbose=0):
+        max_segments=None, val_size=0.2, random_state=42, verbose=0,
+        optimize_hyperparams=False, n_trials=50):
     """
     Train the step-DTW curve method at CASE granularity on schedule-only
     features — the like-for-like comparator described above.
@@ -8480,6 +8596,13 @@ def train_schedule_profile_pipeline_step_dtw(
     None when there are too few cases to train on. The do-no-harm fallback gate
     is off (fallback_pipeline=None): it can only route to an ml_external leaf
     pipeline, which does not exist at case granularity.
+
+    `optimize_hyperparams` / `n_trials` are forwarded to the builder so this
+    comparator can run the SAME Optuna search the ml_step_dtw leaf pipelines run
+    under curve_optimize_hyperparams. Left off, the two sides of the "does the
+    process model help?" comparison differ in tuning as well as in the process
+    model, and tuned-vs-untuned is not a difference anyone wants in that number.
+    Note the cost: the search runs per segment, per (process, sensor).
     """
     if len(train_cases) < 4:
         if verbose:
@@ -8493,6 +8616,7 @@ def train_schedule_profile_pipeline_step_dtw(
         max_segments=(SCHEDULE_STEP_DTW_MAX_SEGMENTS if max_segments is None
                       else int(max_segments)),
         val_size=val_size, random_state=random_state, verbose=verbose,
+        optimize_hyperparams=optimize_hyperparams, n_trials=n_trials,
         fallback_pipeline=None, prev_act_energy_map=None,
     )
 
@@ -8506,18 +8630,28 @@ def train_schedule_profile_pipeline_step_dtw(
     return pipeline
 
 
-def predict_schedule_profile_curve_step_dtw(attributes, pipeline, case_duration_minutes):
+def predict_schedule_profile_curve_step_dtw(attributes, pipeline, case_duration_minutes,
+                                            n_samples=None):
     """
     Predict a complete case profile with the step-DTW method from schedule-only
     attributes, placed on `case_duration_minutes` (the case's own predicted
     span, exactly like the other schedule-level baselines get).
 
+    `n_samples` forces the curve length instead of deriving it from the span --
+    see SCHEDULE_DIRECT_LENGTH_SOURCE. When it is given the span is assumed to
+    have been taken from the same external source, so the 4x guard below is NOT
+    applied: clipping a length that was handed over on purpose would silently
+    re-introduce the very asymmetry the override exists to remove.
+
     Returns (t, v), same shape as predict_schedule_profile_curve.
     """
     _median_len = int(pipeline.get('median_curve_length') or pipeline.get('fixed_length') or 2)
-    spm = pipeline.get('samples_per_minute')
-    n = int(round(float(case_duration_minutes) * spm)) if spm else _median_len
-    n = int(np.clip(n, 2, max(2, int(_SCHEDULE_STEP_DTW_MAX_LENGTH_FACTOR * _median_len))))
+    if n_samples is not None:
+        n = max(2, int(n_samples))
+    else:
+        spm = pipeline.get('samples_per_minute')
+        n = int(round(float(case_duration_minutes) * spm)) if spm else _median_len
+        n = int(np.clip(n, 2, max(2, int(_SCHEDULE_STEP_DTW_MAX_LENGTH_FACTOR * _median_len))))
 
     attrs = dict(attributes or {})
     attrs['_pred_curve_length'] = n
@@ -8528,7 +8662,8 @@ def predict_schedule_profile_curve_step_dtw(attributes, pipeline, case_duration_
 
 
 def train_case_duration_pipeline(train_cases, val_size=0.2, random_state=42,
-                                 model_class=None, verbose=0):
+                                 model_class=None, verbose=0,
+                                 allow_median_fallback=True):
     """
     Train a case-level TOTAL DURATION predictor: schedule-only attributes
     (see build_case_level_curves) -> scalar case duration (minutes). Same
@@ -8624,6 +8759,14 @@ def train_case_duration_pipeline(train_cases, val_size=0.2, random_state=42,
     baseline_val_mae = (float(mean_absolute_error(y_val, np.full(len(y_val), median_duration)))
                        if len(y_val) else float('nan'))
     use_median_fallback = not (pd.notna(val_mae) and pd.notna(baseline_val_mae) and val_mae < baseline_val_mae)
+    # allow_median_fallback=False keeps the model even when it loses to the median.
+    # Used for the schedule-direct span: this floor puts a bound on how wrong that
+    # span can be, and the simulated Petri-net span has no equivalent bound, so
+    # leaving it on hands one side of the comparison a guard the other never gets.
+    # Everything else (notably "Best, duration-corrected", whose whole job is to
+    # REPAIR a wrong span) keeps the floor, where the guard is the point.
+    if not allow_median_fallback:
+        use_median_fallback = False
 
     if verbose:
         _status = 'median fallback (model did not beat it)' if use_median_fallback else 'model'
@@ -8774,7 +8917,9 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
                                              median_case_duration_minutes, random_state=42,
                                              save_curves=False, bootstrap_generator=None,
                                              duration_pipeline=None,
-                                             schedule_step_pipeline=None):
+                                             schedule_step_pipeline=None,
+                                             schedule_direct_span_map=None,
+                                             schedule_direct_duration_pipeline=None):
     """
     For each real test case (from build_case_level_curves), compare its real
     complete profile against (a) the schedule-only prediction and (b) one
@@ -8806,6 +8951,29 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
     the same schedule-aware span the best modes do, instead of a single median
     span for every case. Falls back to ``median_case_duration_minutes`` per
     case whenever no predictor is available or the prediction is non-positive.
+
+    SCHEDULE_DIRECT_LENGTH_SOURCE — the two SCHEDULE-DIRECT series only:
+    ``schedule_direct_span_map`` maps case_id -> (span_minutes, n_samples) taken
+    from the Budget mode's own predicted curves, and when a case is in it both
+    schedule-direct series are placed on exactly that span AND resampled to
+    exactly that many points. The reason is that span and sampling grid are two
+    separate confounds in the complete-profile table: Budget's curves sit on a
+    ~1.04 min grid and the schedule series on ~1.21, and 'total' there is a plain
+    sum over samples, so part of every schedule-direct number was grid arithmetic
+    rather than curve quality. Matching both leaves the CURVE as the only thing
+    that differs between those rows and the Budget row.
+
+    Deliberately NOT applied to the stochastic and bootstrap generators: they are
+    not schedule-direct methods, and silently re-basing them would change rows
+    nobody asked about. They keep the ``duration_pipeline`` span.
+
+    ``schedule_direct_duration_pipeline`` is the fallback span source for the
+    schedule-direct series when a case is absent from the map (a case Budget did
+    not produce a curve for). It is separate from ``duration_pipeline`` so it can
+    be trained WITHOUT the median-duration do-no-harm floor: that floor bounds
+    schedule-direct's worst-case span error in a way the simulated Petri-net span
+    is never bounded, which is an advantage the comparison should not hand it.
+    Falls back to ``duration_pipeline`` when None.
     """
     from scipy.stats import wasserstein_distance
     rng = np.random.default_rng(random_state)
@@ -8828,6 +8996,24 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
             except Exception:
                 pass
 
+        # Schedule-direct span/length: Budget's own, when Budget produced this
+        # case (see SCHEDULE_DIRECT_LENGTH_SOURCE). Otherwise the unfloored
+        # predictor, and only then the shared case_span.
+        sd_span, sd_n = case_span, None
+        _sd_entry = (schedule_direct_span_map or {}).get(str(c['case_id']))
+        if _sd_entry is not None:
+            _span, _n = _sd_entry
+            if _span and float(_span) > 0 and _n and int(_n) >= 2:
+                sd_span, sd_n = float(_span), int(_n)
+        elif schedule_direct_duration_pipeline is not None:
+            try:
+                _sd_pred = float(predict_case_duration(c['attributes'],
+                                                       schedule_direct_duration_pipeline))
+                if _sd_pred > 0:
+                    sd_span = _sd_pred
+            except Exception:
+                pass
+
         row = {'case_id': c['case_id']}
         if save_curves:
             curve_rows.extend({'case_id': c['case_id'], 'series': 'real', 't_minutes': float(t), 'value': float(v)}
@@ -8835,7 +9021,7 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
 
         if schedule_pipeline is not None:
             t_sched, v_sched = predict_schedule_profile_curve(
-                c['attributes'], schedule_pipeline, case_span
+                c['attributes'], schedule_pipeline, sd_span, n_samples=sd_n
             )
             w_sched = np.clip(v_sched, 0, None)
             if w_sched.sum() > 0:
@@ -8848,7 +9034,7 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
         if schedule_step_pipeline is not None:
             try:
                 t_step, v_step = predict_schedule_profile_curve_step_dtw(
-                    c['attributes'], schedule_step_pipeline, case_span)
+                    c['attributes'], schedule_step_pipeline, sd_span, n_samples=sd_n)
             except Exception:
                 t_step, v_step = np.array([]), np.array([])
             w_step = np.clip(v_step, 0, None)
