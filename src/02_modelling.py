@@ -111,6 +111,7 @@ from utils.sim_extractor import (
     train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
     compare_population_shape,
     compare_population_case_stat, compute_population_coverage,
+    SAVE_TRAINED_MODELS, save_trained_pipelines,
 )
 from xgboost import XGBRegressor
 
@@ -1520,6 +1521,11 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
     all_rows = []
     all_curve_rows = [] if SAVE_PREDICTED_CURVES else None
+    # Per-sensor schedule-direct family, persisted at the end of this function
+    # (see save_trained_pipelines) so schedule-level what-ifs can be re-run
+    # later without retraining. Plain dicts + module-level predictors, so they
+    # reload with load_trained_pipelines and work immediately.
+    _sched_models = {}
     for sensor in sensors:
         train_cases = build_case_level_curves(train_expanded_df, sensor, ef_cols=ef_cols)
         test_cases  = build_case_level_curves(test_expanded_df, sensor, ef_cols=ef_cols)
@@ -1563,6 +1569,17 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
                   f"series keep their own predicted span for this sensor, so its "
                   f"numbers are NOT length-matched to Budget.")
         test_case_attrs   = {str(c['case_id']): c['attributes'] for c in test_cases}
+
+        if SAVE_TRAINED_MODELS:
+            _sched_models[sensor] = {
+                'schedule':                 schedule_pipeline,
+                'schedule_step':            schedule_step_pipeline,
+                'duration':                 duration_pipeline,
+                'duration_unfloored':       schedule_direct_duration_pipeline,
+                'stochastic':               stochastic_gen,
+                'bootstrap':                bootstrap_gen,
+                'median_case_duration_minutes': median_case_duration_minutes,
+            }
 
         # duration_pipeline is threaded through so the per-position stochastic
         # generator AND the bootstrap generator are placed on each case's own
@@ -1752,6 +1769,12 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
             population_out.to_csv(os.path.join(out_dir, 'population_distribution_eval.csv'), index=False)
             print(f"  💾 Population-Level Distributional Evaluation saved → "
                   f"schedule_profile_eval_results/{process}/population_distribution_eval.csv")
+
+    if SAVE_TRAINED_MODELS and _sched_models:
+        _sm_path = os.path.join(output_root, process, 'trained_schedule_pipelines.joblib')
+        if save_trained_pipelines(_sched_models, _sm_path, label=f'{process}/schedule'):
+            print(f"  [{process}] schedule-direct pipelines saved "
+                  f"({len(_sched_models)} sensors) → {_sm_path}")
 
     _elapsed = _t.perf_counter() - _t0
     print(f"  💾 Schedule Profile Evaluation saved → schedule_profile_eval_results/{process}/  "
@@ -4436,6 +4459,41 @@ if RUN_CURVE_ONLY_EVALUATION:
         all_energy_pipelines_ml_step_dtw_smooth[_proc]      = _pipelines_ml_step_dtw_smooth
         all_energy_pipelines_ml_external_wcounts[_proc] = _pipelines_ml_external_wcounts
         all_energy_pipelines_ml_external_wmetric[_proc] = _pipelines_ml_external_wmetric
+
+        # ── Persist this process's trained pipelines ──────────────────────────
+        # One joblib per (process, approach) under <run>/trained_models/, saved
+        # as soon as the process finishes training so a crash later in the run
+        # loses nothing. predict_fn closures are stripped at save and rebuilt at
+        # load — see save_trained_pipelines / rebuild_energy_predict_fns in
+        # utils/sim_extractor.py for the round trip.
+        if SAVE_TRAINED_MODELS:
+            _tm_t0 = _time.perf_counter()
+            _tm_saved = []
+            for _tm_approach, _tm_pipes in [
+                ('baseline',                _pipelines_baseline),
+                ('median_activity_sensor',  _pipelines_median_activity_sensor),
+                ('ml_dtw',                  _pipelines_ml_dtw),
+                ('ml_external',             _pipelines_ml_external),
+                ('ml_external_wcounts',     _pipelines_ml_external_wcounts),
+                ('ml_external_wmetric',     _pipelines_ml_external_wmetric),
+                ('ml_only',                 _pipelines_ml_only),
+                ('ml_step_dtw',             _pipelines_ml_step_dtw),
+                ('ml_step_dtw_smooth',      _pipelines_ml_step_dtw_smooth),
+                ('seq2seq',                 _pipelines_seq2seq),
+                ('seq2seq_only',            _pipelines_seq2seq_only),
+                ('seq2seq_external',        _pipelines_seq2seq_external),
+                ('seq2seq_iom',             _pipelines_seq2seq_iom),
+            ]:
+                if not _tm_pipes:
+                    continue
+                _tm_path = os.path.join(_run_dir, 'trained_models', _proc,
+                                        f'{_tm_approach}.joblib')
+                if save_trained_pipelines(_tm_pipes, _tm_path,
+                                          label=f'{_proc}/{_tm_approach}'):
+                    _tm_saved.append(_tm_approach)
+            if _tm_saved:
+                print(f"  [{_proc}] trained models saved "
+                      f"({_time.perf_counter() - _tm_t0:.1f}s): {', '.join(_tm_saved)}")
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════

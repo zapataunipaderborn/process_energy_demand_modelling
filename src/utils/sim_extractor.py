@@ -9150,3 +9150,115 @@ def evaluate_pipeline_joint_duration(test_curves, pipeline):
 
 
 # %%
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAINED-MODEL PERSISTENCE
+# ══════════════════════════════════════════════════════════════════════════════
+# The pipelines exist only in 02_modelling's memory and die with the run, so any
+# follow-up question needing a NEW prediction (a different span policy, a new
+# eval slice, a what-if schedule) costs a full retraining pass. These helpers
+# persist the trained pipeline dicts to the run folder and rebuild them later.
+#
+# What is saved is the picklable payload: the per-leaf 'full_pipeline' dicts
+# (sklearn models, arrays, scalars, torch modules) plus 'reference_curve'. The
+# 'predict_fn' closures are NOT saved — they are lambdas 02_modelling wraps
+# around full_pipeline, so they are rebuilt on load by rebuild_energy_predict_fns
+# from the same approach -> module-level predictor mapping. The schedule-direct
+# family (schedule / schedule_step / duration pipelines / generators) is plain
+# dicts whose predictors are already module-level functions, so it reloads as-is.
+#
+# Set PIPELINE_SAVE_TRAINED_MODELS=false to skip saving (e.g. disk-tight runs).
+
+SAVE_TRAINED_MODELS = _os_seed.environ.get(
+    'PIPELINE_SAVE_TRAINED_MODELS', 'true').lower() == 'true'
+
+
+def _sanitize_for_pickle(obj):
+    """Recursive copy with every callable dropped (predict_fn lambdas and any
+    other closure); everything else is kept as-is. Containers are rebuilt so the
+    live in-memory dicts are never mutated."""
+    if callable(obj) and not hasattr(obj, 'state_dict'):
+        # torch nn.Modules are callable but picklable and wanted; plain
+        # functions/lambdas are neither.
+        return None
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            sv = _sanitize_for_pickle(v)
+            if sv is not None or v is None:
+                out[k] = sv
+        return out
+    if isinstance(obj, (list, tuple)):
+        vals = [_sanitize_for_pickle(v) for v in obj]
+        return type(obj)(vals) if not isinstance(obj, tuple) else tuple(vals)
+    return obj
+
+
+def save_trained_pipelines(pipelines, path, label=''):
+    """
+    Persist one pipelines structure (e.g. {sensor: {activity: {object: leaf}}}
+    for an energy approach, or {sensor: {...}} for the schedule family) to
+    `path` with joblib. Never raises: a failure (an unpicklable torch state, a
+    corrupt leaf) prints a warning and returns False, because model saving must
+    not be able to kill a multi-hour training run at the last step.
+    """
+    import joblib
+    try:
+        _os_seed.makedirs(_os_seed.path.dirname(path), exist_ok=True)
+        joblib.dump(_sanitize_for_pickle(pipelines), path, compress=3)
+        return True
+    except Exception as exc:
+        print(f"  ⚠️ save_trained_pipelines{f' [{label}]' if label else ''}: "
+              f"{type(exc).__name__}: {exc} — models NOT saved to {path}")
+        return False
+
+
+def load_trained_pipelines(path):
+    """joblib.load counterpart of save_trained_pipelines. For energy-approach
+    files, follow with rebuild_energy_predict_fns to restore 'predict_fn'."""
+    import joblib
+    return joblib.load(path)
+
+
+# approach -> callable(full_pipeline) -> predict_fn, mirroring exactly the
+# lambdas 02_modelling builds at reassembly time (same signatures per family:
+# exog-aware approaches take a 4th `exog` argument, the rest three args).
+ENERGY_PREDICT_REBUILDERS = {
+    'baseline':               lambda ep: lambda rv, act, attrs: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
+    'median_activity_sensor': lambda ep: lambda rv, act, attrs: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
+    'ml_dtw':                 lambda ep: lambda rv, act, attrs: predict_raw_curve(rv, act, attrs, pipeline=ep),
+    'ml_only':                lambda ep: lambda rv, act, attrs: predict_raw_curve_ml_only(rv, act, attrs, pipeline=ep),
+    'ml_external':            lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
+    'ml_external_wcounts':    lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
+    'ml_external_wmetric':    lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_exog_prev_activity(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
+    'ml_step_dtw':            lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
+    'ml_step_dtw_smooth':     lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_step_dtw(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
+    'seq2seq':                lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq(rv, act, attrs, pipeline=ep),
+    'seq2seq_only':           lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq_only(rv, act, attrs, pipeline=ep),
+    'seq2seq_iom':            lambda ep: lambda rv, act, attrs: predict_raw_curve_seq2seq_iom(rv, act, attrs, pipeline=ep),
+    'seq2seq_external':       lambda ep: lambda rv, act, attrs, exog=None: predict_raw_curve_seq2seq_external(rv, act, attrs, pipeline=ep, exog_values=exog or {}),
+}
+
+
+def rebuild_energy_predict_fns(pipelines_by_sensor, approach):
+    """
+    Reattach 'predict_fn' to every leaf of a loaded energy-approach structure
+    ({sensor: {activity: {object: {'reference_curve', 'full_pipeline'}}}}),
+    returning it ready for predict_curve_for_instance /
+    compare_complete_case_curves. Mutates and returns the structure.
+
+    Round trip:
+        ep = load_trained_pipelines('<run>/trained_models/<proc>/ml_step_dtw_smooth.joblib')
+        ep = rebuild_energy_predict_fns(ep, 'ml_step_dtw_smooth')
+        compare_complete_case_curves(real_df, sim_df, ep, sensors, ...)
+    """
+    builder = ENERGY_PREDICT_REBUILDERS.get(approach)
+    if builder is None:
+        raise ValueError(f"No predict_fn rebuilder for approach {approach!r} — "
+                         f"known: {sorted(ENERGY_PREDICT_REBUILDERS)}")
+    for _act_map in (pipelines_by_sensor or {}).values():
+        for _obj_map in (_act_map or {}).values():
+            for _leaf in (_obj_map or {}).values():
+                if isinstance(_leaf, dict) and _leaf.get('full_pipeline') is not None:
+                    _leaf['predict_fn'] = builder(_leaf['full_pipeline'])
+    return pipelines_by_sensor
