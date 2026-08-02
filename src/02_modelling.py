@@ -1469,6 +1469,30 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         print(f"  ⚠️ 'Best, budget': no complete-curve output found for "
               f"{process}/{budget_mode_safe} — that series will be missing.")
 
+    # Budget's own per-(sensor, case) span AND sample count, so the two
+    # schedule-direct series can be placed on exactly the same time grid as the
+    # Budget row rather than on their own — see SCHEDULE_DIRECT_LENGTH_SOURCE in
+    # compare_schedule_and_stochastic_profiles. Read straight off the curves
+    # Budget actually produced (not its duration budget) so the match is to what
+    # was scored, not to what was intended.
+    _budget_spans = {}
+    if _budget_curve_path:
+        try:
+            _bc = pd.read_parquet(_budget_curve_path,
+                                  columns=['case_id', 'sensor', 'series', 't_minutes'])
+            _bc = _bc[_bc['series'] == 'predicted']
+            _bc['case_id'] = _bc['case_id'].astype(str)
+            _agg = _bc.groupby(['sensor', 'case_id'])['t_minutes'].agg(['max', 'size'])
+            for (_sen, _cid), _r in _agg.iterrows():
+                _budget_spans.setdefault(_sen, {})[_cid] = (float(_r['max']), int(_r['size']))
+            print(f"  Budget span/length source: {sum(len(v) for v in _budget_spans.values()):,} "
+                  f"(sensor, case) grids from {budget_mode_safe}")
+        except Exception as _exc:
+            print(f"  ⚠️ Could not read Budget curves for span matching "
+                  f"({_budget_curve_path}): {type(_exc).__name__}: {_exc} — the "
+                  f"schedule-direct series fall back to their own predicted span.")
+            _budget_spans = {}
+
     # Raw simulated per-case total span (first activity start -> last
     # activity end) for the winning ("best") mode, straight from its own
     # simulated log — independent of which activities a curve pipeline could
@@ -1507,9 +1531,15 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
         # Same schedule-only inputs, but the step-DTW curve method — so the gap
         # against "Best, mine" (also step-DTW) prices the process model alone.
+        # verbose=1 on purpose: it logs the BIC-chosen "-> N segment(s)" per
+        # (process, sensor), which is the only way to see whether the segment
+        # cap (now matched to ml_step_dtw's 8, see SCHEDULE_STEP_DTW_MAX_SEGMENTS)
+        # is binding on whole-case curves rather than BIC choosing freely.
         try:
             schedule_step_pipeline = train_schedule_profile_pipeline_step_dtw(
-                train_cases, variable=sensor, gain_mode='smooth', verbose=0)
+                train_cases, variable=sensor, gain_mode='smooth', verbose=1,
+                optimize_hyperparams=CURVE_OPTIMIZE_HYPERPARAMS,
+                n_trials=CURVE_N_OPTUNA_TRIALS)
         except Exception as _exc:
             print(f"  ⚠️ Schedule-direct (step-DTW) not trained for {process}/{sensor}: "
                   f"{type(_exc).__name__}: {_exc} — that series will be missing.")
@@ -1520,18 +1550,33 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         if duration_pipeline is None:
             print(f"  ⚠️ Case-duration pipeline not trained for {process}/{sensor} "
                   f"(too few train cases) — 'Best, duration-corrected' will be skipped for this sensor.")
+        # Span source for the schedule-direct series only, and WITHOUT the
+        # median-duration floor: that floor bounds their worst-case span error,
+        # and nothing bounds the simulated Petri-net span, so keeping it here
+        # would be a guard only one side of the comparison gets. Used only for
+        # cases Budget produced no curve for — the rest take Budget's own grid.
+        schedule_direct_duration_pipeline = train_case_duration_pipeline(
+            train_cases, verbose=0, allow_median_fallback=False)
+        _sensor_budget_spans = _budget_spans.get(sensor, {})
+        if _budget_spans and not _sensor_budget_spans:
+            print(f"  ⚠️ No Budget curves for {process}/{sensor} — the schedule-direct "
+                  f"series keep their own predicted span for this sensor, so its "
+                  f"numbers are NOT length-matched to Budget.")
         test_case_attrs   = {str(c['case_id']): c['attributes'] for c in test_cases}
 
-        # duration_pipeline is threaded through so schedule-direct, the
-        # per-position stochastic generator AND the bootstrap generator are all
-        # placed on each case's own predicted span (like "Best, duration-corrected")
-        # instead of a single median span for every case.
+        # duration_pipeline is threaded through so the per-position stochastic
+        # generator AND the bootstrap generator are placed on each case's own
+        # predicted span (like "Best, duration-corrected") instead of a single
+        # median span for every case. The two schedule-direct series bypass it
+        # and take Budget's grid instead — see SCHEDULE_DIRECT_LENGTH_SOURCE.
         _cmp_result = compare_schedule_and_stochastic_profiles(
             test_cases, schedule_pipeline, stochastic_gen, median_case_duration_minutes,
             save_curves=SAVE_PREDICTED_CURVES,
             bootstrap_generator=bootstrap_gen,
             duration_pipeline=duration_pipeline,
             schedule_step_pipeline=schedule_step_pipeline,
+            schedule_direct_span_map=_sensor_budget_spans,
+            schedule_direct_duration_pipeline=schedule_direct_duration_pipeline,
         )
         cmp_df, sensor_curve_df = _cmp_result if SAVE_PREDICTED_CURVES else (_cmp_result, None)
         if cmp_df.empty:
