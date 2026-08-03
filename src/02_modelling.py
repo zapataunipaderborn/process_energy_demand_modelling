@@ -104,8 +104,7 @@ from utils.sim_extractor import compare_complete_case_curves, build_exog_lookup
 from utils.sim_extractor import build_sensor_activity_object_combos
 from utils.sim_extractor import predict_raw_curve_step_dtw
 from utils.sim_extractor import (
-    build_case_level_curves, train_schedule_profile_pipeline,
-    train_schedule_profile_pipeline_step_dtw,
+    build_case_level_curves,
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
     compare_schedule_and_stochastic_profiles,
     train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
@@ -622,14 +621,13 @@ RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'tr
 # Off by default; does NOT affect curve-pipeline training (RUN_CURVE_ONLY_EVALUATION),
 # which the energy-distribution metrics still depend on.
 RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', 'false').lower() == 'true'
-# Schedule Profile Evaluation — ablation of the whole process-simulation step:
-# predicts each case's COMPLETE energy profile directly from schedule-only
-# features (recipe/case attributes, start time, external factors — no
-# simulated activities/durations), plus a stochastic (no-features-at-all)
-# reference generator, both compared against the same real test cases used by
-# the complete-curve eval. Off by default — trains one extra model per
-# (process, sensor), on top of everything else. Does NOT affect any other
-# evaluation. See utils/sim_extractor.py's "Schedule Profile Evaluation" section.
+# Schedule Profile Evaluation — complete-profile reference generators: a
+# stochastic (no-features-at-all) generator plus a bootstrap resampler,
+# compared against the same real test cases used by the complete-curve eval,
+# alongside the already-computed "Best" comparators. Off by default — trains
+# one extra model per (process, sensor), on top of everything else. Does NOT
+# affect any other evaluation. See utils/sim_extractor.py's "Schedule Profile
+# Evaluation" section.
 RUN_SCHEDULE_PROFILE_EVAL = os.environ.get('PIPELINE_RUN_SCHEDULE_PROFILE_EVAL', 'false').lower() == 'true'
 
 # Autoregressive test-time rollout of the prev-activity curve approaches
@@ -1405,20 +1403,14 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
                                 comparator_approach='ml_external'):
     """
     "Schedule Profile Evaluation" — see utils/sim_extractor.py's Schedule Profile
-    Evaluation section for the design. Per sensor: trains a schedule-only
-    case-level predictor and a stochastic reference generator on TRAIN cases,
-    evaluates both against REAL TEST cases, and (if available) merges in the
-    already-computed per-case W1 numbers for the 'ml_external'
-    approach on this process's best-fidelity simulation mode — giving a
-    4-way comparison, all on the exact same real cases: schedule-only vs.
-    stochastic vs. the full process-simulation-based pipeline ("Best, mine")
-    vs. that same pipeline with its timeline rescaled to a dedicated
-    case-duration prediction ("Best, duration-corrected").
-
-    A second schedule-only predictor ("schedule_step") runs the SAME step-DTW
-    curve method "Best, mine" uses, on whole-case curves — so its gap against
-    "Best, mine" isolates the process model rather than mixing it with the
-    change of curve method. See train_schedule_profile_pipeline_step_dtw.
+    Evaluation section for the design. Per sensor: trains a stochastic reference
+    generator (and a bootstrap resampler) on TRAIN cases, evaluates them against
+    REAL TEST cases, and (if available) merges in the already-computed per-case
+    W1 numbers for the 'ml_external' approach on this process's best-fidelity
+    simulation mode — all on the exact same real cases: stochastic vs. the full
+    process-simulation-based pipeline ("Best, mine") vs. that same pipeline
+    with its timeline rescaled to a dedicated case-duration prediction
+    ("Best, duration-corrected").
 
     "Best, duration-corrected" exists because the process-simulation
     timeline has no mechanism forcing its total elapsed time to be
@@ -1470,30 +1462,6 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         print(f"  ⚠️ 'Best, budget': no complete-curve output found for "
               f"{process}/{budget_mode_safe} — that series will be missing.")
 
-    # Budget's own per-(sensor, case) span AND sample count, so the two
-    # schedule-direct series can be placed on exactly the same time grid as the
-    # Budget row rather than on their own — see SCHEDULE_DIRECT_LENGTH_SOURCE in
-    # compare_schedule_and_stochastic_profiles. Read straight off the curves
-    # Budget actually produced (not its duration budget) so the match is to what
-    # was scored, not to what was intended.
-    _budget_spans = {}
-    if _budget_curve_path:
-        try:
-            _bc = pd.read_parquet(_budget_curve_path,
-                                  columns=['case_id', 'sensor', 'series', 't_minutes'])
-            _bc = _bc[_bc['series'] == 'predicted']
-            _bc['case_id'] = _bc['case_id'].astype(str)
-            _agg = _bc.groupby(['sensor', 'case_id'])['t_minutes'].agg(['max', 'size'])
-            for (_sen, _cid), _r in _agg.iterrows():
-                _budget_spans.setdefault(_sen, {})[_cid] = (float(_r['max']), int(_r['size']))
-            print(f"  Budget span/length source: {sum(len(v) for v in _budget_spans.values()):,} "
-                  f"(sensor, case) grids from {budget_mode_safe}")
-        except Exception as _exc:
-            print(f"  ⚠️ Could not read Budget curves for span matching "
-                  f"({_budget_curve_path}): {type(_exc).__name__}: {_exc} — the "
-                  f"schedule-direct series fall back to their own predicted span.")
-            _budget_spans = {}
-
     # Raw simulated per-case total span (first activity start -> last
     # activity end) for the winning ("best") mode, straight from its own
     # simulated log — independent of which activities a curve pipeline could
@@ -1521,10 +1489,10 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
     all_rows = []
     all_curve_rows = [] if SAVE_PREDICTED_CURVES else None
-    # Per-sensor schedule-direct family, persisted at the end of this function
-    # (see save_trained_pipelines) so schedule-level what-ifs can be re-run
-    # later without retraining. Plain dicts + module-level predictors, so they
-    # reload with load_trained_pipelines and work immediately.
+    # Per-sensor generator/duration family, persisted at the end of this
+    # function (see save_trained_pipelines) so schedule-level what-ifs can be
+    # re-run later without retraining. Plain dicts + module-level predictors,
+    # so they reload with load_trained_pipelines and work immediately.
     _sched_models = {}
     for sensor in sensors:
         train_cases = build_case_level_curves(train_expanded_df, sensor, ef_cols=ef_cols)
@@ -1534,48 +1502,17 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
         median_case_duration_minutes = float(np.median([c['duration_minutes'] for c in train_cases]))
 
-        schedule_pipeline = train_schedule_profile_pipeline(train_cases, verbose=0)
-        # Same schedule-only inputs, but the step-DTW curve method — so the gap
-        # against "Best, mine" (also step-DTW) prices the process model alone.
-        # verbose=1 on purpose: it logs the BIC-chosen "-> N segment(s)" per
-        # (process, sensor), which is the only way to see whether the segment
-        # cap (now matched to ml_step_dtw's 8, see SCHEDULE_STEP_DTW_MAX_SEGMENTS)
-        # is binding on whole-case curves rather than BIC choosing freely.
-        try:
-            schedule_step_pipeline = train_schedule_profile_pipeline_step_dtw(
-                train_cases, variable=sensor, gain_mode='smooth', verbose=1,
-                optimize_hyperparams=CURVE_OPTIMIZE_HYPERPARAMS,
-                n_trials=CURVE_N_OPTUNA_TRIALS)
-        except Exception as _exc:
-            print(f"  ⚠️ Schedule-direct (step-DTW) not trained for {process}/{sensor}: "
-                  f"{type(_exc).__name__}: {_exc} — that series will be missing.")
-            schedule_step_pipeline = None
         stochastic_gen    = fit_stochastic_profile_generator(train_cases)
         bootstrap_gen     = fit_bootstrap_profile_generator(train_cases)
         duration_pipeline = train_case_duration_pipeline(train_cases, verbose=0)
         if duration_pipeline is None:
             print(f"  ⚠️ Case-duration pipeline not trained for {process}/{sensor} "
                   f"(too few train cases) — 'Best, duration-corrected' will be skipped for this sensor.")
-        # Span source for the schedule-direct series only, and WITHOUT the
-        # median-duration floor: that floor bounds their worst-case span error,
-        # and nothing bounds the simulated Petri-net span, so keeping it here
-        # would be a guard only one side of the comparison gets. Used only for
-        # cases Budget produced no curve for — the rest take Budget's own grid.
-        schedule_direct_duration_pipeline = train_case_duration_pipeline(
-            train_cases, verbose=0, allow_median_fallback=False)
-        _sensor_budget_spans = _budget_spans.get(sensor, {})
-        if _budget_spans and not _sensor_budget_spans:
-            print(f"  ⚠️ No Budget curves for {process}/{sensor} — the schedule-direct "
-                  f"series keep their own predicted span for this sensor, so its "
-                  f"numbers are NOT length-matched to Budget.")
         test_case_attrs   = {str(c['case_id']): c['attributes'] for c in test_cases}
 
         if SAVE_TRAINED_MODELS:
             _sched_models[sensor] = {
-                'schedule':                 schedule_pipeline,
-                'schedule_step':            schedule_step_pipeline,
                 'duration':                 duration_pipeline,
-                'duration_unfloored':       schedule_direct_duration_pipeline,
                 'stochastic':               stochastic_gen,
                 'bootstrap':                bootstrap_gen,
                 'median_case_duration_minutes': median_case_duration_minutes,
@@ -1584,16 +1521,12 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
         # duration_pipeline is threaded through so the per-position stochastic
         # generator AND the bootstrap generator are placed on each case's own
         # predicted span (like "Best, duration-corrected") instead of a single
-        # median span for every case. The two schedule-direct series bypass it
-        # and take Budget's grid instead — see SCHEDULE_DIRECT_LENGTH_SOURCE.
+        # median span for every case.
         _cmp_result = compare_schedule_and_stochastic_profiles(
-            test_cases, schedule_pipeline, stochastic_gen, median_case_duration_minutes,
+            test_cases, stochastic_gen, median_case_duration_minutes,
             save_curves=SAVE_PREDICTED_CURVES,
             bootstrap_generator=bootstrap_gen,
             duration_pipeline=duration_pipeline,
-            schedule_step_pipeline=schedule_step_pipeline,
-            schedule_direct_span_map=_sensor_budget_spans,
-            schedule_direct_duration_pipeline=schedule_direct_duration_pipeline,
         )
         cmp_df, sensor_curve_df = _cmp_result if SAVE_PREDICTED_CURVES else (_cmp_result, None)
         if cmp_df.empty:
@@ -1629,7 +1562,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
             # Fold in the already-computed "Best, mine" curves for this sensor
             # (from the complete-curve eval parquet, same real test cases) so
-            # one file has all five series: real, schedule, stochastic, best,
+            # one file has every series: real, stochastic, bootstrap, best,
             # best_duration_corrected.
             if _best_curve_path is not None:
                 try:
@@ -1702,7 +1635,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     if all_curve_rows:
         curves_out = pd.concat(all_curve_rows, ignore_index=True)
         curves_out.to_parquet(os.path.join(out_dir, 'predicted_curves.parquet'), index=False)
-        print(f"  💾 Predicted curves (real/schedule/schedule_step/stochastic/bootstrap/best/best_duration_corrected) saved → "
+        print(f"  💾 Predicted curves (real/stochastic/bootstrap/best/best_duration_corrected) saved → "
               f"schedule_profile_eval_results/{process}/predicted_curves.parquet")
 
         # ── Population-Level (unpaired) Distributional Evaluation ─────────
@@ -1721,7 +1654,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 
         real_pooled = _pool_by_sensor(curves_out, 'real')
         population_rows = []
-        for _pop_method in ('schedule', 'schedule_step', 'stochastic', 'bootstrap',
+        for _pop_method in ('stochastic', 'bootstrap',
                             'best', 'best_duration_corrected'):
             method_pooled = _pool_by_sensor(curves_out, _pop_method)
             mag_df = compare_pooled_value_distributions(real_pooled, method_pooled)
@@ -1773,7 +1706,7 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     if SAVE_TRAINED_MODELS and _sched_models:
         _sm_path = os.path.join(output_root, process, 'trained_schedule_pipelines.joblib')
         if save_trained_pipelines(_sched_models, _sm_path, label=f'{process}/schedule'):
-            print(f"  [{process}] schedule-direct pipelines saved "
+            print(f"  [{process}] schedule-profile pipelines saved "
                   f"({len(_sched_models)} sensors) → {_sm_path}")
 
     _elapsed = _t.perf_counter() - _t0
@@ -4901,8 +4834,8 @@ if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribu
                 )
 
     # ── Schedule Profile Evaluation (opt-in — off by default) ─────────────
-    # Runs once per process (not per mode): trains a schedule-only case-level
-    # predictor + stochastic generator on train cases, evaluates both against
+    # Runs once per process (not per mode): trains a stochastic generator
+    # (+ bootstrap resampler) on train cases, evaluates it against
     # real test cases, and merges in the already-computed per-case
     # 'ml_external' numbers for this process's best-fidelity mode as
     # the "Best, mine" comparator — no retraining/resimulating needed for

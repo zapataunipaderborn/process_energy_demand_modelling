@@ -8913,67 +8913,34 @@ def sample_bootstrap_profile(generator, case_duration_minutes, rng=None):
     return t, sample
 
 
-def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stochastic_generator,
+def compare_schedule_and_stochastic_profiles(test_cases, stochastic_generator,
                                              median_case_duration_minutes, random_state=42,
                                              save_curves=False, bootstrap_generator=None,
-                                             duration_pipeline=None,
-                                             schedule_step_pipeline=None,
-                                             schedule_direct_span_map=None,
-                                             schedule_direct_duration_pipeline=None):
+                                             duration_pipeline=None):
     """
     For each real test case (from build_case_level_curves), compare its real
-    complete profile against (a) the schedule-only prediction and (b) one
-    stochastic-generator sample, using the same two Wasserstein distances as
+    complete profile against one stochastic-generator sample (and, when given,
+    one bootstrap sample), using the same two Wasserstein distances as
     compare_complete_case_curves.
 
     Returns a DataFrame with one row per case_id:
-    ['case_id', 'schedule_wasserstein_time', 'schedule_wasserstein_value',
-     'schedule_step_wasserstein_time', 'schedule_step_wasserstein_value',
-     'stochastic_wasserstein_time', 'stochastic_wasserstein_value',
+    ['case_id', 'stochastic_wasserstein_time', 'stochastic_wasserstein_value',
      'bootstrap_wasserstein_time', 'bootstrap_wasserstein_value'].
 
-    ``schedule_step_pipeline`` (from train_schedule_profile_pipeline_step_dtw)
-    is the same schedule-only prediction with the step-DTW curve method instead
-    of DBA+DTW+regression — the row that makes "does the process model help?"
-    a single-variable comparison against "Best, mine". Omitted when None.
-
     When save_curves=True, also returns a second, long-format DataFrame with
-    one row per (case_id, series, timestep) — series in {'real', 'schedule',
-    'schedule_step', 'stochastic', 'bootstrap'} — columns ['case_id', 'series',
-    't_minutes', 'value'], so the exact curves behind the W1 numbers above can
-    be reloaded later for other metrics or plots. The caller adds a 'sensor'
-    column since this function is called once per sensor.
+    one row per (case_id, series, timestep) — series in {'real', 'stochastic',
+    'bootstrap'} — columns ['case_id', 'series', 't_minutes', 'value'], so the
+    exact curves behind the W1 numbers above can be reloaded later for other
+    metrics or plots. The caller adds a 'sensor' column since this function is
+    called once per sensor.
 
     Span handling: when ``duration_pipeline`` is given, each predicted series
-    (schedule-direct, stochastic, bootstrap) is placed on that case's OWN
-    predicted total duration (predict_case_duration on the case attributes),
-    exactly like the "Best, duration-corrected" mode — so these baselines get
-    the same schedule-aware span the best modes do, instead of a single median
-    span for every case. Falls back to ``median_case_duration_minutes`` per
-    case whenever no predictor is available or the prediction is non-positive.
-
-    SCHEDULE_DIRECT_LENGTH_SOURCE — the two SCHEDULE-DIRECT series only:
-    ``schedule_direct_span_map`` maps case_id -> (span_minutes, n_samples) taken
-    from the Budget mode's own predicted curves, and when a case is in it both
-    schedule-direct series are placed on exactly that span AND resampled to
-    exactly that many points. The reason is that span and sampling grid are two
-    separate confounds in the complete-profile table: Budget's curves sit on a
-    ~1.04 min grid and the schedule series on ~1.21, and 'total' there is a plain
-    sum over samples, so part of every schedule-direct number was grid arithmetic
-    rather than curve quality. Matching both leaves the CURVE as the only thing
-    that differs between those rows and the Budget row.
-
-    Deliberately NOT applied to the stochastic and bootstrap generators: they are
-    not schedule-direct methods, and silently re-basing them would change rows
-    nobody asked about. They keep the ``duration_pipeline`` span.
-
-    ``schedule_direct_duration_pipeline`` is the fallback span source for the
-    schedule-direct series when a case is absent from the map (a case Budget did
-    not produce a curve for). It is separate from ``duration_pipeline`` so it can
-    be trained WITHOUT the median-duration do-no-harm floor: that floor bounds
-    schedule-direct's worst-case span error in a way the simulated Petri-net span
-    is never bounded, which is an advantage the comparison should not hand it.
-    Falls back to ``duration_pipeline`` when None.
+    (stochastic, bootstrap) is placed on that case's OWN predicted total
+    duration (predict_case_duration on the case attributes), exactly like the
+    "Best, duration-corrected" mode — so these baselines get the same
+    schedule-aware span the best modes do, instead of a single median span for
+    every case. Falls back to ``median_case_duration_minutes`` per case
+    whenever no predictor is available or the prediction is non-positive.
     """
     from scipy.stats import wasserstein_distance
     rng = np.random.default_rng(random_state)
@@ -8996,54 +8963,10 @@ def compare_schedule_and_stochastic_profiles(test_cases, schedule_pipeline, stoc
             except Exception:
                 pass
 
-        # Schedule-direct span/length: Budget's own, when Budget produced this
-        # case (see SCHEDULE_DIRECT_LENGTH_SOURCE). Otherwise the unfloored
-        # predictor, and only then the shared case_span.
-        sd_span, sd_n = case_span, None
-        _sd_entry = (schedule_direct_span_map or {}).get(str(c['case_id']))
-        if _sd_entry is not None:
-            _span, _n = _sd_entry
-            if _span and float(_span) > 0 and _n and int(_n) >= 2:
-                sd_span, sd_n = float(_span), int(_n)
-        elif schedule_direct_duration_pipeline is not None:
-            try:
-                _sd_pred = float(predict_case_duration(c['attributes'],
-                                                       schedule_direct_duration_pipeline))
-                if _sd_pred > 0:
-                    sd_span = _sd_pred
-            except Exception:
-                pass
-
         row = {'case_id': c['case_id']}
         if save_curves:
             curve_rows.extend({'case_id': c['case_id'], 'series': 'real', 't_minutes': float(t), 'value': float(v)}
                               for t, v in zip(t_real, v_real))
-
-        if schedule_pipeline is not None:
-            t_sched, v_sched = predict_schedule_profile_curve(
-                c['attributes'], schedule_pipeline, sd_span, n_samples=sd_n
-            )
-            w_sched = np.clip(v_sched, 0, None)
-            if w_sched.sum() > 0:
-                row['schedule_wasserstein_time']  = float(wasserstein_distance(t_real, t_sched, u_weights=w_real, v_weights=w_sched))
-                row['schedule_wasserstein_value'] = float(wasserstein_distance(v_real, v_sched))
-                if save_curves:
-                    curve_rows.extend({'case_id': c['case_id'], 'series': 'schedule', 't_minutes': float(t), 'value': float(v)}
-                                      for t, v in zip(t_sched, v_sched))
-
-        if schedule_step_pipeline is not None:
-            try:
-                t_step, v_step = predict_schedule_profile_curve_step_dtw(
-                    c['attributes'], schedule_step_pipeline, sd_span, n_samples=sd_n)
-            except Exception:
-                t_step, v_step = np.array([]), np.array([])
-            w_step = np.clip(v_step, 0, None)
-            if w_step.sum() > 0:
-                row['schedule_step_wasserstein_time']  = float(wasserstein_distance(t_real, t_step, u_weights=w_real, v_weights=w_step))
-                row['schedule_step_wasserstein_value'] = float(wasserstein_distance(v_real, v_step))
-                if save_curves:
-                    curve_rows.extend({'case_id': c['case_id'], 'series': 'schedule_step', 't_minutes': float(t), 'value': float(v)}
-                                      for t, v in zip(t_step, v_step))
 
         if stochastic_generator is not None:
             t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, case_span, rng=rng)

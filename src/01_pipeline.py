@@ -20,8 +20,8 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    (energy_distribution_results/), which don't rely
                                    on instance matching. Default: False.
   run_schedule_profile_eval bool   whether to run the "Schedule Profile Evaluation"
-                                   (Best/mine vs. Schedule-direct vs. Stochastic
-                                   generator, per process) — writes to
+                                   (Best/mine vs. Stochastic generator, per
+                                   process) — writes to
                                    schedule_profile_eval_results/. Default: False.
   run_autoregressive_eval bool     whether to add the autoregressive test-time
                                    rollout rows ("… (autoreg)") to the Curve-Only

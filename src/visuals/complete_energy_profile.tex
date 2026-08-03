@@ -21,12 +21,10 @@
 \toprule
 Method (process model) & Curve generation & Sum & Max & Mean & Std & Roughness & Overall \\
 \midrule
-Best Petri net + Budget + ml\_local & Step DTW & \textbf{0.219} & \textbf{0.077} & 0.081 & 0.390 & 0.602 & 0.274 \\
-Best Petri net + ml\_local & Step DTW & 0.391 & 0.079 & 0.075 & 0.407 & 0.604 & 0.311 \\
+Best Petri net + Budget + ml\_local & Step DTW & \textbf{0.219} & \textbf{0.077} & 0.081 & \textbf{0.390} & \textbf{0.602} & \textbf{0.274} \\
+Best Petri net + ml\_local & Step DTW & 0.391 & 0.079 & \textbf{0.075} & 0.407 & 0.604 & 0.311 \\
 Alpha Petri net + ml\_local & Step DTW & 0.426 & 0.086 & 0.078 & 0.463 & 0.628 & 0.336 \\
 \midrule
-Schedule-direct, Step DTW (no process model) & Step DTW & 0.256 & 0.087 & \textbf{0.065} & \textbf{0.290} & \textbf{0.464} & \textbf{0.232} \\
-Schedule-direct (no process model) & Schedule-only regressor & 0.285 & 0.097 & 0.090 & 0.557 & 0.795 & 0.365 \\
 Profile-generator (no process model) & Stochastic generator & 0.348 & 0.200 & 0.094 & 1.225 & 8.708 & 2.115 \\
 \midrule
 Sensor median (no process model) & Sensor median & 0.341 & 0.210 & 0.105 & 0.845 & 0.844 & 0.469 \\
@@ -37,7 +35,7 @@ Sensor median (no process model) & Sensor median & 0.341 & 0.210 & 0.105 & 0.845
 
 \parbox{\linewidth}{%
 \footnotesize
-\textit{Sensor median (baseline)}: the median curve of each sensor, reused for every case. \textit{Alpha Petri Net}: net discovered by the alpha miner. \textit{Best Petri Net}: best discovered net per process, selected on the training split by the mean of Fitness, Precision, Generalization and Simplicity. \textit{Best Petri Net + Budget}: the same net, with each case generated to match its predicted total-duration budget. \textit{Schedule-direct}: curves placed directly on the real schedule. \textit{Schedule-direct, Step DTW}: the same real schedule and the same schedule-only inputs, but the \textit{Step DTW} curve predictor instead of the schedule-only regressor, so its gap to the Petri-net rows prices the process model alone rather than the process model and the curve method together. \textit{Profile-generator}: stochastic profile generator. The three Petri-net rows use the \textit{Step DTW} curve predictor of Evaluation~2. Each row names the process model the cases are generated from, including its duration predictor (ml\_local = one per activity), and \textit{Curve generation} is how the load curve of each activity or case is then produced. Cells are the median over (process, case, sensor) of the paired per-case relative error $|f(\mathrm{pred})-f(\mathrm{real})|/\overline{|f(\mathrm{real})|}$. Lower is better; \textbf{bold} = best per column. Overall is the average across the metric columns.
+\textit{Sensor median (baseline)}: the median curve of each sensor, reused for every case. \textit{Alpha Petri Net}: net discovered by the alpha miner. \textit{Best Petri Net}: best discovered net per process, selected on the training split by the mean of Fitness, Precision, Generalization and Simplicity. \textit{Best Petri Net + Budget}: the same net, with each case generated to match its predicted total-duration budget. \textit{Profile-generator}: stochastic profile generator. The three Petri-net rows use the \textit{Step DTW} curve predictor of Evaluation~2. Each row names the process model the cases are generated from, including its duration predictor (ml\_local = one per activity), and \textit{Curve generation} is how the load curve of each activity or case is then produced. Cells are the median over (process, case, sensor) of the paired per-case relative error $|f(\mathrm{pred})-f(\mathrm{real})|/\overline{|f(\mathrm{real})|}$. Lower is better; \textbf{bold} = best per column. Overall is the average across the metric columns.
 }
 
 \end{minipage}
