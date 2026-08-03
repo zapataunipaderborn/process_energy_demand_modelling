@@ -1,0 +1,42 @@
+% Curve-generation runtime — \input{} this file.
+\begin{table*}[H]
+\centering
+
+\begin{minipage}{16cm}
+\centering
+
+\captionsetup{
+    justification=centering,
+    singlelinecheck=false,
+    format=plain
+}
+
+\caption{Computational cost of the curve-generation methods.}
+\label{tab:timing_results}
+
+\vspace{-0.5em}
+
+\begin{tabular}{p{5.2cm}|c|c|c|c}
+\toprule
+Method & \makecell{Curve\\models} & \makecell{Training\\total (CPU min)} & \makecell{Training per\\model (CPU s)} & \makecell{Inference per\\curve (ms)} \\
+\midrule
+ML Step DTW (proposed) & 390 & 246.65 & 37.95 & 22.6 \\
+Median per Activity \& Sensor & 390 & \textbf{0.03} & \textbf{$<$0.01} & \textbf{6.6} \\
+ML DTW (no steps) & 390 & 870.83 & 133.97 & 20.9 \\
+ML (no DTW) & 390 & 869.53 & 133.77 & 16.6 \\
+Sensor median & 79 & 0.65 & 0.49 & 6.8 \\
+Seq2Seq DTW (aligned) & 390 & 164.83 & 25.36 & 41.5 \\
+Seq2Seq (DTW-scored) & 390 & 678.74 & 104.42 & 36.3 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+
+\parbox{16cm}{%
+\footnotesize
+Cost of each curve-generation method on the run of Table~\ref{tab:individual_profile_realism}. A curve model is one predictor per (sensor, activity, object); the sensor-median baseline fits one per sensor, so the per-model and per-curve columns are the comparable ones. Training is summed over the 16 workers of the training pool, inference is wall clock over the test curves of a single process. Ratios, not absolute deployment figures. \textbf{Bold} = cheapest per column.
+}
+
+\end{minipage}
+
+\end{table*}

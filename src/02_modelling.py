@@ -3292,12 +3292,17 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
         print("\n" + "─"*80)
         print("  TRAINING ML+ MODELS (shared across all algorithms)")
         print("─"*80)
-        _mlp_glb_tpl, _mlp_pa_tpls, _mlp_feat_cols, _mlp_act_means, _mlp_glb_mean, _mlp_ef_windows = \
-            _mlp_train_models(df_train,
-                              train_datasets.get(process, {}).get('expanded'),
-                              # ef_* lookup over the unsplit series — the
-                              # simulator queries it at test timestamps.
-                              ef_expanded_df=process_datasets_to_model.get(process, {}).get('expanded'))
+        # Timed: these are the activity-duration models behind every reported
+        # ml_plus_global / ml_plus_per_act mode, so the runtime table needs their
+        # cost. Fitted once per process, shared by all algorithms.
+        with _timed('duration_model_training', process=process,
+                    detail='ml_plus (shared)', split='TRAIN'):
+            _mlp_glb_tpl, _mlp_pa_tpls, _mlp_feat_cols, _mlp_act_means, _mlp_glb_mean, _mlp_ef_windows = \
+                _mlp_train_models(df_train,
+                                  train_datasets.get(process, {}).get('expanded'),
+                                  # ef_* lookup over the unsplit series — the
+                                  # simulator queries it at test timestamps.
+                                  ef_expanded_df=process_datasets_to_model.get(process, {}).get('expanded'))
         print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
         print(f"  Global model: {_mlp_glb_tpl[2] if _mlp_glb_tpl else 'None'}")
         print(f"  Per-act models trained: {len(_mlp_pa_tpls)} activities")
