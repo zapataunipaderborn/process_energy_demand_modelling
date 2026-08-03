@@ -2766,47 +2766,56 @@ def build_and_train_pipeline(
 def build_and_train_pipeline_median(train_curves, variable, fixed_length=None,
                                     verbose=1, **_ignored_hp_kwargs):
     """
-    Element-wise MEDIAN curve across a set of training instances, linearly
-    resampled to a common canonical length -- no DBA, no DTW alignment, no
-    regression model, no attribute conditioning at all. At predict time the
-    stored median curve is simply linearly resampled to the target duration.
+    A single MEDIAN LEVEL across a set of training instances -- one number, not
+    a profile. Every value of every training curve is pooled into one vector and
+    the median of that vector is the estimate; at predict time it is emitted as a
+    horizontal line for the target duration. No DBA, no DTW alignment, no
+    regression model, no attribute conditioning, and deliberately no shape: this
+    is the naive floor, so it must not have a ramp-up/plateau/ramp-down of its
+    own to be credited for.
+
+    (It used to take a POINTWISE median of length-normalised curves, which is a
+    full profile -- a shape-carrying estimator masquerading as a floor.)
 
     Used for BOTH naive-floor approaches, which differ only in which curves
     are pooled before the median is taken (the caller sets the 'approach' tag):
       * 'median_activity_sensor' ("Median per Activity & Sensor") -- called by
         _train_curve_only_worker with just this (sensor, activity, object)'s
-        curves.
+        curves, so one level per (sensor, activity, object).
       * 'baseline' ("Baseline") -- called from 02_modelling.py's curve-only
         section with EVERY curve of the sensor pooled across all its
-        activities/objects (the coarser floor).
+        activities/objects, so one level per sensor (the coarser floor).
 
     **_ignored_hp_kwargs absorbs val_size/models/optimize_hyperparams/
     n_trials/n_jobs so it can be called with the exact same signature as
     every other approach builder in _train_curve_only_worker, even though
     none of them apply here (there is no model to validate or tune).
 
-    Returns a minimal pipeline dict: {'reference_curve', 'fixed_length',
-    'approach'}. The default 'approach' tag is 'baseline' (the per-sensor use);
-    the per-combo worker overrides it to 'median_activity_sensor'.
+    Returns a minimal pipeline dict: {'median_level', 'reference_curve',
+    'fixed_length', 'approach'}. 'median_level' is the estimate; the flat
+    'reference_curve' of length `fixed_length` is kept only because consumers
+    read it (02_modelling.py's pipeline dicts, simulation.py's presence check,
+    _build_gap_fill_curves). The default 'approach' tag is 'baseline' (the
+    per-sensor use); the per-combo worker overrides it to
+    'median_activity_sensor'.
     """
     if fixed_length is None:
         fixed_length = max(2, int(round(np.median([len(c['original_values']) for c in train_curves]))))
-    resampled = np.array([
-        np.interp(
-            np.linspace(0, 1, fixed_length),
-            np.linspace(0, 1, len(c['original_values'])),
-            c['original_values'],
-        )
+    vals = np.concatenate([
+        np.asarray(c['original_values'], dtype=float).ravel()
         for c in train_curves
-    ])
-    median_curve = np.median(resampled, axis=0)
+    ]) if train_curves else np.array([], dtype=float)
+    vals = vals[np.isfinite(vals)]
+    level = float(np.median(vals)) if vals.size else 0.0
 
     if verbose:
         print(f"  [baseline/median] {len(train_curves)} curves -> "
-              f"median curve, fixed_length={fixed_length}")
+              f"median level={level:.4f} ({vals.size} pooled values), "
+              f"fixed_length={fixed_length}")
 
     return {
-        'reference_curve': median_curve,
+        'median_level':    level,
+        'reference_curve': np.full(fixed_length, level, dtype=float),
         'fixed_length':    fixed_length,
         'approach':        'baseline',
     }
@@ -2917,12 +2926,12 @@ def _warp_knots_from_path(query, reference, knots=WARP_KNOTS):
 
 
 # =============================================================================
-# MEDIAN FLOOR — no leaf ships a model that loses to its own median curve
+# MEDIAN FLOOR — no leaf ships a model that loses to its own median level
 # =============================================================================
 #
 # 'median_activity_sensor' (build_and_train_pipeline_median) is the naive floor:
-# the pointwise median training curve of one (sensor, activity, object),
-# linearly resampled to the target duration. It beat several learned approaches
+# the median of every value of one (sensor, activity, object)'s training curves,
+# predicted as a flat line for the target duration. It beat several learned approaches
 # outright, and that is a real finding about the data rather than a bug — on
 # many leaves the attributes carry no usable signal about the curve, so a model
 # fitted on them spends its capacity on noise and lands above the median.
@@ -2966,12 +2975,15 @@ CURVE_MEDIAN_FLOOR_RATIO = float(_os_seed.environ.get(
     'PIPELINE_CURVE_MEDIAN_FLOOR_RATIO', '1.0'))
 
 
-def _median_floor_reference(curves, fixed_length):
+def _pointwise_median_curve(curves, fixed_length):
     """
     Pointwise median of `curves` linearly resampled onto `fixed_length` points —
-    the same estimator build_and_train_pipeline_median builds, so a model is
-    measured against the floor that actually ships as 'median_activity_sensor'
-    rather than a lookalike.
+    a median PROFILE (ramp-up/plateau/ramp-down preserved).
+
+    This is no longer what the naive floor does (see _median_floor_reference);
+    it survives only as the 'reference_curve' the step-DTW builder exports for
+    downstream consumers that want a representative shape per leaf
+    (_build_gap_fill_curves, simulation.py's presence check).
 
     NOT pipeline['train_median_curve']: that one is the median of the
     DTW-ALIGNED curves and lives in canonical space as a model feature.
@@ -2985,16 +2997,36 @@ def _median_floor_reference(curves, fixed_length):
     return np.median(resampled, axis=0)
 
 
+def _median_floor_reference(curves, fixed_length):
+    """
+    The floor as a LEVEL: every value of every curve in `curves` pooled into one
+    vector, non-finite dropped, median taken, emitted as a flat array of
+    `fixed_length` points.
+
+    Mirrors build_and_train_pipeline_median exactly, so a model is measured
+    against the floor that actually ships as 'median_activity_sensor' rather
+    than a lookalike. It used to take a pointwise median (a full profile), which
+    stopped being the shipped floor when that estimator became level-only.
+
+    Flat by construction — the length exists only so the array-shaped consumers
+    keep working; _resample_median_floor re-emits it at any length.
+    """
+    vals = np.concatenate([
+        np.asarray(c['original_values'], dtype=float).ravel() for c in curves
+    ]) if len(curves) else np.array([], dtype=float)
+    vals = vals[np.isfinite(vals)]
+    level = float(np.median(vals)) if vals.size else 0.0
+    return np.full(max(2, int(fixed_length)), level, dtype=float)
+
+
 def _resample_median_floor(floor_curve, n):
-    """The floor's prediction for a curve of `n` points — the plain linear
-    resample predict_raw_curve_median does, kept in one place so the fallback
-    and the standalone baseline cannot drift apart."""
+    """The floor's prediction for a curve of `n` points — the constant line
+    predict_raw_curve_median emits, kept in one place so the fallback and the
+    standalone baseline cannot drift apart."""
     floor_curve = np.asarray(floor_curve, dtype=float)
     n = max(2, int(n))
-    if len(floor_curve) == n:
-        return floor_curve.copy()
-    return np.interp(np.linspace(0, 1, n),
-                     np.linspace(0, 1, len(floor_curve)), floor_curve)
+    level = float(np.median(floor_curve)) if floor_curve.size else 0.0
+    return np.full(n, level, dtype=float)
 
 
 # ── Realism-based model selection ────────────────────────────────────────────
@@ -3220,7 +3252,7 @@ def _attach_median_floor(pipeline, train_curves, val_instance_ids, predict_fn,
         'median_floor_active': active,
     })
     if verbose:
-        _kept = 'FLOOR (median curve)' if active else f"model ({pipeline.get('model_name')})"
+        _kept = 'FLOOR (median level)' if active else f"model ({pipeline.get('model_name')})"
         print(f"  [median-floor{label}] held-out MAE: model={model_mae:.4f}  "
               f"floor={floor_mae:.4f} -> keeping {_kept}")
     return pipeline
@@ -3421,21 +3453,23 @@ def predict_raw_curve(raw_values, activity, attributes, pipeline):
 
 def predict_raw_curve_median(raw_values, activity, attributes, pipeline):
     """
-    Predict by linearly resampling the stored median training curve
-    (pipeline['reference_curve'], from build_and_train_pipeline_median) to
-    len(raw_values) -- no model, no DTW warp, no attribute conditioning.
-    The true naive floor.
+    Predict the stored median LEVEL (pipeline['median_level'], from
+    build_and_train_pipeline_median) as one horizontal line for the target
+    duration -- no model, no DTW warp, no resampled profile, no attribute
+    conditioning. The true naive floor: a level, not a shape.
+
+    Only the LENGTH is instance-specific, and it comes from exactly where it
+    always did: attributes['_pred_curve_length'] when the caller supplies a
+    predicted duration, else len(raw_values).
     """
-    reference_curve = np.asarray(pipeline['reference_curve'], dtype=float)
+    level = pipeline.get('median_level')
+    if level is None:
+        # Pipelines persisted before the level-only rewrite carry the flat
+        # reference curve but not the scalar; its median is the same number.
+        level = float(np.median(np.asarray(pipeline['reference_curve'], dtype=float)))
     n = attributes.get('_pred_curve_length', len(raw_values)) if attributes else len(raw_values)
     n = max(2, int(n))
-    if len(reference_curve) == n:
-        return reference_curve.copy()
-    return np.interp(
-        np.linspace(0, 1, n),
-        np.linspace(0, 1, len(reference_curve)),
-        reference_curve,
-    )
+    return np.full(n, float(level), dtype=float)
 
 
 # =============================================================================
@@ -4714,7 +4748,12 @@ def build_and_train_pipeline_step_dtw(
 
     pipeline = {
         'approach':          _tag,
-        'reference_curve':   _median_floor_reference(train_curves, fixed_length),
+        # Pointwise median, NOT the naive floor's level: step-DTW never predicts
+        # from this (it reconstructs from medoid_values/break_fracs/the segment
+        # models), but _build_gap_fill_curves and simulation.py read leaf
+        # reference curves for a representative SHAPE. Was
+        # _median_floor_reference until that helper went level-only.
+        'reference_curve':   _pointwise_median_curve(train_curves, fixed_length),
         'fixed_length':      fixed_length,
         'medoid_values':     np.asarray(train_curves[medoid_row]['original_values'],
                                         dtype=float),
@@ -6569,10 +6608,10 @@ def _dispatch_predict(raw_values, curve, pipeline):
     approach = pipeline.get('approach', 'ml_dtw')
     act, attrs = curve['activity'], curve['attributes']
     if approach in ('baseline', 'median_activity_sensor'):
-        # Both are the median-curve predictor; they differ only in how the
-        # stored reference_curve was pooled: 'baseline' = one median per sensor
-        # (all activities pooled), 'median_activity_sensor' = median per
-        # (sensor, activity, object).
+        # Both are the median-LEVEL predictor (one horizontal line); they differ
+        # only in how the values were pooled before the median: 'baseline' = one
+        # level per sensor (all activities pooled), 'median_activity_sensor' =
+        # one level per (sensor, activity, object).
         return predict_raw_curve_median(raw_values, act, attrs, pipeline)
     if approach == 'ml_dtw':
         return predict_raw_curve(raw_values, act, attrs, pipeline)
@@ -7594,9 +7633,12 @@ COMPLETE_CURVE_FILL_MISSING = _os_seed.environ.get(
 def _build_gap_fill_curves(energy_pipelines, sensors):
     """
     One fallback curve per sensor: the pointwise median of that sensor's trained
-    leaf `reference_curve`s, resampled to their median length. Same idea as the
-    'baseline' row's per-sensor median curve, but taken from the pipelines being
-    evaluated, so no extra training pass and no access to the test split.
+    leaf `reference_curve`s, resampled to their median length. Same pooling idea
+    as the 'baseline' row (everything the sensor has, no conditioning) but taken
+    from the pipelines being evaluated, so no extra training pass and no access
+    to the test split — and it keeps a SHAPE, unlike the flat 'baseline' level,
+    because a gap in a simulated day is better filled with a representative
+    profile than with a constant.
 
     Returns {sensor: np.ndarray}; a sensor with no usable reference curve is
     absent from the dict and its gaps stay unfilled.
