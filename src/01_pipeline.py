@@ -64,11 +64,12 @@ Each entry in EXPERIMENTS defines one run. Fields:
   curve_approaches      list|None  which curve-fitting models to train, e.g.
                                    ['ml_external']. Subset of the
                                    APPROACHES list in 02_modelling.py ('baseline'
-                                   — "Baseline", ONE median curve per sensor
-                                   (pooled over all activities, the naive
-                                   floor); 'median_activity_sensor' — "Median
-                                   per Activity & Sensor", median curve per
-                                   sensor+activity+object, no model;
+                                   — "Baseline", ONE median LEVEL per sensor,
+                                   pooled over all its activities/objects and
+                                   predicted as a flat line (the naive floor);
+                                   'median_activity_sensor' — "Median per
+                                   Activity & Sensor", one median LEVEL per
+                                   sensor+activity+object, also flat, no model;
                                    'ml_dtw' — DBA + DTW +
                                    regression; 'ml_external',
                                    'ml_only', 'seq2seq', 'seq2seq_only',
@@ -220,7 +221,8 @@ EXPERIMENTS = [
         'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
-        'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline'],
+        'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline',
+                                      'median_activity_sensor'],
         'curve_median_floor':    False,
         'save_curve_values':     True,
         'step_dtw_fallback_ratio': 'inf',  

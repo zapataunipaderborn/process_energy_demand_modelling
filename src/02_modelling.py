@@ -933,10 +933,10 @@ def _run_pool_with_stall_watchdog(fn, tasks, n_workers, label,
     return results
 
 # ── Approaches to train — comment out any you want to skip ───────────────────
-#    'baseline'          "Baseline": ONE median curve per SENSOR, pooled over
-#                        all activities/objects (the coarser naive floor)
-#    'median_activity_sensor'  "Median per Activity & Sensor": median training
-#                        curve per (sensor, activity, object), no model
+#    'baseline'          "Baseline": ONE median LEVEL per SENSOR (a flat line),
+#                        pooled over all activities/objects (the coarser floor)
+#    'median_activity_sensor'  "Median per Activity & Sensor": one median LEVEL
+#                        per (sensor, activity, object), flat, no model
 #    'ml_dtw'            DTW + position index (sklearn regressor)
 #    'ml_external'  DTW + external factors (ef_* columns) + prev-activity NAME
 #                   (no lagged meter values — see split_curves_with_prev_activity)
@@ -3700,8 +3700,8 @@ if RUN_CURVE_ONLY_EVALUATION:
         predict_raw_curve_seq2seq_iom,
     )
 
-    all_energy_pipelines                  = {}   # "Baseline": ONE median curve per SENSOR, pooled over all activities/objects (naive floor)
-    all_energy_pipelines_median_activity_sensor = {}   # "Median per Activity & Sensor": median curve per (sensor, activity, object)
+    all_energy_pipelines                  = {}   # "Baseline": ONE median LEVEL per SENSOR (flat), pooled over all activities/objects (naive floor)
+    all_energy_pipelines_median_activity_sensor = {}   # "Median per Activity & Sensor": one median LEVEL per (sensor, activity, object), flat
     all_energy_pipelines_ml_dtw    = {}   # ml_dtw (DBA + DTW + regression -- the former 'baseline')
     all_energy_pipelines_ml_external   = {}   # DTW + Ext. Factors (+ prev-activity name)
     all_energy_pipelines_seq2seq              = {}   # DTW + Seq2Seq
@@ -4030,20 +4030,22 @@ if RUN_CURVE_ONLY_EVALUATION:
         # NOTE: the old inline "mean baseline" block (flat constant = training
         # mean at every timestep, approach='mean_baseline') has been retired.
         # 'baseline' is now a properly registered approach (median training
-        # curve -- an actual shape, not a flat line -- see
-        # build_and_train_pipeline_median), trained via the same worker/
-        # dispatch path as every other approach instead of a bespoke inline
-        # computation.
+        # LEVEL -- see build_and_train_pipeline_median), trained via the same
+        # worker/dispatch path as every other approach instead of a bespoke
+        # inline computation. It is likewise a flat line; what differs from the
+        # retired block is the statistic (median, not mean), the pooling, and
+        # the fact that it goes through the registered path.
 
-        # ── "Baseline": ONE median curve per SENSOR ──────────────────────────
-        # The naive floor: pool EVERY training curve of a sensor (across all its
-        # activities/objects) into a single element-wise median curve, then use
-        # that same curve for every (activity, object) leaf of the sensor. This
-        # is the coarser sibling of _pipelines_median_activity_sensor (from the
-        # worker), which fits a separate median per (sensor, activity, object).
-        # Same predictor (predict_raw_curve_median resamples the stored
-        # reference curve to the target length); the two differ only in how much
-        # they condition the median. Cheap — no model, no DTW.
+        # ── "Baseline": ONE median level per SENSOR ──────────────────────────
+        # The naive floor: pool EVERY value of EVERY training curve of a sensor
+        # (across all its activities/objects) into one vector, take the median,
+        # and predict that one number as a horizontal line for every (activity,
+        # object) leaf of the sensor. This is the coarser sibling of
+        # _pipelines_median_activity_sensor (from the worker), which takes a
+        # separate level per (sensor, activity, object). Same predictor
+        # (predict_raw_curve_median emits the stored level at the target
+        # length); the two differ only in how much they condition the median.
+        # Cheap — no model, no DTW, no shape.
         # Gated on 'baseline' in APPROACHES (like every other approach); it can't
         # run in the per-(sensor,activity,object) worker because the per-sensor
         # pool spans activities/objects a single combo worker never sees together.
