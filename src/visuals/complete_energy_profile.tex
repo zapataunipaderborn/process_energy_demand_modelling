@@ -21,15 +21,15 @@
 \toprule
 Method (process model) & Curve generation & Sum & Max & Mean & Std & Roughness & Overall \\
 \midrule
-Best Petri net + Budget + ml\_local & Step DTW & 0.207 & \textbf{0.075} & 0.067 & 0.390 & 0.565 & 0.261 \\
-Best Petri net + ml\_local & Step DTW & 0.379 & 0.079 & 0.068 & 0.399 & 0.578 & 0.301 \\
-Alpha Petri net + ml\_local & Step DTW & 0.454 & 0.090 & 0.082 & 0.477 & 0.632 & 0.347 \\
+Best Petri net + Budget + ml\_local & Step DTW & \textbf{0.219} & \textbf{0.077} & 0.081 & 0.390 & 0.602 & 0.274 \\
+Best Petri net + ml\_local & Step DTW & 0.391 & 0.079 & 0.075 & 0.407 & 0.604 & 0.311 \\
+Alpha Petri net + ml\_local & Step DTW & 0.426 & 0.086 & 0.078 & 0.463 & 0.628 & 0.336 \\
 \midrule
-Schedule-direct, Step DTW (no process model) & Step DTW & \textbf{0.172} & 0.094 & \textbf{0.067} & \textbf{0.298} & \textbf{0.462} & \textbf{0.219} \\
-Schedule-direct (no process model) & Schedule-only regressor & 0.355 & 0.094 & 0.089 & 0.541 & 0.766 & 0.369 \\
+Schedule-direct, Step DTW (no process model) & Step DTW & 0.256 & 0.087 & \textbf{0.065} & \textbf{0.290} & \textbf{0.464} & \textbf{0.232} \\
+Schedule-direct (no process model) & Schedule-only regressor & 0.285 & 0.097 & 0.090 & 0.557 & 0.795 & 0.365 \\
 Profile-generator (no process model) & Stochastic generator & 0.348 & 0.200 & 0.094 & 1.225 & 8.708 & 2.115 \\
 \midrule
-Sensor median (no process model) & Sensor median & 0.343 & 0.210 & 0.105 & 0.845 & 0.844 & 0.469 \\
+Sensor median (no process model) & Sensor median & 0.341 & 0.210 & 0.105 & 0.845 & 0.844 & 0.469 \\
 \bottomrule
 \end{tabularx}
 
