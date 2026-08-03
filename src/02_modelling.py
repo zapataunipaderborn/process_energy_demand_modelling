@@ -98,8 +98,6 @@ if os.environ.get('PYTHONHASHSEED') is None:
           "str-set iteration order may differ between runs.")
 from utils.simulation import ProcessSimulation
 
-from utils.sim_extractor import annotate_simulated_curve_stats, extract_real_curve_stats, compare_energy_distributions
-from utils.sim_extractor import pool_real_curve_values, pool_simulated_curve_values, compare_pooled_value_distributions
 from utils.sim_extractor import compare_complete_case_curves, build_exog_lookup
 from utils.sim_extractor import build_sensor_activity_object_combos
 from utils.sim_extractor import predict_raw_curve_step_dtw
@@ -108,8 +106,6 @@ from utils.sim_extractor import (
     fit_stochastic_profile_generator, fit_bootstrap_profile_generator,
     compare_schedule_and_stochastic_profiles,
     train_case_duration_pipeline, predict_case_duration, rescale_case_curve_to_duration,
-    compare_population_shape,
-    compare_population_case_stat, compute_population_coverage,
     SAVE_TRAINED_MODELS, save_trained_pipelines,
 )
 from xgboost import XGBRegressor
@@ -614,13 +610,6 @@ RUN_TEST_EVALUATION       = True   # evaluate on held-out test set
 # training and evaluation. Override via PIPELINE_RUN_ENERGY_MODELLING=true/false.
 RUN_CURVE_ONLY_EVALUATION = os.environ.get('PIPELINE_RUN_ENERGY_MODELLING', 'true').lower() == 'true'
 RUN_PROCESS_MODELLING     = os.environ.get('PIPELINE_RUN_PROCESS_MODELLING', 'true').lower() == 'true'
-# Joint Duration + Profile Evaluation heatmaps (the per-instance-matched curve
-# comparison, both the "all together" and "per simulation mode" sections) —
-# slow, and superseded by the energy-distribution metrics (per_case_sensor_*
-# / per_sensor_pooled_values.csv), which don't rely on instance matching.
-# Off by default; does NOT affect curve-pipeline training (RUN_CURVE_ONLY_EVALUATION),
-# which the energy-distribution metrics still depend on.
-RUN_JOINT_DURATION_EVAL   = os.environ.get('PIPELINE_RUN_JOINT_DURATION_EVAL', 'false').lower() == 'true'
 # Schedule Profile Evaluation — complete-profile reference generators: a
 # stochastic (no-features-at-all) generator plus a bootstrap resampler,
 # compared against the same real test cases used by the complete-curve eval,
@@ -1055,13 +1044,11 @@ _run_dir = os.path.join(_results_root, f"{_run_name}_{_run_ts}")
 _process_results_dir = os.path.join(_run_dir, 'process_results')
 _energy_results_dir  = os.path.join(_run_dir, 'energy_results')
 _predicted_logs_dir  = os.path.join(_run_dir, 'predicted_logs')
-_energy_distribution_dir = os.path.join(_run_dir, 'energy_distribution_results')
 _complete_curve_eval_dir = os.path.join(_run_dir, 'complete_curve_eval_results')
 _schedule_profile_eval_dir = os.path.join(_run_dir, 'schedule_profile_eval_results')
 os.makedirs(_process_results_dir, exist_ok=True)
 os.makedirs(_energy_results_dir, exist_ok=True)
 os.makedirs(_predicted_logs_dir, exist_ok=True)
-os.makedirs(_energy_distribution_dir, exist_ok=True)
 os.makedirs(_complete_curve_eval_dir, exist_ok=True)
 os.makedirs(_schedule_profile_eval_dir, exist_ok=True)
 
@@ -1166,33 +1153,6 @@ def _timed(stage, process=None, detail=None, split=None, n_items=None,
 # VISUALIZATION UTILITIES — HEATMAP ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Metrics where LOWER is better (prefixes like train_ or test_ are stripped before checking)
-METRICS_LOWER_IS_BETTER = {
-    'basic_metrics_event_count_error',
-    'basic_metrics_case_count_error',
-    'activity_metrics_js_divergence',
-    'activity_metrics_frequency_mae',
-    'duration_metrics_ks_statistic',
-    'duration_metrics_mean_duration_error',
-    'duration_metrics_median_duration_error',
-    'duration_metrics_std_duration_error',
-    'duration_metrics_activity_duration_error',
-    'duration_metrics_activity_duration_mae',
-    'duration_metrics_activity_duration_rmse',
-    'duration_metrics_activity_duration_wape',
-    'duration_metrics_case_span_error',
-    'duration_metrics_case_span_mae',
-    'duration_metrics_case_span_wape',
-    'duration_metrics_dur_js_whole',
-    'duration_metrics_dur_js_activ',
-    'case_metrics_events_per_case_ks',
-    'case_metrics_median_events_per_case_error',
-    'overall_error',
-    'control_flow_metrics_edge_f1_error',
-    'conformance_metrics_fitness_error',
-    'conformance_metrics_precision_error',
-}
-
 # The 5 short metrics + overall shown in the main heatmap (all 0 = best)
 CORE_METRIC_BASES = [
     'overall_error',
@@ -1238,107 +1198,18 @@ _ENERGY_APPROACH_DICT_NAMES = {
 }
 
 
-def _save_energy_distribution_metrics(process, mode_name, simulated_df, real_expanded_df,
-                                      core_metrics_row, output_root, approach='baseline'):
-    """
-    Compute and save the case/activity/sensor, case/sensor, and raw-pooled-value
-    energy-distribution comparisons (no curve/instance matching) for one
-    (process, mode), using the trained curve-fitting pipelines for `approach`
-    (e.g. 'baseline', 'ml_external' — see _ENERGY_APPROACH_DICT_NAMES),
-    alongside the already-computed CORE_METRIC_BASES scalar values for that
-    same mode, into output_root/<process>/<safe_mode>/.
-
-    Filenames get an `_<approach>` suffix for every approach except 'baseline'
-    (kept unsuffixed for backward compatibility with earlier runs/notebooks),
-    so multiple approaches can coexist side by side in the same folder.
-
-    Silently no-ops (with a short note) when there's nothing to compare against —
-    e.g. no trained pipelines for this process/approach (requires
-    run_energy_modelling=True for at least one prior run), no detectable sensor
-    columns, or an empty simulated/real curve-stats result.
-    """
-    dict_name = _ENERGY_APPROACH_DICT_NAMES.get(approach, f'all_energy_pipelines_{approach}')
-    pipelines_for_process = (
-        globals()[dict_name].get(process) if dict_name in globals() else None
-    )
-    if not pipelines_for_process:
-        return
-    sensors = _detect_sensors_for_energy_distribution(process, real_expanded_df)
-    if not sensors or simulated_df is None or simulated_df.empty:
-        return
-
-    # Timestamp-resolved external factors: the real ef_* series, sampled at
-    # each simulated activity's own timestamps (see build_exog_lookup).
-    _exog_lookup = build_exog_lookup(real_expanded_df)
-
-    try:
-        sim_stats = annotate_simulated_curve_stats(
-            simulated_df, pipelines_for_process, sensors,
-            activity_exog_means=globals().get('_activity_exog_means', {}),
-            exog_lookup=_exog_lookup,
-        )
-        real_stats = extract_real_curve_stats(real_expanded_df, sensors)
-        if sim_stats.empty or real_stats.empty:
-            return
-        result_total = compare_energy_distributions(real_stats, sim_stats, statistic='total_value')
-        result_mean  = compare_energy_distributions(real_stats, sim_stats, statistic='mean_value')
-
-        # Raw pooled-value comparison — no per-case sum/mean at all, so it's
-        # valid for intensive sensors (temperature, concentration) where
-        # summing/averaging across a case has no physical meaning, not just
-        # extensive ones (power, flow) like the two comparisons above.
-        real_pooled = pool_real_curve_values(real_expanded_df, sensors)
-        sim_pooled = pool_simulated_curve_values(
-            simulated_df, pipelines_for_process, sensors,
-            activity_exog_means=globals().get('_activity_exog_means', {}),
-            exog_lookup=_exog_lookup,
-        )
-        result_pooled = compare_pooled_value_distributions(real_pooled, sim_pooled)
-    except Exception as exc:
-        print(f"  ⚠️ Energy-distribution metrics ({approach}) failed for {process}/{mode_name}: {exc}")
-        return
-
-    safe_mode = str(mode_name).replace(' ', '_').replace('/', '_')
-    out_dir = os.path.join(output_root, process, safe_mode)
-    os.makedirs(out_dir, exist_ok=True)
-    suffix = '' if approach == 'baseline' else f'_{approach}'
-
-    result_total['per_activity_sensor'].to_csv(os.path.join(out_dir, f'per_activity_sensor_total{suffix}.csv'), index=False)
-    result_total['per_case_sensor'].to_csv(os.path.join(out_dir, f'per_case_sensor_total{suffix}.csv'), index=False)
-    result_mean['per_activity_sensor'].to_csv(os.path.join(out_dir, f'per_activity_sensor_mean{suffix}.csv'), index=False)
-    result_mean['per_case_sensor'].to_csv(os.path.join(out_dir, f'per_case_sensor_mean{suffix}.csv'), index=False)
-    result_pooled.to_csv(os.path.join(out_dir, f'per_sensor_pooled_values{suffix}.csv'), index=False)
-
-    core_row = {
-        k: v for k, v in core_metrics_row.items()
-        if any(k == f"test_{base}" or k == f"train_{base}" for base in CORE_METRIC_BASES)
-    }
-    core_row['process'] = process
-    core_row['mode'] = mode_name
-    core_row['approach'] = approach
-    pd.DataFrame([core_row]).to_csv(os.path.join(out_dir, f'core_metrics{suffix}.csv'), index=False)
-
-    print(f"  💾 Energy-distribution metrics ({approach}) saved → "
-          f"energy_distribution_results/{process}/{safe_mode}/")
-
-
 def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_expanded_df,
                                       output_root, approach='baseline'):
     """
-    Complete-curve (per real test case) evaluation — see
-    compare_complete_case_curves in utils/sim_extractor.py for the metric itself.
+    Complete-curve (per real test case) curve reconstruction — see
+    compare_complete_case_curves in utils/sim_extractor.py.
 
-    Additional, standalone evaluation: does NOT touch/replace the
-    energy_distribution_results metrics above. For each real test case
-    (matched to this mode's simulated log by case_id), concatenates the
-    real per-activity curves into one complete real profile and the
-    predicted (curve-fitting pipeline `approach`, applied to the simulated
-    log's own activities/durations) curves into one complete simulated
-    profile for that same case, then compares the two along two orthogonal
-    axes: wasserstein_time (is the timing/shape right — shift-tolerant,
-    unlike per-timestep MAE/RMSE) and wasserstein_value (is the distribution
-    of magnitudes right — order-blind, catches scale/spread errors that
-    wasserstein_time can't see).
+    For each real test case (matched to this mode's simulated log by
+    case_id), concatenates the real per-activity curves into one complete
+    real profile and the predicted (curve-fitting pipeline `approach`,
+    applied to the simulated log's own activities/durations) curves into one
+    complete simulated profile for that same case, and persists both curves
+    to predicted_curves*.parquet for the downstream notebooks.
 
     Silently no-ops when there's nothing to compare against (no trained
     pipelines for this process/approach, no detectable sensor columns, or no
@@ -1373,28 +1244,10 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
     os.makedirs(out_dir, exist_ok=True)
     suffix = '' if approach == 'baseline' else f'_{approach}'
 
-    case_curve_df.to_csv(os.path.join(out_dir, f'per_case_complete_curve{suffix}.csv'), index=False)
-
     if curve_df is not None and not curve_df.empty:
         curve_df.to_parquet(os.path.join(out_dir, f'predicted_curves{suffix}.parquet'), index=False)
         print(f"  💾 Predicted curves ({approach}) saved → "
               f"complete_curve_eval_results/{process}/{safe_mode}/predicted_curves{suffix}.parquet")
-
-    summary = (
-        case_curve_df.groupby('sensor')[['wasserstein_time', 'wasserstein_value']]
-        .median()
-        .reset_index()
-        .rename(columns={'wasserstein_time':  'wasserstein_time_median',
-                          'wasserstein_value': 'wasserstein_value_median'})
-    )
-    summary['n_cases'] = case_curve_df.groupby('sensor')['case_id'].nunique().values
-    summary['process'] = process
-    summary['mode'] = mode_name
-    summary['approach'] = approach
-    summary.to_csv(os.path.join(out_dir, f'complete_curve_summary{suffix}.csv'), index=False)
-
-    print(f"  💾 Complete-curve eval ({approach}) saved → "
-          f"complete_curve_eval_results/{process}/{safe_mode}/")
 
 
 def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, sensors, ef_cols,
@@ -1404,13 +1257,14 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     """
     "Schedule Profile Evaluation" — see utils/sim_extractor.py's Schedule Profile
     Evaluation section for the design. Per sensor: trains a stochastic reference
-    generator (and a bootstrap resampler) on TRAIN cases, evaluates them against
-    REAL TEST cases, and (if available) merges in the already-computed per-case
-    W1 numbers for the 'ml_external' approach on this process's best-fidelity
+    generator (and a bootstrap resampler) on TRAIN cases, samples them against
+    REAL TEST cases, and (if available) folds in the already-computed predicted
+    curves for the 'ml_external' approach on this process's best-fidelity
     simulation mode — all on the exact same real cases: stochastic vs. the full
     process-simulation-based pipeline ("Best, mine") vs. that same pipeline
     with its timeline rescaled to a dedicated case-duration prediction
-    ("Best, duration-corrected").
+    ("Best, duration-corrected"). Everything is persisted as curves
+    (predicted_curves.parquet), which the downstream notebooks read.
 
     "Best, duration-corrected" exists because the process-simulation
     timeline has no mechanism forcing its total elapsed time to be
@@ -1438,27 +1292,22 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     _t0 = _t.perf_counter()
 
     def _load_mode_curve_sources(_mode_safe):
-        """(per_case_df, curves_parquet_path) for one simulation mode's
-        already-computed complete-curve outputs of `comparator_approach`
-        (historically always 'ml_external'; follows the complete-curve
-        restriction when that approach was not evaluated)."""
-        _case_df, _curve_path = None, None
+        """Curves-parquet path for one simulation mode's already-computed
+        complete-curve outputs of `comparator_approach` (historically always
+        'ml_external'; follows the complete-curve restriction when that
+        approach was not evaluated)."""
+        _curve_path = None
         _sfx = '' if comparator_approach == 'baseline' else f'_{comparator_approach}'
         if _mode_safe and complete_curve_dir:
-            _p = os.path.join(complete_curve_dir, process, _mode_safe,
-                              f'per_case_complete_curve{_sfx}.csv')
-            if os.path.exists(_p):
-                _case_df = pd.read_csv(_p)
-                _case_df['case_id'] = _case_df['case_id'].astype(str)
             _cp = os.path.join(complete_curve_dir, process, _mode_safe,
                                f'predicted_curves{_sfx}.parquet')
             if os.path.exists(_cp):
                 _curve_path = _cp
-        return _case_df, _curve_path
+        return _curve_path
 
-    best_case_df, _best_curve_path = _load_mode_curve_sources(best_mode_safe)
-    budget_case_df, _budget_curve_path = _load_mode_curve_sources(budget_mode_safe)
-    if budget_mode_safe and budget_case_df is None and _budget_curve_path is None:
+    _best_curve_path = _load_mode_curve_sources(best_mode_safe)
+    _budget_curve_path = _load_mode_curve_sources(budget_mode_safe)
+    if budget_mode_safe and _budget_curve_path is None:
         print(f"  ⚠️ 'Best, budget': no complete-curve output found for "
               f"{process}/{budget_mode_safe} — that series will be missing.")
 
@@ -1533,25 +1382,6 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
             continue
         cmp_df['sensor'] = sensor
         cmp_df['case_id'] = cmp_df['case_id'].astype(str)
-
-        if best_case_df is not None:
-            _best_sensor = (
-                best_case_df[best_case_df['sensor'] == sensor]
-                [['case_id', 'wasserstein_time', 'wasserstein_value']]
-                .rename(columns={'wasserstein_time': 'best_wasserstein_time',
-                                 'wasserstein_value': 'best_wasserstein_value'})
-            )
-            cmp_df = cmp_df.merge(_best_sensor, on='case_id', how='left')
-
-        if budget_case_df is not None:
-            _budget_sensor = (
-                budget_case_df[budget_case_df['sensor'] == sensor]
-                [['case_id', 'wasserstein_time', 'wasserstein_value']]
-                .rename(columns={'wasserstein_time': 'budget_wasserstein_time',
-                                 'wasserstein_value': 'budget_wasserstein_value'})
-            )
-            cmp_df = cmp_df.merge(_budget_sensor, on='case_id', how='left')
-
         all_rows.append(cmp_df)
 
         if SAVE_PREDICTED_CURVES and sensor_curve_df is not None and not sensor_curve_df.empty:
@@ -1619,89 +1449,14 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
     if not all_rows:
         return
 
-    result = pd.concat(all_rows, ignore_index=True)
-    result['process'] = process
-
     out_dir = os.path.join(output_root, process)
     os.makedirs(out_dir, exist_ok=True)
-    result.to_csv(os.path.join(out_dir, 'per_case_schedule_profile_eval.csv'), index=False)
-
-    _metric_cols = [c for c in result.columns if c.endswith('_wasserstein_time') or c.endswith('_wasserstein_value')]
-    summary = result.groupby('sensor')[_metric_cols].median().reset_index()
-    summary['n_cases'] = result.groupby('sensor')['case_id'].nunique().values
-    summary['process'] = process
-    summary.to_csv(os.path.join(out_dir, 'schedule_profile_eval_summary.csv'), index=False)
 
     if all_curve_rows:
         curves_out = pd.concat(all_curve_rows, ignore_index=True)
         curves_out.to_parquet(os.path.join(out_dir, 'predicted_curves.parquet'), index=False)
         print(f"  💾 Predicted curves (real/stochastic/bootstrap/best/best_duration_corrected) saved → "
               f"schedule_profile_eval_results/{process}/predicted_curves.parquet")
-
-        # ── Population-Level (unpaired) Distributional Evaluation ─────────
-        # Pools the whole real case population against each method's whole
-        # case population per sensor (no case_id pairing) -- the right test
-        # for the stochastic/generative methods, which aren't trying to
-        # reproduce any one specific real case. Two sensor-type-agnostic
-        # axes: w1_shape (population generalization of the per-case W1-time
-        # metric above) and w1_magnitude (pooled raw-value W1, reusing
-        # compare_pooled_value_distributions). Strictly per (process,
-        # sensor) -- never pooled across sensors or processes.
-        def _pool_by_sensor(df, series_name):
-            sub = df[df['series'] == series_name]
-            return {s: g['value'].dropna().to_numpy(dtype=float)
-                    for s, g in sub.groupby('sensor') if len(g) > 0}
-
-        real_pooled = _pool_by_sensor(curves_out, 'real')
-        population_rows = []
-        for _pop_method in ('stochastic', 'bootstrap',
-                            'best', 'best_duration_corrected'):
-            method_pooled = _pool_by_sensor(curves_out, _pop_method)
-            mag_df = compare_pooled_value_distributions(real_pooled, method_pooled)
-            shape_df = compare_population_shape(curves_out, method_series=_pop_method)
-            var_df = compare_population_case_stat(curves_out, method_series=_pop_method, stat_fn=np.std)
-            peak_df = compare_population_case_stat(curves_out, method_series=_pop_method, stat_fn=np.max)
-            cov_df = compute_population_coverage(curves_out, method_series=_pop_method)
-            if mag_df.empty and shape_df.empty and var_df.empty and peak_df.empty and cov_df.empty:
-                continue
-            merged = mag_df[['sensor', 'wasserstein']].rename(columns={'wasserstein': 'w1_magnitude'})
-            for _df, _col in ((shape_df, 'w1_shape'), (var_df, 'w1_variability'), (peak_df, 'w1_peak')):
-                merged = merged.merge(
-                    _df[['sensor', 'wasserstein']].rename(columns={'wasserstein': _col}),
-                    on='sensor', how='outer')
-            merged = merged.merge(cov_df[['sensor', 'coverage']], on='sensor', how='outer')
-            merged['method'] = _pop_method
-            population_rows.append(merged)
-
-        if population_rows:
-            population_out = pd.concat(population_rows, ignore_index=True)
-            population_out['process'] = process
-
-            def _scale_of(vals):
-                s = float(np.std(vals)) if len(vals) >= 2 else float('nan')
-                return s if s > 1e-9 else float('nan')
-
-            _mag_scale_map = {s: _scale_of(v) for s, v in real_pooled.items()}
-            population_out['real_magnitude_scale'] = population_out['sensor'].map(_mag_scale_map)
-            population_out['real_shape_scale'] = 1.0
-
-            _real_case_df = curves_out[curves_out['series'] == 'real']
-            _var_by_sensor, _peak_by_sensor = {}, {}
-            for _sensor, _g in _real_case_df.groupby('sensor'):
-                _stds, _peaks = [], []
-                for _, _cg in _g.groupby('case_id'):
-                    _v = _cg['value'].dropna().to_numpy(dtype=float)
-                    if _v.size:
-                        _stds.append(float(np.std(_v)))
-                        _peaks.append(float(np.max(_v)))
-                _var_by_sensor[_sensor] = _scale_of(_stds)
-                _peak_by_sensor[_sensor] = _scale_of(_peaks)
-            population_out['real_variability_scale'] = population_out['sensor'].map(_var_by_sensor)
-            population_out['real_peak_scale'] = population_out['sensor'].map(_peak_by_sensor)
-
-            population_out.to_csv(os.path.join(out_dir, 'population_distribution_eval.csv'), index=False)
-            print(f"  💾 Population-Level Distributional Evaluation saved → "
-                  f"schedule_profile_eval_results/{process}/population_distribution_eval.csv")
 
     if SAVE_TRAINED_MODELS and _sched_models:
         _sm_path = os.path.join(output_root, process, 'trained_schedule_pipelines.joblib')
@@ -1718,25 +1473,6 @@ def _save_schedule_profile_eval(process, train_expanded_df, test_expanded_df, se
 process_test_cols = []
 energy_test_cols = []
 enabled_test_metrics = set()
-
-# Metrics where HIGHER is better (prefixes like train_ or test_ are stripped before checking)
-METRICS_HIGHER_IS_BETTER = {
-
-    'basic_metrics_event_count_ratio',
-    'basic_metrics_case_count_ratio',
-    'activity_metrics_activity_coverage_ratio',
-    'duration_metrics_ks_pvalue',
-    'case_metrics_events_per_case_pvalue',
-    'conformance_metrics_fitness',
-    'conformance_metrics_precision',
-    'conformance_metrics_generalization',
-    'conformance_metrics_simplicity',
-    'control_flow_metrics_edge_precision',
-    'control_flow_metrics_edge_recall',
-    'control_flow_metrics_edge_f1_score',
-    'control_flow_metrics_start_activities_jaccard',
-    'control_flow_metrics_end_activities_jaccard',
-}
 
 def _plot_short_heatmap(target_df, title, save_path=None, agg='mean', split='test'):
     """Short heatmap: error metrics (0=best) + Overall. Works for train or test split."""
@@ -4733,42 +4469,17 @@ def _run_curve_eval_autoregressive_prev_act(pipelines_dict, approach_label, spli
     return records
 
 
-# ── Energy-distribution metrics (deferred) ─────────────────────────────────
+# ── Complete-curve eval (deferred) ──────────────────────────────────────────
 # Every (process, mode) simulated log was collected into
 # _energy_distribution_pending during the per-process loop above, but
 # all_energy_pipelines only exists from here onward (populated by the
 # CURVE-ONLY TRAINING section just above). Compute + save now that the
 # curve pipelines actually exist.
 if 'all_energy_pipelines' in dir() and all_energy_pipelines and _energy_distribution_pending:
-    # Compare against every curve-fitting approach that actually trained
-    # (not just 'baseline') — 'ml_external' ("DTW + ML + Ext. Factors")
-    # is usually the strongest approach per Curve-Only
-    # Evaluation, so it's worth comparing energy-distribution fidelity
-    # against it too, not only the simplest baseline.
-    _energy_approaches_available = ['baseline']
-    if 'all_energy_pipelines_ml_external' in dir() and all_energy_pipelines_ml_external:
-        _energy_approaches_available.append('ml_external')
-
-    print("\n" + "="*50)
-    print(f"ENERGY-DISTRIBUTION METRICS ({len(_energy_distribution_pending)} process/mode combos "
-          f"x {len(_energy_approaches_available)} approach(es): {_energy_approaches_available})")
-    print("="*50)
-    for _proc_p, _mode_p, _sim_p, _exp_p, _core_p in _energy_distribution_pending:
-        for _approach_p in _energy_approaches_available:
-            with _timed('energy_distribution_eval', process=_proc_p,
-                        detail=f'{_mode_p}:{_approach_p}', split='TEST'):
-                _save_energy_distribution_metrics(
-                    _proc_p, _mode_p, _sim_p, _exp_p, _core_p, _energy_distribution_dir,
-                    approach=_approach_p,
-                )
-
     # Complete-curve eval is pure inference (all pipelines are already trained
-    # above), so — unlike the energy-distribution loop above, which is kept to
-    # 'baseline' + 'ml_external' on purpose — it runs against every
-    # approach that actually trained pipelines for this run (i.e. every entry
-    # in APPROACHES with a non-empty all_energy_pipelines_<approach> dict), not
-    # just those two. Independent list, so it doesn't change what
-    # energy_distribution_results computes.
+    # above), so it runs against every approach that actually trained
+    # pipelines for this run (i.e. every entry in APPROACHES with a non-empty
+    # all_energy_pipelines_<approach> dict).
     #
     # Only the prev_activity-conditioned seq2seq* approaches are excluded, not
     # the whole seq2seq family. Root-caused 2026-07-21: predict_curve_for_instance
@@ -5537,544 +5248,6 @@ if RUN_TEST_EVALUATION:
                         verbose=1,
                         save_dir=_gallery_dir,
                     )
-
-# %%
-# ══════════════════════════════════════════════════════════════════════════════
-# JOINT DURATION + PROFILE EVALUATION
-# Real test curves, but curve_length feature replaced with the predicted duration
-# from the best process model, matched per (case_order_idx, activity, occurrence_rank).
-# Only curves with a matched simulated counterpart are evaluated.
-# ══════════════════════════════════════════════════════════════════════════════
-
-_jdur_ready = (
-    globals().get('RUN_JOINT_DURATION_EVAL', False)
-    and globals().get('RUN_CURVE_ONLY_EVALUATION', False)
-    and bool(globals().get('_combined_sim_store'))
-    and 'evaluation_results_df' in globals()
-    and not globals()['evaluation_results_df'].empty
-    and globals().get('TEMPORAL_SPLIT', False)
-    and 'test_datasets' in globals()
-)
-
-if _jdur_ready:
-    _jdur_t0 = _time.perf_counter()
-    display(Markdown("---"))
-    display(Markdown("# Joint Duration + Profile Evaluation"))
-    display(Markdown(
-        "Predicted durations from the best process model replace `curve_length` "
-        "for matched *(case_rank, activity, occurrence)* pairs in the TEST set only."
-    ))
-
-    # ── Pick best process mode per process (lowest TRAIN duration MAE) ──────
-    # Selection on train: the joint eval below reports this mode's numbers on
-    # the test cases, so selecting it on test would report a mode chosen for
-    # fitting the evaluation split. MAE rather than WAPE — the comparison is
-    # always within one process, where the scale is constant, so WAPE's
-    # normalisation buys nothing and MAE stays in interpretable minutes.
-    _jw_col = next(
-        (c for c in ['train_duration_metrics_activity_duration_mae',
-                     'train_duration_metrics_activity_duration_wape']
-         if c in evaluation_results_df.columns),
-        None
-    )
-    _jdur_best_modes = {}
-    if _jw_col:
-        for _jp, _jg in evaluation_results_df.groupby('process'):
-            _jv = _jg.dropna(subset=[_jw_col])
-            if not _jv.empty:
-                _jdur_best_modes[_jp] = _jv.loc[_jv[_jw_col].idxmin(), 'mode']
-
-    print("Best modes for joint eval:")
-    for _jp, _jm in _jdur_best_modes.items():
-        print(f"  {_jp}: {_jm}")
-
-    # ── Build per-process duration override lookup ───────────────────────────
-    # _jdur_override[proc][real_case_id] = {(activity_str, rank_int): sim_dur_sec}
-    _jdur_override = {}
-
-    for _jp, _jbm in _jdur_best_modes.items():
-        _jentries = [e for e in _combined_sim_store
-                     if e['process'] == _jp and e['mode'] == _jbm]
-        if not _jentries:
-            print(f"  [WARN joint] No sim_df found for {_jp}/{_jbm}")
-            continue
-
-        _jsim = _jentries[0]['sim_df'].copy()
-        _jsim['timestamp_start'] = pd.to_datetime(_jsim['timestamp_start'], errors='coerce')
-        _jsim['timestamp_end']   = pd.to_datetime(_jsim['timestamp_end'],   errors='coerce')
-        _jsim = _jsim.dropna(subset=['case_id', 'activity', 'timestamp_start', 'timestamp_end'])
-        _jsim['_dur_sec'] = (_jsim['timestamp_end'] - _jsim['timestamp_start']).dt.total_seconds()
-        _jsim = _jsim[_jsim['_dur_sec'] > 0].copy()
-        if _jsim.empty:
-            print(f"  [WARN joint] Empty sim_df for {_jp}/{_jbm}")
-            continue
-
-        _jrel = test_datasets[_jp]['event_log'].copy()
-        _jrel['timestamp_start'] = pd.to_datetime(_jrel['timestamp_start'], errors='coerce')
-        _jrel = _jrel.dropna(subset=['case_id', 'activity', 'timestamp_start'])
-
-        # Sort cases by first event time → deterministic order index
-        _jreal_order = (
-            _jrel.groupby('case_id')['timestamp_start'].min()
-            .sort_values().index.tolist()
-        )
-        _jsim_order = (
-            _jsim.groupby('case_id')['timestamp_start'].min()
-            .sort_values().index.tolist()
-        )
-        _n_pairs = min(len(_jreal_order), len(_jsim_order))
-        _n_skip  = abs(len(_jreal_order) - len(_jsim_order))
-        print(f"  {_jp}: {len(_jreal_order)} real / {len(_jsim_order)} sim → "
-              f"{_n_pairs} matched, {_n_skip} skipped")
-
-        _jsim = _jsim.sort_values('timestamp_start')
-        _jsim['_rank'] = _jsim.groupby(['case_id', 'activity']).cumcount()
-
-        _jproc_override = {}
-        for _ji in range(_n_pairs):
-            _jrcid = _jreal_order[_ji]
-            _jscid = _jsim_order[_ji]
-            _jsc   = _jsim[_jsim['case_id'] == _jscid]
-            _jproc_override[str(_jrcid)] = {
-                (str(_r['activity']), int(_r['_rank'])): float(_r['_dur_sec'])
-                for _, _r in _jsc.iterrows()
-            }
-        _jdur_override[_jp] = _jproc_override
-
-    # ── Joint eval function ──────────────────────────────────────────────────
-    def _run_curve_eval_joint_duration(pipelines_dict, approach_label,
-                                       df_lookup, act_map, obj_map,
-                                       dur_override, best_modes):
-        import importlib, utils.sim_extractor as _se
-        importlib.reload(_se)
-        from utils.sim_extractor import (split_curves, split_curves_with_prev_activity,
-                                   evaluate_pipeline_joint_duration)
-        records = []
-        for _proc, _sensors in pipelines_dict.items():
-            _df = df_lookup.get(_proc, {}).get('expanded')
-            if _df is None or _df.empty:
-                continue
-            _proc_ov = dur_override.get(_proc, {})
-            if not _proc_ov:
-                continue
-
-            # Real test event log: (case_id, activity, ts_floor) → (real_dur_sec, rank)
-            _jrel = test_datasets[_proc]['event_log'].copy()
-            _jrel['timestamp_start'] = pd.to_datetime(_jrel['timestamp_start'], errors='coerce')
-            _jrel['timestamp_end']   = pd.to_datetime(_jrel['timestamp_end'],   errors='coerce')
-            _jrel = _jrel.dropna(subset=['case_id', 'activity', 'timestamp_start', 'timestamp_end'])
-            _jrel['_dur_sec'] = (_jrel['timestamp_end'] - _jrel['timestamp_start']).dt.total_seconds()
-            _jrel = _jrel[_jrel['_dur_sec'] > 0].sort_values('timestamp_start')
-            _jrel['_rank'] = _jrel.groupby(['case_id', 'activity']).cumcount()
-            _jrel['_tsf']  = _jrel['timestamp_start'].dt.floor('s')
-            _jel_lkp = {}
-            for _, _r in _jrel.iterrows():
-                _jel_lkp[(str(_r['case_id']), str(_r['activity']), _r['_tsf'])] = \
-                    (float(_r['_dur_sec']), int(_r['_rank']))
-
-            # Rebuild instance_id → (case_id, activity, ts_floor) from expanded df
-            # Must mirror the groupby in split_curves exactly.
-            _dfx = _df.copy()
-            if 'object_log' not in _dfx.columns:
-                _dfx['object_log'] = '_all_'
-            _dfx['object_log'] = _dfx['object_log'].fillna('_all_')
-            _dfx['_tsf'] = pd.to_datetime(
-                _dfx['timestamp_start_log'], errors='coerce'
-            ).dt.floor('s')
-
-            _acts = act_map.get(_proc, [])
-            _objs = obj_map.get(_proc, [])
-            if not _acts and 'activity_log' in _df.columns:
-                _acts = _df['activity_log'].dropna().unique().tolist()
-            if not _objs and 'object_log' in _df.columns:
-                _objs = _df['object_log'].dropna().unique().tolist()
-            if not _objs:
-                _objs = ['_all_']
-
-            for _sensor, _sensor_val in _sensors.items():
-                _leaf_eps = [
-                    ([_a], [_o], _ep)
-                    for _a, _obj_d in _sensor_val.items()
-                    for _o, _ep in _obj_d.items()
-                ]
-                if not _leaf_eps:
-                    continue
-
-                for _leaf_acts, _leaf_objs, _ep in _leaf_eps:
-                    _fp = _ep.get('full_pipeline', {})
-                    _appr = _fp.get('approach', 'baseline')
-                    _exog = (
-                        _fp.get('exog_cols', [])
-                        if _appr in ('ml_external', 'seq2seq_external')
-                        else None
-                    )
-                    if _appr in ('ml_external', 'seq2seq_external'):
-                        _curves, _ = split_curves_with_prev_activity(
-                            _df, _sensor, _leaf_acts, _leaf_objs,
-                            test_size=0.0, verbose=0, exog_columns=_exog,
-                            include_prev_energy=False,
-                        )
-                    else:
-                        _curves, _ = split_curves(
-                            _df, _sensor, _leaf_acts, _leaf_objs,
-                            test_size=0.0, verbose=0,
-                        )
-                    if not _curves:
-                        continue
-
-                    # Build instance_id → (case_id, ts_floor) with same filters as split_curves
-                    _dfx_f = _dfx[_dfx['activity_log'].isin(_leaf_acts)].copy()
-                    if '_all_' not in _leaf_objs:
-                        _dfx_f = _dfx_f[_dfx_f['object_log'].isin(_leaf_objs)]
-                    _uniq = (
-                        _dfx_f[['case_id_log', 'object_log', 'activity_log',
-                                 'timestamp_start_log', '_tsf']]
-                        .drop_duplicates()
-                    )
-                    _uniq = _uniq.copy()
-                    _uniq['_iid'] = _uniq.groupby(
-                        ['case_id_log', 'object_log', 'activity_log', 'timestamp_start_log']
-                    ).ngroup()
-                    _iid_cid = dict(zip(_uniq['_iid'], _uniq['case_id_log'].astype(str)))
-                    _iid_act = dict(zip(_uniq['_iid'], _uniq['activity_log'].astype(str)))
-                    _iid_tsf = dict(zip(_uniq['_iid'], _uniq['_tsf']))
-
-                    # Match curves to simulated durations and inject override
-                    _matched = []
-                    for _cv in _curves:
-                        _iid = _cv['instance_id']
-                        _cid = _iid_cid.get(_iid)
-                        _act = _iid_act.get(_iid)
-                        _tsf = _iid_tsf.get(_iid)
-                        if _cid is None or _tsf is None:
-                            continue
-                        _el_key = (_cid, _act, _tsf)
-                        _el_info = _jel_lkp.get(_el_key)
-                        if _el_info is None:
-                            continue
-                        _real_dur, _rank = _el_info
-                        if _real_dur <= 0:
-                            continue
-                        _sim_dur = _proc_ov.get(_cid, {}).get((_act, _rank))
-                        if _sim_dur is None:
-                            continue
-                        _pred_cl = max(2, int(round(
-                            _cv['original_length'] * _sim_dur / _real_dur
-                        )))
-                        _cv2 = dict(_cv)
-                        _cv2['attributes'] = {**_cv['attributes'],
-                                              '_pred_curve_length': _pred_cl}
-                        _matched.append(_cv2)
-
-                    if not _matched:
-                        continue
-                    try:
-                        _mdf, _ = evaluate_pipeline_joint_duration(
-                            _matched, _fp,
-                        )
-                        for _, _r in _mdf.iterrows():
-                            records.append({
-                                'Approach':  approach_label,
-                                'Process':   _proc,
-                                'Sensor':    _sensor,
-                                'Activity':  _r['activity'],
-                                'N':         _r['n_points'],
-                                'MAE':       _r['MAE'],
-                                'RMSE':      _r['RMSE'],
-                                'WAPE':      _r['WAPE (%)'],
-                                'sMAE':      _r.get('sMAE'),
-                                'sRMSE':     _r.get('sRMSE'),
-                                'BestMode':  best_modes.get(_proc, ''),
-                                'NMatched':  len(_matched),
-                            })
-                    except Exception as _je:
-                        print(f"  [ERROR joint] {approach_label}|{_proc}|{_sensor}: {_je}")
-        return records
-
-    # ── Run for all active approaches ────────────────────────────────────────
-    _jall_records = []
-    for _jlabel, _jpips in [
-        ('Baseline',                      all_energy_pipelines),
-        ('Median per Activity & Sensor',  all_energy_pipelines_median_activity_sensor),
-        ('Step DTW + ML + Ext.',          all_energy_pipelines_ml_step_dtw),
-        ('Step DTW smooth + ML + Ext.',   all_energy_pipelines_ml_step_dtw_smooth),
-        ('ML + Ext. Factors', all_energy_pipelines_ml_external),
-    ]:
-        if not _jpips:
-            continue
-        display(Markdown(f"### Joint — {_jlabel}"))
-        _jrecs = _run_curve_eval_joint_duration(
-            _jpips, _jlabel,
-            test_datasets, _activities_map, _objects_map,
-            _jdur_override, _jdur_best_modes,
-        )
-        _jall_records.extend(_jrecs)
-        print(f"  → {len(_jrecs)} records collected")
-
-    # ── Save parquet + heatmaps ──────────────────────────────────────────────
-    if _jall_records and EXPORT_RESULTS and '_run_dir' in dir():
-        _jdf = pd.DataFrame(_jall_records)
-        _jparquet = os.path.join(_run_dir, 'curve_joint_duration_eval_results.parquet')
-        _jdf.to_parquet(_jparquet, index=False)
-        print(f"\nSaved joint eval → {_jparquet}")
-
-        # Summary tables
-        display(Markdown("## Joint Eval — Median by Approach × Process × Sensor × Activity"))
-        _jmetrics = [m for m in ['sMAE', 'sRMSE', 'WAPE', 'MAE', 'RMSE'] if m in _jdf.columns]
-        _jsumm = (
-            _jdf.groupby(['Approach', 'Process', 'Sensor', 'Activity'])[_jmetrics]
-            .median().round(4)
-        )
-        display(_jsumm)
-        _jsumm.reset_index().to_parquet(
-            os.path.join(_run_dir, 'curve_joint_duration_summary.parquet'), index=False
-        )
-
-        display(Markdown("## Joint Eval — Median by Approach (all processes/sensors)"))
-        _jsumm_appr = _jdf.groupby('Approach')[_jmetrics].median().round(4)
-        display(_jsumm_appr)
-
-        # Heatmaps
-        _jhm_dir = os.path.join(_run_dir, 'joint_duration_eval_heatmaps')
-        os.makedirs(_jhm_dir, exist_ok=True)
-
-        def _plot_joint_hm(df, title, save_dir):
-            _hm_metrics = [m for m in ['sMAE', 'sRMSE', 'WAPE'] if m in df.columns]
-            if not _hm_metrics or df.empty:
-                return
-            _agg = df.groupby('Approach')[_hm_metrics].median()
-            # Normalise 0-1 (lower is better for all three)
-            _norm = _agg.copy()
-            for _c in _hm_metrics:
-                _mn, _mx = _agg[_c].min(), _agg[_c].max()
-                _norm[_c] = (_agg[_c] - _mn) / (_mx - _mn + 1e-12)
-            _norm = _norm.loc[_norm.mean(axis=1).sort_values(ascending=True).index]
-            _annot = _agg.reindex(_norm.index).round(3)
-            _fig, _ax = plt.subplots(
-                figsize=(max(5, len(_hm_metrics) * 2.5), max(3, len(_norm) * 0.7))
-            )
-            sns.heatmap(_norm, annot=_annot, fmt='', cmap='RdYlGn_r',
-                        vmin=0, vmax=1, linewidths=0.5, ax=_ax,
-                        cbar_kws={'label': 'Normalised score (0=best)'})
-            _ax.set_title(title, fontsize=11, fontweight='bold')
-            plt.tight_layout()
-            _fp2 = os.path.join(save_dir,
-                                title.replace(' ', '_').replace('/', '-')
-                                     .replace('|', '-') + '.png')
-            plt.savefig(_fp2, dpi=150, bbox_inches='tight')
-            plt.show()
-
-        _plot_joint_hm(_jdf, 'Joint_Duration_Eval — All_Processes', _jhm_dir)
-        for _jp2, _jpsub in _jdf.groupby('Process'):
-            _plot_joint_hm(_jpsub, f'Joint_Duration_Eval — {_jp2}', _jhm_dir)
-            for _js2, _jssub in _jpsub.groupby('Sensor'):
-                if len(_jssub['Approach'].unique()) < 2:
-                    continue
-                _plot_joint_hm(_jssub, f'Joint_Duration_Eval — {_jp2} — {_js2}', _jhm_dir)
-
-        print(f"Saved heatmaps → {_jhm_dir}")
-    elif not _jall_records:
-        print("[WARN joint] No records collected — check WARN/ERROR messages above.")
-
-# %%
-# ══════════════════════════════════════════════════════════════════════════════
-# JOINT DURATION + PROFILE EVALUATION — PER SIMULATION MODE
-#
-# Same evaluation as above but repeated for every simulation mode so we can
-# see how curve reconstruction degrades as duration model quality drops.
-# Rows in each heatmap = simulation modes sorted by their test duration WAPE
-# (best mode at top).  Columns = sMAE / sRMSE / WAPE of the curve model.
-# One heatmap per (process × curve approach).
-# ══════════════════════════════════════════════════════════════════════════════
-
-if _jdur_ready:
-    _record_runtime('joint_duration_eval', _time.perf_counter() - _jdur_t0,
-                    detail='matched pairs', split='TEST')
-    _jdur_mode_t0 = _time.perf_counter()
-    display(Markdown("---"))
-    display(Markdown("# Joint Duration + Profile Evaluation — Per Simulation Mode"))
-    display(Markdown(
-        "Repeated for **every** simulation mode.  "
-        "Rows = simulation modes sorted by duration WAPE (best first); "
-        "columns = curve metrics.  Shows how curve quality degrades "
-        "as duration accuracy drops."
-    ))
-
-    # ── Collect test-duration WAPE per (process, mode) for row ordering ───────
-    _jpm_wape_col = next(
-        (c for c in ['test_duration_metrics_activity_duration_wape',
-                     'test_duration_metrics_activity_duration_mae']
-         if c in evaluation_results_df.columns),
-        None
-    )
-    _jpm_mode_wape = {}   # {(proc, mode): wape}
-    if _jpm_wape_col:
-        for (_jpp, _jpm_), _jgv in evaluation_results_df.groupby(['process', 'mode']):
-            _jvv = _jgv[_jpm_wape_col].dropna()
-            if not _jvv.empty:
-                _jpm_mode_wape[(_jpp, _jpm_)] = float(_jvv.min())
-
-    # ── Build duration override for every (process, mode) pair ───────────────
-    # Same matching logic as the single-best-mode block above.
-    _jdur_override_by_mode = {}   # {proc: {mode: {case_id: {(act, rank): dur_sec}}}}
-
-    for _jentry in _combined_sim_store:
-        _jp_pm  = _jentry['process']
-        _jm_pm  = _jentry['mode']
-        if _jp_pm not in test_datasets:
-            continue
-
-        _jsim_pm = _jentry['sim_df'].copy()
-        _jsim_pm['timestamp_start'] = pd.to_datetime(_jsim_pm['timestamp_start'], errors='coerce')
-        _jsim_pm['timestamp_end']   = pd.to_datetime(_jsim_pm['timestamp_end'],   errors='coerce')
-        _jsim_pm = _jsim_pm.dropna(subset=['case_id', 'activity', 'timestamp_start', 'timestamp_end'])
-        _jsim_pm['_dur_sec'] = (_jsim_pm['timestamp_end'] - _jsim_pm['timestamp_start']).dt.total_seconds()
-        _jsim_pm = _jsim_pm[_jsim_pm['_dur_sec'] > 0].copy()
-        if _jsim_pm.empty:
-            continue
-
-        _jrel_pm = test_datasets[_jp_pm]['event_log'].copy()
-        _jrel_pm['timestamp_start'] = pd.to_datetime(_jrel_pm['timestamp_start'], errors='coerce')
-        _jrel_pm = _jrel_pm.dropna(subset=['case_id', 'activity', 'timestamp_start'])
-
-        _jreal_ord_pm = (
-            _jrel_pm.groupby('case_id')['timestamp_start'].min()
-            .sort_values().index.tolist()
-        )
-        _jsim_ord_pm = (
-            _jsim_pm.groupby('case_id')['timestamp_start'].min()
-            .sort_values().index.tolist()
-        )
-        _n_pairs_pm = min(len(_jreal_ord_pm), len(_jsim_ord_pm))
-        if _n_pairs_pm == 0:
-            continue
-
-        _jsim_pm = _jsim_pm.sort_values('timestamp_start')
-        _jsim_pm['_rank'] = _jsim_pm.groupby(['case_id', 'activity']).cumcount()
-
-        _jov_pm = {}
-        for _ji_pm in range(_n_pairs_pm):
-            _jrcid_pm = _jreal_ord_pm[_ji_pm]
-            _jscid_pm = _jsim_ord_pm[_ji_pm]
-            _jsc_pm   = _jsim_pm[_jsim_pm['case_id'] == _jscid_pm]
-            _jov_pm[str(_jrcid_pm)] = {
-                (str(_r_pm['activity']), int(_r_pm['_rank'])): float(_r_pm['_dur_sec'])
-                for _, _r_pm in _jsc_pm.iterrows()
-            }
-
-        _jdur_override_by_mode.setdefault(_jp_pm, {})[_jm_pm] = _jov_pm
-
-    _n_pairs_total = sum(len(v) for v in _jdur_override_by_mode.values())
-    print(f"Built overrides for {_n_pairs_total} (process, mode) pairs")
-
-    # ── Run eval for every (process, mode) × curve approach ──────────────────
-    _jpm_all_records = []
-
-    _jpm_curve_approaches = [
-        ('Baseline',                                globals().get('all_energy_pipelines',                {})),
-        ('Median per Activity & Sensor',            globals().get('all_energy_pipelines_median_activity_sensor', {})),
-        ('ML DTW',                          globals().get('all_energy_pipelines_ml_dtw',   {})),
-        ('ML + Ext. Factors',           globals().get('all_energy_pipelines_ml_external', {})),
-        ('Step DTW + ML + Ext.',            globals().get('all_energy_pipelines_ml_step_dtw', {})),
-        ('Step DTW smooth + ML + Ext.',     globals().get('all_energy_pipelines_ml_step_dtw_smooth', {})),
-        ('DTW + Seq2Seq',                           globals().get('all_energy_pipelines_seq2seq',        {})),
-        ('Seq2Seq IOM (DTW-selected)',              globals().get('all_energy_pipelines_seq2seq_iom',    {})),
-        ('DTW + Seq2Seq + Ext. Factors', globals().get('all_energy_pipelines_seq2seq_external', {})),
-    ]
-
-    for _jp_run, _jmodes_run in _jdur_override_by_mode.items():
-        for _jm_run, _jov_run in _jmodes_run.items():
-            _jov_wrapped  = {_jp_run: _jov_run}
-            _jbm_wrapped  = {_jp_run: _jm_run}
-
-            for _jlabel_run, _jpips_run in _jpm_curve_approaches:
-                if not _jpips_run or _jp_run not in _jpips_run:
-                    continue
-                _jrecs_run = _run_curve_eval_joint_duration(
-                    {_jp_run: _jpips_run[_jp_run]}, _jlabel_run,
-                    test_datasets, _activities_map, _objects_map,
-                    _jov_wrapped, _jbm_wrapped,
-                )
-                for _r_run in _jrecs_run:
-                    _r_run['SimMode'] = _jm_run
-                _jpm_all_records.extend(_jrecs_run)
-
-        print(f"  {_jp_run}: done ({len(_jmodes_run)} modes)")
-
-    # ── Save + heatmaps ───────────────────────────────────────────────────────
-    if _jpm_all_records and EXPORT_RESULTS and '_run_dir' in dir():
-        _jpmdf = pd.DataFrame(_jpm_all_records)
-        _jpm_parquet = os.path.join(_run_dir, 'curve_joint_duration_eval_per_mode.parquet')
-        _jpmdf.to_parquet(_jpm_parquet, index=False)
-        print(f"Saved per-mode joint eval → {_jpm_parquet}")
-
-        _jpm_hm_dir = os.path.join(_run_dir, 'joint_duration_eval_heatmaps')
-        os.makedirs(_jpm_hm_dir, exist_ok=True)
-        _jpm_metrics = [m for m in ['sMAE', 'sRMSE', 'WAPE'] if m in _jpmdf.columns]
-
-        def _display_sim_mode(m):
-            m = str(m)
-            if not m.startswith('petri_net_'):
-                return m
-            rest = m[len('petri_net_'):]
-            if rest.endswith('_ml_plus_global'):
-                return rest[:-len('_ml_plus_global')] + ' / ml_global'
-            if rest.endswith('_ml_plus_per_act'):
-                return rest[:-len('_ml_plus_per_act')] + ' / ml_local'
-            return rest + ' / baseline'
-
-        def _plot_per_mode_hm(df, proc, approach, save_dir):
-            if df.empty or not _jpm_metrics:
-                return
-            _agg_pm = df.groupby('SimMode')[_jpm_metrics].median()
-            # Sort rows by duration WAPE (best = lowest = top)
-            _wape_key = {m: _jpm_mode_wape.get((proc, m), 999) for m in _agg_pm.index}
-            _agg_pm = _agg_pm.loc[sorted(_agg_pm.index, key=lambda m: _wape_key.get(m, 999))]
-            _agg_pm.index = [_display_sim_mode(m) for m in _agg_pm.index]
-
-            _norm_pm = _agg_pm.copy().astype(float)
-            for _c_pm in _jpm_metrics:
-                _mn_pm, _mx_pm = _agg_pm[_c_pm].min(), _agg_pm[_c_pm].max()
-                _norm_pm[_c_pm] = (_agg_pm[_c_pm] - _mn_pm) / (_mx_pm - _mn_pm + 1e-12)
-
-            _title_pm = f'Per-Mode Joint Eval — {proc} — {approach}'
-            _fig_pm, _ax_pm = plt.subplots(
-                figsize=(max(5, len(_jpm_metrics) * 2.5), max(3, len(_norm_pm) * 0.7 + 1.5))
-            )
-            sns.heatmap(_norm_pm, annot=_agg_pm.round(3), fmt='', cmap='RdYlGn_r',
-                        vmin=0, vmax=1, linewidths=0.5, ax=_ax_pm,
-                        cbar_kws={'label': 'Normalised (0 = best)'})
-            _ax_pm.set_title(_title_pm, fontsize=11, fontweight='bold')
-            _ax_pm.set_ylabel('Simulation mode (sorted by duration WAPE, best first)')
-            _ax_pm.set_xticklabels(_ax_pm.get_xticklabels(), rotation=0)
-            _ax_pm.set_yticklabels(_ax_pm.get_yticklabels(), rotation=0, fontsize=8)
-            plt.tight_layout()
-            _fp_pm = os.path.join(
-                save_dir,
-                _title_pm.replace(' ', '_').replace('/', '-').replace('|', '-') + '.png'
-            )
-            plt.savefig(_fp_pm, dpi=150, bbox_inches='tight')
-            plt.show()
-
-        display(Markdown("## Per-Mode Joint Eval — Heatmaps by Process × Curve Approach"))
-        for _jp_hm, _jpsub_hm in _jpmdf.groupby('Process'):
-            display(Markdown(f"### {_jp_hm}"))
-            for _jappr_hm, _japsub_hm in _jpsub_hm.groupby('Approach'):
-                _plot_per_mode_hm(_japsub_hm, _jp_hm, _jappr_hm, _jpm_hm_dir)
-
-        display(Markdown("## Per-Mode Joint Eval — Median across all processes"))
-        _jpm_summ = (
-            _jpmdf.groupby(['SimMode', 'Approach'])[_jpm_metrics]
-            .median().round(4)
-        )
-        display(_jpm_summ)
-
-        print(f"Saved per-mode heatmaps → {_jpm_hm_dir}")
-    elif not _jpm_all_records:
-        print("[WARN per-mode joint] No records — check WARN/ERROR messages above.")
-
-    _record_runtime('joint_duration_eval', _time.perf_counter() - _jdur_mode_t0,
-                    detail='per simulation mode', split='TEST')
 
 # %%
 # ══════════════════════════════════════════════════════════════════════════════

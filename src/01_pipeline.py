@@ -14,11 +14,6 @@ Each entry in EXPERIMENTS defines one run. Fields:
   run_energy_modelling  bool       whether to run energy profile/curve modelling
                                    (sensor curve fitting + curve-quality benchmark).
                                    Set False to run process modelling only. Default: True.
-  run_joint_duration_eval bool     whether to run the (slow) per-instance-matched
-                                   "Joint Duration + Profile Evaluation" heatmaps.
-                                   Superseded by the energy-distribution metrics
-                                   (energy_distribution_results/), which don't rely
-                                   on instance matching. Default: False.
   run_schedule_profile_eval bool   whether to run the "Schedule Profile Evaluation"
                                    (Best/mine vs. Stochastic generator, per
                                    process) — writes to
@@ -33,10 +28,9 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    include_prev_energy=True), which reported runs
                                    do not do.
   save_predicted_curves bool       whether to also persist the actual real/predicted
-                                   curve arrays (not just the aggregated Wasserstein
-                                   distances) behind complete-curve eval and schedule
-                                   profile eval, for recomputing other metrics or
-                                   plotting later. Default: False.
+                                   curve arrays behind the complete-curve eval and
+                                   schedule profile eval, for recomputing other
+                                   metrics or plotting later. Default: False.
   complete_curve_approaches list|None restrict the complete-curve eval to these
                                    approaches only. None (default) → every
                                    trained approach is assembled into complete
@@ -154,13 +148,11 @@ Each entry in EXPERIMENTS defines one run. Fields:
                                    held-out curves. None -> False (OFF).
                                    Acceptance is on POINTWISE error, so turning
                                    it on deletes any method that trades
-                                   pointwise accuracy for curve realism: it fired
-                                   on 33/40 leaves for 'exemplar', replacing its
-                                   real measured curve with the smooth median.
+                                   pointwise accuracy for curve realism.
                                    Leave it off to see what each approach really
                                    predicts; turn it on only for a
                                    "never worse than the naive floor" run, and
-                                   not alongside exemplar*/realism reporting.
+                                   not alongside realism reporting.
   curve_median_floor_ratio float|None
                                    margin the model must win by: kept only when
                                    its held-out MAE < ratio x the floor's.
@@ -197,8 +189,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-setting = True
-
 # ── Experiment definitions ────────────────────────────────────────────────────
 EXPERIMENTS = [
 
@@ -211,7 +201,6 @@ EXPERIMENTS = [
         'run_process_modelling': True,
         'mining_algorithms':     ['heuristic', 'alpha', 'inductive'],
         'run_energy_modelling':  True,
-        'run_joint_duration_eval':   False,
         'run_schedule_profile_eval': True,
         'run_autoregressive_eval':   False,
         'save_predicted_curves': True,
@@ -269,7 +258,6 @@ modelling_script = Path(__file__).parent / '02_modelling.py'
 for i, exp in enumerate(EXPERIMENTS, start=1):
     mining_algorithms = exp.get('mining_algorithms')
     run_energy_modelling = exp.get('run_energy_modelling', True)
-    run_joint_duration_eval = exp.get('run_joint_duration_eval', False)
     run_schedule_profile_eval = exp.get('run_schedule_profile_eval', False)
     run_autoregressive_eval = exp.get('run_autoregressive_eval', False)
     save_predicted_curves = exp.get('save_predicted_curves', False)
@@ -303,7 +291,6 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
           f"run_process_modelling={exp.get('run_process_modelling', False)}  "
           f"mining_algorithms={mining_algorithms or '(default)'}  "
           f"run_energy_modelling={run_energy_modelling}  "
-          f"run_joint_duration_eval={run_joint_duration_eval}  "
           f"run_schedule_profile_eval={run_schedule_profile_eval}  "
           f"run_autoregressive_eval={run_autoregressive_eval}  "
           f"save_predicted_curves={save_predicted_curves}  "
@@ -365,7 +352,6 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     env['PIPELINE_TEMPORAL_RESOLUTION']   = exp['temporal_resolution']
     env['PIPELINE_RUN_PROCESS_MODELLING'] = 'true' if exp.get('run_process_modelling', False) else 'false'
     env['PIPELINE_RUN_ENERGY_MODELLING']  = 'true' if run_energy_modelling else 'false'
-    env['PIPELINE_RUN_JOINT_DURATION_EVAL'] = 'true' if run_joint_duration_eval else 'false'
     env['PIPELINE_RUN_SCHEDULE_PROFILE_EVAL'] = 'true' if run_schedule_profile_eval else 'false'
     env['PIPELINE_RUN_AUTOREGRESSIVE_EVAL'] = 'true' if run_autoregressive_eval else 'false'
     env['PIPELINE_SAVE_PREDICTED_CURVES'] = 'true' if save_predicted_curves else 'false'

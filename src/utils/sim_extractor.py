@@ -4551,9 +4551,7 @@ def build_and_train_pipeline_step_dtw(
     (`_tunable` below) — with too few curves the search would select on its own
     training rows, so the fixed fit is used instead. Both arrive from
     CURVE_OPTIMIZE_HYPERPARAMS / CURVE_N_OPTUNA_TRIALS via
-    _train_curve_only_worker, and from the same constants via
-    train_schedule_profile_pipeline_step_dtw, so the leaf pipelines and the
-    schedule-direct comparator are tuned alike.
+    _train_curve_only_worker.
 
     gain_mode : 'step' (default) applies each segment's level gain piecewise-
     constant — sharp edges, the original ml_step_dtw; 'smooth' interpolates the
@@ -7333,12 +7331,10 @@ def _clip_physical(curve):
     measured at ~23-24% of all predicted points on processes 2 and 3, down
     to -512 kW of "cooling water demand".
 
-    Those values are physically impossible, and because the population-level
-    magnitude/variability/coverage comparisons are distributional, negative
-    mass in the predicted distribution corrupts them directly. Clipping is
-    applied to EVERY predictor (process-simulation and schedule-direct
-    alike -- schedule-direct emits ~33% negatives on process_1), so it is a
-    correctness fix, not a thumb on the scale for any one method.
+    Those values are physically impossible, and negative mass in a predicted
+    curve corrupts any downstream distributional comparison directly.
+    Clipping is applied to EVERY predictor, so it is a correctness fix, not
+    a thumb on the scale for any one method.
     """
     return np.clip(np.asarray(curve, dtype=float), 0, None)
 
@@ -7552,426 +7548,6 @@ def _inject_schedule_idle_min(simulated_df, case_col='case_id',
     return df
 
 
-def annotate_simulated_curve_stats(simulated_df, energy_pipelines, sensors,
-                                   activity_exog_means=None,
-                                   temporal_resolution_minutes=15.0,
-                                   case_col='case_id', activity_col='activity',
-                                   object_col='object', exog_lookup=None):
-    """
-    For every activity instance in `simulated_df`, predict each sensor's
-    curve (via predict_curve_for_instance) and reduce it to summary stats.
-
-    Returns a long-format DataFrame with columns
-    ['case_id', 'activity', 'sensor', 'mean_value', 'total_value'] — one row
-    per (instance, sensor) pair that had a usable pipeline. No curve storage,
-    no case/activity matching against a real log — this is computed purely
-    from the simulated log's own activities/durations/attributes.
-    """
-    # Predecessor context per row (name + wall-clock duration of the previous
-    # simulated instance in the same case) — the same two event-log features
-    # ml_external is trained on; 'none'/0.0 mirror the first-of-case
-    # sentinels of split_curves_with_prev_activity(include_prev_energy=False).
-    simulated_df = (simulated_df
-                    .sort_values([case_col, 'timestamp_start'])
-                    .reset_index(drop=True))
-    simulated_df = _inject_schedule_idle_min(simulated_df, case_col, activity_col, object_col)
-    _prev_names = simulated_df.groupby(case_col)[activity_col].shift(1)
-    _durs_min = ((simulated_df['timestamp_end'] - simulated_df['timestamp_start'])
-                 .dt.total_seconds() / 60.0)
-    _prev_durs = _durs_min.groupby(simulated_df[case_col]).shift(1)
-
-    records = []
-    for i, row in simulated_df.iterrows():
-        duration_minutes = (
-            (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60.0
-        )
-        object_attributes = dict(row.get('object_attributes', {}) or {})
-        object_attributes['prev_act_name'] = (
-            str(_prev_names.iloc[i]) if pd.notna(_prev_names.iloc[i]) else 'none')
-        object_attributes['prev_act_duration_min'] = (
-            float(_prev_durs.iloc[i]) if pd.notna(_prev_durs.iloc[i]) else 0.0)
-        for sensor in sensors:
-            curve = predict_curve_for_instance(
-                row[activity_col], row[object_col], duration_minutes,
-                object_attributes, energy_pipelines, sensor,
-                activity_exog_means, temporal_resolution_minutes,
-                exog_lookup=exog_lookup,
-                ts_start=row['timestamp_start'], ts_end=row['timestamp_end'],
-            )
-            if curve is None or len(curve) == 0:
-                continue
-            records.append({
-                'case_id':    row[case_col],
-                'activity':   row[activity_col],
-                'sensor':     sensor,
-                'mean_value': float(np.mean(curve)),
-                'total_value': float(np.sum(curve)),
-            })
-    return pd.DataFrame(records)
-
-
-def extract_real_curve_stats(real_expanded_df, sensors,
-                             case_col='case_id_log', activity_col='activity_log'):
-    """
-    Same output shape as annotate_simulated_curve_stats
-    (['case_id', 'activity', 'sensor', 'mean_value', 'total_value']), computed
-    directly from the real per-timestep sensor dataframe by grouping on
-    (case_id, activity) and reducing each sensor's readings to mean/total.
-    """
-    records = []
-    for (cid, act), g in real_expanded_df.groupby([case_col, activity_col]):
-        for sensor in sensors:
-            if sensor not in g.columns:
-                continue
-            vals = g[sensor].dropna().values
-            if len(vals) == 0:
-                continue
-            records.append({
-                'case_id':     cid,
-                'activity':    act,
-                'sensor':      sensor,
-                'mean_value':  float(np.mean(vals)),
-                'total_value': float(np.sum(vals)),
-            })
-    return pd.DataFrame(records)
-
-
-def compare_energy_distributions(real_stats_df, sim_stats_df, statistic='mean_value'):
-    """
-    Two-level distributional comparison between real and simulated per-instance
-    energy summary stats (from extract_real_curve_stats / annotate_simulated_curve_stats).
-    Uses Earth Mover's Distance (Wasserstein) — no case/activity/instance
-    matching, only pooled distributions.
-
-    statistic : 'mean_value' or 'total_value'
-        Which per-instance summary to compare. 'total_value' surfaces
-        magnitude differences (a case using 2x the energy shows up
-        directly); 'mean_value' is closer to a shape/intensity comparison.
-
-    Returns
-    -------
-    dict with two DataFrames:
-      'per_activity_sensor' — one row per (activity, sensor): pools the
-          per-instance statistic across all cases, real vs simulated.
-      'per_case_sensor' — one row per sensor: first aggregates each case's
-          activities up to one number per case (sum for 'total_value', mean
-          for 'mean_value'), then pools across cases, real vs simulated.
-    """
-    from scipy.stats import wasserstein_distance
-
-    rows_a = []
-    for (act, sensor), real_g in real_stats_df.groupby(['activity', 'sensor']):
-        sim_g = sim_stats_df[
-            (sim_stats_df['activity'] == act) & (sim_stats_df['sensor'] == sensor)
-        ]
-        if sim_g.empty or real_g.empty:
-            continue
-        real_vals = real_g[statistic].values
-        sim_vals  = sim_g[statistic].values
-        rows_a.append({
-            'activity':    act,
-            'sensor':      sensor,
-            'n_real':      len(real_vals),
-            'n_sim':       len(sim_vals),
-            'real_median': float(np.median(real_vals)),
-            'sim_median':  float(np.median(sim_vals)),
-            'wasserstein': float(wasserstein_distance(real_vals, sim_vals)),
-        })
-    per_activity_sensor = pd.DataFrame(rows_a)
-
-    def _per_case(df):
-        agg = 'sum' if statistic == 'total_value' else 'mean'
-        return df.groupby(['case_id', 'sensor'])[statistic].agg(agg).reset_index()
-
-    real_case = _per_case(real_stats_df)
-    sim_case  = _per_case(sim_stats_df)
-
-    rows_b = []
-    for sensor, real_g in real_case.groupby('sensor'):
-        sim_g = sim_case[sim_case['sensor'] == sensor]
-        if sim_g.empty or real_g.empty:
-            continue
-        real_vals = real_g[statistic].values
-        sim_vals  = sim_g[statistic].values
-        rows_b.append({
-            'sensor':        sensor,
-            'n_real_cases':  len(real_vals),
-            'n_sim_cases':   len(sim_vals),
-            'real_median':   float(np.median(real_vals)),
-            'sim_median':    float(np.median(sim_vals)),
-            'wasserstein':   float(wasserstein_distance(real_vals, sim_vals)),
-        })
-    per_case_sensor = pd.DataFrame(rows_b)
-
-    return {'per_activity_sensor': per_activity_sensor, 'per_case_sensor': per_case_sensor}
-
-
-# ---------------------------------------------------------------------------
-# Raw pooled-value distribution comparison — no per-case sum/mean at all.
-#
-# Summing or averaging a sensor's readings across a case only makes physical
-# sense for extensive/flow quantities (power, mass flow) — summing readings
-# of an intensive quantity like temperature has no meaning. This compares
-# every individual reading directly instead, so it works uniformly for any
-# sensor type: pool every timestep from every instance into one set of
-# numbers per sensor (real vs. simulated) and compare those distributions.
-# ---------------------------------------------------------------------------
-
-def pool_real_curve_values(real_expanded_df, sensors, activity_col='activity_log'):
-    """
-    Pool every raw sensor reading (every timestep, every activity instance,
-    every case) per sensor — no per-case or per-activity aggregation.
-
-    Returns {sensor: np.ndarray of all real readings for that sensor}.
-    """
-    pooled = {}
-    for sensor in sensors:
-        if sensor not in real_expanded_df.columns:
-            continue
-        vals = real_expanded_df[sensor].dropna().values
-        if len(vals) > 0:
-            pooled[sensor] = np.asarray(vals, dtype=float)
-    return pooled
-
-
-def pool_simulated_curve_values(simulated_df, energy_pipelines, sensors,
-                                activity_exog_means=None,
-                                temporal_resolution_minutes=15.0,
-                                case_col='case_id', activity_col='activity',
-                                object_col='object', exog_lookup=None):
-    """
-    Pool every predicted sensor curve value (every timestep of every
-    predicted instance) per sensor — no per-instance or per-case aggregation.
-    Mirrors annotate_simulated_curve_stats's prediction step, but keeps the
-    full curve instead of reducing it to mean/total.
-
-    Returns {sensor: np.ndarray of all predicted values for that sensor}.
-    """
-    # Same predecessor-context injection as annotate_simulated_curve_stats —
-    # see the comment there; 'none'/0.0 are the training-side sentinels.
-    simulated_df = (simulated_df
-                    .sort_values([case_col, 'timestamp_start'])
-                    .reset_index(drop=True))
-    simulated_df = _inject_schedule_idle_min(simulated_df, case_col, activity_col, object_col)
-    _prev_names = simulated_df.groupby(case_col)[activity_col].shift(1)
-    _durs_min = ((simulated_df['timestamp_end'] - simulated_df['timestamp_start'])
-                 .dt.total_seconds() / 60.0)
-    _prev_durs = _durs_min.groupby(simulated_df[case_col]).shift(1)
-
-    pooled = {s: [] for s in sensors}
-    for i, row in simulated_df.iterrows():
-        duration_minutes = (
-            (row['timestamp_end'] - row['timestamp_start']).total_seconds() / 60.0
-        )
-        object_attributes = dict(row.get('object_attributes', {}) or {})
-        object_attributes['prev_act_name'] = (
-            str(_prev_names.iloc[i]) if pd.notna(_prev_names.iloc[i]) else 'none')
-        object_attributes['prev_act_duration_min'] = (
-            float(_prev_durs.iloc[i]) if pd.notna(_prev_durs.iloc[i]) else 0.0)
-        for sensor in sensors:
-            curve = predict_curve_for_instance(
-                row[activity_col], row[object_col], duration_minutes,
-                object_attributes, energy_pipelines, sensor,
-                activity_exog_means, temporal_resolution_minutes,
-                exog_lookup=exog_lookup,
-                ts_start=row['timestamp_start'], ts_end=row['timestamp_end'],
-            )
-            if curve is None or len(curve) == 0:
-                continue
-            pooled[sensor].extend(np.asarray(curve, dtype=float).tolist())
-    return {s: np.array(v) for s, v in pooled.items() if v}
-
-
-def compare_pooled_value_distributions(real_pooled, sim_pooled):
-    """
-    Wasserstein distance between the pooled raw-value distributions
-    (from pool_real_curve_values / pool_simulated_curve_values), per sensor.
-    Works uniformly for intensive (temperature, concentration) and
-    extensive (power, flow) sensors alike, since nothing is summed or
-    averaged before comparing.
-    """
-    from scipy.stats import wasserstein_distance
-    rows = []
-    for sensor, real_vals in real_pooled.items():
-        sim_vals = sim_pooled.get(sensor)
-        if sim_vals is None or len(sim_vals) == 0 or len(real_vals) == 0:
-            continue
-        rows.append({
-            'sensor':      sensor,
-            'n_real':      len(real_vals),
-            'n_sim':       len(sim_vals),
-            'real_median': float(np.median(real_vals)),
-            'sim_median':  float(np.median(sim_vals)),
-            'wasserstein': float(wasserstein_distance(real_vals, sim_vals)),
-        })
-    return pd.DataFrame(rows)
-
-
-def compare_population_shape(curves_df, method_series, real_series='real'):
-    """
-    Population-level (unpaired) SHAPE comparison between the real case
-    population and one method's case population — the shape-axis sibling of
-    compare_pooled_value_distributions (which compares raw MAGNITUDE, ignoring
-    time entirely). Operates on a long-format DataFrame with columns
-    ['case_id', 'sensor', 'series', 't_minutes', 'value'] (same schema as
-    predicted_curves.parquet / the curves this module already saves).
-
-    Generalizes the per-case 'W1 time' metric used in
-    compare_schedule_and_stochastic_profiles / compare_complete_case_curves to
-    population level: within EACH population separately, every case's own
-    timestamps are converted to relative time (0..1, using that case's own
-    duration) and its values (clipped to non-negative, used as transport
-    mass) are kept alongside. case_id is then dropped and every case's points
-    are concatenated into one pooled (relative_time, weight) sample per
-    population -- real cases pooled together, method cases pooled together --
-    so no real case is ever matched against a specific method case; only ONE
-    Wasserstein distance is computed per sensor, between the two pooled
-    populations.
-
-    Returns a DataFrame ['sensor', 'n_real_cases', 'n_method_cases',
-    'wasserstein'] -- same column convention as
-    compare_pooled_value_distributions so the two can be merged directly.
-    Already on a scale-free 0..1 relative-time axis, so no extra
-    normalization is needed downstream (unlike the magnitude axis, which is
-    in raw sensor units).
-    """
-    from scipy.stats import wasserstein_distance
-
-    def _pooled_time_mass(sub):
-        t_parts, w_parts, n_cases = [], [], 0
-        for _, g in sub.groupby('case_id'):
-            g = g.sort_values('t_minutes')
-            t = g['t_minutes'].to_numpy(dtype=float)
-            v = g['value'].to_numpy(dtype=float)
-            if t.size == 0:
-                continue
-            duration = float(t.max())
-            if duration <= 1e-9:
-                continue
-            w = np.clip(v, 0, None)
-            if w.sum() <= 0:
-                continue
-            t_parts.append(np.clip(t / duration, 0, 1))
-            w_parts.append(w)
-            n_cases += 1
-        if not t_parts:
-            return None, None, 0
-        return np.concatenate(t_parts), np.concatenate(w_parts), n_cases
-
-    rows = []
-    for sensor, sensor_g in curves_df.groupby('sensor'):
-        real_t, real_w, n_real = _pooled_time_mass(sensor_g[sensor_g['series'] == real_series])
-        method_t, method_w, n_method = _pooled_time_mass(sensor_g[sensor_g['series'] == method_series])
-        if real_t is None or method_t is None:
-            continue
-        rows.append({
-            'sensor':        sensor,
-            'n_real_cases':  n_real,
-            'n_method_cases': n_method,
-            'wasserstein':   float(wasserstein_distance(
-                real_t, method_t, u_weights=real_w, v_weights=method_w)),
-        })
-    return pd.DataFrame(rows)
-
-
-def compare_population_case_stat(curves_df, method_series, stat_fn, real_series='real'):
-    """
-    Population-level (unpaired) comparison of one per-case scalar reduction
-    (e.g. within-case std, peak/max) between the real case population and one
-    method's case population. Generalizes compare_pooled_value_distributions
-    (which pools every raw reading, with no notion of "case" at all) to a
-    specific per-case summary instead -- e.g. does the method reproduce the
-    real distribution of per-case VARIABILITY (stat_fn=np.std, catches methods
-    that regress toward the mean and flatten real case-to-case volatility) or
-    per-case PEAKS (stat_fn=np.max, catches methods that get the average
-    right but never reach real extremes).
-
-    Returns a DataFrame ['sensor', 'n_real_cases', 'n_method_cases',
-    'wasserstein'] -- same column convention as compare_pooled_value_distributions
-    / compare_population_shape, so all three can be merged directly.
-    """
-    from scipy.stats import wasserstein_distance
-
-    def _case_vals(sub):
-        vals = []
-        for _, g in sub.groupby('case_id'):
-            v = g['value'].dropna().to_numpy(dtype=float)
-            if v.size:
-                vals.append(float(stat_fn(v)))
-        return vals
-
-    rows = []
-    for sensor, sensor_g in curves_df.groupby('sensor'):
-        real_vals = _case_vals(sensor_g[sensor_g['series'] == real_series])
-        method_vals = _case_vals(sensor_g[sensor_g['series'] == method_series])
-        if len(real_vals) < 2 or len(method_vals) < 2:
-            continue
-        rows.append({
-            'sensor':         sensor,
-            'n_real_cases':   len(real_vals),
-            'n_method_cases': len(method_vals),
-            'wasserstein':    float(wasserstein_distance(real_vals, method_vals)),
-        })
-    return pd.DataFrame(rows)
-
-
-def compute_population_coverage(curves_df, method_series, real_series='real',
-                                 lower_q=0.05, upper_q=0.95):
-    """
-    Population-level CALIBRATION check -- not a Wasserstein distance, a
-    different KIND of question: not "how far apart are the two
-    distributions" but "does the method's population plausibly COVER
-    reality". For each sensor: what fraction of pooled REAL readings fall
-    within the [lower_q, upper_q] empirical percentile band of the METHOD's
-    pooled readings. The natural check for a stochastic/generative method --
-    ties to calibration/coverage evaluation of probabilistic forecasts.
-
-    HIGHER IS BETTER here (1.0 = every real reading falls inside the
-    method's band) -- the opposite convention from every w1_* metric in this
-    module, which are lower-is-better distances.
-
-    Returns a DataFrame ['sensor', 'n_real', 'n_method', 'coverage'].
-    """
-    rows = []
-    for sensor, sensor_g in curves_df.groupby('sensor'):
-        real_vals = sensor_g[sensor_g['series'] == real_series]['value'].dropna().to_numpy(dtype=float)
-        method_vals = sensor_g[sensor_g['series'] == method_series]['value'].dropna().to_numpy(dtype=float)
-        if real_vals.size == 0 or method_vals.size < 2:
-            continue
-        lo, hi = np.quantile(method_vals, [lower_q, upper_q])
-        inside = (real_vals >= lo) & (real_vals <= hi)
-        rows.append({
-            'sensor':   sensor,
-            'n_real':   int(real_vals.size),
-            'n_method': int(method_vals.size),
-            'coverage': float(inside.mean()),
-        })
-    return pd.DataFrame(rows)
-
-
-# ---------------------------------------------------------------------------
-# Complete-curve (per-case) comparison — curve-as-distribution Wasserstein.
-#
-# Treats one case's full energy profile (its per-activity curves concatenated
-# in time order) as a distribution of energy mass over the time axis, and
-# compares real vs. simulated+predicted profiles for the SAME case with W1
-# (Earth Mover's Distance) over time — a shift-tolerant alternative to
-# pointwise MAE/RMSE that doesn't explode when a simulated activity starts a
-# few minutes early/late.
-#
-# Matching is by case_id: simulation modes in this codebase replay the real
-# test cases through the discovered process model (same case population,
-# though not necessarily the same activity sequence per case), so every real
-# test case has a same-ID simulated counterpart to compare against directly —
-# no population-level/distributional workaround needed here.
-#
-# Both curves are placed on a *case-relative* time axis (minutes since that
-# case's own first activity start) rather than absolute calendar time, so a
-# simulation's scheduling offset (e.g. queueing delay before the case starts)
-# doesn't get charged as timing error — only the internal shape/timing of the
-# case's own profile is compared.
-# ---------------------------------------------------------------------------
-
 def _extract_real_case_curves_all_sensors(real_case_df, sensors,
                                           time_col='datetime_energy', start_col='timestamp_start_log'):
     """
@@ -8142,38 +7718,17 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
     """
     Per real test case (matched to the simulated log by case_id), per sensor:
     build the real case's complete profile and the simulated case's complete
-    predicted profile, and compare them with two Wasserstein distances along
-    two orthogonal axes:
-
-    `wasserstein_time` — EMD with case-relative time as the transport axis,
-    weighted by curve value. Answers "is the timing/shape right" — order-
-    sensitive, but (since it normalises each curve to the same total mass
-    before comparing) blind to whether the overall magnitude is right.
-
-    `wasserstein_value` — EMD with the raw curve *values* as the transport
-    axis, each timestep weighted equally (unweighted). Answers "is the
-    distribution of magnitudes right" — order-blind (doesn't know *when*
-    a value occurred, only that it occurred), but catches both scale and
-    spread/variance errors that `wasserstein_time` can't see, e.g. a model
-    that just predicts the mean everywhere has zero variance in its value
-    distribution and gets penalised here even though it could look
-    deceptively good on a bare mean/total comparison. Works uniformly for
-    intensive (temperature, concentration) and extensive (power, flow)
-    sensors alike, since nothing is summed or averaged before comparing —
-    same reasoning as compare_pooled_value_distributions above.
+    predicted profile, on a shared case-relative time axis.
 
     Returns a DataFrame with one row per (case_id, sensor):
-    ['case_id', 'sensor', 'n_real_pts', 'n_sim_pts', 'wasserstein_time',
-     'wasserstein_value'].
+    ['case_id', 'sensor', 'n_real_pts', 'n_sim_pts'].
 
     When save_curves=True, also returns a second, long-format DataFrame with
     one row per (case_id, sensor, series, timestep) — series in {'real',
     'predicted'} — columns ['case_id', 'sensor', 'series', 't_minutes',
-    'value'], so the exact curves behind the W1 numbers above can be reloaded
-    later for other metrics or plots without re-simulating anything.
+    'value'], so the exact curves can be reloaded later for other metrics or
+    plots without re-simulating anything.
     """
-    from scipy.stats import wasserstein_distance
-
     # Match by case_id as strings, not raw values — the real expanded df and
     # a simulated log can carry the same case_id in different dtypes (e.g.
     # float vs str for numeric-looking IDs), which would silently zero out
@@ -8233,21 +7788,19 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
                 continue
             t_sim, v_sim = sim_pair
 
-            # wasserstein_distance requires non-negative weights.
+            # Only curves with positive total mass are kept — this guard
+            # filters which (case, sensor) curves reach the saved
+            # predicted_curves parquet outputs downstream.
             w_real = np.clip(v_real, 0, None)
             w_sim  = np.clip(v_sim, 0, None)
             if w_real.sum() <= 0 or w_sim.sum() <= 0:
                 continue
 
-            w1_time  = float(wasserstein_distance(t_real, t_sim, u_weights=w_real, v_weights=w_sim))
-            w1_value = float(wasserstein_distance(v_real, v_sim))  # unweighted: values are the axis
             rows.append({
                 'case_id':           cid,
                 'sensor':            sensor,
                 'n_real_pts':        int(len(v_real)),
                 'n_sim_pts':         int(len(v_sim)),
-                'wasserstein_time':  w1_time,
-                'wasserstein_value': w1_value,
             })
 
             if save_curves:
@@ -8280,31 +7833,23 @@ def compare_complete_case_curves(real_expanded_df, simulated_df, energy_pipeline
 
 
 # ---------------------------------------------------------------------------
-# "Schedule Profile Evaluation" — what if we skip process simulation entirely?
+# "Schedule Profile Evaluation" — whole-case reference generators.
 #
 # Everything above (compare_complete_case_curves) predicts a case's energy
 # profile by first simulating its activities/durations via the discovered
-# process model, then predicting each activity's curve. This section builds
-# and evaluates an alternative that never sees the process at all: given only
-# what a production schedule knows in advance — recipe/case attributes, case
-# start time, external factors (a weather forecast, not a simulation output)
-# — predict the WHOLE case's energy profile directly, one case = one curve,
-# the same DBA-barycenter + DTW-decode + regression architecture used
-# elsewhere in this file, just at case granularity instead of activity
-# granularity. Answers: does going through process simulation actually beat
-# just regressing straight from the schedule to a profile?
+# process model, then predicting each activity's curve. This section works at
+# CASE granularity instead: one complete real curve plus schedule-level
+# features per case (build_case_level_curves), a dedicated case-duration
+# regressor (train_case_duration_pipeline), and two naive reference
+# generators — a stochastic generator (per-canonical-position Normal fit,
+# sampled), the "DES + stochastic distributions" style of prior energy-DES
+# literature (e.g. Kouki et al. 2017), plus a bootstrap resampler of whole
+# training curves.
 #
-# Paired with a second, even more naive reference: a stochastic generator
-# (per-canonical-position Normal fit, sampled) that doesn't even use schedule
-# features — the "DES + stochastic distributions" style of prior energy-DES
-# literature (e.g. Kouki et al. 2017), as opposed to a learned model.
-#
-# Since there's no simulated duration for a schedule-only prediction, every
-# case's predicted (and stochastic) profile is placed on the SAME fixed time
-# axis: the mean real case duration over the training set. That value is also
-# what the DBA barycenter itself is expressed against, so training and
-# prediction use one consistent notion of "how long is a typical case" rather
-# than each case's own (unknown, at prediction time) length.
+# Since there's no simulated duration for a generated profile, each sampled
+# profile is placed on the case's predicted duration when a duration
+# pipeline is available, else on the median real case duration over the
+# training set.
 # ---------------------------------------------------------------------------
 
 def build_case_level_curves(real_expanded_df, sensor, ef_cols=None,
@@ -8347,329 +7892,13 @@ def build_case_level_curves(real_expanded_df, sensor, ef_cols=None,
     return out
 
 
-def train_schedule_profile_pipeline(train_cases, fixed_length=None, val_size=0.2,
-                                    random_state=42, max_barycenter_cases=150,
-                                    model_class=None, verbose=0):
-    """
-    Train a case-level, schedule-only profile predictor: DBA barycenter + DTW
-    decode + regression — the same architecture as build_and_train_pipeline,
-    but the base unit is a whole case, and the only inputs are schedule-level
-    features (see build_case_level_curves) — no simulated activities,
-    duration, or previous-activity context.
-
-    max_barycenter_cases caps how many cases feed the DBA computation itself
-    (the slow part) — the regression fit afterwards uses all of them. This
-    keeps runtime roughly constant regardless of how many cases a process has.
-
-    Returns a pipeline dict compatible with predict_schedule_profile_curve,
-    or None if there isn't enough data to train on.
-    """
-    if model_class is None:
-        model_class = GradientBoostingRegressor
-    if len(train_cases) < 4:
-        if verbose:
-            print(f"  [schedule-profile] skipped: only {len(train_cases)} cases (need >= 4)")
-        return None
-
-    rng = np.random.default_rng(random_state)
-    if len(train_cases) <= max_barycenter_cases:
-        bary_cases = train_cases
-    else:
-        idx = rng.choice(len(train_cases), size=max_barycenter_cases, replace=False)
-        bary_cases = [train_cases[i] for i in idx]
-
-    if fixed_length is None:
-        fixed_length = max(2, int(round(np.median([len(c['values']) for c in train_cases]))))
-    resampled_for_dba = np.array([
-        np.interp(np.linspace(0, 1, fixed_length), np.linspace(0, 1, len(c['values'])), c['values'])
-        for c in bary_cases
-    ])[:, :, np.newaxis]
-    dba_barycenter  = _robust_dtw_barycenter(resampled_for_dba, barycenter_size=fixed_length)
-    # Restore the on/off duty cycle DBA averages away (see
-    # _zero_calibrate_barycenter); no-op for non-intermittent sensors.
-    reference_curve = _zero_calibrate_barycenter(dba_barycenter[:, 0], resampled_for_dba)
-
-    for c in train_cases:
-        c['resampled_values'] = _align_curve_with_dtw(c['values'], reference_curve)
-
-    all_keys, key_types = _infer_key_types(train_cases)
-
-    _rel_denom = max(fixed_length - 1, 1)
-    rows = []
-    for c in train_cases:
-        for position_idx in range(fixed_length):
-            row = {'case_id': c['case_id'], 'position_idx': position_idx,
-                   'relative_pos': position_idx / _rel_denom, 'y': c['resampled_values'][position_idx]}
-            for key in all_keys:
-                value = c['attributes'].get(key, None)
-                if key_types[key] == 'numeric':
-                    try:
-                        row[key] = float(value) if value is not None else np.nan
-                    except (ValueError, TypeError):
-                        row[key] = np.nan
-                else:
-                    row[key] = str(value) if value is not None else 'None'
-            rows.append(row)
-    df_reg = pd.DataFrame(rows)
-
-    categorical_cols = [k for k in all_keys if key_types[k] == 'category']
-    X_all = df_reg[['position_idx', 'relative_pos']].copy()
-    for key in all_keys:
-        X_all = X_all.assign(**{key: df_reg[key].values})
-    if categorical_cols:
-        X_all = pd.get_dummies(X_all, columns=categorical_cols, drop_first=True)
-    y_all = df_reg['y'].copy()
-
-    unique_cases = df_reg['case_id'].unique()
-    if len(unique_cases) < 4:
-        train_inst, val_inst = unique_cases, unique_cases
-    else:
-        train_inst, val_inst = train_test_split(unique_cases, test_size=val_size, random_state=random_state)
-    train_mask = df_reg['case_id'].isin(train_inst)
-    val_mask   = df_reg['case_id'].isin(val_inst)
-
-    X_train, X_val = X_all[train_mask].copy(), X_all[val_mask].copy()
-    y_train, y_val = y_all[train_mask].copy(), y_all[val_mask].copy()
-    feature_columns = X_all.columns.tolist()
-
-    numeric_feature_cols = ['position_idx', 'relative_pos'] + [k for k in all_keys if key_types[k] == 'numeric']
-    numeric_feature_cols = [c for c in numeric_feature_cols if c in X_train.columns]
-
-    feature_scaler = None
-    if numeric_feature_cols:
-        X_train[numeric_feature_cols] = X_train[numeric_feature_cols].astype('float64')
-        X_val[numeric_feature_cols]   = X_val[numeric_feature_cols].astype('float64')
-        feature_scaler = StandardScaler()
-        X_train.loc[:, numeric_feature_cols] = feature_scaler.fit_transform(X_train[numeric_feature_cols])
-        X_val.loc[:, numeric_feature_cols]   = feature_scaler.transform(X_val[numeric_feature_cols])
-
-    X_train = X_train.fillna(0)
-    X_val   = X_val.fillna(0)
-
-    model = model_class(n_estimators=150, max_depth=5, learning_rate=0.1,
-                        subsample=0.8, random_state=random_state)
-    model.fit(X_train, y_train)
-    val_mae = float(mean_absolute_error(y_val, model.predict(X_val))) if len(X_val) else float('nan')
-
-    if verbose:
-        print(f"  [schedule-profile] trained on {len(train_cases)} cases "
-              f"({len(bary_cases)} for barycenter), val_mae={val_mae:.4f}")
-
-    return {
-        'model': model, 'reference_curve': reference_curve, 'fixed_length': fixed_length,
-        'all_keys': all_keys, 'key_types': key_types, 'feature_columns': feature_columns,
-        'feature_scaler': feature_scaler, 'numeric_feature_cols': numeric_feature_cols,
-        'val_mae': val_mae,
-    }
-
-
-def predict_schedule_profile_curve(attributes, pipeline, median_case_duration_minutes,
-                                   n_samples=None):
-    """
-    Predict a complete case profile from schedule-only attributes. Output time
-    axis is fixed at median_case_duration_minutes for every case — the only
-    length assumption available without simulating the process, not the
-    (unknown, at prediction time) true case duration.
-
-    `n_samples` resamples the finished curve onto that many points -- see
-    SCHEDULE_DIRECT_LENGTH_SOURCE. The model is still evaluated at its own
-    `fixed_length` positions and interpolated afterwards, deliberately: the
-    regression is fitted on position_idx / relative_pos, so predicting directly
-    at foreign positions would extrapolate features rather than resample a curve.
-
-    Returns (t, v), same shape as the other build_*_case_curve functions.
-    """
-    fixed_length          = pipeline['fixed_length']
-    model                 = pipeline['model']
-    feature_columns       = pipeline['feature_columns']
-    feature_scaler        = pipeline.get('feature_scaler')
-    numeric_feature_cols  = pipeline.get('numeric_feature_cols', [])
-    all_keys              = pipeline['all_keys']
-    key_types             = pipeline['key_types']
-
-    _rel_denom = max(fixed_length - 1, 1)
-    rows = []
-    for position_idx in range(fixed_length):
-        row = {'position_idx': position_idx, 'relative_pos': position_idx / _rel_denom}
-        for key in all_keys:
-            value = attributes.get(key, None)
-            if key_types[key] == 'numeric':
-                try:
-                    row[key] = float(value) if value is not None else np.nan
-                except (ValueError, TypeError):
-                    row[key] = np.nan
-            else:
-                row[key] = str(value) if value is not None else 'None'
-        rows.append(row)
-    X = pd.DataFrame(rows)
-
-    categorical_cols = [k for k in all_keys if key_types[k] == 'category']
-    if categorical_cols:
-        X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
-    for col in feature_columns:
-        if col not in X.columns:
-            X[col] = 0
-    X = X[feature_columns]
-
-    if feature_scaler is not None and numeric_feature_cols:
-        cols_to_scale = [c for c in numeric_feature_cols if c in X.columns]
-        if cols_to_scale:
-            X[cols_to_scale] = X[cols_to_scale].astype('float64')
-            X.loc[:, cols_to_scale] = feature_scaler.transform(X[cols_to_scale])
-    X = X.fillna(0)
-
-    y_pred = model.predict(X)
-    if n_samples is not None and int(n_samples) >= 2 and int(n_samples) != fixed_length:
-        _n = int(n_samples)
-        y_pred = np.interp(np.linspace(0, 1, _n), np.linspace(0, 1, fixed_length), y_pred)
-        t = np.linspace(0, median_case_duration_minutes, _n)
-    else:
-        t = np.linspace(0, median_case_duration_minutes, fixed_length)
-    # Same non-negativity constraint as the process-simulation curves
-    # (see _clip_physical) -- applied to every predictor, not just one.
-    return t, _clip_physical(y_pred)
-
-
-# --- Schedule-direct with the STEP-DTW method (the process ablation) --------
-# train_schedule_profile_pipeline above answers "schedule-only vs. the full
-# pipeline" with a DIFFERENT curve method on each side (DBA+DTW+GBR here,
-# ml_step_dtw_smooth in the complete-curve eval), so its gap prices the process
-# model and the curve method together. The pair below holds the curve method
-# fixed: the same builder that produces 'ml_step_dtw_smooth' per (sensor,
-# activity, object) leaf is trained here on WHOLE-CASE curves with schedule-only
-# features, so the remaining gap against "Best, mine" is what the process model
-# itself contributes (per-activity leaves, activity duration + prev-activity
-# context, and a simulated rather than regressed span).
-#
-# The segment cap is TIED to ml_step_dtw's own STEP_DTW_MAX_SEGMENTS, because
-# "the same curve method" has to include its capacity. An earlier value of 25
-# was chosen on the argument that a whole case is longer and multi-phase, so it
-# should be allowed a finer staircase than a single activity's curve — but that
-# also makes segment count a second thing varying between this row and the
-# Petri-net rows, and segment count is exactly what sets how well the spread and
-# jaggedness of a curve can be reproduced (the Std and Roughness columns, where
-# this row's margin is largest). With the caps equal, the remaining gap is the
-# process model alone, which is the only claim this comparator is here to make.
-#
-# Nothing here picks a segment COUNT — _stepdtw_segment_medoid chooses that by
-# BIC, separately capped at L // min_seg with min_seg = max(2, L // 25), i.e.
-# ~25 for any curve of 50+ samples. So this cap BINDS on whole-case curves in a
-# way it barely does per activity: if the logged counts (verbose=1 logs
-# "-> N segment(s)") sit at the cap for most cases, the honest report is the
-# matched-capacity number here plus an uncapped variant named as its own row,
-# not a silent raise back to 25.
-SCHEDULE_STEP_DTW_MAX_SEGMENTS = int(_os_seed.environ.get(
-    'PIPELINE_SCHEDULE_STEP_DTW_MAX_SEGMENTS', str(STEP_DTW_MAX_SEGMENTS)))
-
-# A predicted span that is wildly wrong must not turn into a multi-million-point
-# curve; lengths are clipped to this multiple of the median training length.
-_SCHEDULE_STEP_DTW_MAX_LENGTH_FACTOR = 4.0
-
-
-def _case_to_step_dtw_curve(case):
-    """One build_case_level_curves case as a curve dict the step-DTW builder
-    accepts. 'activity' and 'instance_id' are required by the builder's own
-    scoring hooks (_attach_median_floor, the fallback gate); there is only one
-    'activity' here by construction — the whole case."""
-    return {
-        'instance_id':     str(case['case_id']),
-        'case_id':         str(case['case_id']),
-        'activity':        '__case__',
-        'attributes':      dict(case.get('attributes') or {}),
-        'original_values': np.asarray(case['values'], dtype=float),
-        # ef_* factors are already reduced to per-case means inside
-        # 'attributes' by build_case_level_curves, so there is no per-position
-        # exogenous series left to hand over — the features stay case-level.
-        'exog_values':     {},
-    }
-
-
-def train_schedule_profile_pipeline_step_dtw(
-        train_cases, variable='case_profile', gain_mode='smooth',
-        max_segments=None, val_size=0.2, random_state=42, verbose=0,
-        optimize_hyperparams=False, n_trials=50):
-    """
-    Train the step-DTW curve method at CASE granularity on schedule-only
-    features — the like-for-like comparator described above.
-
-    Returns a pipeline dict for predict_schedule_profile_curve_step_dtw, or
-    None when there are too few cases to train on. The do-no-harm fallback gate
-    is off (fallback_pipeline=None): it can only route to an ml_external leaf
-    pipeline, which does not exist at case granularity.
-
-    `optimize_hyperparams` / `n_trials` are forwarded to the builder so this
-    comparator can run the SAME Optuna search the ml_step_dtw leaf pipelines run
-    under curve_optimize_hyperparams. Left off, the two sides of the "does the
-    process model help?" comparison differ in tuning as well as in the process
-    model, and tuned-vs-untuned is not a difference anyone wants in that number.
-    Note the cost: the search runs per segment, per (process, sensor).
-    """
-    if len(train_cases) < 4:
-        if verbose:
-            print(f"  [schedule-profile/step-dtw] skipped: only {len(train_cases)} cases (need >= 4)")
-        return None
-
-    curves = [_case_to_step_dtw_curve(c) for c in train_cases]
-    pipeline = build_and_train_pipeline_step_dtw(
-        curves, variable=variable,
-        gain_mode=gain_mode,
-        max_segments=(SCHEDULE_STEP_DTW_MAX_SEGMENTS if max_segments is None
-                      else int(max_segments)),
-        val_size=val_size, random_state=random_state, verbose=verbose,
-        optimize_hyperparams=optimize_hyperparams, n_trials=n_trials,
-        fallback_pipeline=None, prev_act_energy_map=None,
-    )
-
-    # Sampling rate of the training curves, so a predicted span in MINUTES can
-    # be turned back into a curve length in SAMPLES — 'curve_length' is one of
-    # the model's own features, so it has to stay in the units it was fitted in.
-    _spm = [len(c['values']) / max(float(c['duration_minutes']), 1e-6) for c in train_cases]
-    _spm = float(np.median([s for s in _spm if np.isfinite(s) and s > 0] or [0.0]))
-    pipeline['samples_per_minute']  = _spm if _spm > 0 else None
-    pipeline['median_curve_length'] = int(np.median([len(c['values']) for c in train_cases]))
-    return pipeline
-
-
-def predict_schedule_profile_curve_step_dtw(attributes, pipeline, case_duration_minutes,
-                                            n_samples=None):
-    """
-    Predict a complete case profile with the step-DTW method from schedule-only
-    attributes, placed on `case_duration_minutes` (the case's own predicted
-    span, exactly like the other schedule-level baselines get).
-
-    `n_samples` forces the curve length instead of deriving it from the span --
-    see SCHEDULE_DIRECT_LENGTH_SOURCE. When it is given the span is assumed to
-    have been taken from the same external source, so the 4x guard below is NOT
-    applied: clipping a length that was handed over on purpose would silently
-    re-introduce the very asymmetry the override exists to remove.
-
-    Returns (t, v), same shape as predict_schedule_profile_curve.
-    """
-    _median_len = int(pipeline.get('median_curve_length') or pipeline.get('fixed_length') or 2)
-    if n_samples is not None:
-        n = max(2, int(n_samples))
-    else:
-        spm = pipeline.get('samples_per_minute')
-        n = int(round(float(case_duration_minutes) * spm)) if spm else _median_len
-        n = int(np.clip(n, 2, max(2, int(_SCHEDULE_STEP_DTW_MAX_LENGTH_FACTOR * _median_len))))
-
-    attrs = dict(attributes or {})
-    attrs['_pred_curve_length'] = n
-    v = np.asarray(predict_raw_curve_step_dtw(np.zeros(n), '__case__', attrs, pipeline,
-                                              exog_values={}), dtype=float)
-    t = np.linspace(0, float(case_duration_minutes), len(v))
-    return t, _clip_physical(v)
-
-
 def train_case_duration_pipeline(train_cases, val_size=0.2, random_state=42,
                                  model_class=None, verbose=0,
                                  allow_median_fallback=True):
     """
     Train a case-level TOTAL DURATION predictor: schedule-only attributes
-    (see build_case_level_curves) -> scalar case duration (minutes). Same
-    feature encoding as train_schedule_profile_pipeline, but one row per
-    case (not per position) and a single scalar target instead of a whole
-    curve.
+    (see build_case_level_curves) -> scalar case duration (minutes). One row
+    per case, with a single scalar target.
 
     Used to correct "Best, duration-corrected": the process-simulation
     timeline (discovered process model + per-activity duration draws) has
@@ -8918,21 +8147,17 @@ def compare_schedule_and_stochastic_profiles(test_cases, stochastic_generator,
                                              save_curves=False, bootstrap_generator=None,
                                              duration_pipeline=None):
     """
-    For each real test case (from build_case_level_curves), compare its real
-    complete profile against one stochastic-generator sample (and, when given,
-    one bootstrap sample), using the same two Wasserstein distances as
-    compare_complete_case_curves.
+    For each real test case (from build_case_level_curves), place its real
+    complete profile alongside one stochastic-generator sample (and, when
+    given, one bootstrap sample) on a shared time axis.
 
-    Returns a DataFrame with one row per case_id:
-    ['case_id', 'stochastic_wasserstein_time', 'stochastic_wasserstein_value',
-     'bootstrap_wasserstein_time', 'bootstrap_wasserstein_value'].
+    Returns a DataFrame with one row per case_id: ['case_id'].
 
     When save_curves=True, also returns a second, long-format DataFrame with
     one row per (case_id, series, timestep) — series in {'real', 'stochastic',
     'bootstrap'} — columns ['case_id', 'series', 't_minutes', 'value'], so the
-    exact curves behind the W1 numbers above can be reloaded later for other
-    metrics or plots. The caller adds a 'sensor' column since this function is
-    called once per sensor.
+    exact curves can be reloaded later for other metrics or plots. The caller
+    adds a 'sensor' column since this function is called once per sensor.
 
     Span handling: when ``duration_pipeline`` is given, each predicted series
     (stochastic, bootstrap) is placed on that case's OWN predicted total
@@ -8942,7 +8167,6 @@ def compare_schedule_and_stochastic_profiles(test_cases, stochastic_generator,
     every case. Falls back to ``median_case_duration_minutes`` per case
     whenever no predictor is available or the prediction is non-positive.
     """
-    from scipy.stats import wasserstein_distance
     rng = np.random.default_rng(random_state)
     rows = []
     curve_rows = [] if save_curves else None
@@ -8970,10 +8194,10 @@ def compare_schedule_and_stochastic_profiles(test_cases, stochastic_generator,
 
         if stochastic_generator is not None:
             t_stoch, v_stoch = sample_stochastic_profile(stochastic_generator, case_span, rng=rng)
+            # Positive-mass guard — filters which curves reach the saved
+            # predicted_curves parquet downstream.
             w_stoch = np.clip(v_stoch, 0, None)
             if w_stoch.sum() > 0:
-                row['stochastic_wasserstein_time']  = float(wasserstein_distance(t_real, t_stoch, u_weights=w_real, v_weights=w_stoch))
-                row['stochastic_wasserstein_value'] = float(wasserstein_distance(v_real, v_stoch))
                 if save_curves:
                     curve_rows.extend({'case_id': c['case_id'], 'series': 'stochastic', 't_minutes': float(t), 'value': float(v)}
                                       for t, v in zip(t_stoch, v_stoch))
@@ -8982,8 +8206,6 @@ def compare_schedule_and_stochastic_profiles(test_cases, stochastic_generator,
             t_boot, v_boot = sample_bootstrap_profile(bootstrap_generator, case_span, rng=rng)
             w_boot = np.clip(v_boot, 0, None)
             if w_boot.sum() > 0:
-                row['bootstrap_wasserstein_time']  = float(wasserstein_distance(t_real, t_boot, u_weights=w_real, v_weights=w_boot))
-                row['bootstrap_wasserstein_value'] = float(wasserstein_distance(v_real, v_boot))
                 if save_curves:
                     curve_rows.extend({'case_id': c['case_id'], 'series': 'bootstrap', 't_minutes': float(t), 'value': float(v)}
                                       for t, v in zip(t_boot, v_boot))
@@ -8993,83 +8215,6 @@ def compare_schedule_and_stochastic_profiles(test_cases, stochastic_generator,
     if save_curves:
         return pd.DataFrame(rows), pd.DataFrame(curve_rows)
     return pd.DataFrame(rows)
-
-
-def evaluate_pipeline_joint_duration(test_curves, pipeline):
-    """
-    Timing-aware evaluation for joint duration experiments.
-
-    Differs from evaluate_pipeline_on_test in the decode step:
-      1. Resample original_values to _pred_curve_length steps  → fake_raw
-      2. _dispatch_predict(fake_raw, ...)  → y_pred at _pred_cl steps
-         (DTW decode uses _pred_cl-scaled timeline; curve_length feature = _pred_cl)
-      3. Linearly resample y_pred from _pred_cl back to len(original_values)
-      4. Compare to original_values
-
-    When _pred_cl == original_length the result is identical to the standard eval.
-    When _pred_cl != original_length (wrong simulated duration) the decode operates
-    on the wrong time scale, so timing errors propagate into sMAE/sRMSE/WAPE.
-    """
-    per_curve_metrics = []
-    all_true, all_pred = [], []
-
-    for curve in test_curves:
-        orig_values = np.asarray(curve['original_values'], dtype=float)
-        orig_len    = len(orig_values)
-        pred_cl     = max(2, int(curve['attributes'].get('_pred_curve_length', orig_len)))
-
-        # Step 1 — resample real curve to predicted length (sets DTW time scale)
-        fake_raw = np.interp(
-            np.linspace(0, orig_len - 1, pred_cl),
-            np.arange(orig_len),
-            orig_values,
-        )
-
-        # Step 2 — predict at predicted length
-        y_pred_at_pred = np.asarray(_dispatch_predict(fake_raw, curve, pipeline), dtype=float)
-
-        # Step 3 — resample prediction back to real length for comparison
-        if pred_cl == orig_len:
-            y_pred = y_pred_at_pred
-        else:
-            y_pred = np.interp(
-                np.linspace(0, pred_cl - 1, orig_len),
-                np.arange(pred_cl),
-                y_pred_at_pred,
-            )
-
-        # Step 4 — compute metrics against real values
-        mae   = float(mean_absolute_error(orig_values, y_pred))
-        rmse  = float(np.sqrt(mean_squared_error(orig_values, y_pred)))
-        _den  = float(np.sum(np.abs(orig_values)))
-        wape  = float(np.sum(np.abs(orig_values - y_pred)) / _den * 100) if _den > 0 else np.nan
-
-        _mu  = orig_values.mean()
-        _sig = orig_values.std()
-        _cv_ok = _sig > 1e-10 and (_mu == 0 or (_sig / abs(_mu)) > 0.01)
-        if _cv_ok:
-            _zt   = (orig_values - _mu) / _sig
-            _zp   = (y_pred      - _mu) / _sig
-            smae  = float(np.mean(np.abs(_zt - _zp)))
-            srmse = float(np.sqrt(np.mean((_zt - _zp) ** 2)))
-        else:
-            smae = srmse = np.nan
-
-        per_curve_metrics.append({
-            'instance_id': curve['instance_id'],
-            'activity':    curve['activity'],
-            'n_points':    orig_len,
-            'MAE':         mae,
-            'RMSE':        rmse,
-            'WAPE (%)':    wape,
-            'sMAE':        smae,
-            'sRMSE':       srmse,
-        })
-        all_true.extend(orig_values.tolist())
-        all_pred.extend(y_pred.tolist())
-
-    mdf = pd.DataFrame(per_curve_metrics)
-    return mdf, (np.array(all_true), np.array(all_pred))
 
 
 # %%
@@ -9086,9 +8231,9 @@ def evaluate_pipeline_joint_duration(test_curves, pipeline):
 # (sklearn models, arrays, scalars, torch modules) plus 'reference_curve'. The
 # 'predict_fn' closures are NOT saved — they are lambdas 02_modelling wraps
 # around full_pipeline, so they are rebuilt on load by rebuild_energy_predict_fns
-# from the same approach -> module-level predictor mapping. The schedule-direct
-# family (schedule / schedule_step / duration pipelines / generators) is plain
-# dicts whose predictors are already module-level functions, so it reloads as-is.
+# from the same approach -> module-level predictor mapping. The duration
+# pipelines and stochastic generators are plain dicts whose predictors are
+# already module-level functions, so they reload as-is.
 #
 # Set PIPELINE_SAVE_TRAINED_MODELS=false to skip saving (e.g. disk-tight runs).
 

@@ -89,19 +89,19 @@ def sterilization_profile(t_ges = 6000,
     T2 = np.minimum(T2, T_steri)
     T2 = T2 - (T2[0] - T1[-1]) * (1 - (t2 - t_phase)/(t_heating - t_phase))
 
-    # === Gesamtdaten kombinieren
+    # === Combine overall data
     t_total = np.concatenate([t1, t2])
     T_total = np.concatenate([T1, T2])
-    # === PHASE 1 (t1): Konstanter Massenstrom
+    # === PHASE 1 (t1): constant mass flow
     Q_dot_steam1 = np.full_like(t1, m_dot_steam * h_vap_kJkg)  # [kW]
-    # === PHASE 2 (t2): Abnehmender Massenstrom
+    # === PHASE 2 (t2): decreasing mass flow
     Q_dot_steam2 = m_dot2 * h_vap_kJkg  # [kW]
-    # === Gesamter Leistungsvektor und Zeitvektor
+    # === Total power vector and time vector
     Q_dot_steam_total = np.concatenate([Q_dot_steam1, Q_dot_steam2])
     t_steam_total = np.concatenate([t1, t2])
 
 
-    # === Dampfmassenberechnung ===
+    # === Steam mass calculation ===
     m_dampf_phase1 = m_dot_steam * (t1[-1] - t1[0])
     m_dampf_phase2 = trapezoid(m_dot2, t2)
     m_dampf_gesamt = m_dampf_phase1 + m_dampf_phase2
@@ -112,10 +112,10 @@ def sterilization_profile(t_ges = 6000,
                                                      h_vap_kJkg) * hold_duty_factor
     m_dampf_gesamt = m_dampf_gesamt + m_steam_holding
 
-    # === Speicherberechnung ===
+    # === Storage calculation ===
     volume_storage = calculate_storage_volume(m_dampf_gesamt, T_steam, fill_factor, delta_T_storage)
 
-    # Ziel-Kühlenergie aus Systemmodell
+    # Target cooling energy from the system model
     Q_target_kJ, _ = calculate_cooling_demand(m_cp, T_steri, T_final)
     Q_target_kWh = Q_target_kJ / 3600
     cp_cool = cp_water
@@ -123,7 +123,7 @@ def sterilization_profile(t_ges = 6000,
     t3 = np.arange(int(t_heating) + int(t_holding) + 1, int(t_ges) + 1)
     t_cool_relative = t3 - t3[0]
     t_cool_duration = t_cool_relative[-1]
-    # Iterative Suche nach passendem k
+    # Iterative search for a suitable k
     k = 1e-3
     tolerance = 0.01
     max_iterations = 100
@@ -136,7 +136,7 @@ def sterilization_profile(t_ges = 6000,
         if T0_out <= T_steri:
             break
         k *= 0.9
-    # Temperaturverlauf: a smooth rise-then-fall "bump" instead of a pure exponential
+    # Temperature course: a smooth rise-then-fall "bump" instead of a pure exponential
     # decay — a quick but continuous ramp-up (no instant jump when cooling switches
     # on), a brief near-peak plateau, then an S-shaped decay back down. The peak is
     # fixed at delta_T0 (already guaranteed <= T_steri by the search above, so no
