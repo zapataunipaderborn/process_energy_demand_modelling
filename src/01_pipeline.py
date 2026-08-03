@@ -208,18 +208,6 @@ EXPERIMENTS = [
         'split_type':            'temporal',
         'random_seed':           42,     
                                          
-        # seq2seq first: they are the only approaches that have ever killed a run
-        # (numba/softDTW in a forked worker), and 02_modelling.py now trains the
-        # seq2seq pool BEFORE the sklearn pool, so a fork problem surfaces in the
-        # first minutes of process_1 instead of hours in. Order here is the
-        # reporting order; the pool order is what makes the failure early.
-        #
-        # NOTE the pair keeps its previous RELATIVE order (external before iom).
-        # A seq2seq worker seeds once per combo (stable_seed('seq2seq', s, a, o))
-        # and then trains its approaches in list order off that one stream, so
-        # swapping the two would silently change both models' numbers. Moving the
-        # pair ahead of the sklearn names does not: the two pools filter APPROACHES
-        # into disjoint lists, so only order WITHIN a group reaches the RNG.
         'curve_approaches': [
             'seq2seq_external',
             'seq2seq_iom',
@@ -229,18 +217,6 @@ EXPERIMENTS = [
             'ml_only',
             'ml_step_dtw_smooth',
         ],
-        # LSTM only — the transformer cell is the O(T^2) one and it is what made
-        # experiment_1_20260801 look hung. Both cells used to be trained per combo
-        # with the lower val_loss kept; on this data's long activities that cost:
-        #   T=1000  lstm 15.4 min   transformer  47.3 min
-        #   T=2000  lstm 24.6 min   transformer 175.3 min   (per combo, per approach,
-        #                                                    at the worker's 1 thread)
-        # Attention is quadratic in sequence length, the LSTM is ~linear, and the
-        # long-activity combos in process_4_1 run to thousands of 1-min steps.
-        # Dropping the cell removes the quadratic term AND the second training run
-        # per combo — roughly 8x on the affected process. Set to
-        # ['lstm', 'transformer'] to restore the comparison (and expect the long
-        # combos to take hours).
         'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
@@ -311,40 +287,15 @@ for i, exp in enumerate(EXPERIMENTS, start=1):
     print(f"{'='*60}\n")
 
     env = os.environ.copy()
-    # ── CPU-only, fork-safe child ────────────────────────────────────────────
-    # Hide the GPUs from the modelling child BEFORE torch is ever imported.
-    # Everything in the run is CPU-only by design, but a parent that has merely
-    # probed CUDA (set_global_seeds' torch.cuda.is_available at startup) forks
-    # poisoned children: experiment_986 lost 7 hours with all 16 seq2seq
-    # workers and the parent stuck in futex_wait at 4s CPU each — the
-    # in-worker guards (_train_seq2seq_worker) run only AFTER the fork, which
-    # is too late for locks inherited FROM the fork. With no visible GPU the
-    # parent never initialises CUDA and there is nothing to inherit.
+    
     env['CUDA_VISIBLE_DEVICES']           = ''
     env['PYTORCH_NVML_BASED_CUDA_CHECK']  = '1'
-    # numba must use its FORK-SAFE threading layer. This is the confirmed cause of
-    # the experiment_1_20260731 death: tslearn's softDTW (seq2seq_iom's reference
-    # curve) is @njit, and numba resolves its threading layer by priority
-    # tbb > omp > workqueue. TBB is not installed in htp_causal, so it picks 'omp'
-    # -- and numba's OpenMP layer (numba/np/ufunc/omppool.*.so) installs a
-    # pthread_atfork CHILD handler that prints
-    #   "Terminating: fork() called from a process already using GNU OpenMP..."
-    # and kills every process forked after numba has run in the parent. Once the
-    # seq2seq stall-watchdog fell back to running tasks INLINE (which executes
-    # softDTW in the parent), the next pool's 16 workers were all killed at fork.
-    # 'workqueue' is numba's fork-safe layer and carries no atfork handler.
-    # Verified: parent-runs-softDTW then forks 16 workers -> 0/16 under the default
-    # layer, 16/16 under workqueue, with identical numerics.
     env['NUMBA_THREADING_LAYER']          = 'workqueue'
     # ── Reproducibility ──────────────────────────────────────────────────────
     # One master seed for the child run: 02_modelling.py seeds python/numpy/torch
     # from it and derives every per-combo training seed from it.
     env['PIPELINE_RANDOM_SEED']       = str(random_seed)
     env['PIPELINE_RANDOM_SPLIT_SEED'] = str(random_seed)
-    # PYTHONHASHSEED only takes effect at interpreter start, so it has to be set
-    # HERE, on the child's environment — str hashing is randomised per process
-    # otherwise, and any set-of-strings iterated without sorting would order
-    # differently between two runs that are identical in every other respect.
     env['PYTHONHASHSEED']             = str(random_seed)
     env['PIPELINE_DATA_EXPERIMENT']       = exp['data_experiment']
     env['PIPELINE_RUN_NAME']              = exp['run_name']

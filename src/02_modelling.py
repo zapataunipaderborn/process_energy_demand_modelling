@@ -1,24 +1,10 @@
-# %% [markdown]
-# <div style="text-align: center; font-size: 50px;">
-#     <b>Energy and Sensor mapping on Process Data</b>
-# </div>
 
 # %%
 
 import os
-# Disable ALL progress bars (tqdm) to silence pm4py replay noise
+
 os.environ["TQDM_DISABLE"] = "1"
 
-# numba must use its FORK-SAFE threading layer, and this has to be set BEFORE
-# numba is imported (pm4py/tslearn pull it in below). numba resolves the layer by
-# priority tbb > omp > workqueue; TBB is not installed in htp_causal, so the
-# default is 'omp' -- whose atfork child handler KILLS every process forked after
-# numba has run in this one ("Terminating: fork() called from a process already
-# using GNU OpenMP"). That is what killed experiment_1_20260731: the seq2seq
-# watchdog's inline fallback ran tslearn softDTW in the parent, and the next
-# pool's 16 workers all died at fork. 01_pipeline.py exports this for the
-# modelling child; setdefault here keeps a direct `python 02_modelling.py` and
-# the debug notebook equally safe without overriding a deliberate choice.
 os.environ.setdefault("NUMBA_THREADING_LAYER", "workqueue")
 
 import logging
