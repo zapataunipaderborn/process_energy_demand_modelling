@@ -1219,7 +1219,14 @@ def _save_complete_curve_eval_metrics(process, mode_name, simulated_df, real_exp
             save_curves=SAVE_PREDICTED_CURVES,
         )
     except Exception as exc:
-        print(f"  ⚠️ Complete-curve eval ({approach}) failed for {process}/{mode_name}: {exc}")
+        # Traceback, not just the message. A one-line `⚠️ ... : 'NoneType' object
+        # has no attribute 'get'` repeated for every (process, mode) is what let a
+        # broken predict_fn closure go unnoticed for a whole 8-hour run: the stage
+        # reported "failed", the downstream table showed an empty row, and there
+        # was nothing on disk to say WHERE it broke.
+        import traceback, textwrap as _tw
+        print(f"  ⚠️ Complete-curve eval ({approach}) failed for {process}/{mode_name}: {exc}\n"
+              + _tw.indent(traceback.format_exc(), '      '))
         return
     case_curve_df, curve_df = _result if SAVE_PREDICTED_CURVES else (_result, None)
     if case_curve_df.empty:
@@ -3977,14 +3984,14 @@ if RUN_CURVE_ONLY_EVALUATION:
                     # (sensor, activity, object), no model.
                     _pipelines_median_activity_sensor.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': _r['median_activity_sensor']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['median_activity_sensor']: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_median(rv, act, attrs, pipeline=ep))(_r['median_activity_sensor']),
                         'full_pipeline':   _r['median_activity_sensor'],
                     }
                 if 'ml_dtw' in _r:
                     # The former 'baseline': DBA barycenter + DTW alignment + regression.
                     _pipelines_ml_dtw.setdefault(_s, {}).setdefault(_a, {})[_o] = {
                         'reference_curve': _r['ml_dtw']['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_r['ml_dtw']: predict_raw_curve(rv, act, attrs, pipeline=ep),
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve(rv, act, attrs, pipeline=ep))(_r['ml_dtw']),
                         'full_pipeline':   _r['ml_dtw'],
                     }
                 if 'ml_external' in _r:
@@ -4067,7 +4074,16 @@ if RUN_CURVE_ONLY_EVALUATION:
                 for _la, _lo in _leaves:
                     _pipelines_baseline.setdefault(_cs, {}).setdefault(_la, {})[_lo] = {
                         'reference_curve': _ep_s['reference_curve'],
-                        'predict_fn':      lambda rv, act, attrs, ep=_ep_s: predict_raw_curve_median(rv, act, attrs, pipeline=ep),
+                        # Capture the pipeline in an OUTER lambda, never as a default
+                        # argument (`ep=_ep_s`): a default arg leaves a 4th positional
+                        # slot open, and predict_curve_for_instance probes calling
+                        # conventions positionally — its (rv, act, attrs, exog) attempt
+                        # would bind exog (None here, this approach has no exog_cols)
+                        # into `ep` and predict_raw_curve_median would then call .get
+                        # on None. That AttributeError is not the TypeError the probe
+                        # loop falls through on, so it killed the whole eval. Keep this
+                        # signature identical to ENERGY_PREDICT_REBUILDERS['baseline'].
+                        'predict_fn':      (lambda ep: lambda rv, act, attrs: predict_raw_curve_median(rv, act, attrs, pipeline=ep))(_ep_s),
                         'full_pipeline':   _ep_s,
                     }
             # Single-threaded, unlike the two pools above — directly comparable

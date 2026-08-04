@@ -1,29 +1,40 @@
 % Process-model stage runtime — \input{} this file.
-\begin{table}[H]
+\vspace{1em}
+
+\noindent
+\begin{minipage}{\textwidth}
 \centering
 
-\caption{Computational cost of the process-model stages.}
+\captionsetup{
+    justification=centering,
+    singlelinecheck=false,
+    format=plain
+}
+
+\captionof{table}{Computational cost of the process-model stages.}
 \label{tab:timing_process_stages}
 
 \vspace{-0.5em}
-\footnotesize
-\begin{tabular}{p{5.2cm}|r|l|r|r}
+
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}X|r|l|r|r}
 \toprule
 Stage & Cost & Unit & N & Total (s) \\
 \midrule
-Process discovery -- Alpha miner & 1.68 & s / process & 6 & 10.1 \\
-Process discovery -- Heuristic miner & 5.05 & s / process & 6 & 30.3 \\
-Process discovery -- Inductive miner & 5.07 & s / process & 6 & 30.4 \\
-Case-duration model (budgeting) & 0.51 & s / process & 6 & 3.0 \\
-Duration ML models (ml\_global + ml\_local, one fit) & 5.12 & s / process & 6 & 30.7 \\
-Case generation -- sampled durations & 1.13 & ms / case & 5,544 & 6.2 \\
-Case generation -- ML global durations & 5.37 & ms / case & 5,544 & 29.8 \\
-Case generation -- ML per-activity durations & 2.30 & ms / case & 5,544 & 12.8 \\
-Process-model scoring & 2.38 & ms / case & 16,632 & 39.5 \\
-Complete profile + scoring -- Sensor median & 5.77 & ms / case & 16,632 & 95.9 \\
-Complete profile + scoring -- ML Step DTW (proposed) & 436.46 & ms / case & 16,632 & 7,259.2 \\
+Process discovery -- Alpha miner & 1.66 & s / process & 6 & 9.9 \\
+Process discovery -- Heuristic miner & 4.79 & s / process & 6 & 28.8 \\
+Process discovery -- Inductive miner & 4.71 & s / process & 6 & 28.3 \\
+Case-duration model (budgeting) & 0.50 & s / process & 6 & 3.0 \\
+Duration ML models (ml\_global + ml\_local, one fit) & 5.09 & s / process & 6 & 30.5 \\
+Case generation -- sampled durations & 1.05 & ms / case & 5,544 & 5.8 \\
+Case generation -- ML global durations & 5.18 & ms / case & 5,544 & 28.7 \\
+Case generation -- ML per-activity durations & 2.28 & ms / case & 5,544 & 12.6 \\
+Process-model scoring & 2.30 & ms / case & 16,632 & 38.2 \\
+Complete profile + scoring -- Sensor median & 0.23 & ms / case & 16,632 & 3.8 \\
+Complete profile + scoring -- Median per Activity \& Sensor & 0.27 & ms / case & 16,632 & 4.5 \\
+Complete profile + scoring -- ML Step DTW (proposed) & 433.69 & ms / case & 16,632 & 7,213.1 \\
 \bottomrule
-\end{tabular}
+\end{tabularx}
 
 \vspace{0.5em}
 
@@ -32,4 +43,6 @@ Complete profile + scoring -- ML Step DTW (proposed) & 436.46 & ms / case & 16,6
 Runtime of the process-model stages, same run. Fitting stages are per process, generation stages per generated case (test split, 6 processes). Case generation is the simulator alone; complete profile adds the curve models over a whole case and the comparison against its real counterpart. Cost is single-process wall clock, a ratio rather than an absolute deployment figure; Total is what this run spent on the stage over its N units, so it scales with the experiment grid (every net crossed with every process).
 }
 
-\end{table}
+\end{minipage}
+
+\vspace{1em}
