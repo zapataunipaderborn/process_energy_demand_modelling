@@ -366,7 +366,7 @@ def _mlp_fit_model_with_oof(sub, feat_cols, n_splits=5):
     return (m, sc, best_name, calib), oof_out
 
 
-def _mlp_train_models(df_train, expanded_df=None, ef_expanded_df=None):
+def _mlp_train_models(df_train, expanded_df=None, ef_expanded_df=None, process=None):
     """Train ML+ global and per-act models from the training event log.
 
     expanded_df: optional per-timestamp frame carrying the ef_* external-factor
@@ -453,13 +453,22 @@ def _mlp_train_models(df_train, expanded_df=None, ef_expanded_df=None):
         if c in df.columns
     ]
 
-    global_mlp_tuple, _ = _mlp_fit_model_with_oof(df, mlp_feat_cols)
+    # The global and per-activity fits are timed apart: they share the feature
+    # prep above, but each _mlp_fit_model_with_oof call pays the full candidate
+    # x CV machinery regardless of subset size, so ml_local scales with the
+    # activity count, not the event count (measured ~5x the global fit).
+    with _timed('duration_model_training', process=process,
+                detail='ml_plus:global', split='TRAIN', n_items=1):
+        global_mlp_tuple, _ = _mlp_fit_model_with_oof(df, mlp_feat_cols)
 
     act_mlp_models = {}
-    for act, sub in df.groupby('activity'):
-        tpl, _ = _mlp_fit_model_with_oof(sub, mlp_feat_cols)
-        if tpl is not None:
-            act_mlp_models[act] = tpl
+    with _timed('duration_model_training', process=process,
+                detail='ml_plus:per_act', split='TRAIN',
+                n_items=df['activity'].nunique()):
+        for act, sub in df.groupby('activity'):
+            tpl, _ = _mlp_fit_model_with_oof(sub, mlp_feat_cols)
+            if tpl is not None:
+                act_mlp_models[act] = tpl
 
     return (global_mlp_tuple, act_mlp_models, mlp_feat_cols,
             activity_means, global_mean, ef_windows)
@@ -3117,7 +3126,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
 
             with _timed('duration_model_training', process=process, detail='ml_plus', split='TRAIN'):
                 _glb_tpl, _pa_tpls, _mlp_feat_cols, _act_means, _glb_mean, _mlp_ef_windows = \
-                    _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'))
+                    _mlp_train_models(df_train, train_datasets.get(process, {}).get('expanded'),
+                                      process=process)
 
             print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
             print(f"  Global model: {_glb_tpl[2] if _glb_tpl else 'None'}")
@@ -3309,7 +3319,8 @@ for process in process_datasets_to_model.keys() if RUN_PROCESS_MODELLING else []
                                   train_datasets.get(process, {}).get('expanded'),
                                   # ef_* lookup over the unsplit series — the
                                   # simulator queries it at test timestamps.
-                                  ef_expanded_df=process_datasets_to_model.get(process, {}).get('expanded'))
+                                  ef_expanded_df=process_datasets_to_model.get(process, {}).get('expanded'),
+                                  process=process)
         print(f"  feat_cols ({len(_mlp_feat_cols)}): {_mlp_feat_cols}")
         print(f"  Global model: {_mlp_glb_tpl[2] if _mlp_glb_tpl else 'None'}")
         print(f"  Per-act models trained: {len(_mlp_pa_tpls)} activities")
