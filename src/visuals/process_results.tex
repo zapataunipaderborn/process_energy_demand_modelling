@@ -11,15 +11,15 @@
 \toprule
 Method & \makecell[l]{Time\\approach} & Fitness & Precision & \makecell{Generalization} & Simplicity & \makecell{Evt-Ratio\\Error} & \makecell{Activity\\duration\\WAPE (\%)} & \makecell{Lead time\\WAPE (\%)} \\
 \midrule
-\multirow{3}{*}{\makecell[c]{Alpha \\ (Baseline)}} & baseline & 0.635 & 0.398 & 0.525 & 0.489 & 0.333 & 37.970 & 66.955 \\
+\multirow{3}{*}{\makecell[c]{Alpha \\ Petri net \\ (Baseline)}} & baseline & 0.635 & 0.398 & 0.525 & 0.489 & 0.333 & 37.970 & 66.955 \\
  & ml\_global & 0.635 & 0.398 & 0.525 & 0.489 & 0.333 & 27.375 & 58.738 \\
  & ml\_local & 0.635 & 0.398 & 0.525 & 0.489 & 0.333 & 26.602 & 58.582 \\
 \cline{1-9}
-\multirow{3}{*}{\makecell[c]{Best \\ Petri Net}} & baseline & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & 43.875 & 74.272 \\
+\multirow{3}{*}{\makecell[c]{Best \\ Petri net}} & baseline & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & 43.875 & 74.272 \\
  & ml\_global & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & 25.709 & 59.853 \\
  & ml\_local & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.333 & \textbf{21.139} & 59.252 \\
 \cline{1-9}
-\multirow{3}{*}{\makecell[c]{Best \\ Petri Net \\ + Budget}} & baseline & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.357 & 38.399 & 35.057 \\
+\multirow{3}{*}{\makecell[c]{Best \\ Petri net \\ + Budget}} & baseline & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.357 & 38.399 & 35.057 \\
  & ml\_global & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & 0.267 & 26.203 & \textbf{23.011} \\
  & ml\_local & \textbf{0.994} & \textbf{0.728} & \textbf{0.664} & \textbf{0.660} & \textbf{0.250} & 22.630 & 23.165 \\
 \cline{1-9}
@@ -28,6 +28,6 @@ Method & \makecell[l]{Time\\approach} & Fitness & Precision & \makecell{Generali
 \vspace{0.5em}
 \noindent\raggedright\footnotesize
 
-Process models: Alpha (baseline miner), Best Petri Net (best discovered net) and Best Petri Net + Budget (adds duration budgeting at simulation time), each crossed with three activity-duration predictors: baseline samples the fitted statistical distributions, ml\_global is one ML algorithm for all activities, ml\_local one per activity. Fitness, Precision, Generalization and Simplicity score discovery quality (higher is better; median across processes). Evt-Ratio Error is the simulated-to-real event-count ratio error (lower is better). Activity duration and Lead time are WAPEs against the real test cases (lower is better): the former the median over cases, the latter pooled over them. \textbf{Bold} = best per column.
+Process models: Alpha Petri net (baseline miner), Best Petri net (best discovered net) and Best Petri net + Budget (adds duration budgeting at simulation time), each crossed with three activity-duration predictors: baseline samples the fitted statistical distributions, ml\_global is one ML algorithm for all activities, ml\_local one per activity. Fitness, Precision, Generalization and Simplicity score discovery quality (higher is better; Fitness is the median over all pooled test cases when per-case fitness is available, the others the median across processes, as they are model-level metrics with no per-case form). Evt-Ratio Error is the simulated-to-real event-count ratio error (lower is better). Activity duration and Lead time are WAPEs against the real test cases (lower is better): the former the median over cases, the latter pooled over them. \textbf{Bold} = best per column.
 
 \end{table*}
