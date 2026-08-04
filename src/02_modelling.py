@@ -1661,6 +1661,31 @@ def _mean_trace_fitness(log_df, net, im, fm):
         return np.nan
 
 
+def _per_case_trace_fitness(log_df, net, im, fm):
+    """Token-replay fitness per case: {case_id (str): trace_fitness}.
+
+    The same replay as _mean_trace_fitness, but the per-trace scores are kept
+    instead of averaged away, so fitness can be pooled over cases in the
+    results (like every timing metric) rather than only per process.
+    Returns an empty dict on failure."""
+    try:
+        log_obj = pm4py.convert_to_event_log(log_df)
+        replay = token_replay.apply(
+            log_obj, net, im, fm,
+            parameters={'consider_remaining_in_fitness': True}
+        )
+        out = {}
+        for trace, item in zip(log_obj, replay):
+            cid = str(trace.attributes.get('concept:name'))
+            if item.get('trace_fitness') is not None:
+                out[cid] = float(item['trace_fitness'])
+            else:
+                out[cid] = 1.0 if item.get('trace_is_fit') else 0.0
+        return out
+    except Exception:
+        return {}
+
+
 def _safe_precision(log_df, net, im, fm):
     """Compute token-based precision; returns np.nan on failure."""
     try:
@@ -2203,11 +2228,13 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         'simplicity': np.nan,
     }
 
+    _fitness_per_case = {}   # case_id (str) -> replay fitness, filled below
     if process_models is not None:
         # Per-station evaluation: filter the REAL log by station and replay against
         # each station's own net.  This avoids the cross-station precision artifact
         # and is not confounded by the simulation's inflated event count.
         fit_list, prec_list, gen_list, sim_list = [], [], [], []
+        _fit_by_case = {}
         seen_stations: set = set()
         for key, pm_entry in process_models.items():
             _obj, obj_type, station = key
@@ -2226,7 +2253,13 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
                 log_st = pm4py.format_dataframe(
                     df_st, case_id=case_col,
                     activity_key=activity_col, timestamp_key=start_col)
-                f  = _mean_trace_fitness(log_st, net_s, im_s, fm_s)
+                # One replay serves both levels: the per-trace scores feed the
+                # per-case fitness, their mean is the station-level fitness
+                # (identical to the former _mean_trace_fitness result).
+                _st_fit = _per_case_trace_fitness(log_st, net_s, im_s, fm_s)
+                for _cid, _v in _st_fit.items():
+                    _fit_by_case.setdefault(_cid, []).append(_v)
+                f  = float(np.mean(list(_st_fit.values()))) if _st_fit else np.nan
                 p  = _safe_precision(log_st, net_s, im_s, fm_s)
                 g  = _safe_generalization(log_st, net_s, im_s, fm_s)
                 s  = _safe_simplicity(net_s)
@@ -2240,6 +2273,9 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
         if prec_list: conformance_metrics['precision']      = float(np.mean(prec_list))
         if gen_list:  conformance_metrics['generalization'] = float(np.mean(gen_list))
         if sim_list:  conformance_metrics['simplicity']     = float(np.mean(sim_list))
+        # A case's fitness is the mean over the stations it was replayed at
+        # (one net per station; most processes have a single station net).
+        _fitness_per_case = {c: float(np.mean(v)) for c, v in _fit_by_case.items()}
     # For non-Petri modes (statistical, ML) there is no process model, so
     # conformance metrics stay NaN.  Direct sim-vs-real comparison is
     # already captured by the DFG edge metrics and the basic metrics above.
@@ -2354,6 +2390,12 @@ def comprehensive_simulation_evaluation(simulated_df, real_df, real_expanded_df=
     _pc = _per_case_median_metrics(simulated_df, real_df,
                                    case_col=case_col, activity_col=activity_col,
                                    start_col=start_col, end_col=end_col)
+    # Attach the per-case replay fitness (real log vs discovered net) so it is
+    # exported to process_eval_per_case.parquet and can be pooled over cases
+    # like the timing metrics. NaN for non-Petri modes and unreplayed cases.
+    if _fitness_per_case and isinstance(_pc.get('per_case'), pd.DataFrame):
+        _pc['per_case']['fitness'] = (_pc['per_case']['case_id'].astype(str)
+                                      .map(_fitness_per_case))
     report(f"\nPer-case median metrics ({_pc.get('n_cases', 0)} cases matched):")
 
     # Fall back to global values for any metric the per-case routine couldn't compute
