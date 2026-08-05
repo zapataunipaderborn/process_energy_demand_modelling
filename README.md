@@ -1,6 +1,6 @@
-# Process-Aware Energy Demand Modelling
+# Process and Energy Digital Twin — modelling pipeline
 
-This repository contains the full modelling pipeline for predicting industrial energy load profiles from process event logs: process models are mined from event logs (pm4py), process behaviour is simulated, and per-activity energy curves are predicted by a set of competing approaches — naive medians, DTW/DBA-based regression (`ml_*`), the segment-based step-DTW method (`ml_step_dtw_smooth`), and seq2seq neural baselines — which are then evaluated on held-out data and assembled into complete case-level and schedule-level load profiles.
+This repository contains the code for the paper *"Process and Energy Digital Twin: modeling and simulating industrial processes and their dynamic energy profiles with Process Mining and Machine Learning"*. The pipeline extracts a process model from event logs with Process Mining (pm4py) and per-activity energy profile models with Machine Learning, couples the two for simulation, and evaluates how faithfully the simulated process and energy profiles reproduce the real system. The energy profile approaches compared in the paper — the proposed segment-based Step DTW method, its ablations, sequence-to-sequence baselines, and median baselines — are all implemented here.
 
 ## Repository layout
 
@@ -10,11 +10,14 @@ This repository contains the full modelling pipeline for predicting industrial e
 | `src/02_modelling.py` | The modelling pipeline itself: train/test split, process mining, simulation, curve-model training, curve-only evaluation, complete-curve evaluation, schedule-profile evaluation, result export. |
 | `src/utils/` | Library code: `sim_extractor.py` (feature/curve extraction, all curve-model builders and predictors, evaluation), `simulation.py` (discrete-event process simulation). |
 | `src/simulation_process/` | The synthetic process_1 generator (`generate_process_1.py` + physical autoclave/distillation models). |
-| `src/03_results.ipynb` | Results notebook: builds the paper's evaluation tables from a finished run in `results/`. |
-| `src/04_visuals.ipynb` | Figure notebook: builds the paper's figures from a finished run in `results/`. |
-| `data/gold/experiment_1/<process>/datasets/` | Model-ready inputs per process: `df_event_log.parquet`, `df_expanded.parquet`, `df_production_plan.parquet`. |
-| `results/<run_name>_<timestamp>/` | One folder per pipeline run: metrics tables (parquet/csv), evaluation results per stage, mined Petri nets, run log, `info.json`. |
+| `src/03_results.ipynb` | Results notebook: builds the paper's evaluation tables (process models, individual profiles, complete profiles). Ships with executed outputs, so the paper's results can be inspected directly. |
+| `src/04_visuals.ipynb` | Figure notebook: builds the paper's figures. |
+| `src/05_computational_time_analysis.ipynb` | Computational-cost notebook: builds the runtime tables of the appendix. |
+| `data/gold/experiment_<n>/<process>/datasets/` | Model-ready inputs per process: `df_event_log.parquet`, `df_expanded.parquet`, `df_production_plan.parquet`. Only the synthetic process_1 data can be regenerated here (see below). |
+| `text/` | Manuscript sources. |
 | `requirements.txt` | Pinned Python dependencies (Python 3.10). |
+
+There is no shipped results folder: each pipeline run creates its own `results/<run_name>_<timestamp>/` directory locally (metrics tables, evaluation results per stage, mined Petri nets, run log, `info.json`), and the notebooks read the latest run of their experiment from there. The evaluation results of the paper's full run are visible in the executed notebook outputs.
 
 ## Data availability
 
@@ -53,15 +56,7 @@ pip install -r requirements.txt
 
    Everything is CPU-only by design (GPUs are hidden from the child process). A full tuned run on process_1 takes on the order of hours; a throttled sanity run (no Optuna, one sensor via `PIPELINE_CURVE_MAX_SENSORS=1`) finishes in minutes.
 
-4. **Inspect the results.** Outputs land in `results/<run_name>_<timestamp>/`:
-   - `summary_train_test.parquet`, `curve_eval_results.parquet` — per-curve and aggregated curve-prediction metrics per approach,
-   - `process_results/` — process-model (Petri net) quality per mining algorithm and simulation mode,
-   - `complete_curve_eval_results/` — complete case-profile evaluation per (process × simulation mode × approach),
-   - `schedule_profile_eval_results/` — schedule-level load-profile comparison (best model vs. stochastic generators),
-   - `runtime_profile.parquet`/`.csv`, `runtime_summary.csv`, `runtime_by_method.csv` — wall-clock cost of every stage (mining, duration models, each simulation, each evaluation) and the training cost of each curve method,
-   - `pipeline_execution.log`, `info.json` — full run log and configuration record.
-
-   The notebooks `src/03_results.ipynb` and `src/04_visuals.ipynb` reproduce the paper's tables and figures from such a run folder (set the experiment folder name at the top of each notebook).
+4. **Inspect the results.** The run writes its outputs to `results/<run_name>_<timestamp>/`. The notebooks `src/03_results.ipynb`, `src/04_visuals.ipynb`, and `src/05_computational_time_analysis.ipynb` then rebuild the paper's tables and figures from that folder (set the experiment name at the top of each notebook).
 
 5. *(Optional)* Reproducibility is seeded end to end: the same `random_seed` yields the same train/test partition, the same per-combo model seeds, and a pinned `PYTHONHASHSEED` in the child process.
 
