@@ -221,11 +221,6 @@ EXPERIMENTS = [
         'seq2seq_cells': ['lstm'],
         'curve_optimize_hyperparams': True,
         'curve_n_optuna_trials': 10,
-        # 'baseline' = ONE median level per SENSOR — the naive floor of the
-        # complete-profile table. 'median_activity_sensor' is deliberately NOT
-        # here: the per-(sensor, activity, object) median is the floor of the
-        # curve evaluation, and assembling it into complete case profiles too
-        # costs a full (process x mode) inference pass for a row no table shows.
         'complete_curve_approaches': ['ml_step_dtw_smooth', 'baseline'],
         'curve_median_floor':    False,
         'save_curve_values':     True,
