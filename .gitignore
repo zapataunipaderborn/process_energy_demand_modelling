@@ -5,7 +5,6 @@ __pycache__/
 *pipeline_execution.log
 results/*
 nohup.out
-text.md
 text_highlights.md
 src_private/
-
+text/*
