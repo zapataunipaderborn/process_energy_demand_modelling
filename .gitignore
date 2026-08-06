@@ -8,3 +8,4 @@ nohup.out
 text_highlights.md
 src_private/
 text/*
+.DS_Store
