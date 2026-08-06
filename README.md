@@ -70,6 +70,3 @@ To apply the pipeline to a new process, provide the three parquet files under `d
 
 then add the process name to `processes_to_run` in `src/01_pipeline.py`.
 
-## License
-
-See [LICENSE](LICENSE).
