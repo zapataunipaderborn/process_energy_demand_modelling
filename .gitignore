@@ -5,7 +5,8 @@ __pycache__/
 *pipeline_execution.log
 results/*
 nohup.out
-text_highlights.md
 src_private/
 text/*
 .DS_Store
+results/
+.venv/
