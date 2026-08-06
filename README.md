@@ -14,7 +14,6 @@ This repository contains the code for the paper *"Process and Energy Digital Twi
 | `src/04_visuals.ipynb` | Figure notebook: builds the paper's figures. |
 | `src/05_computational_time_analysis.ipynb` | Computational-cost notebook: builds the runtime tables of the appendix. |
 | `data/gold/experiment_<n>/<process>/datasets/` | Model-ready inputs per process: `df_event_log.parquet`, `df_expanded.parquet`, `df_production_plan.parquet`. Only the synthetic process_1 data can be regenerated here (see below). |
-| `text/` | Manuscript sources. |
 | `requirements.txt` | Pinned Python dependencies (Python 3.10). |
 
 There is no shipped results folder: each pipeline run creates its own `results/<run_name>_<timestamp>/` directory locally (metrics tables, evaluation results per stage, mined Petri nets, run log, `info.json`), and the notebooks read the latest run of their experiment from there. The evaluation results of the paper's full run are visible in the executed notebook outputs.
